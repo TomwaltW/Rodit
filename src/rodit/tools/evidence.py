@@ -18,7 +18,9 @@ DefaultToolEvidenceProvider 实现 core.ports.ToolEvidenceProvider，只处理 c
 3. 一单都没有 → bundle.missing 标 MISSING_ORDER。
 
 冲突处理的主题（§5.2.1 实时接口优先级 1，覆盖同主题的政策 / 详情页 / FAQ）：
-- 价格与活动：promotions（和店铺满减政策比较；一次只查当前商品，不会互相覆盖）；
+- 价格与活动：topic_for_price(item)；和店铺满减政策、FAQ、详情页里的活动说法由
+  knowledge.conflict 专门比较（实时没有活动、或满减档位 / 折扣对不上时才覆盖），
+  不走通用的 contradicts——政策多写一句"定制款不参加"、活动日期不算冲突；
 - 退换资格：只有"不能无理由退货"时是 seven_day_return（否定说法，覆盖"支持七天无理由"）；
   可以退 / 需要人工判断时不带主题——内容里引用的政策原文可能带否定词，比较会误删一致的说法；
 - 库存：topic_for_stock(item, sku)。
@@ -587,8 +589,9 @@ class DefaultToolEvidenceProvider:
                 label=ev.tool_label("price"),
                 content=price_content(price, item),
                 data={"price": _dump(price)},
-                # 和店铺满减政策同主题：实时活动配置和政策冲突时覆盖政策（§5.2.1）
-                topic=PolicyKey.PROMOTIONS.value,
+                # 实时活动配置和店铺满减政策冲突时覆盖政策（§5.2.1）：由 knowledge.conflict
+                # 按 data["price"] 专门比较，不和政策共用 promotions 主题
+                topic=ev.topic_for_price(item.item_id),
                 fetched_at=price.fetched_at,
             )
         )
