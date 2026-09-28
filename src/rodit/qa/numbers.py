@@ -4,12 +4,17 @@
 - 先做 NFKC 归一（全角数字、全角冒号变半角），去掉千分位逗号；"48小时"和"48 小时"一样处理。
 - 数值比较：259 和 259.00 相同，09 和 9 相同。
 - 时间（10:30）、日期（09-28、10 月 8 日）整体比较：证据里出现同一时间 / 日期才算有依据，
-  不拆成单个数字分别放行。
+  不拆成单个数字分别放行。证据里没跟时分的"10-12"可能是范围（"每包 10-12 片"），
+  "1:20 兑水"是比例：日期 / 时间照样记下，里面的数字也照样算有依据；
+  "10-15 分钟""10-20㎡""10-12 岁"带了单位，是范围，不是日期。
 - 证据 data 里的 ISO 时间戳（2026-09-28T10:30:00+08:00）只提供日期和时间（同时按东八区折算，
   回答里的时间由 core.clock.fmt_time 按东八区写），不把年月日时分秒当普通数字，
   避免"35 元""9 日"被时间戳里的分钟、月份放行。fmt_time 写法（"截至 09-28 10:30"）也一样：
   日期、时间整体记下，月日时分不再当普通数字（"满 28 减 10，30 元"不能被它放行）。
 - "30 号"（没写月份）是某月的几号：证据里有这一天的日期（任何月份）或同样的数字才算有依据。
+- 买家没写单位的身高（"163 108斤想穿宽松一点选什么码"）：问尺码的消息里、所在分句没有价格
+  时间用语（按词或"数字 + 单位"认，"一点""日常""夏天""到""发"不算）时算身体尺寸；
+  身体尺寸的范围（"身高161-163"）两头都算。
 - 回答里的"16 点""4 点半"按时间比较（"下午 4 点"也认 16:00），证据里有同一时间就算有依据。
 - 紧跟在字母或下划线后面的数字是编号（o_1002、ZT7300000001、k_1），两边都不参与比较。
 - 中文数字只在时长、折扣、重量、金额单位前识别（"三天""两个工作日""七天无理由""五折"），
@@ -38,8 +43,16 @@ _TIME_CN = re.compile(r"(?<![\d.])([01]?\d|2[0-4])\s*点(?:\s*(半)|\s*([0-5]?\d
 _DATE_CN = re.compile(r"(?<![\d.])(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)")
 _DATE_MD = re.compile(
     r"(?<![\d.:-])(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\d.:-])"
-    r"(?!\s*(?:个|天|日|小时|元|块|%|号|件|码|cm|厘米|斤|公斤|kg))"
+    r"(?!\s*(?:个|天|日|小时|分钟|分|秒|周|月|年|岁|元|块|%|号|件|码|cm|厘米|mm|毫米|m|米|平|度|期"
+    r"|斤|公斤|kg|g|克|ml|毫升|片|粒|次|倍|人))"
 )
+# fmt_time 写法（"截至 09-28 10:30"）：日期后面紧跟时分，整体是一个时间点
+_DATE_TIME_MD = re.compile(
+    r"(?<![\d.:-])(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\s+([01]?\d|2[0-4]):([0-5]\d)(?!\d)"
+)
+# 比例不是钟点（"按 1:20 兑水稀释""比例 1:1"）
+_RATIO_BEFORE = re.compile(r"(?:比例|配比)\s*(?:为|是)?\s*$")
+_RATIO_AFTER = re.compile(r"\s*(?:的?比例|配比|兑|稀释|调配|混合|勾兑)")
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 _CN_NUMBER = CN_NUMBER_BEFORE_UNIT  # 中文数字（core.numerals）；cn_to_int 也从这里导出
 _UNIT_AFTER = re.compile(
@@ -58,14 +71,19 @@ _BODY_BEFORE = re.compile(
     r"\s*[:：]?\s*(?:是|有|约|大概|差不多)?\s*$"
 )
 # 买家没写单位的数字（"165 110斤穿什么码"里的 165）：消息在问尺码、
-# 所在分句又不涉及价格和时间时才算身体尺寸
+# 所在分句又不涉及价格和时间时才算身体尺寸。价格、时间用语按词或"数字 + 单位"认，
+# 不用单字："想穿宽松一点""日常穿""夏天穿""161到163之间""给我发什么码"都是在问尺码
 _CLAUSE_SPLIT = re.compile(r"[，,。.！!？?；;\n]")
 _BODY_CONTEXT = re.compile(
     r"斤|kg|公斤|cm|厘米|身高|体重|胸围|腰围|臀围|肩宽|脚长|穿|尺码|码", re.IGNORECASE
 )
 _RISK_CONTEXT = re.compile(
-    r"元|块|钱|价|包邮|便宜|优惠|折|减|卖|运费|补偿|红包|天|日|小时|周|月|号|点|到|发"
+    r"元|块钱|\d\s*块|钱|价|包邮|便宜|优惠|折扣|打折|\d\s*折|满\s*\d|减\s*\d|卖|运费|补偿|红包|券"
+    r"|\d\s*(?:个)?\s*(?:小时|天|日|周|星期|月|号|点)|几号|几点|几天|多久|哪天"
+    r"|发货|发出|到货|送到|送达|签收|到账"
 )
+# 身体尺寸的范围（"身高161-163""160到165cm"）：一头是身体尺寸，另一头也是
+_RANGE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:到|至|[-~–—])\s*(\d+(?:\.\d+)?)(?![\d.])")
 
 
 def normalize(text: str) -> str:
@@ -155,18 +173,27 @@ class NumberSet:
                     self.dates.add((local.month, local.day))
                     self.times.add((local.hour, local.minute))
         norm = _ISO_DATETIME.sub(" ", norm)
-        # 日期、时间整体记下，再把它们遮掉：月日时分不当普通数字
+        # fmt_time 写法、写了月份的日期、钟点时间整体记下，再把它们遮掉：月日时分不当普通数字
         spans: list[tuple[int, int]] = []
-        for pattern in (_DATE_CN, _DATE_MD):
-            for m in pattern.finditer(norm):
-                month, day = int(m.group(1)), int(m.group(2))
-                if _valid_date(month, day):
-                    self.dates.add((month, day))
-                    spans.append(m.span())
+        for m in _DATE_TIME_MD.finditer(norm):
+            self.dates.add((int(m.group(1)), int(m.group(2))))
+            self.times.add((int(m.group(3)), int(m.group(4))))
+            spans.append(m.span())
+        for m in _DATE_CN.finditer(norm):
+            month, day = int(m.group(1)), int(m.group(2))
+            if _valid_date(month, day):
+                self.dates.add((month, day))
+                spans.append(m.span())
+        # 没跟时分的"10-12"可能是范围（"每包 10-12 片"）：日期记下，数字不遮
+        for m in _DATE_MD.finditer(norm):
+            month, day = int(m.group(1)), int(m.group(2))
+            if _valid_date(month, day):
+                self.dates.add((month, day))
         for m in _TIME.finditer(norm):
             if not _is_identifier(norm, m.start()):
                 self.times.add((int(m.group(1)), int(m.group(2))))
-                spans.append(m.span())
+                if not _is_ratio(norm, m):
+                    spans.append(m.span())
         norm = _blank(norm, spans)
         self.values |= _plain_values(norm)
 
@@ -182,6 +209,12 @@ class NumberSet:
             for token in extract_numbers(clause):
                 if token.value is not None and (token.body or (sizing and token.bare)):
                     self.buyer_values.add(token.value)
+            for m in _RANGE.finditer(clause):
+                if _is_identifier(clause, m.start()):
+                    continue
+                unit = _UNIT_AFTER.match(clause, m.end())
+                if _is_body(clause, m.start(), unit.group(1) if unit else None):
+                    self.buyer_values |= {Decimal(m.group(1)), Decimal(m.group(2))}
 
     def supports(self, token: NumberToken) -> bool:
         if token.date is not None:
@@ -199,6 +232,12 @@ class NumberSet:
         if token.value in self.values:
             return True
         return (token.body or token.bare) and token.value in self.buyer_values
+
+
+def _is_ratio(norm: str, m: re.Match[str]) -> bool:
+    """ "按 1:20 兑水""比例 1:1"：冒号两边是比例，不是钟点。"""
+    before = norm[max(0, m.start() - 6) : m.start()]
+    return bool(_RATIO_BEFORE.search(before) or _RATIO_AFTER.match(norm, m.end()))
 
 
 def _plain_values(norm: str) -> set[Decimal]:
