@@ -31,9 +31,11 @@ from rodit.core.enums import (
 from rodit.core.errors import ConcurrencyConflict
 from rodit.core.models import (
     AfterSaleReview,
+    ItemCard,
     KnowledgeGap,
     KnowledgeItem,
     LabeledSample,
+    PolicyEntry,
     ShopAuth,
     SuggestionRecord,
 )
@@ -513,3 +515,99 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
     # B 自己读得到（证明数据确实写进去了）
     assert repos.suggestions.get(SHOP_B, b_sug.id) is not None
     assert repos.reviews.get(SHOP_B, "as_9001") is not None
+
+
+# ---------------------------------------------------------------- 文本清洗（NUL 等控制字符）
+
+DIRTY_TEXT = "这件\x00是纯棉\x07的吗\x1b\n尺码\t偏小吗\r"
+"""带 NUL 和其他 C0 控制字符的文字（换行、制表符要保留）。"""
+CLEAN_TEXT = "这件是纯棉的吗\n尺码\t偏小吗"
+
+
+def check_text_sanitation(make: Callable[[], RepoSet]) -> None:
+    """NUL 和其他 C0 控制字符（换行、制表符除外）在模型边界去掉（core.models.strip_control_chars）。
+
+    PostgreSQL 的 TEXT / JSONB 不接受 NUL，内存实现照单全收；两种实现对同一段文字的写入结果
+    必须一致：都写得进去，读回的都是去掉控制字符后的文字。模型用构造函数或 model_validate
+    创建时清洗（model_copy 不做校验，调用方自己用构造函数）。
+    """
+    repos = make()
+    world = build_demo_world()
+
+    msg = make_message(DIRTY_TEXT, world=world, msg_id="m_nul")
+    assert msg.text == CLEAN_TEXT
+    assert repos.conversations.add_message(msg) is True
+    stored = repos.conversations.recent_messages(SHOP_A, msg.conversation_id)
+    assert [m.text for m in stored] == [CLEAN_TEXT]
+
+    k = repos.knowledge.add_knowledge(
+        KnowledgeItem(
+            shop_id=SHOP_A,
+            question=DIRTY_TEXT,
+            answer="亲\x00，是纯棉的哦",
+            source=KnowledgeSource.ADOPTED,
+            status=KnowledgeStatus.CANDIDATE,
+        )
+    )
+    got = repos.knowledge.get_knowledge(SHOP_A, k.id)
+    assert got is not None and got.question == CLEAN_TEXT and got.answer == "亲，是纯棉的哦"
+
+    repos.knowledge.upsert_policy(
+        PolicyEntry(shop_id=SHOP_A, key="ship_time", value="付款后\x00 48 小时发货", updated_at=NOW)
+    )
+    assert repos.knowledge.get_policies(SHOP_A)["ship_time"].value == "付款后 48 小时发货"
+    card = ItemCard(
+        shop_id=SHOP_A,
+        platform=world.shop(SHOP_A).platform,
+        item_id="i_nul",
+        title="碎花\x00连衣裙",
+        attributes={"面料": "棉\x0095%"},
+        size_advice="偏小\x00一码",
+        care=["手洗\x00"],
+        detail_text=DIRTY_TEXT,
+        updated_at=NOW,
+    )
+    assert card.title == "碎花连衣裙" and card.detail_text == CLEAN_TEXT
+    assert card.attributes == {"面料": "棉95%"} and card.care == ["手洗"]
+    repos.knowledge.upsert_item_card(card)
+    assert repos.knowledge.get_item_card(SHOP_A, "i_nul") == card
+
+    dirty_record = {
+        **_suggestion(SHOP_A, "c_nul", minutes=1).model_dump(),
+        "question_text": DIRTY_TEXT,
+        "text": "亲\x00，是的",
+    }
+    rec = repos.suggestions.add(SuggestionRecord.model_validate(dirty_record))
+    assert rec.question_text == CLEAN_TEXT and rec.text == "亲，是的"
+    edited = SuggestionRecord.model_validate(
+        {**rec.model_dump(), "status": SuggestionStatus.EDITED_SENT, "edited_text": "亲\x00，是"}
+    )
+    repos.suggestions.update(edited)
+    got_rec = repos.suggestions.get(SHOP_A, rec.id)
+    assert got_rec is not None and got_rec.edited_text == "亲，是"
+    assert got_rec.question_text == CLEAN_TEXT and got_rec.text == "亲，是的"
+
+    repos.feedback.add_gap(
+        KnowledgeGap(
+            shop_id=SHOP_A, missing="policy:gift", question_text=DIRTY_TEXT, created_at=NOW
+        )
+    )
+    repos.feedback.add_label(LabeledSample(shop_id=SHOP_A, text=DIRTY_TEXT, created_at=NOW))
+    assert [g.question_text for g in repos.feedback.list_gaps(SHOP_A)] == [CLEAN_TEXT]
+    assert [s.text for s in repos.feedback.list_labels(SHOP_A)] == [CLEAN_TEXT]
+
+    saved = repos.reviews.save(
+        AfterSaleReview(
+            shop_id=SHOP_A,
+            aftersale_id="as_nul",
+            platform_status=AfterSaleStatus.PENDING_REVIEW,
+            state=ReviewState.NEW,
+            reason="买家说\x00没收到",
+            action_result={"note": "已\x00处理", "steps": ["a\x00b"]},
+        ),
+        expected_version=None,
+    )
+    got_review = repos.reviews.get(SHOP_A, "as_nul")
+    assert got_review is not None and got_review == saved
+    assert got_review.reason == "买家说没收到"
+    assert got_review.action_result == {"note": "已处理", "steps": ["ab"]}

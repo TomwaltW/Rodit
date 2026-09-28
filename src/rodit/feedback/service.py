@@ -42,6 +42,7 @@ from rodit.core.models import (
     KnowledgeItem,
     LabeledSample,
     SuggestionRecord,
+    strip_control_chars,
 )
 from rodit.core.pii import contains_pii, mask_pii
 from rodit.core.ports import (
@@ -153,6 +154,9 @@ class FeedbackService:
           做成 FAQ 会把过期的实时数据当成标准答案（§5.2.1 实时数据优先）。
         """
         actor = _require_human(agent_id, "agent_id")
+        if isinstance(edited_text, str):
+            # 推荐记录用 model_copy 更新（不做校验）：先去掉 NUL 等控制字符，和模型边界的清洗一致
+            edited_text = strip_control_chars(edited_text)
         if not isinstance(edited_text, str) or not edited_text.strip():
             raise ValueError("编辑后的文字不能为空")
         with self._lock:
