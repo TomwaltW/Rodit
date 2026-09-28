@@ -1,7 +1,9 @@
 """证据冲突处理与长度预算（方案 §5.2.1 "高优先级覆盖低优先级"、§14 "控制证据长度"）。
 
-冲突（core.evidence 模块文档）：同一 topic 下只保留优先级最高（priority 最小）的来源，
-其余从证据里移除、id 记进 overridden_ids；同一来源（同优先级）之间不互相覆盖。
+冲突（core.evidence 模块文档）：同一 topic 下，低优先级证据和更高优先级依据内容冲突时
+（core.evidence.contradicts）从证据里移除、id 记进 overridden_ids；内容一致时两者都保留
+（FAQ 标准回答仍可直接用，§5.4）。类目通用知识遇到同主题的更具体来源一律让位。
+同一来源（同优先级）之间不互相覆盖。
 自由文本（详情页一句、FAQ 回答）可能同时涉及几个主题（如"24 小时内发货，默认发中通"）：
 内部用 Candidate.topics 记全部主题，任一主题被更高优先级的来源占据就移除这一句
 （宁可少说，不说和高优先级依据矛盾的话）；对外的 Evidence.topic 只写第一个主题。
@@ -16,7 +18,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from rodit.core.enums import PolicyKey
+from rodit.core import evidence as ev
+from rodit.core.enums import EvidenceSource, PolicyKey
 from rodit.core.models import Evidence
 
 STRUCTURED_RANK = 2.0
@@ -78,7 +81,22 @@ def resolve_conflicts(cands: Sequence[Candidate]) -> tuple[list[Candidate], list
     kept: list[Candidate] = []
     overridden: list[str] = []
     for c in cands:
-        if any(best[t] < c.evidence.priority for t in c.topics):
+        losing = {t for t in c.topics if best[t] < c.evidence.priority}
+        if not losing:
+            kept.append(c)
+            continue
+        # 类目通用知识是泛泛的建议：同主题有更具体的来源就不用它
+        if c.evidence.source == EvidenceSource.CATEGORY:
+            overridden.append(c.evidence.id)
+            continue
+        # 其余来源：只有内容冲突才覆盖（core.evidence.contradicts），一致时两者都保留
+        higher = [o for o in cands if o.evidence.priority < c.evidence.priority]
+        same_topic = [o.evidence.content for o in higher if o.topics & losing]
+        if ev.contradicts(
+            c.evidence.content,
+            reference=[o.evidence.content for o in higher],
+            same_topic=same_topic,
+        ):
             overridden.append(c.evidence.id)
         else:
             kept.append(c)

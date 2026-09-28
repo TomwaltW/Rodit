@@ -207,12 +207,13 @@ def test_shipping_policy_policies_and_outdated_faq(world, repo, make_retriever, 
         "policy:courier_choice",
         "policy:remote_areas",
         "policy:presale",
+        "faq:2",
     ]
     ship = b.get("policy:ship_time")
     assert ship.label == "店铺政策 · 发货时效" and ship.topic == "ship_time"
     assert ship.data == {"key": "ship_time", "value": world.policy_map(SHOP_A)["ship_time"].value}
-    # FAQ 回答涉及发货时效，同主题以店铺政策为准（被覆盖）
-    assert len(b.overridden_ids) == 1 and b.overridden_ids[0].startswith("faq:")
+    # FAQ 回答和店铺政策一致（都是 48 小时）：两者都保留，FAQ 可以直接回答（§5.4）
+    assert b.overridden_ids == []
 
     # 方案 §5.2.1 的例子：政策改成 72 小时，FAQ 还写着 48 小时 → 以政策为准
     repo.upsert_policy(
@@ -244,7 +245,9 @@ def test_return_policy_policies_platform_rule_and_tools_unavailable(world, make_
 def test_invoice_gift(world, make_retriever, route):
     ctx = make_context("能开发票吗", world)
     b = make_retriever().retrieve(ctx, route(Intent.INVOICE_GIFT))
-    assert _ids(b) == ["policy:invoice", "policy:gift", "policy:shipping_insurance"]
+    # FAQ "能开发票吗" 的标准回答和发票政策一致，保留（§5.4 FAQ 直答）
+    assert _ids(b) == ["policy:invoice", "policy:gift", "policy:shipping_insurance", "faq:3"]
+    assert b.overridden_ids == []
     assert b.missing == ["policy:warranty"]  # 店铺 A 没填保修
     assert "3 个工作日" in b.get("policy:invoice").content
 

@@ -174,3 +174,15 @@ def test_off_platform_request_vs_answer():
     assert find_off_platform_in_answer("可以打我电话 13812345678")
     assert find_off_platform_in_answer("可以支付宝转账给我")
     assert not find_off_platform_in_answer("可以再加个腰带哦")
+
+
+def test_mask_placeholders_and_weak_contact_words_are_not_requests():
+    """§6.6 规则 1：遮盖占位符、正常提到手机号 / 电话的问题不算站外请求。"""
+    assert find_off_platform_request("改地址，电话 [手机号]") == []
+    assert find_off_platform_request("能改个手机号吗") == []
+    assert find_off_platform_request("快递员没打电话") == []
+    assert find_off_platform_request("留个手机号吧") == ["留个手机号"]
+    assert find_off_platform_request("你的电话多少") == ["你的电话"]
+    assert find_off_platform_request("我手机13812345678") == ["13812345678"]
+    assert find_off_platform_in_answer("请留下您的手机号") == ["手机号"]
+    assert find_off_platform_in_answer("亲，已为您登记 [手机号]") == []

@@ -24,15 +24,17 @@
 - tool:price:{item_id}                {"price": PriceInfo}
 （模型对象都以 model_dump(mode="json") 存入，读取时用对应模型 model_validate。）
 
-冲突处理（§5.2.1）：每条证据可以带一个 topic（Topic 的取值）。同一 topic 下只保留优先级最高
-（EvidenceSource.priority 最小）的来源，其余从 EvidenceBundle.evidences 移除、
-id 记进 overridden_ids。
+冲突处理（§5.2.1）：每条证据可以带一个 topic（PolicyKey / Topic 的取值）。同一 topic 下，
+低优先级的证据只有和更高优先级的依据内容冲突（contradicts：数字、快递公司、肯定否定不一致）时
+才被覆盖：从 EvidenceBundle.evidences 移除、id 记进 overridden_ids；内容一致时两者都保留。
 自由文本（详情页、FAQ 回答）先按句切段，用 detect_topics 给每段打主题，只移除冲突的那一段。
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections.abc import Sequence
 from enum import StrEnum
 
 from rodit.core.enums import POLICY_LABELS, Intent, Platform, PolicyKey
@@ -228,6 +230,37 @@ def split_sentences(text: str) -> list[str]:
 def detect_topics(text: str) -> set[str]:
     """给一段自由文本打事实主题（PolicyKey 取值）。检索做冲突处理时用。"""
     return {str(topic) for topic, pattern in _TOPIC_PATTERNS if pattern.search(text or "")}
+
+
+_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+_COURIER = re.compile(r"中通|圆通|申通|韵达|顺丰|邮政|EMS|京东|极兔|德邦|百世|天天")
+_NEGATIVE = re.compile(r"不支持|不能|没有|暂不|无法|不发货|不参加|不提供|不送|不包邮|不可以")
+
+
+def _facts(text: str) -> tuple[set[str], set[str]]:
+    norm = unicodedata.normalize("NFKC", text or "")
+    return set(_NUMBER.findall(norm)), set(_COURIER.findall(norm))
+
+
+def contradicts(lower: str, *, reference: Sequence[str], same_topic: Sequence[str]) -> bool:
+    """同主题的低优先级文字是否和高优先级依据冲突（§5.2.1 冲突时高优先级覆盖低优先级）。
+
+    - reference：所有更高优先级依据的文字；same_topic：其中和它同主题的那些。
+    - 低优先级文字里出现高优先级依据里都没有的数字（时效、金额、天数）或快递公司 → 冲突；
+    - 和同主题依据的肯定 / 否定不一致（"有赠品" vs "目前没有赠品"）→ 冲突；
+    - 否则视为一致：两者都保留（例如 FAQ 标准回答和店铺政策说的是同一件事，FAQ 仍可直接用，§5.4）。
+    """
+    numbers, couriers = _facts(lower)
+    ref_numbers: set[str] = set()
+    ref_couriers: set[str] = set()
+    for text in reference:
+        n, c = _facts(text)
+        ref_numbers |= n
+        ref_couriers |= c
+    if numbers - ref_numbers or couriers - ref_couriers:
+        return True
+    lower_negative = bool(_NEGATIVE.search(lower or ""))
+    return any(bool(_NEGATIVE.search(t or "")) != lower_negative for t in same_topic)
 
 
 # ---------------------------------------------------------------- 证据 ID 构造
