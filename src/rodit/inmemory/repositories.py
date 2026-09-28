@@ -466,6 +466,6 @@ class InMemoryShopAuthRepository:
         with self._lock:
             self._auth[auth.shop_id] = auth.model_copy()
 
-    def delete(self, shop_id: str) -> None:
+    def delete(self, shop_id: str) -> bool:
         with self._lock:
-            self._auth.pop(shop_id, None)
+            return self._auth.pop(shop_id, None) is not None

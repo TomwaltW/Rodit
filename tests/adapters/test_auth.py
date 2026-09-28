@@ -179,3 +179,22 @@ def test_revoke_accepts_callables_and_names_duplicates(repo, guard, clock):
     }
     assert calls == [SHOP_A, SHOP_A]
     assert guard.revoke(SHOP_A) == {"auth": 0}
+
+
+class _UndecryptableAuthRepository(InMemoryShopAuthRepository):
+    """令牌读不出来（旧版加密、密钥不对、数据损坏）：get 抛错，删除照常。"""
+
+    def get(self, shop_id: str) -> ShopAuth | None:
+        raise RuntimeError(f"店铺 {shop_id} 的令牌无法解密")
+
+
+def test_revoke_does_not_need_to_decrypt_the_token(world, clock):
+    """取消订购只删除，用不着令牌明文：令牌解不出来也要删掉令牌、清理店铺数据（§8.4）。"""
+    repo = _UndecryptableAuthRepository()
+    repo.save(_auth(clock, SHOP_A))
+    conversations = InMemoryConversationRepository()
+    conversations.add_message(make_message("在吗", world=world, msg_id="a1"))
+    counts = AuthGuard(repo, clock).revoke(SHOP_A, [conversations])
+    assert counts == {"auth": 1, "InMemoryConversationRepository": 2}
+    assert repo.delete(SHOP_A) is False  # 已经删掉了
+    assert conversations.get_conversation(SHOP_A, "conv_889") is None

@@ -918,8 +918,9 @@ class PgShopAuthRepository:
                 (auth.shop_id, sealed, list(auth.scopes), auth.expires_at),
             )
 
-    def delete(self, shop_id: str) -> None:
-        self.purge_shop(shop_id)
+    def delete(self, shop_id: str) -> bool:
+        """只删除、不解密：旧格式或密钥不对的令牌也能删掉（取消订购，§8.4）。"""
+        return self.purge_shop(shop_id) > 0
 
     def purge_shop(self, shop_id: str) -> int:
         with self._db.session(shop_id) as conn:

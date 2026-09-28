@@ -110,9 +110,9 @@ class AuthGuard:
         传函数）。返回每一项删除的条数，键是仓储类名或函数名（重名时加 #2、#3），
         另有 "auth"（删除的令牌数，0 或 1）。某一项清理失败时异常向外抛；令牌已经删除，
         purge_shop 是幂等的，可以重试。
+        不读令牌（不解密）：旧版加密、换过密钥、数据损坏的令牌读不出来，取消订购照样删除。
         """
-        had_token = self._repo.get(shop_id) is not None
-        self._repo.delete(shop_id)
+        had_token = bool(self._repo.delete(shop_id))
         counts: dict[str, int] = {"auth": int(had_token)}
         for purger in _purgers(purge):
             name = _unique_name(_label(purger), counts)
