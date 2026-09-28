@@ -756,7 +756,7 @@ class AssistEngine:
             return None
         if ctx.unresolved_turns >= self._config.conversation.unresolved_turns_alert:
             return None
-        text = self._config.generation.auto_reply_prefix + top.text
+        text = _with_ai_prefix(self._config.generation.auto_reply_prefix, top.text)
         if len(text) > ctx.config.max_answer_chars:
             return None
         return top.model_copy(update={"text": text})
@@ -886,6 +886,15 @@ class AssistEngine:
     def _warn(stage: str, exc: BaseException) -> None:
         # 只记异常类型，不记异常消息（可能带买家原文，§12.3 日志脱敏）
         logger.warning("问答引擎降级：%s 失败（%s）", stage, type(exc).__name__)
+
+
+def _with_ai_prefix(prefix: str, text: str) -> str:
+    """全自动回复开头加且只加一次 AI 生成内容标识（§12.3）。会话历史里的自动回复带着前缀，
+    大模型照着写时回答开头已经有了：先去掉再加。"""
+    body = text.lstrip()
+    while prefix and body.startswith(prefix):
+        body = body[len(prefix) :].lstrip()
+    return prefix + body
 
 
 # ---------------------------------------------------------------- 审计 detail（不放买家原文）
