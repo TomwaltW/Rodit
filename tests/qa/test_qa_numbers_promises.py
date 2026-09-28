@@ -195,3 +195,26 @@ def test_size_answer_with_largest_size_passes(world, ev):
     # 真正的绝对化用语照样拦截
     assert "absolute_term" in blocking("亲，这款是全网最好的", ctx, bundle)
     assert "absolute_term" in blocking("亲，保证明天到", ctx, bundle)
+
+
+@pytest.mark.parametrize(
+    ("question", "answer", "ok"),
+    [
+        # §11.1 的写法：买家没写单位的身高，回答里复述不算编造
+        ("165 110斤穿什么码", "亲，您 165、110 斤建议 M 码", True),
+        ("165 110斤穿什么码", "亲，身高 165 cm、体重 110 斤建议 M 码", True),
+        ("我165，穿什么码", "亲，身高 165 建议 M 码", True),
+        # 同样没写单位，但分句在谈价格 / 时间：不算依据
+        ("150 包邮卖不卖？", "亲，可以 150 包邮卖给您哦", False),
+        ("165 110斤穿什么码，3 天能到吗", "亲，3 天能到哦", False),
+        ("我165，150 包邮卖吗，穿什么码", "亲，可以 150 包邮哦", False),
+        ("165 110斤穿什么码，3 天能到吗", "亲，您 165、110 斤建议 M 码", True),
+        # 买家说的身高不能给回答里的价格当依据
+        ("165 110斤穿什么码", "亲，这款 165 元", False),
+    ],
+)
+def test_buyer_bare_size_numbers_in_sizing_clause(question, answer, ok):
+    ns = NumberSet()
+    ns.add_text("尺码建议：M 码适合 100–115 斤")
+    ns.add_buyer_text(question)
+    assert (unsupported_numbers(answer, ns) == []) is ok

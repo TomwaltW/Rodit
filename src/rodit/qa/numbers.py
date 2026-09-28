@@ -57,6 +57,15 @@ _BODY_BEFORE = re.compile(
     r"(?:身高|体重|腰围|胸围|臀围|肩宽|脚长|脚宽|腿长|臂长|袖长|衣长|裤长|年龄)"
     r"\s*[:：]?\s*(?:是|有|约|大概|差不多)?\s*$"
 )
+# 买家没写单位的数字（"165 110斤穿什么码"里的 165）：消息在问尺码、
+# 所在分句又不涉及价格和时间时才算身体尺寸
+_CLAUSE_SPLIT = re.compile(r"[，,。.！!？?；;\n]")
+_BODY_CONTEXT = re.compile(
+    r"斤|kg|公斤|cm|厘米|身高|体重|胸围|腰围|臀围|肩宽|脚长|穿|尺码|码", re.IGNORECASE
+)
+_RISK_CONTEXT = re.compile(
+    r"元|块|钱|价|包邮|便宜|优惠|折|减|卖|运费|补偿|红包|天|日|小时|周|月|号|点|到|发"
+)
 
 
 def normalize(text: str) -> str:
@@ -103,6 +112,18 @@ class NumberToken:
     day: int | None = None
     clock: tuple[int, int] | None = None
     body: bool = False
+    unit: str | None = None  # 数字后面的单位（没有单位为 None）
+
+    @property
+    def bare(self) -> bool:
+        """没有单位的普通数字（不是日期、时间、几号、钟点）。"""
+        return (
+            self.unit is None
+            and self.date is None
+            and self.time is None
+            and self.day is None
+            and self.clock is None
+        )
 
 
 def _blank(text: str, spans: list[tuple[int, int]]) -> str:
@@ -150,9 +171,17 @@ class NumberSet:
         self.values |= _plain_values(norm)
 
     def add_buyer_text(self, text: str) -> None:
-        """买家自己说的数字：只记数值；只有回答里的身体尺寸（NumberToken.body）能用它们当依据。
-        买家说的时间、日期、价格、时长都不算依据（§5.5：价格和时效必须在证据里找到）。"""
-        self.buyer_values |= _plain_values(normalize(text))
+        """买家自己说的身体尺寸：带身体单位（cm / 斤 / 码……）或前面是"身高""体重"……的数字，
+        以及问尺码的消息里没写单位的数字（"165 110斤穿什么码"的 165；分句里不能有价格、时间用语）。
+        买家说的时间、日期、价格、时长都不算依据（§5.5：价格和时效必须在证据里找到）；
+        回答里也只有身体尺寸或没写单位的数字能用它们当依据（见 supports）。"""
+        norm = normalize(text)
+        asks_size = bool(_BODY_CONTEXT.search(norm))
+        for clause in _CLAUSE_SPLIT.split(norm):
+            sizing = asks_size and not _RISK_CONTEXT.search(clause)
+            for token in extract_numbers(clause):
+                if token.value is not None and (token.body or (sizing and token.bare)):
+                    self.buyer_values.add(token.value)
 
     def supports(self, token: NumberToken) -> bool:
         if token.date is not None:
@@ -169,7 +198,7 @@ class NumberSet:
                 return True
         if token.value in self.values:
             return True
-        return token.body and token.value in self.buyer_values
+        return (token.body or token.bare) and token.value in self.buyer_values
 
 
 def _plain_values(norm: str) -> set[Decimal]:
@@ -239,7 +268,8 @@ def extract_numbers(text: str) -> list[NumberToken]:
         if unit_text:
             label += unit_text if unit_text == "%" else f" {unit_text}"
         body = _is_body(norm, m.start(), unit_text)
-        found.append((m.start(), NumberToken(text=label, value=value, body=body)))
+        token = NumberToken(text=label, value=value, body=body, unit=unit_text)
+        found.append((m.start(), token))
     for m in _CN_NUMBER.finditer(norm):
         n = cn_to_int(m.group(1))
         if n is None:
@@ -248,7 +278,8 @@ def extract_numbers(text: str) -> list[NumberToken]:
         unit_text = unit.group(1) if unit else None
         label = m.group(1) + (unit_text or "")
         body = _is_body(norm, m.start(), unit_text)
-        found.append((m.start(), NumberToken(text=label, value=Decimal(n), body=body)))
+        token = NumberToken(text=label, value=Decimal(n), body=body, unit=unit_text)
+        found.append((m.start(), token))
     found.sort(key=lambda x: x[0])
     return [token for _, token in found]
 
