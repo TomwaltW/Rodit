@@ -19,7 +19,7 @@ from typing import Any
 
 from rodit.core.enums import REVIEW_TRANSITIONS, ReviewState
 from rodit.core.errors import ActionNotAllowed
-from rodit.core.models import ActionResult, AfterSaleReview
+from rodit.core.models import ActionResult, AfterSaleReview, strip_control_chars
 
 HISTORY_KEY = "history"
 NEGOTIATED_KEY = "negotiated"
@@ -49,10 +49,12 @@ def transition(
         raise ActionNotAllowed(f"售后审核不能从 {review.state} 迁移到 {to}（§7.3.2 状态机）")
     meta = _meta(review)
     entry: dict[str, Any] = {"from": str(review.state), "to": str(to), "at": at.isoformat()}
+    # 新记录用 model_copy 生成、不走模型边界的清洗：自由文本先去掉 NUL 等控制字符，
+    # 否则 PostgreSQL 的 JSONB 写不进去（内存实现照存，两种实现不一致）
     if by is not None:
-        entry["by"] = by
+        entry["by"] = strip_control_chars(by)
     if note is not None:
-        entry["note"] = note
+        entry["note"] = strip_control_chars(note)
     meta[HISTORY_KEY] = [*meta.get(HISTORY_KEY, []), entry]
     if to == ReviewState.NEGOTIATE:
         meta[NEGOTIATED_KEY] = True

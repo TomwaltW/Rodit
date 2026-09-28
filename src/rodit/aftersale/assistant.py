@@ -64,6 +64,7 @@ from rodit.core.models import (
     OrderInfo,
     ShopConfig,
     aftersale_idempotency_key,
+    strip_control_chars,
 )
 from rodit.core.pii import mask_pii
 from rodit.core.ports import AfterSaleActionPort, AfterSaleReviewRepository, AuditSink, ToolGateway
@@ -444,8 +445,9 @@ class ReviewAssistant:
         by: str | None = None,
         note: str | None = None,
     ) -> AfterSaleReview:
-        # 客服填写的备注可能带买家手机号等，记录和审计里都只存脱敏后的
-        note = mask_pii(note) if note else note
+        # 客服填写的备注可能带买家手机号等，记录和审计里都只存脱敏后的。先去掉 NUL 等控制字符
+        # 再脱敏：夹在号码中间的控制字符会让号码认不出来；JSONB 也不接受 NUL
+        note = mask_pii(strip_control_chars(note)) if note else note
         moved = transition(rec, to, at=now, by=by, note=note)
         detail: dict[str, Any] = {
             "aftersale_id": rec.aftersale_id,
