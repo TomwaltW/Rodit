@@ -12,6 +12,7 @@ from rodit.core.config import GenerationConfig
 from rodit.core.enums import EvidenceSource, Intent, KnowledgeSource, KnowledgeStatus, PolicyKey
 from rodit.core.errors import KnowledgeUnavailable, TenantIsolationError, ToolUnavailable
 from rodit.core.evidence import Need
+from rodit.core.evidence_line import evidence_line_chars
 from rodit.core.models import Evidence, EvidenceBundle, KnowledgeItem, PolicyEntry, Sku
 from rodit.core.ports import EvidenceRetriever
 from rodit.inmemory import HashingEmbedder
@@ -23,6 +24,11 @@ from rodit.testing.fixtures import SHOP_A, SHOP_B, SHOP_C, SHOP_D
 
 def _ids(bundle: EvidenceBundle) -> list[str]:
     return bundle.ids()
+
+
+def _prompt_chars(evidences: list[Evidence]) -> int:
+    """这些证据在提示词【依据】里占的字数（各行 + 行间换行）。"""
+    return sum(evidence_line_chars(e) for e in evidences) + max(len(evidences) - 1, 0)
 
 
 def _assert_well_formed(bundle: EvidenceBundle) -> None:
@@ -465,14 +471,15 @@ def test_tool_only_intent_does_not_touch_knowledge(flaky, world, make_retriever,
 def test_budget_trims_lowest_priority_first(world, make_retriever, route):
     ctx = make_context("能机洗吗？会掉色吗", world, shop_id=SHOP_C, item_id="i_c1")
     full = make_retriever().retrieve(ctx, route(Intent.USAGE))
-    total = sum(len(e.content) for e in full.evidences)
+    # 预算按提示词里的整行计（core.evidence_line），和生成的提示词一致
+    total = _prompt_chars(full.evidences)
     cat = full.get("category:apparel_wash")
-    budget = total - len(cat.content)
+    budget = total - evidence_line_chars(cat) - 1
     b = make_retriever(config=GenerationConfig(max_evidence_chars=budget)).retrieve(
         ctx, route(Intent.USAGE)
     )
     assert _ids(b) == [i for i in _ids(full) if i != "category:apparel_wash"]
-    assert sum(len(e.content) for e in b.evidences) <= budget
+    assert _prompt_chars(b.evidences) <= budget
 
 
 def test_budget_keeps_policy_and_platform_last(world, make_retriever, route):
@@ -494,7 +501,7 @@ def test_budget_drops_irrelevant_detail_sentences_before_structured_fields(
     full = make_retriever().retrieve(ctx, route(Intent.PRODUCT_SPEC))
     structured = [e for e in full.evidences if ":detail:" not in e.id]
     relevant = full.get("item:i_555:detail:2")  # "面料亲肤透气。"
-    budget = sum(len(e.content) for e in structured) + len(relevant.content)
+    budget = _prompt_chars([*structured, relevant])
     b = make_retriever(config=GenerationConfig(max_evidence_chars=budget)).retrieve(
         ctx, route(Intent.PRODUCT_SPEC)
     )

@@ -9,6 +9,7 @@ from rodit.knowledge.conflict import (
     Candidate,
     content_chars,
     dedupe,
+    line_chars,
     ordered_topics,
     resolve_conflicts,
     trim_to_budget,
@@ -164,14 +165,18 @@ def test_trim_drops_lowest_priority_then_lowest_rank_then_latest():
         Candidate(_e("faq:2", EvidenceSource.FAQ, chars=40), rank=0.4),
         Candidate(_e("category:c", EvidenceSource.CATEGORY, chars=40), rank=0.0),
     ]
-    kept = trim_to_budget(cands, 150)
+    # 预算按提示词里的整行计（line_chars："[id] 标签：内容" + 行间换行），不只数 content
+    budget = line_chars(cands[:3])
+    kept = trim_to_budget(cands, budget)
     assert [c.evidence.id for c in kept] == ["policy:a", "item:i:attr:a", "item:i:detail:0"]
-    assert content_chars(kept) <= 150
+    assert line_chars(kept) <= budget
+    assert content_chars(kept) == 120
     # 预算足够时原样返回
     assert trim_to_budget(cands, 10_000) == cands
     # 同优先级同 rank：靠后的先删
     same = [Candidate(_e(f"item:i:attr:{n}", EvidenceSource.ITEM, chars=40)) for n in "abc"]
-    assert [c.evidence.id for c in trim_to_budget(same, 80)] == ["item:i:attr:a", "item:i:attr:b"]
+    kept_same = trim_to_budget(same, line_chars(same[:2]))
+    assert [c.evidence.id for c in kept_same] == ["item:i:attr:a", "item:i:attr:b"]
 
 
 def test_trim_keeps_at_least_one_evidence():

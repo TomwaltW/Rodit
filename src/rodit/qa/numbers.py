@@ -1,5 +1,5 @@
 """数字一致性（方案 §5.5 第一道"数字一致性"）：回答里的价格、时效、尺码、百分比、身高体重等数字，
-必须能在证据（或买家自己说的话）里找到。
+必须能在证据里找到；买家自己说的数字只放行身高体重、尺码这类身体尺寸（价格、折扣、时长不行）。
 
 - 先做 NFKC 归一（全角数字、全角冒号变半角），去掉千分位逗号；"48小时"和"48 小时"一样处理。
 - 数值比较：259 和 259.00 相同，09 和 9 相同。
@@ -7,7 +7,10 @@
   不拆成单个数字分别放行。
 - 证据 data 里的 ISO 时间戳（2026-09-28T10:30:00+08:00）只提供日期和时间（同时按东八区折算，
   回答里的时间由 core.clock.fmt_time 按东八区写），不把年月日时分秒当普通数字，
-  避免"35 元""9 日"被时间戳里的分钟、月份放行。
+  避免"35 元""9 日"被时间戳里的分钟、月份放行。fmt_time 写法（"截至 09-28 10:30"）也一样：
+  日期、时间整体记下，月日时分不再当普通数字（"满 28 减 10，30 元"不能被它放行）。
+- "30 号"（没写月份）是某月的几号：证据里有这一天的日期（任何月份）或同样的数字才算有依据。
+- 回答里的"16 点""4 点半"按时间比较（"下午 4 点"也认 16:00），证据里有同一时间就算有依据。
 - 紧跟在字母或下划线后面的数字是编号（o_1002、ZT7300000001、k_1），两边都不参与比较。
 - 中文数字只在时长、折扣、重量、金额单位前识别（"三天""两个工作日""七天无理由""五折"），
   "第一"不算；"这一件""一块洗"这类量词用法不算。
@@ -22,12 +25,15 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from rodit.core.clock import CST
+from rodit.core.numerals import CN_NUMBER_BEFORE_UNIT, cn_to_int
 
 _THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 _ISO_DATETIME = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?"
 )
 _TIME = re.compile(r"(?<![\d.])([01]?\d|2[0-4]):([0-5]\d)(?!\d)")
+# "16 点""4 点半""9 点 30 分"：和证据里的 16:00 / 16:30 按时间比较（"下午 4 点"也认 16:00）
+_TIME_CN = re.compile(r"(?<![\d.])([01]?\d|2[0-4])\s*点(?:\s*(半)|\s*([0-5]?\d)\s*分)?")
 # "10 月 8 日"；"09-28"（fmt_time 的写法：月份两位）。"3-5 天""10-15 个工作日"是范围，不是日期
 _DATE_CN = re.compile(r"(?<![\d.])(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)")
 _DATE_MD = re.compile(
@@ -35,53 +41,27 @@ _DATE_MD = re.compile(
     r"(?!\s*(?:个|天|日|小时|元|块|%|号|件|码|cm|厘米|斤|公斤|kg))"
 )
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
-_CN_DIGITS = "零一二两三四五六七八九十"
-_CN_NUMBER = re.compile(
-    rf"(?<!第)([{_CN_DIGITS}]{{1,3}})(?=\s*(?:个)?(?:小时|工作日|天|日|周|星期|月|年|折|斤|元))"
-)
+_CN_NUMBER = CN_NUMBER_BEFORE_UNIT  # 中文数字（core.numerals）；cn_to_int 也从这里导出
 _UNIT_AFTER = re.compile(
     r"\s*(个工作日|工作日|个小时|小时|分钟|天|日|周|个月|月|年|元|块|%|cm|厘米|mm|毫米|kg|公斤|斤"
     r"|克|ml|毫升|件|个|码|折|号|岁)",
     re.IGNORECASE,
 )
 _IDENTIFIER_CHAR = re.compile(r"[A-Za-z_]")
+# 没写月份的"30 号"（写了月份的由 _DATE_CN 整体取走）
+_DAY_OF_MONTH = re.compile(r"(?<![\d.])(?<!月)(?<!月\s)(\d{1,2})\s*号")
 
-_CN_VALUES = {
-    "零": 0,
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-}
+# 身体尺寸（§5.1 尺码建议）：买家说过的这类数字，回答里复述不算编造
+_BODY_UNITS = frozenset({"cm", "厘米", "mm", "毫米", "kg", "公斤", "斤", "码", "岁"})
+_BODY_BEFORE = re.compile(
+    r"(?:身高|体重|腰围|胸围|臀围|肩宽|脚长|脚宽|腿长|臂长|袖长|衣长|裤长|年龄)"
+    r"\s*[:：]?\s*(?:是|有|约|大概|差不多)?\s*$"
+)
 
 
 def normalize(text: str) -> str:
     """NFKC 归一并去掉千分位逗号。"""
     return _THOUSANDS.sub("", unicodedata.normalize("NFKC", text or ""))
-
-
-def cn_to_int(s: str) -> int | None:
-    """ "七"→7、"十五"→15、"二十"→20、"两"→2；不支持的写法返回 None。"""
-    if not s:
-        return None
-    if "十" not in s:
-        if len(s) != 1:
-            return None
-        return _CN_VALUES.get(s)
-    tens_part, _, ones_part = s.partition("十")
-    if "十" in ones_part or len(tens_part) > 1 or len(ones_part) > 1:
-        return None
-    tens = 1 if not tens_part else _CN_VALUES.get(tens_part)
-    ones = 0 if not ones_part else _CN_VALUES.get(ones_part)
-    if tens is None or ones is None:
-        return None
-    return tens * 10 + ones
 
 
 def _is_identifier(text: str, start: int) -> bool:
@@ -109,21 +89,38 @@ def _valid_date(month: int, day: int) -> bool:
 
 @dataclass(frozen=True)
 class NumberToken:
-    """回答里的一个数字、时间或日期。text 是带单位的原文片段，用于拦截原因。"""
+    """回答里的一个数字、时间或日期。text 是带单位的原文片段，用于拦截原因。
+
+    - day：没写月份的"30 号"里的几号；
+    - clock：回答里"16 点""4 点半"这种写法的 (时, 分)，value 是钟点数（证据里写的是"16 点"时用）；
+    - body：身体尺寸（单位是 cm / 斤 / 码……，或前面是"身高""体重"……），买家说过就算有依据。
+    """
 
     text: str
     value: Decimal | None = None
     time: tuple[int, int] | None = None
     date: tuple[int, int] | None = None  # (月, 日)
+    day: int | None = None
+    clock: tuple[int, int] | None = None
+    body: bool = False
+
+
+def _blank(text: str, spans: list[tuple[int, int]]) -> str:
+    """把这些片段换成等长空格（位置不变），后面的普通数字匹配就不会再取到它们的分量。"""
+    chars = list(text)
+    for start, end in spans:
+        chars[start:end] = " " * (end - start)
+    return "".join(chars)
 
 
 @dataclass
 class NumberSet:
-    """证据和买家消息里出现过的数字、时间、日期。"""
+    """证据里出现过的数字、时间、日期；buyer_values 是买家消息里的数字（只放行身体尺寸）。"""
 
     values: set[Decimal] = field(default_factory=set)
     times: set[tuple[int, int]] = field(default_factory=set)
     dates: set[tuple[int, int]] = field(default_factory=set)
+    buyer_values: set[Decimal] = field(default_factory=set)
 
     def add_text(self, text: str) -> None:
         norm = normalize(text)
@@ -137,31 +134,64 @@ class NumberSet:
                     self.dates.add((local.month, local.day))
                     self.times.add((local.hour, local.minute))
         norm = _ISO_DATETIME.sub(" ", norm)
+        # 日期、时间整体记下，再把它们遮掉：月日时分不当普通数字
+        spans: list[tuple[int, int]] = []
         for pattern in (_DATE_CN, _DATE_MD):
             for m in pattern.finditer(norm):
                 month, day = int(m.group(1)), int(m.group(2))
                 if _valid_date(month, day):
                     self.dates.add((month, day))
+                    spans.append(m.span())
         for m in _TIME.finditer(norm):
             if not _is_identifier(norm, m.start()):
                 self.times.add((int(m.group(1)), int(m.group(2))))
-        for m in _NUMBER.finditer(norm):
-            if _is_identifier(norm, m.start()):
-                continue
-            value = _to_decimal(m.group(0))
-            if value is not None:
-                self.values.add(value)
-        for m in _CN_NUMBER.finditer(norm):
-            n = cn_to_int(m.group(1))
-            if n is not None:
-                self.values.add(Decimal(n))
+                spans.append(m.span())
+        norm = _blank(norm, spans)
+        self.values |= _plain_values(norm)
+
+    def add_buyer_text(self, text: str) -> None:
+        """买家自己说的数字：只记数值；只有回答里的身体尺寸（NumberToken.body）能用它们当依据。
+        买家说的时间、日期、价格、时长都不算依据（§5.5：价格和时效必须在证据里找到）。"""
+        self.buyer_values |= _plain_values(normalize(text))
 
     def supports(self, token: NumberToken) -> bool:
         if token.date is not None:
             return token.date in self.dates
         if token.time is not None:
             return token.time in self.times
-        return token.value is not None and token.value in self.values
+        if token.value is None:
+            return False
+        if token.day is not None and any(d == token.day for _, d in self.dates):
+            return True
+        if token.clock is not None:
+            hour, minute = token.clock
+            if (hour, minute) in self.times or (hour < 12 and (hour + 12, minute) in self.times):
+                return True
+        if token.value in self.values:
+            return True
+        return token.body and token.value in self.buyer_values
+
+
+def _plain_values(norm: str) -> set[Decimal]:
+    """普通数字和单位前的中文数字（编号里的数字不算）。"""
+    values: set[Decimal] = set()
+    for m in _NUMBER.finditer(norm):
+        if _is_identifier(norm, m.start()):
+            continue
+        value = _to_decimal(m.group(0))
+        if value is not None:
+            values.add(value)
+    for m in _CN_NUMBER.finditer(norm):
+        n = cn_to_int(m.group(1))
+        if n is not None:
+            values.add(Decimal(n))
+    return values
+
+
+def _is_body(norm: str, start: int, unit: str | None) -> bool:
+    if unit is not None and unit.lower() in _BODY_UNITS:
+        return True
+    return bool(_BODY_BEFORE.search(norm[max(0, start - 8) : start]))
 
 
 def extract_numbers(text: str) -> list[NumberToken]:
@@ -186,22 +216,39 @@ def extract_numbers(text: str) -> list[NumberToken]:
             taken.append(m.span())
             time = (int(m.group(1)), int(m.group(2)))
             found.append((m.start(), NumberToken(text=m.group(0), time=time)))
+    for m in _TIME_CN.finditer(norm):
+        if free(m):
+            taken.append(m.span())
+            hour = int(m.group(1))
+            minute = 30 if m.group(2) else int(m.group(3) or 0)
+            token = NumberToken(text=m.group(0), value=Decimal(hour), clock=(hour, minute))
+            found.append((m.start(), token))
+    for m in _DAY_OF_MONTH.finditer(norm):
+        day = int(m.group(1))
+        if free(m) and 1 <= day <= 31:
+            taken.append(m.span())
+            token = NumberToken(text=f"{m.group(1)} 号", value=Decimal(day), day=day)
+            found.append((m.start(), token))
     for m in _NUMBER.finditer(norm):
         value = _to_decimal(m.group(0))
         if not free(m) or value is None:
             continue
         unit = _UNIT_AFTER.match(norm, m.end())
+        unit_text = unit.group(1) if unit else None
         label = m.group(0)
-        if unit:
-            label += unit.group(1) if unit.group(1) == "%" else f" {unit.group(1)}"
-        found.append((m.start(), NumberToken(text=label, value=value)))
+        if unit_text:
+            label += unit_text if unit_text == "%" else f" {unit_text}"
+        body = _is_body(norm, m.start(), unit_text)
+        found.append((m.start(), NumberToken(text=label, value=value, body=body)))
     for m in _CN_NUMBER.finditer(norm):
         n = cn_to_int(m.group(1))
         if n is None:
             continue
         unit = _UNIT_AFTER.match(norm, m.end())
-        label = m.group(1) + (unit.group(1) if unit else "")
-        found.append((m.start(), NumberToken(text=label, value=Decimal(n))))
+        unit_text = unit.group(1) if unit else None
+        label = m.group(1) + (unit_text or "")
+        body = _is_body(norm, m.start(), unit_text)
+        found.append((m.start(), NumberToken(text=label, value=Decimal(n), body=body)))
     found.sort(key=lambda x: x[0])
     return [token for _, token in found]
 

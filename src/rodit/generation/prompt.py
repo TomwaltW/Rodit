@@ -19,10 +19,10 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from rodit.core.clock import fmt_time
 from rodit.core.config import GenerationConfig
 from rodit.core.enums import INTENT_LABELS, Intent, Mode, Role, RouteAction
 from rodit.core.evidence import PLATFORM_NAMES
+from rodit.core.evidence_line import evidence_line_parts
 from rodit.core.models import ConversationContext, Evidence, EvidenceBundle, RouteDecision
 from rodit.core.ports import LLMMessage, LLMRequest
 from rodit.core.states import recent_turns
@@ -86,15 +86,17 @@ def _one_line(text: str) -> str:
 
 
 def _evidence_block(evidence: EvidenceBundle, budget: int) -> list[str]:
-    """按来源优先级排列依据，总长（含换行）不超过 budget；放不下的依据截断或丢弃。"""
+    """按来源优先级排列依据，总长（含换行）不超过 budget。
+
+    每行的写法和计长用 core.evidence_line，和检索的长度预算（knowledge.conflict.trim_to_budget）
+    一致：检索留下的依据这里都放得下。万一放不下（证据包不是检索给的），跳过那一条、继续放后面的，
+    不在第一条放不下处整体截断；一条都放不下（单条超长）时截断放第一条，不交空依据。
+    """
     ordered: list[Evidence] = sorted(evidence.evidences, key=lambda e: e.priority)
     lines: list[str] = []
     used = 0
     for ev in ordered:
-        head = f"[{ev.id}] {ev.label}："
-        content = _one_line(mask_text(ev.content))
-        if ev.fetched_at is not None and "截至" not in content:
-            content += f"（数据截至 {fmt_time(ev.fetched_at)}）"
+        head, content = evidence_line_parts(ev)
         line = head + content
         sep = 1 if lines else 0  # 行间换行也算进预算
         remaining = budget - used - sep
@@ -103,9 +105,9 @@ def _evidence_block(evidence: EvidenceBundle, budget: int) -> list[str]:
             used += sep + len(line)
             continue
         room = remaining - len(head) - 1
-        if room >= _MIN_PARTIAL:
+        if not lines and room >= _MIN_PARTIAL:
             lines.append(head + content[:room] + "…")
-        break
+            used += len(lines[-1])
     return lines
 
 
