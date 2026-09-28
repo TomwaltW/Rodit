@@ -132,14 +132,82 @@ ABSOLUTE_TERM_EXCEPTIONS: tuple[str, ...] = (
 )
 
 
+FIBER_NAMES: tuple[str, ...] = (
+    "棉",
+    "纯棉",
+    "桑蚕丝",
+    "柞蚕丝",
+    "蚕丝",
+    "真丝",
+    "羊毛",
+    "绵羊毛",
+    "羊绒",
+    "山羊绒",
+    "马海毛",
+    "兔毛",
+    "驼绒",
+    "牦牛绒",
+    "麻",
+    "亚麻",
+    "苎麻",
+    "涤纶",
+    "聚酯纤维",
+    "锦纶",
+    "尼龙",
+    "氨纶",
+    "腈纶",
+    "粘纤",
+    "粘胶纤维",
+    "莫代尔",
+    "莱赛尔",
+    "天丝",
+    "醋酸纤维",
+    "铜氨纤维",
+    "竹纤维",
+    "牛皮",
+    "羊皮",
+    "鹅绒",
+    "鸭绒",
+    "白鹅绒",
+    "白鸭绒",
+)
+"""纤维 / 材质名：和 100% 连在一起是成分标注（如"桑蚕丝 100%"），不是宣传用语。"""
+
+_FIBER = "|".join(sorted(map(re.escape, FIBER_NAMES), key=len, reverse=True))
+_COMPOSITION = re.compile(rf"(?:{_FIBER})\s*[:：]?\s*100\s*%|100\s*%\s*(?:{_FIBER})")
+_SPACES = re.compile(r"\s+")
+
+
+def _squash(text: str) -> str:
+    return _SPACES.sub("", text)
+
+
+def _mask_supported_compositions(norm: str, evidence_text: str) -> str:
+    """把依据里原样出现的成分标注（"桑蚕丝 100%""100% 棉"）遮掉，其中的 100% 不算绝对化用语。"""
+    support = _squash(_norm(evidence_text))
+    out = norm
+    for m in _COMPOSITION.finditer(norm):
+        if _squash(m.group(0)) in support:
+            out = out[: m.start()] + "\u0000" * (m.end() - m.start()) + out[m.end() :]
+    return out
+
+
 def find_absolute_terms(
     text: str,
     *,
     terms: tuple[str, ...] | list[str] = ABSOLUTE_TERMS,
     exceptions: tuple[str, ...] | list[str] = ABSOLUTE_TERM_EXCEPTIONS,
+    evidence_text: str | None = None,
 ) -> list[str]:
-    """找出绝对化用语：先把例外词组整体遮掉，再做子串匹配。返回命中的词（按出现顺序，去重）。"""
+    """找出绝对化用语：先把例外词组整体遮掉，再做子串匹配。返回命中的词（按出现顺序，去重）。
+
+    evidence_text 是依据原文（不含买家消息）：回答里的成分标注（纤维名和 100% 连写，
+    如"桑蚕丝 100%"）在依据里原样出现时，这个 100% 是如实的纤维含量，不算绝对化用语；
+    依据里没有、或写法不同（"100% 纯棉" vs 依据"棉 100%"）的照常命中，宁可让模型按依据改写。
+    """
     norm = _norm(text)
+    if evidence_text:
+        norm = _mask_supported_compositions(norm, evidence_text)
     for ex in sorted(exceptions, key=len, reverse=True):
         norm = norm.replace(unicodedata.normalize("NFKC", ex), "\u0000" * len(ex))
     found: list[tuple[int, str]] = []

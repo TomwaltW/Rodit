@@ -255,3 +255,13 @@ def test_absolute_terms_and_exceptions(world, ev):
     custom = QAGateConfig(absolute_terms=["顶配"], absolute_term_exceptions=[])
     _, hits = run("亲，这是顶配款，最好看", ctx, bundle, config=custom)
     assert [h.span for h in hits] == ["顶配"]
+
+
+def test_composition_100_percent_in_evidence_passes(world, ev):
+    """ "桑蚕丝 100%"是商品卡片上的成分标注：依据里有就放行，没有照常拦截（§5.5）。"""
+    ctx = make_context("真丝的吗", world, item_id="i_888")
+    bundle = EvidenceBundle(evidences=[ev.item_attr("面料", item_id="i_888")])
+    assert blocking_hits(run("亲，面料是桑蚕丝 100% 哦", ctx, bundle)[1]) == []
+    other = EvidenceBundle(evidences=[ev.item_attr("面料")])  # i_555：棉 95%、氨纶 5%
+    _, hits = run("亲，面料是桑蚕丝 100% 哦", ctx, other, ids=["item:i_555:attr:面料"])
+    assert "absolute_term" in rules(blocking_hits(hits))

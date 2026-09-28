@@ -159,6 +159,19 @@ def test_absolute_terms_are_caught():
     assert find_absolute_terms("质量最好", exceptions=[]) == ["最"]
 
 
+def test_composition_100_percent_backed_by_evidence_is_not_absolute():
+    """成分标注（纤维名和 100% 连写）在依据里原样出现时如实，不算绝对化用语。"""
+    evidence = "面料：桑蚕丝 100%\n洗涤保养：专业干洗"
+    assert find_absolute_terms("亲，面料是桑蚕丝100%哦", evidence_text=evidence) == []
+    assert find_absolute_terms("亲，面料是桑蚕丝 １００％ 哦", evidence_text=evidence) == []
+    # 依据里没有、写法不同、或者还带别的绝对化用语：照常命中
+    assert find_absolute_terms("亲，面料是桑蚕丝100%哦") == ["100%"]
+    assert find_absolute_terms("亲，100%桑蚕丝", evidence_text=evidence) == ["100%"]
+    assert find_absolute_terms("亲，棉 100%", evidence_text=evidence) == ["100%"]
+    assert find_absolute_terms("亲，100% 满意", evidence_text="满意 100%") == ["100%"]
+    assert find_absolute_terms("亲，桑蚕丝 100%，绝对不起球", evidence_text=evidence) == ["绝对"]
+
+
 def test_off_platform_request_vs_answer():
     assert find_off_platform_request("加个微信吧，转账给你便宜点")
     assert find_off_platform_request("加个v吧")

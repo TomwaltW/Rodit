@@ -73,6 +73,21 @@ def _seed_history(harness: EvalHarness, case: EvalCase, conv: str, shop_id: str,
             )
 
 
+def _item_text(world: DemoWorld, case: EvalCase) -> str | None:
+    """用例商品卡片上的文字（标题、属性、SKU、洗涤 / 使用、详情页），评分时核对成分标注。"""
+    if case.item_id is None:
+        return None
+    shop_id = getattr(fixtures, case.shop)
+    card = next(
+        (i for i in world.items if i.shop_id == shop_id and i.item_id == case.item_id), None
+    )
+    if card is None:
+        return None
+    return card.model_dump_json(
+        include={"title", "attributes", "skus", "care", "usage", "detail_text"}
+    )
+
+
 def run_case(harness: EvalHarness, case: EvalCase) -> EngineResult | None:
     shop_id = getattr(fixtures, case.shop)
     buyer = getattr(fixtures, case.buyer)
@@ -107,7 +122,11 @@ def run_eval(
         harness = make_harness()
         result = run_case(harness, case)
         results[case.id] = result
-        scores.append(score_case(case, result, max_chars=max_chars))
+        scores.append(
+            score_case(
+                case, result, max_chars=max_chars, evidence_text=_item_text(harness.world, case)
+            )
+        )
         if result is not None and result.route is not None:
             samples.append(
                 Sample(

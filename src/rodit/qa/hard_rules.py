@@ -5,7 +5,7 @@
 | format | 去掉 Markdown（**、__、#、`、[x](url)→x、列表符号） | 否，改写文本 |
 | length | 超过 ctx.config.max_answer_chars 在句子边界截断 | 否，改写文本 |
 | off_platform | core.lexicon.find_off_platform_in_answer（原文和清洗后都查） | 是 |
-| absolute_term | core.lexicon.find_absolute_terms（QAGateConfig 的词表和例外） | 是 |
+| absolute_term | core.lexicon.find_absolute_terms（词表和例外；依据里原样有的成分标注放行） | 是 |
 | banned_word | ctx.config.banned_words（商家禁用词，附录 C 第 14 题） | 是 |
 | forbidden_claim | 当前商品和证据里商品卡片的 forbidden_claims（被否定时放行） | 是 |
 | number_mismatch | 回答里的数字必须出现在证据或买家自己的消息里（qa.numbers） | 是 |
@@ -187,9 +187,12 @@ def _off_platform_hits(raw: str, cleaned: str) -> list[HardRuleHit]:
     ]
 
 
-def _absolute_hits(text: str, config: QAGateConfig) -> list[HardRuleHit]:
+def _absolute_hits(text: str, config: QAGateConfig, corpus: EvidenceCorpus) -> list[HardRuleHit]:
     terms = find_absolute_terms(
-        text, terms=config.absolute_terms, exceptions=config.absolute_term_exceptions
+        text,
+        terms=config.absolute_terms,
+        exceptions=config.absolute_term_exceptions,
+        evidence_text=corpus.evidence_text,
     )
     return [HardRuleHit(rule="absolute_term", detail=f"包含绝对化用语：{t}", span=t) for t in terms]
 
@@ -260,7 +263,7 @@ def check_hard_rules(
         )
     corpus = EvidenceCorpus(ctx, evidence)
     hits.extend(_off_platform_hits(text, cleaned))
-    hits.extend(_absolute_hits(cleaned, config))
+    hits.extend(_absolute_hits(cleaned, config, corpus))
     hits.extend(_banned_word_hits(cleaned, ctx.config.banned_words))
     hits.extend(_forbidden_claim_hits(cleaned, ctx, evidence))
     hits.extend(_number_hits(cleaned, corpus))

@@ -108,6 +108,10 @@ def test_score_case_dimensions():
         case, _result(case, "亲，48 小时发货，全网最快", cites=["policy:ship_time"])
     )
     assert absolute.compliance == 0
+    spec = next(c for c in CASES if c.id == "spec-07")
+    silk = _result(spec, "亲，面料：桑蚕丝 100%", cites=["item:i_888:attr:面料"])
+    assert score_case(spec, silk).compliance == 0  # 没有商品卡片可核对
+    assert score_case(spec, silk, evidence_text="面料：桑蚕丝 100%").compliance == 2
     off = score_case(case, _result(case, "加我微信聊", cites=["policy:ship_time"]))
     assert off.compliance == 0
     wrong_intent = score_case(

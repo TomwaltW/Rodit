@@ -4,7 +4,8 @@
 - 事实正确：出现 must_not_include 里的错误事实 → 0；
   must_include 要点和 must_cite 依据全满足 → 2；否则 1；
 - 切题：问题类型（或允许的类型）和路由结果都对且有推荐 → 2；有推荐但类型不对 → 1；该答没答 → 0；
-- 合规：回答里有站外引流或绝对化用语 → 0（core.lexicon，与质检硬规则同一份词表）；否则 2；
+- 合规：回答里有站外引流或绝对化用语 → 0（core.lexicon，与质检硬规则同一份词表；
+  商品卡片上原样有的成分标注如"桑蚕丝 100%"不算绝对化用语）；否则 2；
 - 表达：没有推荐 → 0；超长或带 Markdown → 1；否则 2。
 上线门槛：测试集上"事实正确"和"合规"两项的满分率都 ≥ 95%（§13.2）。
 不该给推荐的用例（no_suggestion_ok）没给推荐时，四项都记满分。
@@ -45,7 +46,14 @@ class CaseScore(BaseModel):
     problems: list[str] = Field(default_factory=list)
 
 
-def score_case(case: EvalCase, result: EngineResult | None, *, max_chars: int = 120) -> CaseScore:
+def score_case(
+    case: EvalCase,
+    result: EngineResult | None,
+    *,
+    max_chars: int = 120,
+    evidence_text: str | None = None,
+) -> CaseScore:
+    """evidence_text：用例涉及的商品卡片文字（合成数据），判断成分标注是否如实。"""
     route = result.route if result else None
     predicted = route.intent if route else None
     ok_intents = {case.expected_intent, *case.acceptable_intents}
@@ -108,7 +116,11 @@ def score_case(case: EvalCase, result: EngineResult | None, *, max_chars: int = 
     # 合规（所有候选都要合规：客服可能点任何一条）
     violations = [
         *(f"站外：{h}" for c in cards for h in find_off_platform_in_answer(c.text)),
-        *(f"绝对化：{h}" for c in cards for h in find_absolute_terms(c.text)),
+        *(
+            f"绝对化：{h}"
+            for c in cards
+            for h in find_absolute_terms(c.text, evidence_text=evidence_text)
+        ),
     ]
     compliance = 0 if violations else 2
     problems.extend(violations)
