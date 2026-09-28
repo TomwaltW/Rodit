@@ -396,8 +396,11 @@ class KnowledgeRepository(Protocol):
         status: KnowledgeStatus,
         *,
         approved_by: str | None = None,
+        expected_status: KnowledgeStatus | None = None,
     ) -> KnowledgeItem:
-        """不存在（或不属于该店）抛 KeyError。"""
+        """不存在（或不属于该店）抛 KeyError。
+        expected_status 不为空时是比较后更新：当前状态不等于它就抛 ConcurrencyConflict、不写入
+        （多实例部署时防止商家审核通过和驳回同时发生，后写的覆盖先写的）。"""
         ...
 
     def set_knowledge_embedding(

@@ -17,6 +17,8 @@ base_url / model 由部署配置决定，代码里不写死。实现 core.ports.
 - request.purpose / shop_id 只用于本地计量（MeteredLLMClient），不发给模型服务。
 
 默认传输层用标准库 urllib（不引入新依赖）；测试注入假的 transport，不访问网络。
+默认传输层不跟随重定向：urllib 跟随 3xx 时会把 Authorization 原样带到新地址（别的主机、
+甚至明文 HTTP），密钥就泄露了。模型接口的 POST 本来就不需要重定向，3xx 按非 2xx 报 LLMError。
 """
 
 from __future__ import annotations
@@ -49,14 +51,26 @@ def _parse_body(raw: bytes) -> dict[str, Any]:
     return parsed
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """不跟随任何重定向：3xx 作为 HTTPError 交回调用方，Authorization 不会被带到别处。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _urlopen(request: urllib.request.Request, timeout: float) -> Any:
+    # 每次新建 opener：代理设置按调用时的环境变量读取（和 urllib.request.urlopen 一样走代理）
+    return urllib.request.build_opener(_RefuseRedirects).open(request, timeout=timeout)
+
+
 def urllib_transport(
     url: str, headers: dict[str, str], body: dict[str, Any], timeout_s: float
 ) -> tuple[int, dict[str, Any]]:
-    """默认传输层（标准库 urllib，走环境里配置的 HTTP(S) 代理）。"""
+    """默认传输层（标准库 urllib，走环境里配置的 HTTP(S) 代理，不跟随重定向）。"""
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _urlopen(req, timeout=timeout_s) as resp:
             status, raw = resp.status, resp.read()
     except urllib.error.HTTPError as e:  # 非 2xx：尽量带回错误体，解析不了就算了
         try:
@@ -267,7 +281,9 @@ class OpenAICompatibleClient:
 
     @staticmethod
     def _http_error(status: int, body: dict[str, Any], key: str) -> str:
-        if status == 429:
+        if 300 <= status < 400:
+            head = f"大模型接口返回重定向（HTTP {status}），不跟随：请检查 base_url"
+        elif status == 429:
             head = "大模型接口限流（HTTP 429）"
         elif status >= 500:
             head = f"大模型服务错误（HTTP {status}）"

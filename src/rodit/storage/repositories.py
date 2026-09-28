@@ -24,6 +24,10 @@ from datetime import datetime
 from typing import Any
 
 import psycopg
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from psycopg.types.json import Jsonb
 from pydantic import SecretStr, TypeAdapter
 
@@ -298,13 +302,30 @@ class PgKnowledgeRepository:
         status: KnowledgeStatus,
         *,
         approved_by: str | None = None,
+        expected_status: KnowledgeStatus | None = None,
     ) -> KnowledgeItem:
+        # 比较后更新：WHERE 里带上期望状态。并发的另一个事务先提交时，READ COMMITTED 下
+        # 这条 UPDATE 会按新行重新判断条件，状态已变就更新 0 行
+        cond, params = "shop_id = %s AND id = %s", [shop_id, knowledge_id]
+        if expected_status is not None:
+            cond += " AND status = %s"
+            params.append(expected_status)
         with self._session(shop_id) as conn:
             r = conn.execute(
                 "UPDATE knowledge_item SET status = %s, approved_by = COALESCE(%s, approved_by)"
-                f" WHERE shop_id = %s AND id = %s RETURNING {_K_COLS}",
-                (status, approved_by, shop_id, knowledge_id),
+                f" WHERE {cond} RETURNING {_K_COLS}",
+                [status, approved_by, *params],
             ).fetchone()
+            if r is None and expected_status is not None:
+                cur = conn.execute(
+                    "SELECT status FROM knowledge_item WHERE shop_id = %s AND id = %s",
+                    (shop_id, knowledge_id),
+                ).fetchone()
+                if cur is not None:
+                    raise ConcurrencyConflict(
+                        f"知识 {knowledge_id} 的状态已是 {cur['status']}，"
+                        f"不是 {KnowledgeStatus(expected_status).value}"
+                    )
         if r is None:
             raise KeyError(knowledge_id)
         return _knowledge(r)
@@ -790,13 +811,30 @@ class PgAfterSaleReviewRepository:
 # ================================================================ 授权（§8.4）
 
 
+_TOKEN_FORMAT = b"RDT1"  # 密文格式标记（版本 1：AES-256-GCM）
+_TOKEN_NONCE_BYTES = 12
+_TOKEN_TAG_BYTES = 16
+_TOKEN_KDF_INFO = b"rodit shop_auth access_token v1"
+
+
+def _token_cipher(encryption_key: str) -> AESGCM:
+    """从配置的密钥串派生 256 位 AES 密钥（HKDF-SHA256）。"""
+    kdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_TOKEN_KDF_INFO)
+    return AESGCM(kdf.derive(encryption_key.encode("utf-8")))
+
+
 class PgShopAuthRepository:
-    """实现 core.ports.ShopAuthRepository。access_token 用 pgcrypto 对称加密（AES-256）后落库。
+    """实现 core.ports.ShopAuthRepository。access_token 在应用里用 AES-256-GCM 加密后落库。
 
     - encryption_key 由应用层从环境变量读（默认 RODIT_TOKEN_KEY，见 from_env），
       仓库里没有真实密钥；只有测试里写死合成的密钥。
-    - 密钥作为查询参数传给 pgp_sym_encrypt / pgp_sym_decrypt，不拼进 SQL；
-      repr、异常消息里都不出现密钥和令牌（令牌进出都是 SecretStr）。
+    - 加解密都在应用进程里做，数据库只收到、只存密文（BYTEA）：密钥和明文令牌从不作为
+      SQL 参数发给数据库——库开了慢查询日志（log_min_duration_statement）或 auto_explain 时，
+      绑定参数会原样写进数据库日志。
+    - 密文格式：b"RDT1" + 12 字节随机 nonce + 密文 + 16 字节认证标签；店铺 ID 作为附加认证数据，
+      把一个店铺的密文挪到别的店铺名下解不出来。
+    - 密钥不对、密文损坏、旧格式（v0.x 用库内 pgcrypto 加密的令牌）都抛 TokenDecryptionError，
+      需要重新授权写入；repr、异常消息里都不出现密钥和令牌（令牌进出都是 SecretStr）。
     - 换密钥：用旧密钥读出、新密钥写回（MVP 未提供批量工具）。
     """
 
@@ -806,7 +844,7 @@ class PgShopAuthRepository:
         if len(encryption_key or "") < self.MIN_KEY_LENGTH:
             raise ValueError(f"令牌加密密钥至少 {self.MIN_KEY_LENGTH} 个字符")
         self._db = db
-        self._key = SecretStr(encryption_key)
+        self._cipher = _token_cipher(encryption_key)
 
     def __repr__(self) -> str:
         return "PgShopAuthRepository(encryption_key=***)"
@@ -818,41 +856,55 @@ class PgShopAuthRepository:
             raise RuntimeError(f"环境变量 {env_name} 未设置：店铺令牌必须加密存储（方案 §8.4）")
         return cls(db, encryption_key=key)
 
+    def _encrypt(self, shop_id: str, token: str) -> bytes:
+        nonce = os.urandom(_TOKEN_NONCE_BYTES)
+        sealed = self._cipher.encrypt(nonce, token.encode("utf-8"), shop_id.encode("utf-8"))
+        return _TOKEN_FORMAT + nonce + sealed
+
+    def _decrypt(self, shop_id: str, blob: bytes) -> str:
+        head = len(_TOKEN_FORMAT)
+        if not blob.startswith(_TOKEN_FORMAT) or len(blob) < (
+            head + _TOKEN_NONCE_BYTES + _TOKEN_TAG_BYTES
+        ):
+            raise TokenDecryptionError(
+                f"店铺 {shop_id} 的令牌格式不对（可能是旧版加密或数据损坏）：请重新授权写入"
+            )
+        nonce = blob[head : head + _TOKEN_NONCE_BYTES]
+        try:
+            plain = self._cipher.decrypt(
+                nonce, blob[head + _TOKEN_NONCE_BYTES :], shop_id.encode("utf-8")
+            )
+            return plain.decode("utf-8")
+        except (InvalidTag, UnicodeDecodeError) as e:
+            raise TokenDecryptionError(
+                f"店铺 {shop_id} 的令牌无法解密：请检查令牌加密密钥是否与写入时一致"
+            ) from e
+
     def get(self, shop_id: str) -> ShopAuth | None:
         with self._db.session(shop_id) as conn:
-            try:
-                r = conn.execute(
-                    "SELECT shop_id, pgp_sym_decrypt(access_token, %s) AS token, scopes,"
-                    " expires_at FROM shop_auth WHERE shop_id = %s",
-                    (self._key.get_secret_value(), shop_id),
-                ).fetchone()
-            except psycopg.errors.ExternalRoutineInvocationException as e:
-                raise TokenDecryptionError(
-                    f"店铺 {shop_id} 的令牌无法解密：请检查令牌加密密钥是否与写入时一致"
-                ) from e
+            r = conn.execute(
+                "SELECT shop_id, access_token, scopes, expires_at FROM shop_auth"
+                " WHERE shop_id = %s",
+                (shop_id,),
+            ).fetchone()
         if r is None:
             return None
         return ShopAuth(
             shop_id=r["shop_id"],
-            access_token=SecretStr(r["token"]),
+            access_token=SecretStr(self._decrypt(r["shop_id"], bytes(r["access_token"]))),
             scopes=list(r["scopes"]),
             expires_at=_cst(r["expires_at"]),
         )
 
     def save(self, auth: ShopAuth) -> None:
+        sealed = self._encrypt(auth.shop_id, auth.access_token.get_secret_value())
         with self._db.session(auth.shop_id) as conn:
             conn.execute(
                 "INSERT INTO shop_auth (shop_id, access_token, scopes, expires_at)"
-                " VALUES (%s, pgp_sym_encrypt(%s, %s, 'cipher-algo=aes256'), %s, %s)"
+                " VALUES (%s, %s, %s, %s)"
                 " ON CONFLICT (shop_id) DO UPDATE SET access_token = EXCLUDED.access_token,"
                 " scopes = EXCLUDED.scopes, expires_at = EXCLUDED.expires_at",
-                (
-                    auth.shop_id,
-                    auth.access_token.get_secret_value(),
-                    self._key.get_secret_value(),
-                    list(auth.scopes),
-                    auth.expires_at,
-                ),
+                (auth.shop_id, sealed, list(auth.scopes), auth.expires_at),
             )
 
     def delete(self, shop_id: str) -> None:

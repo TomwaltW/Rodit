@@ -10,10 +10,19 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+)
 
 from rodit.core.decision import DecisionResponse
 from rodit.core.enums import (
@@ -46,6 +55,42 @@ from rodit.core.enums import (
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+# ---------------------------------------------------------------- 文本清洗
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f]")
+
+
+def strip_control_chars(value: str) -> str:
+    """去掉 NUL 和其他 C0 控制字符（保留换行、制表符）。
+
+    PostgreSQL 的 TEXT / JSONB 不接受 NUL，内存实现照单全收；会写进存储的自由文本在模型边界
+    统一清洗，两种实现对同一段文字的结果一致
+    （契约见 rodit.testing.contracts.check_text_sanitation）。
+    只在构造 / model_validate 时生效；model_copy(update=...) 不做校验，调用方自己先清洗。
+    """
+    return _CONTROL_CHARS.sub("", value) if value else value
+
+
+def _strip_json(value: Any) -> Any:
+    """JSON 值里的字符串（含键）逐个清洗，其余原样。"""
+    if isinstance(value, str):
+        return strip_control_chars(value)
+    if isinstance(value, dict):
+        return {
+            (strip_control_chars(k) if isinstance(k, str) else k): _strip_json(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_strip_json(v) for v in value]
+    return value
+
+
+CleanText = Annotated[str, AfterValidator(strip_control_chars)]
+"""会写进存储的自由文本：去掉 NUL 等控制字符。"""
+CleanJson = Annotated[dict[str, Any], AfterValidator(_strip_json)]
+"""会写进 JSONB 的 dict：字符串逐个清洗。"""
 
 
 # 约定：模型里的 dict[str, Any] 字段（Shop.config_overrides、Evidence.data、
@@ -84,7 +129,7 @@ class StandardMessage(_Model):
     conversation_id: str
     msg_id: str
     buyer_ref: str
-    text: str
+    text: CleanText
     item_card: ItemRef | None = None
     order_card: OrderRef | None = None
     agent_id: str | None = None
@@ -135,6 +180,7 @@ class Shop(_Model):
         unknown = set(v) - SHOP_CONFIG_FIELDS
         if unknown:
             raise ValueError(f"未知的店铺配置项：{sorted(unknown)}")
+        v = _strip_json(v)  # 存 JSONB：去掉 NUL 等控制字符
         ShopConfig.model_validate(v)  # 取值必须合法
         return v
 
@@ -155,7 +201,7 @@ class ShopAuth(_Model):
 class PolicyEntry(_Model):
     shop_id: str
     key: str  # 通常是 PolicyKey 的取值
-    value: str
+    value: CleanText
     updated_at: AwareDatetime
 
 
@@ -177,16 +223,16 @@ class ItemCard(_Model):
     shop_id: str
     platform: Platform
     item_id: str
-    title: str
+    title: CleanText
     category: str | None = None
-    attributes: dict[str, str] = Field(default_factory=dict)
+    attributes: dict[str, CleanText] = Field(default_factory=dict)
     skus: list[Sku] = Field(default_factory=list)
     size_chart: list[dict[str, str | int | float]] = Field(default_factory=list)
-    size_advice: str | None = None  # 商家填写，尺码推荐最重要的依据
-    care: list[str] = Field(default_factory=list)
-    usage: list[str] = Field(default_factory=list)  # 使用 / 安装说明
-    forbidden_claims: list[str] = Field(default_factory=list)  # 不能说的卖点，质检用
-    detail_text: str | None = None  # 详情页文字 + 详情图 OCR 文字
+    size_advice: CleanText | None = None  # 商家填写，尺码推荐最重要的依据
+    care: list[CleanText] = Field(default_factory=list)
+    usage: list[CleanText] = Field(default_factory=list)  # 使用 / 安装说明
+    forbidden_claims: list[CleanText] = Field(default_factory=list)  # 不能说的卖点，质检用
+    detail_text: CleanText | None = None  # 详情页文字 + 详情图 OCR 文字
     updated_at: AwareDatetime
 
     def find_sku(self, sku_id: str) -> Sku | None:
@@ -198,8 +244,8 @@ class KnowledgeItem(_Model):
 
     id: int | None = None
     shop_id: str
-    question: str
-    answer: str
+    question: CleanText
+    answer: CleanText
     source: KnowledgeSource
     status: KnowledgeStatus
     item_id: str | None = None  # 只适用于某个商品的 FAQ
@@ -220,7 +266,7 @@ class KnowledgeGap(_Model):
     shop_id: str
     intent: Intent | None = None
     missing: str  # 如 "policy:invoice"、"item:i_555:size_advice"
-    question_text: str | None = None  # 已做个人信息最小化
+    question_text: CleanText | None = None  # 已做个人信息最小化
     source: Literal["engine", "feedback"] = "engine"
     created_at: AwareDatetime
 
@@ -229,7 +275,7 @@ class LabeledSample(_Model):
     """判断层标注数据（§5.8 "理解错误 → 判断层标注集"，§6.4 训练小模型分类器）。"""
 
     shop_id: str
-    text: str  # 已做个人信息最小化
+    text: CleanText  # 已做个人信息最小化
     predicted_intent: Intent | None = None
     true_intent: Intent | None = None
     source: Literal["feedback_reject", "feedback_adopt", "manual"] = "manual"
@@ -652,15 +698,15 @@ class SuggestionRecord(_Model):
     shop_id: str
     conversation_id: str
     msg_id: str | None = None  # 触发推荐的买家消息
-    question_text: str | None = None  # 买家问题（已做个人信息最小化），反馈闭环生成候选知识用
+    question_text: CleanText | None = None  # 买家问题（已做个人信息最小化），反馈闭环生成候选知识用
     item_id: str | None = None  # 当前商品：采纳后生成的候选 FAQ 按商品限定范围
     intent: Intent
-    text: str
+    text: CleanText
     kind: DraftKind = DraftKind.LLM
     evidence_ids: list[str] = Field(default_factory=list)
     qa_scores: dict[str, float] | None = None
     status: SuggestionStatus
-    edited_text: str | None = None
+    edited_text: CleanText | None = None
     reject_reason: RejectReason | None = None
     agent_id: str | None = None
     latency_ms: int | None = None
@@ -683,7 +729,7 @@ class StoredMessage(_Model):
     shop_id: str
     conversation_id: str
     role: Role
-    text: str | None = None
+    text: CleanText | None = None
     item_id: str | None = None
     sku_id: str | None = None
     order_ref: str | None = None
@@ -703,12 +749,12 @@ class AfterSaleReview(_Model):
     state: ReviewState
     matched_rules: list[str] = Field(default_factory=list)  # 如 ["R2", "R6"]
     suggestion: ReviewAdvice | None = None
-    reason: str | None = None  # 建议理由，展示给客服
+    reason: CleanText | None = None  # 建议理由，展示给客服
     requires_manager: bool = False  # R6：必须店长确认
     risk_flags: list[str] = Field(default_factory=list)  # 如 R7 "30 天内售后 ≥ 3 次"
     verify_started_at: AwareDatetime | None = None  # R4 签收核查开始时间
     confirmed_by: str | None = None
-    action_result: dict[str, Any] | None = None
+    action_result: CleanJson | None = None
     version: int = 0  # 乐观锁（幂等键用平台的 status_version，见 aftersale_idempotency_key）
     updated_at: AwareDatetime | None = None
 
@@ -725,7 +771,7 @@ class AuditEvent(_Model):
     shop_id: str | None
     actor: str  # system / agent_id / merchant
     action: str  # 如 "route"、"generate"、"qa"、"suggest"、"feedback"、"aftersale.confirm"
-    detail: dict[str, Any] = Field(default_factory=dict)  # 不放买家原文，只放最小化后的内容
+    detail: CleanJson = Field(default_factory=dict)  # 不放买家原文，只放最小化后的内容
     created_at: AwareDatetime
 
 
@@ -735,7 +781,7 @@ class DecisionLogEntry(_Model):
     stage: DecisionStage
     provider: str
     questions_ver: str
-    answers: dict[str, Any]
+    answers: CleanJson
     route_result: str | None = None
     latency_ms: int | None = None
     created_at: AwareDatetime

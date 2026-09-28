@@ -29,7 +29,7 @@ def e2e_pg_dsn() -> Iterator[str]:
     from psycopg import sql
     from psycopg.conninfo import make_conninfo
 
-    from rodit.storage import Database
+    from rodit.storage import MIGRATIONS, Database
 
     name = f"rodit_e2e_{uuid.uuid4().hex[:12]}"
     try:
@@ -39,7 +39,7 @@ def e2e_pg_dsn() -> Iterator[str]:
         pytest.skip(f"PostgreSQL 不可用或没有建库权限（{type(e).__name__}），跳过")
     dsn = make_conninfo(ADMIN_DSN, dbname=name)
     try:
-        assert Database(dsn).migrate() == [1]
+        assert Database(dsn).migrate() == [m.version for m in MIGRATIONS]
         yield dsn
     finally:
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
