@@ -116,11 +116,12 @@ def review(aftersale_id: str = "as_2002", **kw: Any) -> AfterSaleReview:
 def test_migrate_is_idempotent_and_keeps_data(db, admin_db, truncate):
     PgKnowledgeRepository(db).upsert_shop(Shop(id=SHOP_A, platform=Platform.TAOBAO))
     assert db.migrate() == []
-    assert db.applied_versions() == [1]
+    assert db.applied_versions() == [m.version for m in MIGRATIONS]
     with admin_db.session(None) as conn:  # 脚本本身也能重复执行
-        conn.execute(MIGRATIONS[0].sql())
+        for m in MIGRATIONS:
+            conn.execute(m.sql())
         rows = conn.execute("SELECT version, name FROM schema_migrations").fetchall()
-    assert [(r["version"], r["name"]) for r in rows] == [(1, "schema.sql")]
+    assert [(r["version"], r["name"]) for r in rows] == [(m.version, m.name) for m in MIGRATIONS]
     assert PgKnowledgeRepository(db).get_shop(SHOP_A) is not None
 
 
@@ -128,8 +129,9 @@ def test_concurrent_migrate_runs_once(make_database):
     dsn = make_database()
     assert Database(dsn).applied_versions() == []
     results = run_concurrently(4, lambda: Database(dsn).migrate())
-    assert sorted(results, key=len) == [[], [], [], [1]]
-    assert Database(dsn).applied_versions() == [1]
+    every = [m.version for m in MIGRATIONS]
+    assert sorted(results, key=len) == [[], [], [], every]
+    assert Database(dsn).applied_versions() == every
 
 
 # ================================================================ 乐观锁（§10 version）

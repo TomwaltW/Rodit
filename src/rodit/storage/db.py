@@ -70,8 +70,12 @@ class Migration:
         return resources.files("rodit.storage").joinpath(self.name).read_text(encoding="utf-8")
 
 
-MIGRATIONS: tuple[Migration, ...] = (Migration(1, "schema.sql"),)
-"""按版本升序；已发布的脚本不再修改，结构变化加新版本。"""
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(1, "schema.sql"),
+    Migration(2, "migration_0002_aftersale_status_version.sql"),
+)
+"""按版本升序；已发布的脚本不再修改，结构变化加新版本（tests/storage/test_migrations.py
+按内容哈希锁定已发布的脚本）。"""
 
 
 class Database:

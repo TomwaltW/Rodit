@@ -17,7 +17,7 @@ import pytest
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
-from rodit.storage import BUSINESS_TABLES, Database
+from rodit.storage import BUSINESS_TABLES, MIGRATIONS, Database
 
 ADMIN_DSN = os.environ.get("RODIT_TEST_PG_DSN", "dbname=postgres")
 TOKEN_KEY = "rodit-test-token-key-synthetic-only"  # 只用于测试的合成密钥
@@ -59,7 +59,7 @@ def make_database(pg_admin_dsn: str) -> Iterator[Callable[[], str]]:
 @pytest.fixture(scope="session")
 def pg_dsn(make_database: Callable[[], str]) -> str:
     dsn = make_database()
-    assert Database(dsn).migrate() == [1]
+    assert Database(dsn).migrate() == [m.version for m in MIGRATIONS]
     return dsn
 
 
