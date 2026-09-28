@@ -199,7 +199,8 @@ def test_price_evidence(env):
     assert bundle.ids() == [ev.tool_price("i_555")]
     price_ev = bundle.evidences[0]
     assert price_ev.label == "实时数据 · 价格与活动"
-    assert price_ev.topic == PolicyKey.PROMOTIONS.value  # 和店铺满减政策比较（§5.2.1）
+    # 和店铺满减政策由 knowledge.conflict 按 data["price"] 专门比较（§5.2.1），不共用 promotions
+    assert price_ev.topic == ev.topic_for_price("i_555")
     assert PriceInfo.model_validate(price_ev.data["price"]).promotions == ["店铺满 199 减 20"]
     assert "售价 259.00 元" in price_ev.content
     assert "当前没有活动" in env.collect(Intent.PRICE_PROMO, item_id="i_888").evidences[0].content
@@ -379,14 +380,14 @@ def _lower(source: EvidenceSource, eid: str, content: str, topic: str) -> Candid
 
 
 def test_price_evidence_overrides_contradicting_promotions_policy(env):
-    """价格与活动证据的主题是 promotions：和店铺满减政策冲突时（i_888 当前没有活动），
-    政策被实时数据覆盖；一致时（i_555 参加满减）两者都保留。走真实的 provider 和冲突处理。"""
+    """价格与活动证据和店铺满减政策冲突时（i_888 当前没有活动），政策被实时数据覆盖；
+    一致时（i_555 参加满减）两者都保留。走真实的 provider 和冲突处理。"""
     policy = env.w.policy_map(SHOP_A)[PolicyKey.PROMOTIONS.value].value
     promo = _lower(EvidenceSource.POLICY, "policy:promotions", policy, PolicyKey.PROMOTIONS.value)
     for item_id, expected_lost in (("i_888", ["policy:promotions"]), ("i_555", [])):
         bundle = env.collect(Intent.PRICE_PROMO, item_id=item_id)
         price_ev = bundle.get(ev.tool_price(item_id))
-        assert price_ev is not None and price_ev.topic == PolicyKey.PROMOTIONS.value
+        assert price_ev is not None and price_ev.topic == ev.topic_for_price(item_id)
         _, lost = resolve_conflicts([Candidate.of(price_ev), promo])
         assert lost == expected_lost, item_id
 
