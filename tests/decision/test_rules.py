@@ -74,6 +74,10 @@ def test_top1_accuracy_on_synthetic_set(synthetic_intent_samples):
         ("M码还有吗", Intent.STOCK),  # 尺码词被库存问法整体覆盖，不算尺码问题
         ("怎么用优惠券", Intent.PRICE_PROMO),
         ("新疆包邮吗", Intent.SHIPPING_POLICY),
+        ("能寄到新疆吗", Intent.SHIPPING_POLICY),  # 动词在地区前面
+        ("发不发西藏", Intent.SHIPPING_POLICY),
+        ("送得到海南吗", Intent.SHIPPING_POLICY),
+        ("可以邮寄到香港吗", Intent.SHIPPING_POLICY),
         ("什么时候能发货", Intent.SHIPPING_POLICY),
         ("退款什么时候到账", Intent.REFUND_PROGRESS),
         ("能退款吗", Intent.RETURN_POLICY),
