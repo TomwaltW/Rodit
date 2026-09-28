@@ -189,13 +189,15 @@ def test_high_risk_answer_carries_risk_hints_and_bundle_alerts(kit: Kit) -> None
 # ================================================================ 规则 1、3、7：不检索 / 模板
 
 
-def test_off_platform_script_skips_retrieval(kit: Kit) -> None:
+def test_off_platform_script_retrieves_only_its_platform_rule(kit: Kit) -> None:
     kit.router.decide = make_route(
         Intent.OFF_PLATFORM, RouteAction.OFF_PLATFORM_SCRIPT, rule=1, confidence=0.97
     )
+    kit.retriever.bundles[Intent.OFF_PLATFORM] = EvidenceBundle()
     result = kit.engine().handle(kit.msg("加个微信吧，转账给你便宜点"))
     assert result is not None
-    assert kit.retriever.calls == []
+    # 检索只为给卡片找依据（平台站外交易规则，§5.1、§5.6），证据包为空也照给标准话术
+    assert [route.action for _, route in kit.retriever.calls] == [RouteAction.OFF_PLATFORM_SCRIPT]
     assert kit.generator.calls[0]["evidence_ids"] == []
     [card] = result.suggestions
     assert card.text == OFF_PLATFORM_SCRIPT

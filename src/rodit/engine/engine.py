@@ -116,7 +116,7 @@ from rodit.core.models import (
     SuggestionRecord,
 )
 from rodit.core.pii import mask_pii
-from rodit.core.pipeline import ACTION_PLANS, ActionPlan
+from rodit.core.pipeline import ACTION_PLANS, ActionPlan, risk_hint, soothe_with_answer
 from rodit.core.ports import (
     AnswerGenerator,
     AuditSink,
@@ -449,6 +449,8 @@ class AssistEngine:
             return REASON_HUMAN_PRIORITY
         if route.action == RouteAction.TRANSFER_HUMAN:
             return REASON_TRANSFER
+        if run.ctx is not None and route.intent in run.ctx.config.disabled_intents:
+            return REASON_DISABLED  # 路由按店铺配置拦下的类型（§9.3），不是"没把握判断"
         return REASON_NO_SUGGESTION_DEGRADED if route.degraded else REASON_NO_SUGGESTION
 
     def _plan_units(
@@ -458,7 +460,10 @@ class AssistEngine:
         if not plan.per_part:
             if route.action in _ANSWER_ACTIONS and route.intent in disabled:
                 return [], REASON_DISABLED
-            unit = _Unit(route, route.intent_confidence, ctx.config.suggestion_count)
+            limit = ctx.config.suggestion_count
+            if route.action == RouteAction.SOOTHE and not soothe_with_answer(route, disabled):
+                limit = 1  # 规则 3 不附回答（店铺关闭 / 投诉 / 降级的高风险）：只留安抚话术
+            unit = _Unit(route, route.intent_confidence, limit)
             return [unit], None
         parts = [(p.intent, p.confidence) for p in route.parts] or [
             (route.intent, route.intent_confidence)
@@ -474,8 +479,17 @@ class AssistEngine:
             if intent in disabled:
                 reason = reason or REASON_DISABLED
                 continue
-            action = RouteAction.HIGH_RISK_ANSWER if intent in high_risk else RouteAction.ANSWER
-            part_route = route.model_copy(update={"intent": intent, "parts": [], "action": action})
+            risky = intent in high_risk
+            # 每条只带自己的风险提示（§5.6），不继承整条消息的（那里有别的分条的提示）
+            part_route = route.model_copy(
+                update={
+                    "intent": intent,
+                    "parts": [],
+                    "action": RouteAction.HIGH_RISK_ANSWER if risky else RouteAction.ANSWER,
+                    "high_risk": risky,
+                    "risk_hints": [risk_hint(intent)] if risky else [],
+                }
+            )
             units.append(_Unit(part_route, confidence, 1))
         return units, reason
 

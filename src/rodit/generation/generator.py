@@ -11,7 +11,9 @@
 8. FAQ 相似度 ≥ faq_direct_min_score → 商家审核过的标准回答原文；
 9. 其余交给大模型：一条直接回答，名额够时再加一条附带追问（§5.4 "1–3 条候选"）。
 
-SOOTHE（规则 3）先放一条安抚话术，剩下的名额按上面的顺序出回答（没有依据就只有安抚话术）。
+SOOTHE（规则 3）先放一条安抚话术，剩下的名额按上面的顺序出回答（没有依据就只有安抚话术）；
+回答部分和规则 4–8 用同样的闸门（core.pipeline.soothe_with_answer）：店铺关闭的类型、投诉、
+判断层降级时的高风险类型只给安抚话术，不调大模型（§9.3、§5.7、§12.2）。
 大模型失败（LLMError，含输出无法解析）时退回已有的 FAQ / 模板草稿，都没有就返回空列表（§12.2）。
 返回的草稿最多 ctx.config.suggestion_count 条；不加全自动的 AI 标识前缀（引擎加）。
 """
@@ -23,6 +25,7 @@ from rodit.core.enums import DraftKind, Intent, RouteAction
 from rodit.core.errors import LLMError
 from rodit.core.evidence import LLM_FREE_INTENTS, MISSING_ITEM, MISSING_ORDER, PlatformRuleKey
 from rodit.core.models import ConversationContext, Draft, Evidence, EvidenceBundle, RouteDecision
+from rodit.core.pipeline import soothe_with_answer
 from rodit.core.ports import LLMClient
 from rodit.generation import evidence_view as V
 from rodit.generation import templates as T
@@ -86,6 +89,8 @@ class DefaultAnswerGenerator:
         drafts: list[Draft] = []
         if route.action == RouteAction.SOOTHE:
             drafts.append(T.soothe(ctx))
+            if not soothe_with_answer(route, ctx.config.disabled_intents):
+                return drafts  # 店铺关闭 / 投诉 / 降级时的高风险类型：只给安抚话术
         slots = limit - len(drafts)
         if slots > 0:
             drafts.extend(self._answer(ctx, route, evidence, slots, retry_feedback))

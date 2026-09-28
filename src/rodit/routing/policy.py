@@ -4,27 +4,38 @@
 
 1. P(off_platform) ≥ off_platform → 平台规则标准话术（优先级最高；即使店铺关了这一类也照样给）；
 2. need_human ≥ need_human       → 辅助 / 影子：提醒客服优先处理；自动：转人工；
+                                    自动模式另看关键词规则的"要求人工"信号（§5.7 兜底）；
 3. emotion ≥ emotion_escalate    → 辅助 / 影子：安抚话术并标红；自动：转人工；
-   （店铺关闭的问题类型在这里拦下 → 不推荐，记为规则 8）
+                                    安抚话术之外的回答和规则 4–8 用同样的闸门
+                                    （core.pipeline.soothe_with_answer）：店铺关闭的类型、投诉、
+                                    降级时的高风险类型不附回答；投诉另加提醒人工，附回答的
+                                    高风险类型另加该类型的风险提示；
+   （投诉照样按规则 4 提醒人工；其余店铺关闭的问题类型在这里拦下 → 不推荐，记为规则 8）
 4. intent 属于高风险类型          → 投诉：提醒人工、不推荐（§5.1、§5.7）；
                                     其余：辅助推荐 + 风险提示，判断层降级时不推荐（§12.2）；
                                     自动：转人工；
 5. multi_intent ≥ multi_intent   → 辅助：按问题分条推荐（概率 ≥ multi_intent_min_prob 的类型，
-                                    降序最多 max_parts 个；不足两个就往下走）；自动：转人工；
+                                    降序最多 max_parts 个；不足两个就往下走，并提醒客服可能有
+                                    漏答的问题）；自动：转人工；
 6. intent 置信度 ≥ 辅助阈值        → 检索、生成、质检出推荐；达到该类型的自动阈值、店铺开了全自动、
                                     没降级时 auto_eligible；
 7. 置信度低且前两名相差 < clarify_max_gap → 澄清；
 8. 其他                            → 不推荐。
 
 阈值比较："≥" 在相等时命中、"<" 在相等时不命中（容忍 1e-9 的浮点误差）。
+是否题（need_human、multi_intent）的答案来自 n 票自一致性投票时只能取 0、1/n、…、1，
+阈值先按 vote_threshold 换算到票数粒度（默认 3 票、0.7 → 2/3 票，否则 0.7 等于要求全票）。
 """
 
 from __future__ import annotations
+
+import math
 
 from rodit.core.config import RoutingConfig
 from rodit.core.decision import ChoiceAnswer, DecisionResponse, NoulAnswer, ScoreAnswer
 from rodit.core.enums import Intent, Mode, RouteAction
 from rodit.core.models import RouteDecision, RoutePart, ShopConfig
+from rodit.core.pipeline import DEFAULT_RISK_HINT, RISK_HINTS, risk_hint, soothe_with_answer
 from rodit.core.questions import Q_EMOTION, Q_INTENT, Q_MULTI_INTENT, Q_NEED_HUMAN
 
 EPS = 1e-9
@@ -32,18 +43,21 @@ EPS = 1e-9
 ALERT_NEED_HUMAN = "买家要求人工 / 投诉，请优先处理"
 ALERT_EMOTION = "买家情绪激动，建议先安抚"
 ALERT_COMPLAINT = "买家投诉 / 纠纷，请人工优先处理"
+ALERT_MULTI_UNSPLIT = "买家消息里可能不止一个问题，没能分条推荐，请留意是否有漏答"
 
-RISK_HINTS: dict[Intent, str] = {
-    Intent.PRICE_PROMO: "涉及价格承诺，请确认",
-    Intent.COMPARE_AUTHENTIC: "涉及真伪 / 对比，避免绝对化承诺",
-    Intent.MODIFY_ORDER: "需要客服在后台操作改单",
-    Intent.QUALITY_ISSUE: "请买家在申请售后时上传照片凭证",
-    Intent.NOT_RECEIVED: "请核查物流签收细分状态",
-}
-"""高风险类型的风险提示（§5.1 "推荐 + 风险提示"、§5.6 推荐卡片）。"""
-
-DEFAULT_RISK_HINT = "高风险问题，请核实后再发送"
-"""配置里新增的高风险类型没有专门提示时用这一句。"""
+# RISK_HINTS / DEFAULT_RISK_HINT / risk_hint 定义在 core.pipeline（引擎给分条加提示也要用），
+# 这里照旧导出
+__all__ = [
+    "ALERT_COMPLAINT",
+    "ALERT_EMOTION",
+    "ALERT_MULTI_UNSPLIT",
+    "ALERT_NEED_HUMAN",
+    "DEFAULT_RISK_HINT",
+    "RISK_HINTS",
+    "RoutingPolicy",
+    "risk_hint",
+    "vote_threshold",
+]
 
 
 def _ge(value: float, threshold: float) -> bool:
@@ -61,8 +75,21 @@ def _as_intent(value: str) -> Intent | None:
         return None
 
 
-def risk_hint(intent: Intent) -> str:
-    return RISK_HINTS.get(intent, DEFAULT_RISK_HINT)
+def vote_threshold(threshold: float, votes: int | None) -> float:
+    """是否题阈值换算到投票粒度（§6.4 自一致性投票）。
+
+    n 票投票时"是"的占比只能取 0、1/n、…、1。阈值落在两个可取值之间、离下面那个更近
+    （差不到半票）时取下面那个，但不低于过半数；其他情况原样返回。votes 为空或 1
+    （分类器、关键词规则、只采样一次时用模型自报的 p）时不换算。
+    默认 3 票、阈值 0.7 → 2/3（否则等于要求全票）；5 票时 0.7 仍要 4/5。
+    """
+    if votes is None or votes < 2:
+        return threshold
+    needed = math.ceil(threshold * votes - EPS)  # 原样比较需要的票数
+    nearest = math.floor(threshold * votes + 0.5)  # 离阈值最近的票数
+    if nearest < needed and nearest >= votes // 2 + 1:
+        return nearest / votes
+    return threshold
 
 
 class RoutingPolicy:
@@ -79,7 +106,11 @@ class RoutingPolicy:
         shop_config: ShopConfig,
         degraded: bool,
         provider: str,
+        vote_samples: int | None = None,
+        keyword_need_human: float | None = None,
     ) -> RouteDecision:
+        """vote_samples：是否题答案来自几票投票（None：不是投票得到的，见 vote_threshold）；
+        keyword_need_human：关键词规则的"要求人工"概率，只在全自动模式参与规则 2（§5.7）。"""
         cfg = self.config
         auto = mode == Mode.AUTO
         high_risk = set(cfg.high_risk)
@@ -100,6 +131,11 @@ class RoutingPolicy:
         need_human = self._noul(answers, Q_NEED_HUMAN)
         emotion = self._score(answers, Q_EMOTION)
         multi = self._noul(answers, Q_MULTI_INTENT)
+        wants_human = _ge(need_human, vote_threshold(cfg.need_human, vote_samples))
+        if auto and keyword_need_human is not None:
+            # 全自动没人把关：判断层没认出"要人工"时，关键词规则的信号也算（§5.7 立即转人工）
+            wants_human = wants_human or _ge(keyword_need_human, cfg.need_human)
+            need_human = max(need_human, keyword_need_human)
 
         base = {
             "intent": intent,
@@ -131,7 +167,7 @@ class RoutingPolicy:
             )
 
         # 规则 2：要求人工 / 投诉
-        if _ge(need_human, cfg.need_human):
+        if wants_human:
             action = RouteAction.TRANSFER_HUMAN if auto else RouteAction.HUMAN_PRIORITY
             return decide(action, 2, alerts=[ALERT_NEED_HUMAN])
 
@@ -139,16 +175,26 @@ class RoutingPolicy:
         if _ge(emotion, cfg.emotion_escalate):
             if auto:
                 return decide(RouteAction.TRANSFER_HUMAN, 3, alerts=[ALERT_EMOTION])
-            return decide(RouteAction.SOOTHE, 3, alerts=[ALERT_EMOTION], risk_hints=[ALERT_EMOTION])
+            alerts = [ALERT_EMOTION]
+            if intent == Intent.COMPLAINT:  # 投诉：安抚之外还要提醒人工（§5.7）
+                alerts.append(ALERT_COMPLAINT)
+            soothe = decide(RouteAction.SOOTHE, 3, alerts=alerts, risk_hints=[ALERT_EMOTION])
+            if intent in high_risk and soothe_with_answer(soothe, disabled):
+                # 附带的回答是高风险类型：推荐 + 风险提示（§5.1、§6.6 规则 4）
+                hints = [ALERT_EMOTION, risk_hint(intent)]
+                soothe = soothe.model_copy(update={"risk_hints": hints})
+            return soothe
 
-        # 店铺关闭的问题类型：不推荐（规则 1–3 仍然生效）
-        if intent in disabled:
-            return decide(RouteAction.NO_SUGGESTION, 8)
-
-        # 规则 4：高风险类型；投诉一律提醒人工（§5.1、§5.7）
+        # 投诉一律提醒人工（§5.1、§5.7）；店铺关了"投诉"这一类也一样——关的是推荐，不是提醒
         if intent == Intent.COMPLAINT:
             action = RouteAction.TRANSFER_HUMAN if auto else RouteAction.HUMAN_PRIORITY
             return decide(action, 4, alerts=[ALERT_COMPLAINT])
+
+        # 店铺关闭的问题类型：不推荐（规则 1–3 和投诉仍然生效）
+        if intent in disabled:
+            return decide(RouteAction.NO_SUGGESTION, 8)
+
+        # 规则 4：高风险类型
         if intent in high_risk:
             hints = [risk_hint(intent)]
             if auto:
@@ -158,16 +204,20 @@ class RoutingPolicy:
             return decide(RouteAction.HIGH_RISK_ANSWER, 4, risk_hints=hints)
 
         # 规则 5：多个问题
-        if _ge(multi, cfg.multi_intent):
+        pending_alerts: list[str] = []  # 规则 5 分不出条时带到后面的规则
+        if _ge(multi, vote_threshold(cfg.multi_intent, vote_samples)):
             if auto:
                 return decide(RouteAction.TRANSFER_HUMAN, 5)
             parts, dropped_complaint = self._parts(probs, disabled, high_risk, degraded)
+            alerts = [ALERT_COMPLAINT] if dropped_complaint else []
             if len(parts) >= 2:
                 hints = [risk_hint(p.intent) for p in parts if p.intent in high_risk]
-                alerts = [ALERT_COMPLAINT] if dropped_complaint else []
                 return decide(
                     RouteAction.SPLIT_MULTI, 5, parts=parts, risk_hints=hints, alerts=alerts
                 )
+            # 判断层说有多个问题、却认不出第二个类型（投票时各票常常选同一个"主要"类型）：
+            # 往下走只答一个问题，提醒客服别漏答；被去掉的投诉照样提醒人工
+            pending_alerts = [ALERT_MULTI_UNSPLIT, *alerts]
 
         # 规则 6：置信度够 → 出推荐
         if _ge(confidence, cfg.assist_threshold):
@@ -179,16 +229,16 @@ class RoutingPolicy:
                 and _ge(confidence, auto_threshold)
                 and not degraded
             )
-            return decide(RouteAction.ANSWER, 6, auto_eligible=eligible)
+            return decide(RouteAction.ANSWER, 6, auto_eligible=eligible, alerts=pending_alerts)
 
         # 规则 7：置信度低、前两名接近 → 澄清
         top1 = top[0][1] if top else confidence
         top2 = top[1][1] if len(top) > 1 else 0.0
         if _lt(top1 - top2, cfg.clarify_max_gap):
-            return decide(RouteAction.CLARIFY, 7)
+            return decide(RouteAction.CLARIFY, 7, alerts=pending_alerts)
 
         # 规则 8：其他
-        return decide(RouteAction.NO_SUGGESTION, 8)
+        return decide(RouteAction.NO_SUGGESTION, 8, alerts=pending_alerts)
 
     # ---------------------------------------------------------------- 工具
 

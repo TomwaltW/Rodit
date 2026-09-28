@@ -106,7 +106,8 @@ def test_rule3_emotion(mode, action):
     assert (d.action, d.rule) == (action, 3)
     assert d.alerts == [ALERT_EMOTION]
     if action == A.SOOTHE:
-        assert d.risk_hints == [ALERT_EMOTION]  # 推荐卡片上的风险提示（§5.6）
+        # 推荐卡片上的风险提示（§5.6）；附带的价格回答还要带价格承诺提示（§6.6 规则 4）
+        assert d.risk_hints == [ALERT_EMOTION, RISK_HINTS[Intent.PRICE_PROMO]]
     assert _route(_resp(emotion=2.99)).rule == 6
 
 

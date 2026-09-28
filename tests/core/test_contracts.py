@@ -145,7 +145,8 @@ def test_detect_topics_on_detail_text_conflict():
 
 def test_action_plans_cover_all_actions():
     assert set(ACTION_PLANS) == set(RouteAction)
-    assert not ACTION_PLANS[RouteAction.OFF_PLATFORM_SCRIPT].retrieve
+    # 站外话术只取平台站外交易规则当依据（§5.1、§5.6），不用大模型
+    assert ACTION_PLANS[RouteAction.OFF_PLATFORM_SCRIPT].retrieve
     assert not ACTION_PLANS[RouteAction.HUMAN_PRIORITY].generate
     assert ACTION_PLANS[RouteAction.SPLIT_MULTI].per_part
 
