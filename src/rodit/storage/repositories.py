@@ -49,6 +49,7 @@ from rodit.core.models import (
     StandardMessage,
     StoredMessage,
     SuggestionRecord,
+    strip_control_chars,
 )
 from rodit.inmemory.embedding import cosine
 from rodit.storage.db import Conn, Database, StorageUnavailable
@@ -415,7 +416,17 @@ class PgConversationRepository:
                 " SELECT %s, %s, %s, %s, %s, %s"
                 " WHERE EXISTS (SELECT 1 FROM conversation WHERE shop_id = %s AND id = %s)"
                 " ON CONFLICT (shop_id, msg_id) DO NOTHING RETURNING id",
-                (msg_id, shop_id, conversation_id, role, text, at, shop_id, conversation_id),
+                # 和内存实现（StoredMessage 构造时清洗）一致：去掉 NUL 等控制字符再写
+                (
+                    msg_id,
+                    shop_id,
+                    conversation_id,
+                    role,
+                    strip_control_chars(text),
+                    at,
+                    shop_id,
+                    conversation_id,
+                ),
             ).fetchone()
             return inserted is not None
 

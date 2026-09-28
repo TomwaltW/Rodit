@@ -638,6 +638,17 @@ def check_text_sanitation(make: Callable[[], RepoSet]) -> None:
     assert repos.conversations.add_message(msg) is True
     stored = repos.conversations.recent_messages(SHOP_A, msg.conversation_id)
     assert [m.text for m in stored] == [CLEAN_TEXT]
+    # 客服 / 机器人发出的文字（反馈、平台回声）同样清洗
+    assert repos.conversations.add_outgoing(
+        shop_id=SHOP_A,
+        conversation_id=msg.conversation_id,
+        msg_id="agent_nul",
+        role=Role.AGENT,
+        text="有的\x00亲",
+        at=msg.received_at + timedelta(seconds=1),
+    )
+    stored = repos.conversations.recent_messages(SHOP_A, msg.conversation_id)
+    assert [m.text for m in stored] == [CLEAN_TEXT, "有的亲"]
 
     k = repos.knowledge.add_knowledge(
         KnowledgeItem(
