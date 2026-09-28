@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from e2e_support import (
     Chat,
     current_message,
@@ -74,15 +73,6 @@ def test_auto_reply_carries_ai_prefix_exactly_once_even_if_model_copies_it():
 STALE = "24 小时内发货"  # 商品详情页的旧说法；店铺政策是 48 小时（§5.2.1 以店铺政策为准）
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "未修：rodit.knowledge.retrieval 只在本次取到的证据之间判冲突，商品参数类问题不取店铺政策，"
-        "详情页里和政策矛盾的旧说法会进依据。修复（取同主题政策只当裁判）会改变 T2 单元测试 "
-        "tests/knowledge/test_retrieval.py 里断言这句旧说法在依据里的两条用例，超出本任务可写范围，"
-        "交集成方决定"
-    ),
-)
 def test_stale_detail_sentence_is_overridden_even_when_policy_is_not_needed():
     """商品参数类问题不需要店铺政策，但详情页逐句都会进依据：详情页里和店铺政策冲突的旧说法
     （"现货付款后 24 小时内发货"）也要被政策覆盖，不能给大模型看（§5.2.1）。

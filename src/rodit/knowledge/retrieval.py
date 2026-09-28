@@ -12,6 +12,8 @@
 3. 实时依据（TOOL_NEEDS）交给 ToolEvidenceProvider，结果合并（证据、缺失、不可用、澄清、提醒）；
    没有注入 provider 时把每种工具记为不可用（core.evidence.unavailable）。
 4. 冲突处理：同一主题只保留优先级最高的来源，其余移除并记进 overridden_ids（§5.2.1）；
+   详情页句子、FAQ 回答涉及店铺政策主题、而本次没取这条政策时（如商品参数类问题的详情页里写着
+   旧的发货时效），把同主题政策取来只当裁判：参与冲突判断，但不作为依据输出；
    再按 GenerationConfig.max_evidence_chars 控制长度（§14）；证据按优先级排序输出。
 
 店铺隔离（§9.2）：所有仓储调用都带 ctx.shop_id；会话里的商品卡片、仓储返回的政策 / FAQ
@@ -51,6 +53,8 @@ from rodit.knowledge.conflict import (
 from rodit.knowledge.platform_rules import find_platform_rule, platform_rule_evidence
 from rodit.knowledge.search import FaqSearcher
 from rodit.knowledge.text import for_matching, minimized
+
+_POLICY_TOPICS = frozenset(ev.topic_for_policy(k.value) for k in PolicyKey)
 
 CLARIFY_ITEM_QUESTION = "请问您问的是哪一款呢？"
 """会话里有多个商品、又判断不出指哪个时的澄清问题（§5.2.4）。"""
@@ -174,7 +178,11 @@ class KnowledgeRetriever:
                     if clarify is None:
                         clarify = bundle.clarify_question
 
-        kept, lost = resolve_conflicts(dedupe(cands))
+        cands = dedupe(cands)
+        referees = self._policy_referees(ctx, cands) if needs & KNOWLEDGE_NEEDS else []
+        kept, lost = resolve_conflicts([*cands, *referees])
+        referee_ids = {c.evidence.id for c in referees}
+        kept = [c for c in kept if c.evidence.id not in referee_ids]
         _extend_unique(overridden, lost)
         kept = trim_to_budget(kept, self._config.max_evidence_chars)
         kept.sort(key=lambda c: c.evidence.priority)  # 稳定排序：同优先级保持检索顺序
@@ -284,6 +292,30 @@ class KnowledgeRetriever:
             _extend_unique(missing, lost)
         if Need.ITEM_DETAIL in needs:
             cands.extend(item_ev.detail_candidates(card, question))
+
+    def _policy_referees(self, ctx: ConversationContext, cands: list[Candidate]) -> list[Candidate]:
+        """低优先级证据（详情页句子、FAQ 回答）涉及的店铺政策主题、本次又没取这条政策时，
+        取同主题政策当裁判（§5.2.1 以店铺政策为准）。政策没填不记缺失（本次问题不需要它）。"""
+        fetched = {c.evidence.id for c in cands}
+        policy_priority = EvidenceSource.POLICY.priority
+        topics = {
+            t for c in cands if c.evidence.priority > policy_priority for t in c.topics
+        } & _POLICY_TOPICS
+        keys = [t for t in ordered_topics(topics) if ev.policy(t) not in fetched]
+        if not keys:
+            return []
+        policies = self._repo_call(self._repo.get_policies, ctx.shop_id)
+        referees: list[Candidate] = []
+        for key in keys:
+            entry = policies.get(key)
+            if entry is None or not entry.value.strip():
+                continue
+            if entry.shop_id != ctx.shop_id:
+                raise TenantIsolationError(
+                    f"知识仓储返回了店铺 {entry.shop_id} 的政策（查询店铺 {ctx.shop_id}）"
+                )
+            referees.append(Candidate(_policy_evidence(entry)))
+        return referees
 
     @staticmethod
     def _repo_call(fn: Callable[..., _T], *args: object, **kwargs: object) -> _T:

@@ -93,7 +93,11 @@ def test_product_spec_takes_only_the_asked_attribute(world, make_retriever, rout
     assert b.missing == [] and b.clarify_question is None and b.unavailable == []
 
 
-def test_product_spec_detail_split_by_sentence_with_topics(world, make_retriever, route):
+def test_product_spec_detail_split_by_sentence_with_topics(world, repo, make_retriever, route):
+    # 发货时效政策没填：详情页那句发货时效没有裁判，照常进依据
+    repo.upsert_policy(
+        PolicyEntry(shop_id=SHOP_A, key=PolicyKey.SHIP_TIME, value="", updated_at=world.now)
+    )
     ctx = make_context("这个是纯棉的吗", world, item_id="i_555")
     b = make_retriever().retrieve(ctx, route(Intent.PRODUCT_SPEC))
     details = [e for e in b.evidences if ":detail:" in e.id]
@@ -106,6 +110,19 @@ def test_product_spec_detail_split_by_sentence_with_topics(world, make_retriever
     assert details[1].topic == PolicyKey.SHIP_TIME
     assert details[0].topic is None and details[2].topic is None
     assert all(e.label == "商品属性 · 详情页" and set(e.data) == {"text", "seg"} for e in details)
+    assert "policy:ship_time" not in b.missing  # 本次问题不需要这条政策，不记缺失
+
+
+def test_stale_detail_sentence_is_refereed_by_policy_not_retrieved(world, make_retriever, route):
+    """商品参数类问题不取店铺政策，但详情页里和政策矛盾的旧说法（24 小时 vs 政策 48 小时）
+    也要被覆盖：同主题政策取来只当裁判，不作为依据输出（§5.2.1）。"""
+    ctx = make_context("这个是纯棉的吗", world, item_id="i_555")
+    b = make_retriever().retrieve(ctx, route(Intent.PRODUCT_SPEC))
+    _assert_well_formed(b)
+    assert "item:i_555:detail:1" in b.overridden_ids
+    assert {"item:i_555:detail:0", "item:i_555:detail:2"} <= set(_ids(b))
+    assert not [e for e in b.evidences if e.source == EvidenceSource.POLICY]
+    assert b.missing == []
 
 
 def test_product_spec_without_specific_attribute_gives_all(world, make_retriever, route):
@@ -582,12 +599,19 @@ def test_faq_answer_topics_and_scores(world, repo, make_retriever, route):
             created_at=world.now - timedelta(days=1),
         )
     )
-    b = make_retriever().retrieve(make_context("新疆能发吗", world), route(Intent.OTHER))
-    faq = b.evidences[0]
+    b = make_retriever().retrieve(make_context("新疆能发吗", world), route(Intent.SHIPPING_POLICY))
+    [faq_id] = [i for i in b.overridden_ids if i.startswith("faq:")]
+    # 不需要政策的问题类型也一样：同主题政策当裁判，只覆盖、不输出（§5.2.1）
+    b2 = make_retriever().retrieve(make_context("新疆能发吗", world), route(Intent.OTHER))
+    assert faq_id in b2.overridden_ids and b2.evidences == []
+    # 两条政策都没填时没有裁判，FAQ 照常作为依据
+    for key in (PolicyKey.SHIP_TIME, PolicyKey.REMOTE_AREAS):
+        repo.upsert_policy(PolicyEntry(shop_id=SHOP_A, key=key, value="", updated_at=world.now))
+    b3 = make_retriever().retrieve(make_context("新疆能发吗", world), route(Intent.OTHER))
+    faq = b3.evidences[0]
+    assert faq.id == faq_id
     assert faq.topic == "ship_time"  # 按 PolicyKey 顺序取第一个主题
     assert faq.score == 1.0
-    b2 = make_retriever().retrieve(make_context("新疆能发吗", world), route(Intent.SHIPPING_POLICY))
-    assert faq.id in b2.overridden_ids
 
 
 class LeakyRepo:
