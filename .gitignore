@@ -22,3 +22,6 @@ build/
 
 # Claude Code worktrees
 .worktrees/
+
+# Claude Code 本机私有设置
+.claude/settings.local.json
