@@ -227,12 +227,28 @@ class AfterSaleActionPort(Protocol):
 # ---------------------------------------------------------------- 平台接入层（§8.2）
 
 
+class MessageRecall(BaseModel):
+    """PlatformAdapter.on_event 的撤回事件：会话里的一条消息被撤回（§5.3 撤回的消息不再算作
+    最近几轮对话，原文也不再保留）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    shop_id: str
+    conversation_id: str
+    msg_id: str  # 撤回事件本身的平台消息 ID（按它去重）
+    recalled_msg_id: str  # 被撤回的那条消息
+
+
 @runtime_checkable
 class PlatformAdapter(Protocol):
     """平台接入适配器。平台差异只在这里，引擎只认 StandardMessage（§4.1 原则 5）。
 
     - on_message：模式 A 平台推送 / 模式 B 插件上报 → 标准消息；不是买家消息、重复消息或无法识别时
       返回 None。平台买家 ID 用注入的 BuyerRefHasher 哈希成 buyer_ref，昵称等个人信息不向后传。
+    - on_event：on_message 的完整版，应用层用它：买家消息同 on_message；客服 / 机器人发出的消息
+      回声 → StoredMessage（role 为 AGENT / BOT，created_at 取事件时间），撤回 → MessageRecall；
+      应用层据此把客服手打的回复写进会话、把撤回的消息从会话里去掉（§5.3 最近几轮对话）。
+      其他事件、重复事件（按 msg_id 去重）、无法识别时返回 None。
     - send：只有模式 A 的全自动能用（text 已由引擎加好 AI 标识前缀）；
       其他接入模式抛 ActionNotAllowed。
     - transfer_to_human：全自动模式下转人工（§5.7、GB/T 47746）；不支持的平台抛 ActionNotAllowed。
@@ -249,6 +265,8 @@ class PlatformAdapter(Protocol):
         ...
 
     def on_message(self, raw: dict) -> StandardMessage | None: ...
+
+    def on_event(self, raw: dict) -> StandardMessage | StoredMessage | MessageRecall | None: ...
 
     def get_context(self, shop_id: str, conversation_id: str) -> PlatformContext: ...
 
@@ -421,7 +439,13 @@ class ConversationRepository(Protocol):
     def recent_messages(
         self, shop_id: str, conversation_id: str, *, limit: int = 20
     ) -> list[StoredMessage]:
-        """最近 limit 条消息，按 created_at 升序（同一时间按写入顺序）。"""
+        """最近 limit 条消息，按 created_at 升序（同一时间按写入顺序）；不含已撤回的消息。"""
+        ...
+
+    def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
+        """消息被撤回（§5.3）：删掉它的文字和卡片，之后 recent_messages 不再返回它；msg_id 仍算
+        见过（平台重推这条消息时 add_message / add_outgoing 返回 False）。
+        找不到这条消息、或已经撤回过时返回 False。"""
         ...
 
     def purge_shop(self, shop_id: str) -> int: ...

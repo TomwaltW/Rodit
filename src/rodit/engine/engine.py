@@ -6,6 +6,10 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
 1. 店铺检查：不存在或已停用 → 不处理、不保存消息，返回带 no_suggestion_reason 的结果（§8.4）；
 2. 去重：ConversationRepository.add_message 返回 False → 返回 None（重复消息什么都不做、不留痕）；
    不是买家消息（接入层本不该送来）也返回 None；
+   乱序（§8.3 按会话保证顺序）：会话里已经有比本条晚的买家消息（平台推送晚到）→ 本条照常存进
+   会话，但不单独回答旧问题，改为重新处理会话里最新的那条买家消息（本条按时间落在它的 Turn 里
+   或历史里），结果等同按顺序到达；重新处理时不出 auto_reply（最新那条可能已经自动回复过，
+   全自动下由此转人工）；
 3. 刷新推荐：同一会话之前 SHOWN 的推荐记录改成 EXPIRED（§5.3 新消息到达时刷新推荐）；
 4. 会话理解（engine.understanding.ConversationBuilder）→ ConversationContext；
 5. 路由 → RouteDecision，按 core.pipeline.ACTION_PLANS[route.action] 执行：
@@ -35,6 +39,8 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    整个系统只在这里加）。不满足时退回智能辅助（照常给推荐），并且 transfer_to_human=True——
    §5.7 全自动模式下质检不通过、依据不足、投诉等都要转人工，§12.2 全自动出故障由客服接管。
    影子模式（§13.4）：mode=SHADOW，推荐只用于事后对比，app 层不得展示；不出 auto_reply、不转人工。
+   店铺或配置读不出来（知识库故障等，不是已知停用）而消息是 AUTO 时，生效模式无从判断：
+   按全自动的兜底处理，transfer_to_human=True（§12.2 全自动模式下任何故障 → 客服接管）。
 
 降级（§12.2）：每个环节单独兜住，handle() 对合法消息永不抛错。降级标记（EngineResult.degraded）：
 - "storage"      会话 / 推荐 / 缺失知识记录读写失败（仍然出推荐，缺 suggestion_id）
@@ -107,7 +113,9 @@ from rodit.core.models import (
     Draft,
     EngineResult,
     EvidenceBundle,
+    ItemRef,
     KnowledgeGap,
+    OrderRef,
     QAResult,
     RouteDecision,
     Shop,
@@ -185,6 +193,7 @@ ALERT_UNRESOLVED = "买家连续{n}轮表示没听懂或答非所问，建议客
 
 _ANSWER_ACTIONS = frozenset({RouteAction.ANSWER, RouteAction.HIGH_RISK_ANSWER})
 _CONTEXT_MISSING = frozenset({MISSING_ORDER, MISSING_ITEM})
+_LATE_CHECK_LIMIT = 20  # 判断乱序时读的最近消息条数
 
 
 def missing_for_intent(intent: Intent) -> str:
@@ -220,6 +229,10 @@ class _Run:
     msg: StandardMessage
     started: float
     mode: Mode = Mode.ASSIST
+    # 消息是 AUTO、但店铺 / 配置读不出来、生效模式无从判断：按全自动兜底转人工（§12.2）
+    auto_unverified: bool = False
+    # 乱序：本条晚到，改为重新处理会话里最新的买家消息（run.msg 已换成那条），不出 auto_reply
+    late: bool = False
     ctx: ConversationContext | None = None
     route: RouteDecision | None = None
     degraded: list[str] = field(default_factory=list)
@@ -324,12 +337,14 @@ class AssistEngine:
             self._warn("shop", exc)
             run.degrade(DEGRADED_KNOWLEDGE)
             shop, shop_error = None, REASON_KNOWLEDGE
+            run.auto_unverified = msg.mode == Mode.AUTO
         if shop is not None:
             # 先定生效模式：后面任何一步失败，影子模式的结果也不能被展示
             try:
                 run.mode = effective_mode(msg.mode, self._builder.shop_config(shop))
             except Exception as exc:  # noqa: BLE001 — 配置算不出来时会话理解会再失败一次
                 self._warn("shop_config", exc)
+                run.auto_unverified = msg.mode == Mode.AUTO
         run.add_latency("understand", t)
         if shop_error == REASON_SHOP_INACTIVE:
             return self._finish(run, reason=shop_error)
@@ -345,6 +360,11 @@ class AssistEngine:
             return None
         if shop is None:
             return self._finish(run, reason=shop_error)
+        latest = self._newer_buyer_message(msg)
+        if latest is not None:  # 乱序：本条已存进会话，改为重新处理最新那条（§8.3）
+            logger.info("消息晚到，重新处理会话里最新的买家消息")
+            run.msg = msg = latest
+            run.late = True
 
         # 3. 新消息到达：刷新推荐
         self._expire_shown(run)
@@ -418,6 +438,36 @@ class AssistEngine:
             cards=[c for c, _ in cards],
             units=units,
             auto_reply=auto_reply,
+        )
+
+    # ------------------------------------------------------------ 乱序（§8.3）
+
+    def _newer_buyer_message(self, msg: StandardMessage) -> StandardMessage | None:
+        """会话里比 msg 晚的最新一条买家消息（还原成 StandardMessage）；没有返回 None。
+
+        平台推送可能乱序：旧消息晚到时不能单独回答旧问题、把新消息的推荐顶掉。时间相同不算晚。
+        记录里没有的字段（buyer_ref、接待客服、模式、平台扩展字段）沿用 msg 的——同一会话。
+        """
+        try:
+            stored = self._conversations.recent_messages(
+                msg.shop_id, msg.conversation_id, limit=_LATE_CHECK_LIMIT
+            )
+        except Exception:  # noqa: BLE001 — 读不到就按本条处理（会话理解会记 storage 降级）
+            return None
+        newer = [m for m in stored if m.role == Role.BUYER and m.created_at > msg.received_at]
+        if not newer:
+            return None
+        last = newer[-1]
+        return msg.model_copy(
+            update={
+                "msg_id": last.msg_id,
+                "text": last.text or "",
+                "item_card": ItemRef(item_id=last.item_id, sku_id=last.sku_id)
+                if last.item_id
+                else None,
+                "order_card": OrderRef(order_id=last.order_ref) if last.order_ref else None,
+                "received_at": last.created_at,
+            }
         )
 
     # ------------------------------------------------------------ 刷新推荐（§5.3）
@@ -702,7 +752,7 @@ class AssistEngine:
         """
         if route.action != RouteAction.TRANSFER_HUMAN or route.rule != 3:
             return None
-        if ctx.mode != Mode.AUTO or not ctx.config.auto_reply_enabled:
+        if ctx.mode != Mode.AUTO or not ctx.config.auto_reply_enabled or run.late:
             return None
         soothe_route = route.model_copy(update={"action": RouteAction.SOOTHE})
         bundle = EvidenceBundle()
@@ -746,6 +796,8 @@ class AssistEngine:
         cards: list[tuple[SuggestionCard, Draft]],
     ) -> SuggestionCard | None:
         if ctx.mode != Mode.AUTO or not ctx.config.auto_reply_enabled:
+            return None
+        if run.late:  # 重新处理最新那条：它可能已经自动回复过，不再发一遍
             return None
         if not route.auto_eligible or plan.per_part or not cards:
             return None
@@ -800,9 +852,10 @@ class AssistEngine:
                 },
             )
         shadow = run.mode == Mode.SHADOW
+        auto = run.mode == Mode.AUTO or run.auto_unverified
         transfer = not shadow and (
             (route is not None and route.action == RouteAction.TRANSFER_HUMAN)
-            or (run.mode == Mode.AUTO and auto_reply is None)
+            or (auto and auto_reply is None)
         )
         ctx = run.ctx
         result = EngineResult(
@@ -838,6 +891,7 @@ class AssistEngine:
             msg_ids=[run.msg.msg_id],
             mode=run.mode,
             no_suggestion_reason=REASON_ENGINE,
+            transfer_to_human=run.mode == Mode.AUTO or run.auto_unverified,
             degraded=list(run.degraded),
             latency_ms=run.latency_ms(),
         )

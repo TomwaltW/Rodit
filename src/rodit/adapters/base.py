@@ -11,6 +11,7 @@
   C 独立话术助手（没有平台数据，tools 必须是 NullToolGateway）。send 只在模式 A 且开了
   全自动时可用，transfer_to_human 只在模式 A 可用，其余抛 ActionNotAllowed（§8.2）；
 - 会话上下文：本地记录买家消息、客服回声、发出的消息和最近的商品 / 订单卡片，供 get_context；
+  客服回声和撤回也由 on_event 交给应用层，写进会话仓储（§5.3 最近几轮对话）；
 - 推荐展示：show_suggestions 把推荐卡片放进该会话的"侧边栏"（模式 B；模式 A 的辅助、模式 C 的
   网页工具同理），新的一批替换旧的。
 
@@ -44,7 +45,7 @@ from rodit.core.models import (
     SuggestionCard,
 )
 from rodit.core.pii import BuyerRefHasher, contains_pii, mask_pii
-from rodit.core.ports import ToolGateway
+from rodit.core.ports import MessageRecall, ToolGateway
 
 AccessMode = Literal["A", "B", "C"]
 """接入模式（§8.1）：A 官方机器人 / 消息接口，B 工作台插件，C 独立话术助手。"""
@@ -128,8 +129,9 @@ def minimize(text: str) -> str:
 class RawEvent:
     """子类从平台原始消息解析出的中间结果（只在接入层内部使用）。
 
-    kind：buyer 买家消息 → StandardMessage；agent 客服 / 机器人发出的消息回声 → 只记进本地上下文；
-    recall 撤回 → 从本地上下文删除 recalled_msg_id。其他事件（系统提示、图片等）子类直接返回 None。
+    kind：buyer 买家消息 → StandardMessage；agent 客服 / 机器人发出的消息回声 → 记进本地上下文，
+    on_event 返回 StoredMessage；recall 撤回 → 从本地上下文删除 recalled_msg_id，on_event 返回
+    MessageRecall。其他事件（系统提示、图片等）子类直接返回 None。
     raw_buyer_id 是平台原始买家 ID，只在 BaseMockAdapter 里哈希，不会出现在任何输出里。
     """
 
@@ -298,6 +300,12 @@ class BaseMockAdapter:
 
         不是买家消息（客服回声、撤回、系统提示）、重复消息、无法识别时返回 None。
         """
+        event = self.on_event(raw)
+        return event if isinstance(event, StandardMessage) else None
+
+    def on_event(self, raw: dict) -> StandardMessage | StoredMessage | MessageRecall | None:
+        """on_message 的完整版（core.ports.PlatformAdapter.on_event）：买家消息 → StandardMessage；
+        客服 / 机器人回声 → StoredMessage（role=AGENT）；撤回 → MessageRecall；其余返回 None。"""
         if not isinstance(raw, Mapping):
             return None
         try:
@@ -312,9 +320,9 @@ class BaseMockAdapter:
         if event.kind == "buyer":
             return self._accept_buyer(event)
         if event.kind == "agent":
-            self._accept_agent(event)
-        elif event.kind == "recall":
-            self._accept_recall(event)
+            return self._accept_agent(event)
+        if event.kind == "recall":
+            return self._accept_recall(event)
         return None
 
     def get_context(self, shop_id: str, conversation_id: str) -> PlatformContext:
@@ -532,14 +540,13 @@ class BaseMockAdapter:
                 conv.order = order
         return msg
 
-    def _accept_agent(self, event: RawEvent) -> None:
+    def _accept_agent(self, event: RawEvent) -> StoredMessage | None:
+        """客服 / 机器人回声：本地有这个会话时记进本地上下文；都交给应用层写进会话仓储
+        （本地没有的会话可能是重启或被淘汰了，仓储里有没有由 add_outgoing 判断）。"""
         text = event.text.strip() if isinstance(event.text, str) else ""
         if not text:
-            return
+            return None
         with self._lock:
-            conv = self._conversation(event.shop_id, event.conversation_id)
-            if conv is None or not self._first_time(event.shop_id, event.msg_id):
-                return  # 没有买家消息的会话不记客服消息
             try:
                 stored = StoredMessage(
                     msg_id=event.msg_id,
@@ -550,18 +557,31 @@ class BaseMockAdapter:
                     created_at=event.at or self._clock.now(),
                 )
             except ValidationError:
-                return
-            conv.messages.append(stored)
-
-    def _accept_recall(self, event: RawEvent) -> None:
-        with self._lock:
-            conv = self._conversation(event.shop_id, event.conversation_id)
-            if conv is None or not event.recalled_msg_id:
-                return
+                return None
             if not self._first_time(event.shop_id, event.msg_id):
-                return
-            kept = [m for m in conv.messages if m.msg_id != event.recalled_msg_id]
-            conv.messages = deque(kept, maxlen=self._context_limit)
+                return None
+            conv = self._conversation(event.shop_id, event.conversation_id)
+            if conv is not None:  # 没有买家消息的会话本地不记客服消息
+                conv.messages.append(stored)
+        return stored.model_copy()
+
+    def _accept_recall(self, event: RawEvent) -> MessageRecall | None:
+        recalled = opt_str(event.recalled_msg_id)
+        if recalled is None:
+            return None
+        with self._lock:
+            if not self._first_time(event.shop_id, event.msg_id):
+                return None
+            conv = self._conversation(event.shop_id, event.conversation_id)
+            if conv is not None:
+                kept = [m for m in conv.messages if m.msg_id != recalled]
+                conv.messages = deque(kept, maxlen=self._context_limit)
+        return MessageRecall(
+            shop_id=event.shop_id,
+            conversation_id=event.conversation_id,
+            msg_id=event.msg_id,
+            recalled_msg_id=recalled,
+        )
 
 
 def as_mapping(value: Any) -> Mapping[str, Any]:

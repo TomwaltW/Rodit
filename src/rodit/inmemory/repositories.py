@@ -270,6 +270,18 @@ class InMemoryConversationRepository:
             msgs = self._messages.get((shop_id, conversation_id), [])
             return [m.model_copy() for m in msgs[-limit:]] if limit > 0 else []
 
+    def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
+        # 撤回：消息整条删掉（原文不留），msg_id 留在 _msg_ids 里继续去重
+        with self._lock:
+            msgs = self._messages.get((shop_id, conversation_id))
+            if not msgs:
+                return False
+            kept = [m for m in msgs if m.msg_id != msg_id]
+            if len(kept) == len(msgs):
+                return False
+            self._messages[(shop_id, conversation_id)] = kept
+            return True
+
     def purge_shop(self, shop_id: str) -> int:
         with self._lock:
             n = 0

@@ -225,6 +225,40 @@ def check_conversation_repository(make: Callable[[], ConversationRepository]) ->
     assert repo.purge_shop(SHOP_B) > 0
     assert repo.get_conversation(SHOP_B, m1.conversation_id) is None
     assert len(repo.recent_messages(SHOP_A, m1.conversation_id)) == 3
+    check_conversation_recall(make)
+
+
+def check_conversation_recall(make: Callable[[], ConversationRepository]) -> None:
+    """撤回（§5.3）：消息不再出现在最近几轮里、原文不留；msg_id 仍然去重；按店铺、会话隔离。"""
+    repo = make()
+    world = build_demo_world()
+    conv = "conv_recall"
+    m1 = make_message(
+        "我的手机号13812345678，这件有M码吗",
+        world=world,
+        msg_id="m_r1",
+        conversation_id=conv,
+        item_id="i_555",
+        at=NOW - timedelta(seconds=30),
+    )
+    m2 = make_message("那黑色的吧", world=world, msg_id="m_r2", conversation_id=conv, at=NOW)
+    other_shop = make_message(
+        "在吗", world=world, shop_id=SHOP_B, msg_id="m_r1", conversation_id=conv
+    )
+    assert repo.add_message(m1) and repo.add_message(m2) and repo.add_message(other_shop)
+    # 别的会话、别的店铺撤回不了这条
+    assert repo.recall_message(SHOP_A, "conv_other", "m_r1") is False
+    assert repo.recall_message(SHOP_A, conv, "m_missing") is False
+    assert repo.recall_message(SHOP_A, conv, "m_r1") is True
+    assert repo.recall_message(SHOP_A, conv, "m_r1") is False  # 已经撤回过
+    msgs = repo.recent_messages(SHOP_A, conv)
+    assert [m.msg_id for m in msgs] == ["m_r2"]
+    assert all("13812345678" not in (m.text or "") for m in msgs)
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, conv, limit=1)] == ["m_r2"]
+    assert repo.add_message(m1) is False  # 平台重推被撤回的消息：仍然去重
+    assert [m.msg_id for m in repo.recent_messages(SHOP_B, conv)] == ["m_r1"]
+    assert repo.purge_shop(SHOP_A) > 0
+    assert repo.recent_messages(SHOP_A, conv) == []
 
 
 # ---------------------------------------------------------------- 推荐

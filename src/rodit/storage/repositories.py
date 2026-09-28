@@ -344,6 +344,8 @@ class PgConversationRepository:
     消息按 (shop_id, msg_id) 去重（唯一约束 + ON CONFLICT DO NOTHING，并发重复推送也只存一条）。
     先写消息、再补会话：message 指向 conversation 的外键延迟到提交时检查，
     所以重复消息不会凭空建出会话。
+    撤回的消息留一行"墓碑"继续占住 msg_id（去重），文字和卡片清空：text IS NULL 表示已撤回
+    （正常写入的消息 text 都不是 NULL），recent_messages 不返回它。
     """
 
     def __init__(self, db: Database) -> None:
@@ -422,12 +424,22 @@ class PgConversationRepository:
             rows = conn.execute(
                 f"SELECT {_M_COLS} FROM ("
                 f" SELECT id, {_M_COLS} FROM message"
-                " WHERE shop_id = %s AND conversation_id = %s"
+                " WHERE shop_id = %s AND conversation_id = %s AND text IS NOT NULL"
                 " ORDER BY created_at DESC, id DESC LIMIT %s"
                 ") recent ORDER BY created_at, id",
                 (shop_id, conversation_id, limit),
             ).fetchall()
         return [_message(r) for r in rows]
+
+    def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
+        with self._db.session(shop_id) as conn:
+            updated = conn.execute(
+                "UPDATE message SET text = NULL, item_id = NULL, sku_id = NULL, order_ref = NULL"
+                " WHERE shop_id = %s AND conversation_id = %s AND msg_id = %s"
+                " AND text IS NOT NULL RETURNING id",
+                (shop_id, conversation_id, msg_id),
+            ).fetchone()
+            return updated is not None
 
     def purge_shop(self, shop_id: str) -> int:
         with self._db.session(shop_id) as conn:

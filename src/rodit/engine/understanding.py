@@ -8,7 +8,8 @@
   （按相邻两条的间隔判断，连续发的一串都会合并），文字用空格连接，Turn.at 取最后一条的时间。
   current 是末尾那个合并后的买家 Turn（一定包含本条消息）；history 保留最近
   generation.history_rounds 轮（一轮 = 一条买家 Turn 及其后的回复），不足时全部保留。
-- 商品：本条消息带商品卡片 → 该商品（SKU 取卡片上的）；否则文字点名了会话里某一件
+- 商品：本条消息带商品卡片 → 该商品（SKU 取卡片上的）；本条没有、但合并进当前 Turn 的前几条
+  消息带了（"先发商品卡片，再问这个……"）→ 其中最近的那张卡片，同样对待；否则文字点名了会话里某一件
   （类目末级，如"牛仔裤"）→ 那件；否则买家用"这个 / 那件"之类指代、而会话里出现过两件及以上
   商品 → 先看有没有用规格值指代（"那件黑色的""L 码的那件"，只有一件候选有这个规格），
   有就用那件，否则置空（检索据此给澄清问题，§5.2.4）；"这个有 M 码吗"是在问尺码，
@@ -226,7 +227,9 @@ class ConversationBuilder:
         current = turns[-1]  # _load_messages 保证最后一条是本条买家消息
         history = keep_rounds(turns[:-1], self._config.generation.history_rounds)
 
-        item, sku_id, candidates = self._resolve_item(msg, messages, current.text, notes)
+        item, sku_id, candidates = self._resolve_item(
+            msg, messages, current.text, notes, current_ids=current.msg_ids
+        )
         recent_orders = self._recent_orders(msg, notes)
         order = self._resolve_order(msg, messages, current.text, recent_orders, notes)
 
@@ -289,6 +292,8 @@ class ConversationBuilder:
         messages: Sequence[StoredMessage],
         text: str,
         notes: _Notes,
+        *,
+        current_ids: Sequence[str] = (),
     ) -> tuple[ItemCard | None, str | None, list[str]]:
         candidates: list[str] = []
         for m in reversed(messages):
@@ -296,11 +301,19 @@ class ConversationBuilder:
                 candidates.append(m.item_id)
         cache: dict[str, ItemCard | None] = {}
         shop_id = msg.shop_id
+        # 当前 Turn（合并后当一条处理，§5.3）里最近一张商品卡片
+        turn_card = next(
+            (m for m in reversed(messages) if m.msg_id in current_ids and m.item_id),
+            None,
+        )
 
         item_id: str | None
         if msg.item_card is not None:
             item_id = msg.item_card.item_id
             base_sku = msg.item_card.sku_id
+        elif turn_card is not None:
+            item_id = turn_card.item_id
+            base_sku = turn_card.sku_id
         else:
             item_id = self._pick_item(shop_id, candidates, text, cache, notes)
             base_sku = next(
