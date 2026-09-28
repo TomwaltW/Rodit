@@ -31,6 +31,23 @@ class KnowledgeUnavailable(RoditError):
     """知识库故障。此时不推荐（§12.2）。"""
 
 
+class StorageUnavailable(RoditError):
+    """数据库连不上或超时。消息里不带连接串（可能含密码）。
+
+    降级（§12.2）：问答链路不推荐（客服照常工作）；售后审核、反馈不落库时如实报错，不假装成功。
+    """
+
+
+class ShopInactive(RoditError):
+    """店铺不存在或已停用（SUSPENDED）：不处理这条消息（§8.4 取消订购 / 授权过期后停止处理）。"""
+
+    def __init__(self, shop_id: str, status: object | None = None) -> None:
+        self.shop_id = shop_id
+        self.status = status
+        state = "不存在" if status is None else f"状态为 {status}"
+        super().__init__(f"店铺 {shop_id} {state}，不处理")
+
+
 class ReadOnlyViolation(RoditError):
     """问答链路尝试调用写接口。问答引擎只调用只读工具（§7）。"""
 

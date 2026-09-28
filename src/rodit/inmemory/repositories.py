@@ -302,11 +302,17 @@ class InMemorySuggestionRepository:
                 return None
             return rec.model_copy(deep=True)
 
-    def update(self, record: SuggestionRecord) -> SuggestionRecord:
+    def update(
+        self, record: SuggestionRecord, *, expected_status: SuggestionStatus | None = None
+    ) -> SuggestionRecord:
         with self._lock:
             cur = self._records.get(record.id) if record.id is not None else None
             if cur is None or cur.shop_id != record.shop_id:
                 raise KeyError(record.id)
+            if expected_status is not None and cur.status != expected_status:
+                raise ConcurrencyConflict(
+                    f"推荐 {record.id} 的状态已是 {cur.status.value}，不是 {expected_status.value}"
+                )
             self._records[record.id] = record.model_copy(deep=True)
             return record.model_copy(deep=True)
 

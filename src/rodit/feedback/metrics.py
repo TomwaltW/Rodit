@@ -25,7 +25,8 @@ from typing import Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from rodit.core.audit import AuditAction
+from rodit.core import audit as _audit
+from rodit.core.audit import AuditAction, ResultKey
 from rodit.core.enums import INTENT_LABELS, Intent, RejectReason, Role, SuggestionStatus
 from rodit.core.models import NON_BLOCKING_HARD_RULES, StoredMessage, SuggestionRecord
 from rodit.core.ports import AuditLog
@@ -238,33 +239,19 @@ def adoption_report(
 
 # ================================================================ 质检与降级（§12.4 我们自己看）
 
-# engine.result 审计事件 detail 的键（引擎按这里写，报表按这里读）。detail 里不放买家原文。
-RESULT_INTENT = "intent"  # str：RouteDecision.intent 的取值；没有路由结果时省略
-RESULT_ACTION = "action"  # str：RouteAction 的取值
-RESULT_SUGGESTIONS = "suggestions"  # int：输出的推荐卡片数
-RESULT_NO_SUGGESTION = "no_suggestion_reason"  # str | None：EngineResult.no_suggestion_reason
-RESULT_QA_CHECKED = "qa_checked"  # int：本条消息跑了几次 QualityGate.check（含重写后的复检）
-RESULT_QA_FAILED = "qa_failed"  # int：其中 passed=False 的次数（被拦截的草稿数）
-RESULT_QA_REASONS = "qa_reasons"  # list[str]：不通过的原因（QAResult.reasons，已最小化）
-RESULT_HARD_HITS = "hard_hits"  # list[str]：命中的硬规则名（HardRuleHit.rule），每次命中一项
-RESULT_DEGRADED = "degraded"  # list[str]：EngineResult.degraded，如 ["llm", "tool:logistics"]
-RESULT_TRANSFER = "transfer_to_human"  # bool
-RESULT_LATENCY = (
-    "latency_ms"  # dict[str, int]：各环节耗时（EngineResult.latency_ms），端到端用 "total"
-)
-RESULT_DETAIL_KEYS = (
-    RESULT_INTENT,
-    RESULT_ACTION,
-    RESULT_SUGGESTIONS,
-    RESULT_NO_SUGGESTION,
-    RESULT_QA_CHECKED,
-    RESULT_QA_FAILED,
-    RESULT_QA_REASONS,
-    RESULT_HARD_HITS,
-    RESULT_DEGRADED,
-    RESULT_TRANSFER,
-    RESULT_LATENCY,
-)
+# engine.result 审计事件 detail 的键：定义在 core.audit.ResultKey（引擎写、报表读同一份）
+RESULT_DETAIL_KEYS = _audit.RESULT_DETAIL_KEYS  # 定义在 core.audit.ResultKey
+RESULT_INTENT = ResultKey.INTENT.value
+RESULT_ACTION = ResultKey.ACTION.value
+RESULT_SUGGESTIONS = ResultKey.SUGGESTIONS.value
+RESULT_NO_SUGGESTION = ResultKey.NO_SUGGESTION.value
+RESULT_QA_CHECKED = ResultKey.QA_CHECKED.value
+RESULT_QA_FAILED = ResultKey.QA_FAILED.value
+RESULT_QA_REASONS = ResultKey.QA_REASONS.value
+RESULT_HARD_HITS = ResultKey.HARD_HITS.value
+RESULT_DEGRADED = ResultKey.DEGRADED.value
+RESULT_TRANSFER = ResultKey.TRANSFER.value
+RESULT_LATENCY = ResultKey.LATENCY.value
 LATENCY_TOTAL = "total"
 
 

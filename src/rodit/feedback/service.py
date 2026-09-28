@@ -35,7 +35,7 @@ from rodit.core.enums import (
     RejectReason,
     SuggestionStatus,
 )
-from rodit.core.errors import ActionNotAllowed
+from rodit.core.errors import ActionNotAllowed, ConcurrencyConflict
 from rodit.core.models import (
     AuditEvent,
     KnowledgeGap,
@@ -52,7 +52,7 @@ from rodit.core.ports import (
 )
 from rodit.feedback.metrics import char_similarity
 
-KNOWLEDGE_RETIRED = "knowledge.retired"
+KNOWLEDGE_RETIRED = AuditAction.KNOWLEDGE_RETIRED.value  # 兼容旧名
 """商家下线 FAQ / 驳回候选知识的审计事件名（core.audit.AuditAction 里还没有，见回执）。"""
 
 # 候选知识没有生成的原因（FeedbackOutcome.candidate_skipped）
@@ -161,7 +161,7 @@ class FeedbackService:
                 return self._mark_sent(record, actor, edited_unchanged=True)
             now = self._clock.now()
             answer = minimize_text(edited_text.strip())
-            updated = self._suggestions.update(
+            updated = self._update_shown(
                 record.model_copy(
                     update={
                         "status": SuggestionStatus.EDITED_SENT,
@@ -218,7 +218,7 @@ class FeedbackService:
             if reason == RejectReason.WRONG_INTENT and true_intent == record.intent:
                 raise ValueError("理解错误时 true_intent 不能和推荐的类型相同")
             now = self._clock.now()
-            updated = self._suggestions.update(
+            updated = self._update_shown(
                 record.model_copy(
                     update={
                         "status": SuggestionStatus.REJECTED,
@@ -333,11 +333,18 @@ class FeedbackService:
             )
         return record
 
+    def _update_shown(self, record: SuggestionRecord) -> SuggestionRecord:
+        """比较后更新：只有仍是 SHOWN 才写入（多实例部署时防止重复反馈、或和过期撞车）。"""
+        try:
+            return self._suggestions.update(record, expected_status=SuggestionStatus.SHOWN)
+        except ConcurrencyConflict as exc:
+            raise ActionNotAllowed(f"推荐 {record.id} 的状态已经变化，请刷新后再操作") from exc
+
     def _mark_sent(
         self, record: SuggestionRecord, actor: str, *, edited_unchanged: bool
     ) -> FeedbackOutcome:
         now = self._clock.now()
-        updated = self._suggestions.update(
+        updated = self._update_shown(
             record.model_copy(update={"status": SuggestionStatus.SENT, "agent_id": actor})
         )
         label: LabeledSample | None = None

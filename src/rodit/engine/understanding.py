@@ -35,7 +35,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from rodit.core.clock import Clock
 from rodit.core.config import EngineConfig, effective_shop_config
 from rodit.core.enums import Mode, Role, ShopStatus
-from rodit.core.errors import KnowledgeUnavailable, RoditError
+from rodit.core.errors import (  # noqa: F401  (re-export)
+    KnowledgeUnavailable,
+    RoditError,
+    ShopInactive,
+)
 from rodit.core.models import (
     ConversationContext,
     ItemCard,
@@ -63,16 +67,6 @@ DEGRADED_STORAGE = "storage"
 DEGRADED_KNOWLEDGE = "knowledge"
 
 _MAX_ITEM_CANDIDATES = 5  # 消歧时最多读取的候选商品卡片数
-
-
-class ShopInactive(RoditError):
-    """店铺不存在或已停用（SUSPENDED）：不处理这条消息（§8.4 取消订购 / 授权过期后停止处理）。"""
-
-    def __init__(self, shop_id: str, status: ShopStatus | None = None) -> None:
-        self.shop_id = shop_id
-        self.status = status
-        state = "不存在" if status is None else f"状态为 {status}"
-        super().__init__(f"店铺 {shop_id} {state}，不处理")
 
 
 class Understanding(BaseModel):

@@ -33,7 +33,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from rodit.core.errors import RoditError
+from rodit.core.errors import RoditError, StorageUnavailable  # noqa: F401  (re-export)
 
 APP_ROLE = "rodit_app"
 TRAINER_ROLE = "rodit_trainer"
@@ -59,10 +59,6 @@ BUSINESS_TABLES: tuple[str, ...] = (
 _MIGRATION_LOCK = 0x526F646974  # advisory lock 的键（"Rodit"），只用于串行化迁移
 
 Conn = psycopg.Connection[dict[str, Any]]
-
-
-class StorageUnavailable(RoditError):
-    """数据库连不上或超时。消息里不带连接串（可能含密码）。"""
 
 
 @dataclass(frozen=True)

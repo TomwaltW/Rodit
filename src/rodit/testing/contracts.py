@@ -267,6 +267,22 @@ def check_suggestion_repository(make: Callable[[], SuggestionRepository]) -> Non
     assert updated.status == SuggestionStatus.EDITED_SENT
     assert repo.get(SHOP_A, a1.id).edited_text == "改过"
     assert [r.text for r in repo.list(SHOP_A, status=SuggestionStatus.SHOWN)] == ["a3", "a2"]
+    # 比较后更新：状态已不是期望值时不写入
+    try:
+        repo.update(
+            a1.model_copy(update={"status": SuggestionStatus.EXPIRED}),
+            expected_status=SuggestionStatus.SHOWN,
+        )
+    except ConcurrencyConflict:
+        pass
+    else:
+        raise AssertionError("状态已变化时比较后更新应抛 ConcurrencyConflict")
+    assert repo.get(SHOP_A, a1.id).status == SuggestionStatus.EDITED_SENT
+    ok = repo.update(
+        a2.model_copy(update={"status": SuggestionStatus.SENT}),
+        expected_status=SuggestionStatus.SHOWN,
+    )
+    assert ok.status == SuggestionStatus.SENT
     try:
         repo.update(b1.model_copy(update={"shop_id": SHOP_A}))
     except KeyError:

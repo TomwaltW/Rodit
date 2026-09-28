@@ -28,7 +28,13 @@ class InMemoryCache:
             while len(self._data) > self._max:
                 self._data.pop(next(iter(self._data)))
 
-    def clear_shop(self, shop_id: str) -> None:
+    def purge_shop(self, shop_id: str) -> int:
         with self._lock:
-            for k in [k for k in self._data if k[0] == shop_id]:
+            keys = [k for k in self._data if k[0] == shop_id]
+            for k in keys:
                 del self._data[k]
+            return len(keys)
+
+    def clear_shop(self, shop_id: str) -> None:
+        """同 purge_shop，不返回条数（兼容旧名）。"""
+        self.purge_shop(shop_id)

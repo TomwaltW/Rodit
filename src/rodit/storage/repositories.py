@@ -495,18 +495,34 @@ class PgSuggestionRepository:
             ).fetchone()
         return _suggestion(r) if r else None
 
-    def update(self, record: SuggestionRecord) -> SuggestionRecord:
+    def update(
+        self, record: SuggestionRecord, *, expected_status: SuggestionStatus | None = None
+    ) -> SuggestionRecord:
         if record.id is None:
             raise KeyError(None)
         fields = [f for f in _S_FIELDS if f != "shop_id"]
         values = dict(zip(_S_FIELDS, _suggestion_values(record), strict=True))
         assignments = ", ".join(f"{f} = %s" for f in fields)
+        where = "shop_id = %s AND id = %s"
+        params: list[object] = [*(values[f] for f in fields), record.shop_id, record.id]
+        if expected_status is not None:
+            where += " AND status = %s"
+            params.append(expected_status.value)
         with self._db.session(record.shop_id) as conn:
             r = conn.execute(
-                f"UPDATE suggestion SET {assignments} WHERE shop_id = %s AND id = %s"
-                f" RETURNING {_S_COLS}",
-                [*(values[f] for f in fields), record.shop_id, record.id],
+                f"UPDATE suggestion SET {assignments} WHERE {where} RETURNING {_S_COLS}",
+                params,
             ).fetchone()
+            if r is None and expected_status is not None:
+                exists = conn.execute(
+                    "SELECT status FROM suggestion WHERE shop_id = %s AND id = %s",
+                    (record.shop_id, record.id),
+                ).fetchone()
+                if exists is not None:
+                    raise ConcurrencyConflict(
+                        f"推荐 {record.id} 的状态已是 {exists['status']}，"
+                        f"不是 {expected_status.value}"
+                    )
         if r is None:
             raise KeyError(record.id)
         return _suggestion(r)

@@ -281,6 +281,10 @@ class AuditLog(AuditSink, Protocol):
         since: datetime | None = None,
     ) -> list[DecisionLogEntry]: ...
 
+    def purge_shop(self, shop_id: str) -> int:
+        """删除该店铺的审计记录（§8.4 按约定删除数据），返回删除条数。"""
+        ...
+
 
 @runtime_checkable
 class Cache(Protocol):
@@ -291,6 +295,10 @@ class Cache(Protocol):
         ...
 
     def set(self, shop_id: str, key: str, value: object) -> None: ...
+
+    def purge_shop(self, shop_id: str) -> int:
+        """删除该店铺的全部缓存（§8.4），返回删除条数。"""
+        ...
 
 
 # ================================================================ 2. 仓储
@@ -418,8 +426,12 @@ class SuggestionRepository(Protocol):
 
     def get(self, shop_id: str, suggestion_id: int) -> SuggestionRecord | None: ...
 
-    def update(self, record: SuggestionRecord) -> SuggestionRecord:
-        """按 (record.shop_id, record.id) 整条更新；不存在抛 KeyError。"""
+    def update(
+        self, record: SuggestionRecord, *, expected_status: SuggestionStatus | None = None
+    ) -> SuggestionRecord:
+        """按 (record.shop_id, record.id) 整条更新；不存在抛 KeyError。
+        expected_status 不为空时是比较后更新：当前状态不等于它就抛 ConcurrencyConflict、不写入
+        （多实例部署时防止同一条推荐被重复反馈，或客服刚发送的推荐被过期覆盖）。"""
         ...
 
     def list(

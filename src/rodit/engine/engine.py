@@ -68,7 +68,8 @@ UNDERSTAND、ROUTE 各一条；RETRIEVE、GENERATE、QA 每次调用 / 每条分
 - "degraded"    list[str]   同 EngineResult.degraded
 - "latency_ms"  dict[str, int]  同 EngineResult.latency_ms
 - "missing"     list[str]   同 EngineResult.missing_knowledge
-（常量 RESULT_DETAIL_KEYS。）
+另有 "no_suggestion_reason"、"qa_checked"、"qa_reasons"、"transfer_to_human"；
+键的完整定义见 core.audit.ResultKey（常量 RESULT_DETAIL_KEYS，报表按同一份读）。
 
 耗时（EngineResult.latency_ms，§12.1、§12.4）：键固定为 understand / route / retrieve / generate /
 qa / total，毫秒整数，没跑的环节为 0；分条推荐时同一环节累加。用 time.perf_counter 量墙钟耗时
@@ -83,7 +84,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from rodit.core.audit import AuditAction
+from rodit.core import audit as _audit
+from rodit.core.audit import AuditAction, ResultKey
 from rodit.core.clock import Clock
 from rodit.core.config import EngineConfig
 from rodit.core.context import shop_scope
@@ -97,7 +99,7 @@ from rodit.core.enums import (
     RouteAction,
     SuggestionStatus,
 )
-from rodit.core.errors import KnowledgeUnavailable
+from rodit.core.errors import ConcurrencyConflict, KnowledgeUnavailable
 from rodit.core.evidence import LLM_FREE_INTENTS, MISSING_ITEM, MISSING_ORDER
 from rodit.core.models import (
     AuditEvent,
@@ -154,17 +156,8 @@ DEGRADED_QA = "qa"
 DEGRADED_AUDIT = "audit"
 DEGRADED_ENGINE = "engine"
 
-RESULT_DETAIL_KEYS = (
-    "intent",
-    "action",
-    "rule",
-    "suggestions",
-    "hard_hits",
-    "qa_failed",
-    "degraded",
-    "latency_ms",
-    "missing",
-)
+
+RESULT_DETAIL_KEYS = _audit.RESULT_DETAIL_KEYS  # 定义在 core.audit.ResultKey
 LATENCY_KEYS = ("understand", "route", "retrieve", "generate", "qa", "total")
 
 # ---------------------------------------------------------------- 给客服看的原因与提醒
@@ -234,7 +227,9 @@ class _Run:
     latency: dict[str, float] = field(default_factory=lambda: dict.fromkeys(LATENCY_KEYS, 0.0))
     alerts: list[str] = field(default_factory=list)
     hard_hits: list[str] = field(default_factory=list)
+    qa_checked: int = 0
     qa_failed: int = 0
+    qa_reasons: list[str] = field(default_factory=list)
     result: EngineResult | None = None
 
     def degrade(self, code: str) -> None:
@@ -428,9 +423,13 @@ class AssistEngine:
                 msg.shop_id, conversation_id=msg.conversation_id, status=SuggestionStatus.SHOWN
             )
             for record in shown:
-                self._suggestions.update(
-                    record.model_copy(update={"status": SuggestionStatus.EXPIRED})
-                )
+                try:
+                    self._suggestions.update(
+                        record.model_copy(update={"status": SuggestionStatus.EXPIRED}),
+                        expected_status=SuggestionStatus.SHOWN,
+                    )
+                except ConcurrencyConflict:
+                    continue  # 客服刚好发送 / 反馈了这条：以客服的操作为准
         except Exception as exc:  # noqa: BLE001
             self._warn("expire", exc)
             run.degrade(DEGRADED_STORAGE)
@@ -552,6 +551,7 @@ class AssistEngine:
                     qa_error = True
                     continue
                 results.append(qa)
+                run.qa_checked += 1
                 run.hard_hits.extend(h.rule for h in qa.hard_hits)
                 if qa.degraded:
                     run.degrade(DEGRADED_DECISION_QA)
@@ -561,6 +561,7 @@ class AssistEngine:
                 run.qa_failed += 1
                 why = _qa_reasons(qa)
                 failed_reasons.extend(why)
+                run.qa_reasons.extend(r for r in why if r not in run.qa_reasons)
                 if draft.kind == DraftKind.LLM:
                     llm_failed.append(qa)
                 else:  # FAQ / 模板：标准回答本身有问题，重写没用
@@ -797,16 +798,21 @@ class AssistEngine:
     def _write_result(self, run: _Run, result: EngineResult) -> None:
         route = result.route
         detail: dict[str, Any] = {
-            "intent": str(route.intent) if route else None,
-            "action": str(route.action) if route else None,
-            "rule": route.rule if route else None,
-            "suggestions": len(result.suggestions),
-            "hard_hits": list(run.hard_hits),
-            "qa_failed": run.qa_failed,
-            "degraded": list(result.degraded),
-            "latency_ms": dict(result.latency_ms),
-            "missing": list(result.missing_knowledge),
+            ResultKey.INTENT: str(route.intent) if route else None,
+            ResultKey.ACTION: str(route.action) if route else None,
+            ResultKey.RULE: route.rule if route else None,
+            ResultKey.SUGGESTIONS: len(result.suggestions),
+            ResultKey.NO_SUGGESTION: result.no_suggestion_reason,
+            ResultKey.QA_CHECKED: run.qa_checked,
+            ResultKey.QA_FAILED: run.qa_failed,
+            ResultKey.QA_REASONS: [mask_pii(r) for r in run.qa_reasons],
+            ResultKey.HARD_HITS: list(run.hard_hits),
+            ResultKey.DEGRADED: list(result.degraded),
+            ResultKey.TRANSFER: result.transfer_to_human,
+            ResultKey.LATENCY: dict(result.latency_ms),
+            ResultKey.MISSING: list(result.missing_knowledge),
         }
+        detail = {str(k): v for k, v in detail.items()}
         self._audit(run, AuditAction.RESULT, detail)
 
     # ------------------------------------------------------------ 留痕
