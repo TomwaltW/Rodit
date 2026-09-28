@@ -218,5 +218,6 @@ def build_generation_request(
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         json_mode=True,
+        timeout_s=config.timeout_s,
         shop_id=ctx.shop_id,
     )

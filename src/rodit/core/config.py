@@ -88,6 +88,7 @@ class GenerationConfig(_Model):
     max_evidence_chars: int = 1500  # 控制证据长度（§14 降本）
     temperature: float = 0.3
     max_tokens: int = 400
+    timeout_s: float = 2.5  # 生成 ≤ 2.5 秒（§12.1）
     auto_reply_prefix: str = "【智能客服】"  # 全自动回复的 AI 生成内容标识（§12.3）
 
 
@@ -108,6 +109,15 @@ class AfterSaleConfig(_Model):
     repeat_threshold: int = 3  # R7
 
 
+class LLMConfig(_Model):
+    """境内已备案大模型（D5）的调用配置。密钥不在这里：只写环境变量名，调用时再读。"""
+
+    base_url: str | None = None  # OpenAI 兼容接口地址；为空时从环境变量 RODIT_LLM_BASE_URL 读
+    model: str | None = None  # 为空时从 RODIT_LLM_MODEL 读
+    api_key_env: str = "RODIT_LLM_API_KEY"
+    timeout_s: float = 10.0  # 单次调用的上限；各环节自己的预算见 decision / generation
+
+
 class PrivacyConfig(_Model):
     # buyer_ref 哈希的盐从这个环境变量读（§8.3）；生产部署必须设置，仓库里没有真实值
     buyer_salt_env: str = "RODIT_BUYER_SALT"
@@ -122,6 +132,7 @@ class EngineConfig(_Model):
     logistics: LogisticsConfig = Field(default_factory=LogisticsConfig)
     aftersale: AfterSaleConfig = Field(default_factory=AfterSaleConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     # 配置分层（§9.3）：平台默认 → 类目默认 → 店铺配置，下层覆盖上层
     shop_defaults_by_platform: dict[Platform, dict[str, Any]] = Field(default_factory=dict)
     shop_defaults_by_category: dict[str, dict[str, Any]] = Field(default_factory=dict)

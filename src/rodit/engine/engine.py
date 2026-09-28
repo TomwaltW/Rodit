@@ -100,7 +100,7 @@ from rodit.core.enums import (
     SuggestionStatus,
 )
 from rodit.core.errors import ConcurrencyConflict, KnowledgeUnavailable
-from rodit.core.evidence import LLM_FREE_INTENTS, MISSING_ITEM, MISSING_ORDER
+from rodit.core.evidence import LLM_FREE_INTENTS, MISSING_ITEM, MISSING_ORDER, missing_any
 from rodit.core.models import (
     AuditEvent,
     ConversationContext,
@@ -188,8 +188,8 @@ _CONTEXT_MISSING = frozenset({MISSING_ORDER, MISSING_ITEM})
 
 
 def missing_for_intent(intent: Intent) -> str:
-    """没有依据、证据包又没说缺什么时的缺失标记。"""
-    return f"knowledge:{intent}"
+    """没有依据、也说不清缺哪条时的缺失标记（core.evidence.missing_any）。"""
+    return missing_any(intent)
 
 
 # ---------------------------------------------------------------- 一条消息的处理状态
@@ -397,7 +397,13 @@ class AssistEngine:
         # 6. 按执行计划跑
         plan = ACTION_PLANS[route.action]
         if not plan.generate:
-            return self._finish(run, reason=self._no_generate_reason(run, route))
+            soothe = self._transfer_soothe(run, ctx, route)
+            return self._finish(
+                run,
+                reason=self._no_generate_reason(run, route),
+                cards=[soothe[0]] if soothe else None,
+                auto_reply=soothe[1] if soothe else None,
+            )
         units, plan_reason = self._plan_units(run, ctx, route, plan)
         for unit in units:
             self._run_unit(run, ctx, unit, plan)
@@ -685,6 +691,50 @@ class AssistEngine:
         return out
 
     # ------------------------------------------------------------ 全自动（§5.6、§12.2、§12.3）
+
+    def _transfer_soothe(
+        self, run: _Run, ctx: ConversationContext, route: RouteDecision
+    ) -> tuple[SuggestionCard, SuggestionCard] | None:
+        """全自动模式下因情绪激烈转人工时，附一句安抚话术（§5.7 "转人工，附安抚话术"）。
+
+        只用生成器的安抚模板（不调大模型），过质检硬规则，加 AI 标识前缀后仍不超长才发；
+        任何一步不满足就只转人工。返回 (记录下来的卡片, 带前缀的自动回复)。
+        """
+        if route.action != RouteAction.TRANSFER_HUMAN or route.rule != 3:
+            return None
+        if ctx.mode != Mode.AUTO or not ctx.config.auto_reply_enabled:
+            return None
+        soothe_route = route.model_copy(update={"action": RouteAction.SOOTHE})
+        bundle = EvidenceBundle()
+        try:
+            drafts = self._generator.generate(ctx, soothe_route, bundle)
+            draft = next(
+                (d for d in drafts if d.kind == DraftKind.TEMPLATE and d.variant == "soothe"),
+                None,
+            )
+            if draft is None:
+                return None
+            qa = self._gate.check(ctx, soothe_route, draft, bundle)
+        except Exception as exc:  # noqa: BLE001 — 安抚话术出不来就只转人工
+            self._warn("transfer_soothe", exc)
+            return None
+        if not qa.passed:
+            return None
+        text = self._config.generation.auto_reply_prefix + qa.text
+        if len(text) > ctx.config.max_answer_chars:
+            return None
+        card = build_card(
+            draft=draft,
+            qa=qa,
+            bundle=bundle,
+            route=soothe_route,
+            intent=route.intent,
+            intent_confidence=route.intent_confidence,
+            degraded=[],
+        )
+        persisted = self._persist(run, ctx, [(card, draft)])
+        stored = persisted[0][0] if persisted else card
+        return stored, stored.model_copy(update={"text": text})
 
     def _auto_reply(
         self,

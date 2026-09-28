@@ -6,7 +6,7 @@
 各类证据的 data 结构（Evidence.data）：
 - platform:{platform}:{key}           {"platform", "key", "text"}
 - policy:{key}                        {"key", "value"}
-- item:{item_id}:title                {"title"}
+- item:{item_id}:title                {"title", "forbidden_claims"}（质检用商家标注的不能说的卖点）
 - item:{item_id}:attr:{name}          {"name", "value"}
 - item:{item_id}:sku                  {"skus": [Sku...]}
 - item:{item_id}:size_chart           {"rows": [...], "conservative": bool}
@@ -184,6 +184,8 @@ class Topic(StrEnum):
 
     PRICE = "price"
     STOCK = "stock"
+    CARE = "care"  # 洗涤保养：商品自己的说明覆盖类目通用建议
+    USAGE = "usage"  # 使用安装
 
 
 def topic_for_policy(key: str) -> str:
@@ -341,7 +343,7 @@ def tool_price(item_id: str) -> str:
 
 # 工具不可用 / 知识缺失的标记（EvidenceBundle.unavailable / missing）
 def unavailable(kind: str) -> str:
-    """kind 取 order / logistics / aftersale / stock / price。"""
+    """kind 取 order / logistics / aftersale / return / stock / price。"""
     return f"tool:{kind}"
 
 
@@ -356,6 +358,11 @@ def missing_platform_rule(platform: Platform | str, key: str) -> str:
 def missing_item_field(item_id: str | None, field: str) -> str:
     """field 如 size_advice / size_chart / attr:面料；item_id 为空表示缺当前商品。"""
     return f"item:{item_id or '?'}:{field}"
+
+
+def missing_any(intent: str) -> str:
+    """没有找到任何依据、又说不清具体缺哪条时的缺失标记。"""
+    return f"knowledge:{intent}"
 
 
 MISSING_ITEM = "item:?"  # 需要商品知识但会话里没有当前商品

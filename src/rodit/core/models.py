@@ -48,6 +48,13 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# 约定：模型里的 dict[str, Any] 字段（Shop.config_overrides、Evidence.data、
+# AfterSaleReview.action_result、AuditEvent.detail、DecisionLogEntry.answers、
+# StandardMessage.extension）只放 JSON 原生值
+# （str / int / float / bool / None / list / dict）；Decimal、时间写成字符串。这样内存实现和
+# PostgreSQL（JSONB）读回来的值一致。
+
+
 # ---------------------------------------------------------------- 标准会话（§8.3）
 
 
@@ -203,7 +210,12 @@ class KnowledgeItem(_Model):
 
 
 class KnowledgeGap(_Model):
-    """知识缺失提醒（§5.8 "知识缺失 → 提醒商家补知识"，§5.7 "提示缺哪类知识"）。"""
+    """知识缺失提醒（§5.8 "知识缺失 → 提醒商家补知识"，§5.7 "提示缺哪类知识"）。
+
+    missing 的写法：引擎记 EvidenceBundle.missing 里的标记（core.evidence 的 missing_* 构造），
+    或 core.evidence.missing_any(intent)（没有依据、也说不清缺哪条）；反馈闭环记
+    missing_item_field(item_id, intent) 或 missing_any(intent)。
+    """
 
     shop_id: str
     intent: Intent | None = None
@@ -252,6 +264,7 @@ class OrderInfo(_Model):
     courier: str | None = None
     seven_day_return: bool = True  # 商品是否支持七天无理由（定制商品等例外）
     promised_ship_by: AwareDatetime | None = None  # 平台/店铺承诺的最晚发货时间
+    fetched_at: AwareDatetime | None = None  # 从平台读取的时间（接口故障用缓存时，回答写"截至"）
 
 
 class StockInfo(_Model):
@@ -334,6 +347,7 @@ class AfterSaleInfo(_Model):
     evidence_count: int = 0  # 买家上传的凭证（照片）数量
     status_version: str = "0"  # 平台状态版本（如修改时间戳），用于幂等键和重读校验
     note: str | None = None  # 买家填写的说明；ToolGateway 实现负责先过 mask_pii
+    fetched_at: AwareDatetime | None = None  # 从平台读取的时间
 
 
 class ReturnEligibility(_Model):
@@ -370,9 +384,9 @@ class HumanConfirmation(_Model):
     @field_validator("operator")
     @classmethod
     def _human(cls, v: str) -> str:
-        if v.strip().lower() in {"system", "bot", "auto"}:
+        if not v.strip() or v.strip().lower() in {"system", "bot", "auto"}:
             raise ValueError("售后写操作必须由人确认")
-        return v
+        return v.strip()
 
 
 def aftersale_idempotency_key(aftersale_id: str, action: str, status_version: str) -> str:
@@ -518,7 +532,7 @@ class RouteDecision(_Model):
     action: RouteAction
     rule: int = Field(ge=1, le=8)  # 命中的 §6.6 规则序号
     intent: Intent
-    intent_confidence: float
+    intent_confidence: float = Field(ge=0.0, le=1.0)
     top_intents: list[tuple[Intent, float]] = Field(default_factory=list)
     parts: list[RoutePart] = Field(default_factory=list)
     need_human: float = 0.0

@@ -46,6 +46,7 @@ from rodit.core.models import (
     StockInfo,
     Turn,
 )
+from rodit.core.pii import mask_pii
 from rodit.core.ports import LLMRequest, LLMResponse
 from rodit.core.questions import (
     Q_ANSWERS_QUESTION,
@@ -260,20 +261,23 @@ class InMemoryToolGateway:
 
     def get_logistics(self, shop_id: str, order_id: str) -> LogisticsTrace | None:
         self._enter("get_logistics", shop_id, order_id)
-        return next(
-            (
-                t.model_copy(deep=True)
-                for t in self.world.traces
-                if t.shop_id == shop_id and t.order_id == order_id
-            ),
+        trace = next(
+            (t for t in self.world.traces if t.shop_id == shop_id and t.order_id == order_id),
             None,
         )
+        if trace is None:
+            return None
+        # ToolGateway 协议：平台自由文本由实现先脱敏
+        events = [
+            e.model_copy(update={"description": mask_pii(e.description)}) for e in trace.events
+        ]
+        return trace.model_copy(deep=True, update={"events": events})
 
     def get_aftersale(self, shop_id: str, aftersale_id: str) -> AfterSaleInfo | None:
         self._enter("get_aftersale", shop_id, aftersale_id)
         return next(
             (
-                a.model_copy(deep=True)
+                _masked(a)
                 for a in self.world.aftersales
                 if a.shop_id == shop_id and a.aftersale_id == aftersale_id
             ),
@@ -291,7 +295,7 @@ class InMemoryToolGateway:
     ) -> list[AfterSaleInfo]:
         self._enter("list_aftersales", shop_id, order_id, buyer_ref, status, since)
         out = [
-            a.model_copy(deep=True)
+            _masked(a)
             for a in self.world.aftersales
             if a.shop_id == shop_id
             and (order_id is None or a.order_id == order_id)
@@ -348,10 +352,12 @@ class InMemoryToolGateway:
     ) -> AfterSaleInfo:
         for i, a in enumerate(self.world.aftersales):
             if a.shop_id == shop_id and a.aftersale_id == aftersale_id:
+                # 版本号用毫秒并保证递增：同一秒内的两次变化也能区分
+                version = max(int(at.timestamp() * 1000), int(a.status_version) + 1)
                 update: dict[str, Any] = {
                     "status": status,
                     "updated_at": at,
-                    "status_version": str(int(at.timestamp())),
+                    "status_version": str(version),
                 }
                 if evidence_count is not None:
                     update["evidence_count"] = evidence_count
@@ -359,6 +365,10 @@ class InMemoryToolGateway:
                 self.world.aftersales[i] = updated
                 return updated
         raise ActionNotAllowed(f"售后单 {aftersale_id} 不存在或不属于店铺 {shop_id}")
+
+
+def _masked(info: AfterSaleInfo) -> AfterSaleInfo:
+    return info.model_copy(deep=True, update={"note": mask_pii(info.note) if info.note else None})
 
 
 _NEXT_STATUS = {

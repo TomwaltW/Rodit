@@ -85,7 +85,7 @@ def test_product_spec_takes_only_the_asked_attribute(world, make_retriever, rout
     assert fabric.data == {"name": "面料", "value": "棉 95%、氨纶 5%"}
     assert "棉 95%" in fabric.content
     title = b.get("item:i_555:title")
-    assert title.data == {"title": "法式碎花连衣裙"}
+    assert title.data == {"title": "法式碎花连衣裙", "forbidden_claims": ["防晒", "抗菌"]}
     sku = b.get("item:i_555:sku")
     assert [s["sku_id"] for s in sku.data["skus"]] == ["k_1", "k_2", "k_3", "k_4"]
     assert set(sku.data) == {"skus"}

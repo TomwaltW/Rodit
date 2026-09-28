@@ -16,10 +16,10 @@ from rodit.core import evidence as ev
 from rodit.core.enums import EvidenceSource
 from rodit.core.models import Evidence
 
-TOPIC_CARE = "care"
+TOPIC_CARE = ev.Topic.CARE.value
 """洗涤保养主题：商品卡片的 care 和类目通用的洗涤建议互相冲突时，以商品为准。"""
 
-TOPIC_USAGE = "usage"
+TOPIC_USAGE = ev.Topic.USAGE.value
 """使用说明主题：商品卡片的 usage 和类目通用的使用建议互相冲突时，以商品为准。"""
 
 APPAREL = "服饰"

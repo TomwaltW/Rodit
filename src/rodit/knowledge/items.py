@@ -136,7 +136,11 @@ def _item_evidence(
 def title_candidate(card: ItemCard) -> Candidate:
     return Candidate(
         _item_evidence(
-            ev.item_title(card.item_id), "标题", f"商品标题：{card.title}", {"title": card.title}
+            ev.item_title(card.item_id),
+            "标题",
+            f"商品标题：{card.title}",
+            # 商家标注的不能说的卖点跟着标题证据走，质检据此拦截（§5.2.2 forbidden_claims）
+            {"title": card.title, "forbidden_claims": list(card.forbidden_claims)},
         )
     )
 

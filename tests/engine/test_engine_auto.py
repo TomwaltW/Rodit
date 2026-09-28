@@ -9,7 +9,15 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from engine_support import Kit, bundle_of, make_route, policy_evidence, qa_fail, qa_pass
+from engine_support import (
+    SOOTHE_SCRIPT,
+    Kit,
+    bundle_of,
+    make_route,
+    policy_evidence,
+    qa_fail,
+    qa_pass,
+)
 
 from rodit.core.audit import AuditAction
 from rodit.core.enums import DraftKind, Intent, Mode, RouteAction
@@ -242,3 +250,34 @@ def test_shadow_shop_never_auto_replies(kit: Kit) -> None:
     assert result.mode == Mode.SHADOW
     assert result.auto_reply is None
     assert result.transfer_to_human is False
+
+
+def test_auto_emotion_transfer_sends_soothe_script_and_transfers(kit: Kit) -> None:
+    """§5.7：全自动模式下情绪激烈 → 转人工，附安抚话术（模板，带 AI 标识前缀）。"""
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True)
+    kit.router.decide = make_route(
+        Intent.QUALITY_ISSUE, action=RouteAction.TRANSFER_HUMAN, rule=3, emotion=3.6
+    )
+    result = run_auto(kit, "你们这什么垃圾东西！！！")
+    assert result.transfer_to_human is True
+    assert result.auto_reply is not None
+    assert result.auto_reply.text == PREFIX + SOOTHE_SCRIPT
+    assert result.auto_reply.kind == DraftKind.TEMPLATE
+    assert [c.text for c in result.suggestions] == [SOOTHE_SCRIPT]
+    [call] = kit.generator.calls
+    assert call["action"] == RouteAction.SOOTHE
+
+
+def test_auto_transfer_for_other_reasons_sends_nothing(kit: Kit) -> None:
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True)
+    kit.router.decide = make_route(Intent.MODIFY_ORDER, action=RouteAction.TRANSFER_HUMAN, rule=4)
+    result = run_auto(kit, "能改个地址吗")
+    assert result.transfer_to_human is True
+    assert result.auto_reply is None and result.suggestions == []
+    assert kit.generator.calls == []
+
+
+def test_assist_mode_emotion_is_not_auto_soothed(kit: Kit) -> None:
+    kit.router.decide = make_route(Intent.QUALITY_ISSUE, action=RouteAction.SOOTHE, rule=3)
+    result = kit.engine().handle(kit.msg("气死了"))
+    assert result is not None and result.auto_reply is None

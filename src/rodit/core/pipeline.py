@@ -15,6 +15,7 @@ class ActionPlan:
     retrieve: bool  # 调 EvidenceRetriever
     generate: bool  # 调 AnswerGenerator
     check: bool  # 调 QualityGate（FAQ / 模板草稿只跑硬规则，由 QualityGate 自己按 draft.kind 区分）
+    # 约定：generate=True 时 check 一定为 True——任何要给客服 / 买家看的文字都要过质检（§5.5）
     per_part: bool = False  # 按 RouteDecision.parts 分条执行（规则 5）
 
 
