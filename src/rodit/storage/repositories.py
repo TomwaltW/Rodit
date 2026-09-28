@@ -125,9 +125,9 @@ class PgKnowledgeRepository:
         self._clock = clock or SystemClock()
 
     @contextmanager
-    def _session(self, shop_id: str) -> Iterator[Conn]:
+    def _session(self, shop_id: str, *, unbounded: bool = False) -> Iterator[Conn]:
         try:
-            with self._db.session(shop_id) as conn:
+            with self._db.session(shop_id, unbounded=unbounded) as conn:
                 yield conn
         except (StorageUnavailable, psycopg.OperationalError) as e:
             raise KnowledgeUnavailable("知识库暂时不可用") from e
@@ -343,7 +343,8 @@ class PgKnowledgeRepository:
                 raise KeyError(knowledge_id)
 
     def purge_shop(self, shop_id: str) -> int:
-        with self._session(shop_id) as conn:
+        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
+        with self._session(shop_id, unbounded=True) as conn:
             n = 0
             for table in ("shop_policy", "item_card", "knowledge_item"):
                 n += conn.execute(f"DELETE FROM {table} WHERE shop_id = %s", (shop_id,)).rowcount
@@ -474,7 +475,8 @@ class PgConversationRepository:
             return updated is not None
 
     def purge_shop(self, shop_id: str) -> int:
-        with self._db.session(shop_id) as conn:
+        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
+        with self._db.session(shop_id, unbounded=True) as conn:
             n = conn.execute("DELETE FROM message WHERE shop_id = %s", (shop_id,)).rowcount
             n += conn.execute("DELETE FROM conversation WHERE shop_id = %s", (shop_id,)).rowcount
             return n
@@ -597,7 +599,8 @@ class PgSuggestionRepository:
         return [_suggestion(r) for r in rows]
 
     def purge_shop(self, shop_id: str) -> int:
-        with self._db.session(shop_id) as conn:
+        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
+        with self._db.session(shop_id, unbounded=True) as conn:
             return conn.execute("DELETE FROM suggestion WHERE shop_id = %s", (shop_id,)).rowcount
 
 
@@ -678,7 +681,8 @@ class PgFeedbackRepository:
         return [_label(r) for r in rows]
 
     def purge_shop(self, shop_id: str) -> int:
-        with self._db.session(shop_id) as conn:
+        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
+        with self._db.session(shop_id, unbounded=True) as conn:
             n = conn.execute("DELETE FROM knowledge_gap WHERE shop_id = %s", (shop_id,)).rowcount
             n += conn.execute("DELETE FROM labeled_sample WHERE shop_id = %s", (shop_id,)).rowcount
             return n
@@ -813,7 +817,8 @@ class PgAfterSaleReviewRepository:
         return [_review(r) for r in rows]
 
     def purge_shop(self, shop_id: str) -> int:
-        with self._db.session(shop_id) as conn:
+        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
+        with self._db.session(shop_id, unbounded=True) as conn:
             return conn.execute(
                 "DELETE FROM aftersale_review WHERE shop_id = %s", (shop_id,)
             ).rowcount
@@ -1012,8 +1017,11 @@ class PgAuditLog:
         return [DecisionLogEntry(**{**r, "created_at": _cst(r["created_at"])}) for r in rows]
 
     def purge_shop(self, shop_id: str) -> int:
-        """删除该店铺的审计和判断记录（§8.4 按约定删除数据时调用；是否保留由委托协议决定）。"""
-        with self._db.session(shop_id) as conn:
+        """删除该店铺的审计和判断记录（§8.4 按约定删除数据时调用；是否保留由委托协议决定）。
+
+        不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）：审计记录量最大。
+        """
+        with self._db.session(shop_id, unbounded=True) as conn:
             n = conn.execute("DELETE FROM audit_log WHERE shop_id = %s", (shop_id,)).rowcount
             n += conn.execute("DELETE FROM decision_log WHERE shop_id = %s", (shop_id,)).rowcount
             return n

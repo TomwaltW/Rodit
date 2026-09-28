@@ -7,6 +7,8 @@ PostgreSQL 默认 statement_timeout = 0（不限时）：查询被锁住或存�
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -16,7 +18,7 @@ from rodit.core.config import EngineConfig, LLMConfig
 from rodit.core.enums import Platform
 from rodit.storage import Database
 from rodit.testing.fakes import InMemoryToolGateway
-from rodit.testing.fixtures import build_demo_world
+from rodit.testing.fixtures import SHOP_A, build_demo_world
 
 
 @pytest.fixture
@@ -76,3 +78,40 @@ def test_migrate_runs_without_request_timeouts(prod_env, monkeypatch):
     assert production.migrate() == []
     (db,) = prod_env["databases"]
     assert db.statement_timeout_ms is None and db.lock_timeout_ms is None
+
+
+class _FakeResult:
+    rowcount = 0
+
+    def fetchone(self) -> None:
+        return None
+
+    def fetchall(self) -> list[Any]:
+        return []
+
+
+class _FakeConn:
+    def execute(self, *args: Any, **kw: Any) -> _FakeResult:
+        return _FakeResult()
+
+
+def test_production_purge_runs_without_request_timeouts(prod_env, monkeypatch):
+    """§8.4 取消订购：repos.purgers() 的每个 purge_shop 都开不限时的事务（大店铺一次删
+    几百万行，请求级的 2 秒上限下永远删不完）；普通请求仍然用有上限的事务。
+    不连数据库，只记录 session 参数。"""
+    sessions: list[bool] = []
+
+    @contextmanager
+    def recording_session(self: Database, shop_id: str | None, **kw: Any) -> Iterator[Any]:
+        sessions.append(kw.get("unbounded", False))
+        yield _FakeConn()
+
+    monkeypatch.setattr(Database, "session", recording_session)
+    unit = _build()
+    for purger in unit.repos.purgers():
+        purger.purge_shop(SHOP_A)
+    assert sessions and all(sessions)
+    sessions.clear()
+    unit.repos.audit.list_events(SHOP_A)
+    unit.repos.knowledge.get_shop(SHOP_A)
+    assert sessions == [False, False]

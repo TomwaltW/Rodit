@@ -56,7 +56,10 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 def production_database(dsn_env: str = "RODIT_DATABASE_DSN") -> Database:
-    """请求用的数据库：连接串、语句超时、等锁超时都从环境变量读（后两者有默认值）。"""
+    """请求用的数据库：连接串、语句超时、等锁超时都从环境变量读（后两者有默认值）。
+
+    取消订购时的清理（§8.4，AuthGuard.revoke 调各仓储的 purge_shop）也用这个库，但开不限时的
+    事务（Database.session 的 unbounded）：大店铺一次删几百万行，2 秒的请求上限下永远删不完。"""
     return Database.from_env(
         dsn_env,
         statement_timeout_ms=_positive_int_env(

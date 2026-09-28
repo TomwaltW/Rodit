@@ -20,7 +20,8 @@
   数据库的语句日志 / 慢查询日志里不会出现它们。
 - 请求用的 Database 要设 statement_timeout_ms / lock_timeout_ms（生产组装从环境变量读，
   见 rodit.app.production）：库的默认值是不限时，语句被锁住或存储卡住时请求线程会一直挂着，
-  "超时 → KnowledgeUnavailable → 不推荐"（§12.2）也就触发不了。迁移用的连接不设。
+  "超时 → KnowledgeUnavailable → 不推荐"（§12.2）也就触发不了。迁移用的连接不设；
+  §8.4 清理店铺数据（各仓储的 purge_shop）用 session(…, unbounded=True)，也不受这两个上限约束。
 """
 
 from __future__ import annotations
@@ -146,11 +147,18 @@ class Database:
             raise StorageUnavailable("数据库连接失败") from e
 
     @contextmanager
-    def session(self, shop_id: str | None, *, trainer: bool = False) -> Iterator[Conn]:
+    def session(
+        self, shop_id: str | None, *, trainer: bool = False, unbounded: bool = False
+    ) -> Iterator[Conn]:
         """一个事务：正常退出提交，异常回滚，连接随即关闭。
 
         shop_id=None 表示不设店铺范围：在行级安全下读不到任何业务数据，只能写没有店铺归属的
         审计事件。trainer=True 切换到训练导出角色（只能读 labeled_sample）。
+
+        unbounded=True 不设本库配置的语句 / 等锁超时（用库的默认值，与 migrate() 相同），
+        只给 §8.4 清理店铺数据（purge_shop）用：大店铺一次删几百万行，远超请求级的上限，
+        每次都被取消回滚的话令牌已删、数据却永远删不掉。角色和店铺范围照常设置，行级安全
+        仍然生效。请求路径一律用默认值（有上限）。
         """
         if shop_id is not None and not shop_id.strip():
             raise ValueError("shop_id 不能是空字符串")
@@ -167,7 +175,7 @@ class Database:
                 ("statement_timeout", self._statement_timeout_ms),
                 ("lock_timeout", self._lock_timeout_ms),
             ):
-                if value is not None:
+                if value is not None and not unbounded:
                     conn.execute("SELECT set_config(%s, %s, true)", (setting, str(value)))
             yield conn
 
