@@ -149,3 +149,19 @@ def test_precision_fixes_are_idempotent():
     ):
         once = mask_pii(text)
         assert mask_pii(once) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # 门牌号后面隔着空格的价格、日期是后面的问题，不是房号
+        ("寄到样例路100号 200元以上包邮吗", "寄到[地址] 200元以上包邮吗"),
+        ("寄到样例路100号 5号能到吗", "寄到[地址] 5号能到吗"),
+        ("寄到样例路100号 3件一起发吗", "寄到[地址] 3件一起发吗"),
+        # 房号、楼栋照常遮住
+        ("寄到样例路100号 1201", "寄到[地址]"),
+        ("寄到样例路100号3号楼2单元401室", "寄到[地址]"),
+    ],
+)
+def test_numbers_after_street_number_that_are_not_rooms(text, expected):
+    assert mask_pii(text) == expected
