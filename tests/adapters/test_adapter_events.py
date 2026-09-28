@@ -36,8 +36,10 @@ def test_taobao_echo_and_recall_are_surfaced(taobao, tb):
     assert (echo.shop_id, echo.conversation_id, echo.msg_id) == (SHOP_A, CONV, "a1")
     assert echo.role == Role.AGENT and echo.text == "有的亲"
     assert echo.created_at == DEFAULT_NOW  # 用事件时间
-    # 重复的回声：None（按 msg_id 去重）
-    assert taobao.on_event(tb(msg_id="a1", direction="out", content="有的亲")) is None
+    # 平台重推同一条回声：照样交给应用层（写会话失败时靠重推补上；仓储按 msg_id 去重），
+    # 本地上下文里不重复追加
+    again = taobao.on_event(tb(msg_id="a1", direction="out", content="有的亲"))
+    assert isinstance(again, StoredMessage) and again.msg_id == "a1"
     recall = taobao.on_event(tb(msg_id="r1", msg_type="recall", recall_msg_id="b1"))
     assert recall == MessageRecall(
         shop_id=SHOP_A, conversation_id=CONV, msg_id="r1", recalled_msg_id="b1"

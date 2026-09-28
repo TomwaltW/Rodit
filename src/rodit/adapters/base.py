@@ -543,7 +543,9 @@ class BaseMockAdapter:
 
     def _accept_agent(self, event: RawEvent) -> StoredMessage | None:
         """客服 / 机器人回声：本地有这个会话时记进本地上下文；都交给应用层写进会话仓储
-        （本地没有的会话可能是重启或被淘汰了，仓储里有没有由 add_outgoing 判断）。"""
+        （本地没有的会话可能是重启或被淘汰了，仓储里有没有由 add_outgoing 判断）。
+        不按 msg_id 挡掉重推：应用层写会话失败时抛错让平台重推，这里要照样交出去
+        （本地上下文里已经有这条就不再追加；仓储按 msg_id 去重）。"""
         text = event.text.strip() if isinstance(event.text, str) else ""
         if not text:
             return None
@@ -559,10 +561,9 @@ class BaseMockAdapter:
                 )
             except ValidationError:
                 return None
-            if not self._first_time(event.shop_id, event.msg_id):
-                return None
             conv = self._conversation(event.shop_id, event.conversation_id)
-            if conv is not None:  # 没有买家消息的会话本地不记客服消息
+            # 没有买家消息的会话本地不记客服消息；重推的同一条不重复追加
+            if conv is not None and all(m.msg_id != event.msg_id for m in conv.messages):
                 conv.messages.append(stored)
         return stored.model_copy()
 

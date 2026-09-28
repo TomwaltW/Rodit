@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -439,3 +440,57 @@ def test_questionnaire_answers_are_cleaned_before_shop_config_is_written():
     words = shop.config_overrides["banned_words"]
     assert words and all("\x00" not in w for w in words)
     assert "最好" in words
+
+
+# ---------------------------------------------------------------- 复审第三轮
+
+
+def test_buyer_message_sent_after_the_agent_does_not_split_one_send():
+    """写回的时间是服务端收到反馈的时间（晚于实际发送）：买家在客服发送之后、反馈到达之前发的
+    消息不能把同一次发送拆成两份；之后撤回回声，这条回复就从会话里去掉。"""
+    service = _service()
+    clock = service.unit.clock
+    base = clock.now()
+    t0 = _ms(service)
+    card = service.handle_event("B", taobao_event("什么时候发货", msg_id="b1", send_time_ms=t0))
+    card = card.suggestions[0]
+    clock.set(base + timedelta(seconds=5.4))  # 反馈到达（客服 t0+5.0s 点的发送）
+    service.feedback_sent(SHOP_A, card.suggestion_id, agent_id=AGENT)
+    clock.set(base + timedelta(seconds=5.6))  # 买家 t0+5.2s 发的消息到达
+    service.handle_event("B", taobao_event("有人吗", msg_id="b2", send_time_ms=t0 + 5200))
+    clock.set(base + timedelta(seconds=5.8))  # 回声到达（平台发送时间 t0+5.0s）
+    service.handle_event("B", _echo(card.text, "e1", t0 + 5000))
+    msgs = service.unit.repos.conversations.recent_messages(SHOP_A, CONV)
+    assert sum(1 for m in msgs if m.text == card.text) == 1
+    assert [m.msg_id for m in msgs] == ["b1", "e1", "b2"]
+    service.handle_event("B", _recall("r1", "e1"))
+    assert all(
+        m.text != card.text for m in service.unit.repos.conversations.recent_messages(SHOP_A, CONV)
+    )
+
+
+def test_echo_take_over_failure_is_retried_so_a_later_recall_works():
+    """回声接替写回记录时写库失败：抛给平台重推，重推照常接替；之后按平台 msg_id 撤回能找到。"""
+    service = _service()
+    t0 = _ms(service)
+    card = service.handle_event("B", taobao_event("什么时候发货", msg_id="q1", send_time_ms=t0))
+    card = card.suggestions[0]
+    service.feedback_sent(SHOP_A, card.suggestion_id, agent_id=AGENT)
+    repo = service.unit.repos.conversations
+    original = repo.recall_message
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kwargs: Any):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StorageUnavailable("会话库暂时不可用")
+        return original(*args, **kwargs)
+
+    repo.recall_message = flaky  # type: ignore[method-assign]
+    echo = _echo(card.text, "plat_out_1", t0 + 1000)
+    with pytest.raises(StorageUnavailable):
+        service.handle_event("B", echo)
+    service.handle_event("B", echo)  # 平台重推
+    assert [m for m, _ in _stored(service)] == ["q1", "plat_out_1"]
+    service.handle_event("B", _recall("r1", "plat_out_1"))
+    assert [m for m, _ in _stored(service)] == ["q1"]
