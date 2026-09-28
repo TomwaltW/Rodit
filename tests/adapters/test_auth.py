@@ -17,7 +17,7 @@ from rodit.adapters import (
     scopes_for_phase,
 )
 from rodit.core.enums import KnowledgeStatus, Platform
-from rodit.core.errors import AuthExpired
+from rodit.core.errors import AuthExpired, TokenDecryptionError
 from rodit.core.models import KnowledgeGap, ShopAuth
 from rodit.inmemory import (
     InMemoryConversationRepository,
@@ -198,3 +198,27 @@ def test_revoke_does_not_need_to_decrypt_the_token(world, clock):
     assert counts == {"auth": 1, "InMemoryConversationRepository": 2}
     assert repo.delete(SHOP_A) is False  # 已经删掉了
     assert conversations.get_conversation(SHOP_A, "conv_889") is None
+
+
+class _UnreadableTokens:
+    """令牌读不出来的仓储（旧版加密、换过密钥、数据损坏）。"""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get(self, shop_id):
+        raise TokenDecryptionError(f"店铺 {shop_id} 的令牌格式不对")
+
+
+def test_unreadable_token_means_reauthorise_not_crash(clock):
+    """令牌读不出来：处理消息时按需要重新授权拒绝（AuthExpired → 403），到期告警里列出来。"""
+    repo = InMemoryShopAuthRepository()
+    repo.save(_auth(clock, SHOP_A))
+    guard = AuthGuard(_UnreadableTokens(repo), clock)
+    with pytest.raises(AuthExpired, match="重新授权"):
+        guard.require(SHOP_A)
+    assert guard.is_authorized(SHOP_A) is False
+    assert guard.expiring([SHOP_A], within=timedelta(days=1)) == [SHOP_A]

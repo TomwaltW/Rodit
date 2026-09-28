@@ -19,7 +19,7 @@ from datetime import timedelta
 from typing import Literal, Protocol, runtime_checkable
 
 from rodit.core.clock import Clock
-from rodit.core.errors import AuthExpired
+from rodit.core.errors import AuthExpired, TokenDecryptionError
 from rodit.core.models import ShopAuth
 from rodit.core.ports import ShopAuthRepository
 
@@ -72,9 +72,13 @@ class AuthGuard:
     def require(self, shop_id: str, scopes: Iterable[str] = MVP_SCOPES) -> ShopAuth:
         """返回有效的授权；没有授权、已过期（expires_at ≤ 现在）或缺权限时抛 AuthExpired。
 
+        令牌读不出来（旧版加密、换过密钥、数据损坏）也按需要重新授权处理，抛 AuthExpired。
         异常信息不含令牌（ShopAuth.access_token 是 SecretStr）。
         """
-        auth = self._repo.get(shop_id)
+        try:
+            auth = self._repo.get(shop_id)
+        except TokenDecryptionError as exc:
+            raise AuthExpired(f"店铺 {shop_id} 的令牌读不出来，请重新授权（方案 §8.4）") from exc
         if auth is None:
             raise AuthExpired(f"店铺 {shop_id} 没有授权或已取消订购，停止处理（方案 §8.4）")
         if auth.expires_at <= self._clock.now():
@@ -92,11 +96,16 @@ class AuthGuard:
         return True
 
     def expiring(self, shop_ids: Iterable[str], *, within: timedelta) -> list[str]:
-        """授权在 within 之内到期（含已过期、没有授权）的店铺，按传入顺序（§12.4 授权过期告警）。"""
+        """授权在 within 之内到期（含已过期、没有授权、令牌读不出来）的店铺，按传入顺序
+        （§12.4 授权过期告警）。"""
         deadline = self._clock.now() + within
         out: list[str] = []
         for shop_id in shop_ids:
-            auth = self._repo.get(shop_id)
+            try:
+                auth = self._repo.get(shop_id)
+            except TokenDecryptionError:
+                out.append(shop_id)  # 需要重新授权
+                continue
             if auth is None or auth.expires_at <= deadline:
                 out.append(shop_id)
         return out

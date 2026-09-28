@@ -33,7 +33,11 @@ from pydantic import SecretStr, TypeAdapter
 
 from rodit.core.clock import CST, Clock, SystemClock
 from rodit.core.enums import DecisionStage, KnowledgeStatus, ReviewState, Role, SuggestionStatus
-from rodit.core.errors import ConcurrencyConflict, KnowledgeUnavailable, RoditError
+from rodit.core.errors import (
+    ConcurrencyConflict,
+    KnowledgeUnavailable,
+    TokenDecryptionError,
+)
 from rodit.core.models import (
     AfterSaleReview,
     AuditEvent,
@@ -71,8 +75,7 @@ def _cst(dt: datetime | None) -> datetime | None:
     return dt.astimezone(CST) if dt is not None else None
 
 
-class TokenDecryptionError(RoditError):
-    """店铺令牌解密失败：密钥与写入时不一致，或数据损坏。消息里不带密钥和令牌。"""
+# TokenDecryptionError 定义在 core.errors（授权检查要认它），从这里导入的旧写法照常可用
 
 
 # ================================================================ 知识（§5.2）

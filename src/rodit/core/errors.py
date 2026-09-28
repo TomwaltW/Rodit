@@ -70,3 +70,10 @@ class ComplianceError(RoditError):
 
 class AuthExpired(RoditError):
     """店铺授权过期或已取消订购：停止处理（§8.4）。"""
+
+
+class TokenDecryptionError(RoditError):
+    """店铺令牌解密失败：密钥与写入时不一致、旧版加密格式，或数据损坏。消息里不带密钥和令牌。
+
+    授权检查（adapters.auth.AuthGuard）把它当作"需要重新授权"：停止处理、列进到期告警。
+    """

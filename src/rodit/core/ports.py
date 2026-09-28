@@ -235,7 +235,7 @@ class MessageRecall(BaseModel):
 
     shop_id: str
     conversation_id: str
-    msg_id: str  # 撤回事件本身的平台消息 ID（按它去重）
+    msg_id: str  # 撤回事件本身的平台消息 ID（撤回是幂等的，平台重推同一条撤回照常交给应用层）
     recalled_msg_id: str  # 被撤回的那条消息
 
 
@@ -248,7 +248,8 @@ class PlatformAdapter(Protocol):
     - on_event：on_message 的完整版，应用层用它：买家消息同 on_message；客服 / 机器人发出的消息
       回声 → StoredMessage（role 为 AGENT / BOT，created_at 取事件时间），撤回 → MessageRecall；
       应用层据此把客服手打的回复写进会话、把撤回的消息从会话里去掉（§5.3 最近几轮对话）。
-      其他事件、重复事件（按 msg_id 去重）、无法识别时返回 None。
+      其他事件、重复的买家消息 / 回声（按 msg_id 去重）、无法识别时返回 None；撤回不去重
+      （幂等：写库失败时平台重推能再应用一次）。
     - send：只有模式 A 的全自动能用（text 已由引擎加好 AI 标识前缀）；
       其他接入模式抛 ActionNotAllowed。
     - transfer_to_human：全自动模式下转人工（§5.7、GB/T 47746）；不支持的平台抛 ActionNotAllowed。
