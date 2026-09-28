@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Sequence
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import NamedTuple
 
@@ -279,6 +279,14 @@ class _Facts(NamedTuple):
     couriers: set[str]
 
 
+def _number_key(text: str) -> str:
+    """数字按值比较："259" 和 "259.00" 是同一个数。"""
+    try:
+        return format(Decimal(text).normalize(), "f")
+    except InvalidOperation:
+        return text
+
+
 def _facts(text: str) -> _Facts:
     norm = arabize(unicodedata.normalize("NFKC", text or ""))
     durations: list[frozenset[_DurationKey]] = []
@@ -289,8 +297,8 @@ def _facts(text: str) -> _Facts:
                 durations.append(_duration_keys(value, m.group(3)))
         rest = rest[: m.start()] + " " * (m.end() - m.start()) + rest[m.end() :]
     return _Facts(
-        numbers=set(_NUMBER.findall(norm)),
-        plain_numbers=set(_NUMBER.findall(rest)),
+        numbers={_number_key(n) for n in _NUMBER.findall(norm)},
+        plain_numbers={_number_key(n) for n in _NUMBER.findall(rest)},
         durations=durations,
         couriers=set(_COURIER.findall(norm)),
     )

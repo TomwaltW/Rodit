@@ -62,3 +62,12 @@ def test_core_numeral_helper():
     from rodit.qa import numbers
 
     assert numbers.cn_to_int is cn_to_int
+
+
+def test_numbers_compare_by_value_not_spelling():
+    """ "259 元"和实时价格"259.00 元"是同一个数，不算冲突；不同的数照常冲突。"""
+    ref = ["实时价格：售价 259.00 元，活动：店铺满 199 减 20"]
+    assert not ev.contradicts(
+        "问：多少钱\n答：这款 259 元，满 199 减 20", reference=ref, same_topic=ref
+    )
+    assert ev.contradicts("问：多少钱\n答：这款 239 元", reference=ref, same_topic=ref)
