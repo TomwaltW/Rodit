@@ -7,12 +7,14 @@
 - 判断层不可用（未配置、DecisionError / LLMError、答案不完整）→ degraded=True，大模型草稿不放行
   （§12.2：质检不可用时不推荐未经质检的生成内容），原因里加"质检不可用"；
 - 跑了判断层质检时写一条 decision_log（stage=qa），不写 audit_log（引擎写）；
+  写失败只记警告（只记异常类型），质检结论照常返回；
 - 进判断层的回答先遮个人信息（回答可能复述了买家的手机号、地址，§5.3）；
   QAResult.text 不遮，它是要展示给客服、发给这位买家的文本。
 """
 
 from __future__ import annotations
 
+import logging
 import time
 
 from rodit.core.clock import Clock
@@ -49,6 +51,8 @@ from rodit.core.questions import (
 from rodit.core.states import build_qa_state
 from rodit.qa.hard_rules import blocking_hits, check_hard_rules
 from rodit.qa.masking import mask_text, masked_context, masked_evidence
+
+logger = logging.getLogger(__name__)
 
 QA_UNAVAILABLE = "质检不可用"
 EMPTY_ANSWER = "回答为空"
@@ -171,19 +175,23 @@ class DefaultQualityGate:
         latency_ms = int((time.perf_counter() - started) * 1000)
         clarify = draft.need_clarify or draft.variant == "clarify"
         reasons = [*hard_reasons, *model_reasons(scores, self._config, clarify=clarify)]
-        self._audit.log_decision(
-            DecisionLogEntry(
-                shop_id=ctx.shop_id,
-                conversation_id=ctx.conversation_id,
-                stage=DecisionStage.QA,
-                provider=provider.name,
-                questions_ver=QA_QUESTIONS_VER,
-                answers={k: a.model_dump(mode="json") for k, a in response.answers.items()},
-                route_result="block" if reasons else "pass",
-                latency_ms=latency_ms,
-                created_at=self._clock.now(),
+        try:
+            self._audit.log_decision(
+                DecisionLogEntry(
+                    shop_id=ctx.shop_id,
+                    conversation_id=ctx.conversation_id,
+                    stage=DecisionStage.QA,
+                    provider=provider.name,
+                    questions_ver=QA_QUESTIONS_VER,
+                    answers={k: a.model_dump(mode="json") for k, a in response.answers.items()},
+                    route_result="block" if reasons else "pass",
+                    latency_ms=latency_ms,
+                    created_at=self._clock.now(),
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001 — 留痕失败不影响质检结论（§12.2）
+            # 只记异常类型，不记异常消息（可能带买家原文，§12.3 日志脱敏）
+            logger.warning("decision_log（qa）写入失败（%s）", type(exc).__name__)
         return QAResult(
             passed=not reasons,
             text=text,

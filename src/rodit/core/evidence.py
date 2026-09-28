@@ -110,7 +110,7 @@ INTENT_NEEDS: dict[Intent, frozenset[Need]] = {
     Intent.MALFUNCTION: frozenset({_N.CARE_USAGE, _N.ITEM_ATTRS, _N.FAQ, _N.POLICY}),
     Intent.COMPLAINT: frozenset(),
     Intent.GREETING: frozenset({_N.POLICY}),
-    Intent.OFF_PLATFORM: frozenset(),
+    Intent.OFF_PLATFORM: frozenset({_N.PLATFORM_RULE}),  # 标准话术引用平台站外交易规则（§5.1）
     Intent.OTHER: frozenset({_N.FAQ}),
 }
 
@@ -156,6 +156,7 @@ INTENT_PLATFORM_RULES: dict[Intent, tuple[PlatformRuleKey, ...]] = {
     Intent.REFUND_PROGRESS: (PlatformRuleKey.REFUND_TIMING,),
     Intent.QUALITY_ISSUE: (PlatformRuleKey.APPLY_AFTERSALE,),
     Intent.NOT_RECEIVED: (PlatformRuleKey.APPLY_AFTERSALE,),
+    Intent.OFF_PLATFORM: (PlatformRuleKey.OFF_PLATFORM,),
 }
 
 LLM_FREE_INTENTS = frozenset({Intent.GREETING, Intent.OFF_PLATFORM})

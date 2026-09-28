@@ -137,6 +137,8 @@ def _requirements(
         )
     if route.action == RouteAction.SOOTHE:
         reqs.append("买家情绪比较激动：先用一句道歉或安抚的话开头，再回答问题。")
+    elif intent == Intent.QUALITY_ISSUE:  # §7.3.1 收到的东西坏了：情绪平稳也要先安抚
+        reqs.append("买家反映收到的商品有问题：先用一句道歉安抚的话开头，再说明怎么处理。")
     if route.high_risk or route.action == RouteAction.HIGH_RISK_ANSWER:
         reqs.append(
             "这是高风险问题：只说依据里有的事实，不做任何依据之外的承诺；"
