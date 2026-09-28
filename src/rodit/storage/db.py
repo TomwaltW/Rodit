@@ -16,8 +16,8 @@
 - 应用账号：一个登录角色，GRANT rodit_app TO 它（不能是超级用户、不能带 BYPASSRLS）；
   连接串放在环境变量里（默认 RODIT_DATABASE_DSN），不进仓库。
 - 训练导出任务：单独的登录角色，只 GRANT rodit_trainer（见 schema.sql 开头的说明）。
-- 不要在生产库开 log_statement = all / mod：授权令牌加解密的密钥作为查询参数传给 pgcrypto，
-  打开语句日志会把参数写进数据库日志。
+- 授权令牌在应用里加解密（PgShopAuthRepository），密钥和明文令牌不作为查询参数发给数据库，
+  数据库的语句日志 / 慢查询日志里不会出现它们。
 """
 
 from __future__ import annotations

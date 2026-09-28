@@ -4,6 +4,7 @@ version = "0.0.1"
 description = "电商平台商家 AI 客服（淘宝 / 抖店 / 拼多多）"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=50.0.1",
     "fastapi>=0.115",
     "psycopg[binary]>=3.2",
     "pydantic>=2.8",

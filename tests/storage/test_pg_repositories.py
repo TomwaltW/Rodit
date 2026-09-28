@@ -255,17 +255,15 @@ def test_token_is_encrypted_at_rest(db, admin_db, truncate, token_key):
     repo.save(auth())
     with admin_db.session(None) as conn:
         first = bytes(conn.execute("SELECT access_token FROM shop_auth").fetchone()["access_token"])
-    repo.save(auth())  # 同一个令牌再存一次：随机盐，密文不同
+    repo.save(auth())  # 同一个令牌再存一次：随机 nonce，密文不同
     with admin_db.session(None) as conn:
         second = bytes(
             conn.execute("SELECT access_token FROM shop_auth").fetchone()["access_token"]
         )
-        plain = conn.execute(
-            "SELECT pgp_sym_decrypt(access_token, %s) AS t FROM shop_auth", (token_key,)
-        ).fetchone()["t"]
     assert b"tok-synthetic-secret-123" not in first and b"tok-synthetic" not in second
     assert first != second
-    assert plain == "tok-synthetic-secret-123"
+    # 应用里加密（AES-256-GCM），库里只有密文；密钥从不发给数据库（见 test_pg_token_crypto.py）
+    assert first.startswith(b"RDT1") and second.startswith(b"RDT1")
     assert repo.get(SHOP_A).access_token.get_secret_value() == "tok-synthetic-secret-123"
     assert token_key not in repr(repo)
 
