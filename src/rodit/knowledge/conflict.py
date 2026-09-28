@@ -8,9 +8,12 @@
 内部用 Candidate.topics 记全部主题，任一主题被更高优先级的来源占据就移除这一句
 （宁可少说，不说和高优先级依据矛盾的话）；对外的 Evidence.topic 只写第一个主题。
 
-长度预算：证据 content 总字数超过 max_chars 时，按"优先级低的先删；同优先级里 rank 低的先删；
-再相同则靠后的先删"逐条删除，实时数据、平台规则、店铺政策优先级最高，最后才删；
+长度预算：证据在提示词【依据】里占的字数（core.evidence_line：每行 "[id] 标签：内容"，
+含获取时间和行间换行，和 generation.prompt 按同一个字符串计长）超过 max_chars 时，
+按"优先级低的先删；同优先级里 rank 低的先删；再相同则靠后的先删"逐条删除，
+实时数据、平台规则、店铺政策优先级最高，最后才删；
 至少保留一条（单条超长时宁可超预算也不交空证据）。
+这样检索按相关度留下的依据，提示词都放得下，不会再按位置截掉（例如长详情页里最相关的那一句）。
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from dataclasses import dataclass
 
 from rodit.core import evidence as ev
 from rodit.core.enums import EvidenceSource, PolicyKey
+from rodit.core.evidence_line import evidence_line_chars
 from rodit.core.models import Evidence
 
 STRUCTURED_RANK = 2.0
@@ -107,10 +111,20 @@ def content_chars(cands: Sequence[Candidate]) -> int:
     return sum(len(c.evidence.content) for c in cands)
 
 
+def line_chars(cands: Sequence[Candidate]) -> int:
+    """这些证据在提示词【依据】里占的字数：各行字数 + 行间换行（和 generation.prompt 一致）。"""
+    if not cands:
+        return 0
+    return sum(evidence_line_chars(c.evidence) for c in cands) + len(cands) - 1
+
+
 def trim_to_budget(cands: Sequence[Candidate], max_chars: int) -> list[Candidate]:
-    """按预算删证据，返回保留的候选（保持原顺序）。"""
-    total = content_chars(cands)
-    if total <= max_chars:
+    """按预算删证据，返回保留的候选（保持原顺序）。预算按提示词里的整行计（line_chars）。"""
+    # 每行连同它前面的换行一起算，总数比 line_chars 多 1
+    costs = [evidence_line_chars(c.evidence) + 1 for c in cands]
+    total = sum(costs)
+    limit = max_chars + 1
+    if total <= limit:
         return list(cands)
     drop_order = sorted(
         range(len(cands)),
@@ -118,8 +132,8 @@ def trim_to_budget(cands: Sequence[Candidate], max_chars: int) -> list[Candidate
     )
     dropped: set[int] = set()
     for i in drop_order:
-        if total <= max_chars or len(cands) - len(dropped) <= 1:
+        if total <= limit or len(cands) - len(dropped) <= 1:
             break
         dropped.add(i)
-        total -= len(cands[i].evidence.content)
+        total -= costs[i]
     return [c for i, c in enumerate(cands) if i not in dropped]

@@ -5,6 +5,7 @@
   所以能用来跑通"懂→找→写→判"全链路、做回归评测（§13.5），但回答质量远不如真实大模型。
 - HeuristicQAJudge：质检（§5.5 第二道）的启发式判断：数字是否都在依据里、有没有依据外的时效承诺、
   有没有站外引流。只用于离线演示和评测，不能替代判断层（§6.4）。
+  数字核对和硬规则同一套（qa.numbers）：买家自己说的数字只放行身高体重、尺码，价格、时长必须在依据里。
 
 生产环境用 rodit.llm.OpenAICompatibleClient（境内已备案模型，D5）和 rodit.decision 的判断层。
 """
@@ -32,6 +33,7 @@ from rodit.core.questions import (
     Q_PROMISE_RISK,
     Q_TONE,
 )
+from rodit.qa.numbers import NumberSet, unsupported_numbers
 
 _EVIDENCE_LINE = re.compile(r"^\[(?P<id>[^\]]+)\]\s*(?P<label>[^：]*)：(?P<content>.*)$")
 _CURRENT = re.compile(r"（当前消息）：(?P<text>.*)$")
@@ -131,14 +133,17 @@ class HeuristicQAJudge:
             raise DecisionError("启发式判断只支持质检请求（core.states.build_qa_state）")
         answer = str(state.get("answer") or "")
         question = str(state.get("question") or "")
-        corpus = "\n".join(str(e.get("content", "")) for e in state.get("evidence", []))
-        corpus += "\n" + question
-        numbers = set(_NUMBER.findall(unicodedata.normalize("NFKC", answer)))
-        known = set(_NUMBER.findall(unicodedata.normalize("NFKC", corpus)))
-        unsupported = numbers - known
+        evidence = "\n".join(str(e.get("content", "")) for e in state.get("evidence", []))
+        corpus = evidence + "\n" + question
+        # 数字核对和硬规则同一套（qa.numbers）：买家说过的身高体重、尺码可以复述，
+        # 买家报的价格、时长不算依据（§5.5）
+        support = NumberSet()
+        support.add_text(evidence)
+        support.add_buyer_text(question)
+        unsupported = unsupported_numbers(answer, support)
         overlap = len(_bigrams(answer) & _bigrams(corpus)) / max(1, len(_bigrams(answer)))
         grounded = 0.2 if unsupported else (0.95 if overlap >= 0.3 or not answer else 0.6)
-        promises = [p for p in _PROMISE.findall(answer) if p not in corpus]
+        promises = [p for p in _PROMISE.findall(answer) if p not in evidence]
         answers: dict[str, NoulAnswer | ScoreAnswer] = {
             Q_GROUNDED: NoulAnswer(noul=grounded),
             Q_ANSWERS_QUESTION: NoulAnswer(noul=0.9 if answer.strip() else 0.1),

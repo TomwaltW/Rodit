@@ -35,9 +35,12 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Sequence
+from decimal import Decimal
 from enum import StrEnum
+from typing import NamedTuple
 
 from rodit.core.enums import POLICY_LABELS, Intent, Platform, PolicyKey
+from rodit.core.numerals import arabize
 
 
 class Need(StrEnum):
@@ -230,8 +233,10 @@ def split_sentences(text: str) -> list[str]:
 
 
 def detect_topics(text: str) -> set[str]:
-    """给一段自由文本打事实主题（PolicyKey 取值）。检索做冲突处理时用。"""
-    return {str(topic) for topic, pattern in _TOPIC_PATTERNS if pattern.search(text or "")}
+    """给一段自由文本打事实主题（PolicyKey 取值）。检索做冲突处理时用。
+    中文数字先换成阿拉伯数字（"两天内发货"和"2 天内发货"一样打上发货时效）。"""
+    norm = arabize(text or "")
+    return {str(topic) for topic, pattern in _TOPIC_PATTERNS if pattern.search(norm)}
 
 
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
@@ -239,27 +244,81 @@ _COURIER = re.compile(r"中通|圆通|申通|韵达|顺丰|邮政|EMS|京东|极
 _NEGATIVE = re.compile(r"不支持|不能|没有|暂不|无法|不发货|不参加|不提供|不送|不包邮|不可以")
 
 
-def _facts(text: str) -> tuple[set[str], set[str]]:
-    norm = unicodedata.normalize("NFKC", text or "")
-    return set(_NUMBER.findall(norm)), set(_COURIER.findall(norm))
+# 时长（可以是范围"3-5 天"）："10 月 8 日"是日期，不是时长
+_DURATION = re.compile(
+    r"(?<![\d.])(?<!月)(?<!月\s)(\d+(?:\.\d+)?)(?:\s*[-~～—到至]\s*(\d+(?:\.\d+)?))?"
+    r"\s*(?:个)?\s*(小时|钟头|工作日|天|日|周|星期|h(?![a-z]))",
+    re.IGNORECASE,
+)
+_HOURS_PER_UNIT = {"小时": 1, "钟头": 1, "h": 1, "天": 24, "日": 24, "周": 168, "星期": 168}
+_DAY_UNITS = frozenset({"天", "日", "工作日"})
+
+_DurationKey = tuple[str, Decimal]
+
+
+def _duration_keys(value: str, unit: str) -> frozenset[_DurationKey]:
+    """一个时长的可比较写法：按小时折算（两天 = 48 小时）；
+    按天计的另记天数（3 天 ≈ 3 个工作日）。"""
+    n = Decimal(value)
+    keys: set[_DurationKey] = set()
+    per = _HOURS_PER_UNIT.get(unit.lower())
+    if per is not None:
+        keys.add(("h", n * per))
+    if unit in _DAY_UNITS:
+        keys.add(("d", n))
+    return frozenset(keys)
+
+
+class _Facts(NamedTuple):
+    """一段文字里可以比对的事实。"""
+
+    numbers: set[str]  # 全部数字（含时长里的）
+    plain_numbers: set[str]  # 时长以外的数字（金额、件数……）
+    durations: list[frozenset[_DurationKey]]  # 每个时长的可比较写法
+    couriers: set[str]
+
+
+def _facts(text: str) -> _Facts:
+    norm = arabize(unicodedata.normalize("NFKC", text or ""))
+    durations: list[frozenset[_DurationKey]] = []
+    rest = norm
+    for m in _DURATION.finditer(norm):
+        for value in (m.group(1), m.group(2)):
+            if value is not None:
+                durations.append(_duration_keys(value, m.group(3)))
+        rest = rest[: m.start()] + " " * (m.end() - m.start()) + rest[m.end() :]
+    return _Facts(
+        numbers=set(_NUMBER.findall(norm)),
+        plain_numbers=set(_NUMBER.findall(rest)),
+        durations=durations,
+        couriers=set(_COURIER.findall(norm)),
+    )
 
 
 def contradicts(lower: str, *, reference: Sequence[str], same_topic: Sequence[str]) -> bool:
     """同主题的低优先级文字是否和高优先级依据冲突（§5.2.1 冲突时高优先级覆盖低优先级）。
 
     - reference：所有更高优先级依据的文字；same_topic：其中和它同主题的那些。
-    - 低优先级文字里出现高优先级依据里都没有的数字（时效、金额、天数）或快递公司 → 冲突；
+    - 数字先做 NFKC 归一、中文数字换成阿拉伯数字（core.numerals）；
+    - 时长按值比较：低优先级文字里的时长必须在高优先级依据里有等值的时长
+      （"三天" = "72 小时"一致，"两天" vs "72 小时"冲突；依据里别处的"2 件"不算）；
+    - 其余数字（金额、件数……）或快递公司，高优先级依据里都没有 → 冲突；
     - 和同主题依据的肯定 / 否定不一致（"有赠品" vs "目前没有赠品"）→ 冲突；
     - 否则视为一致：两者都保留（例如 FAQ 标准回答和店铺政策说的是同一件事，FAQ 仍可直接用，§5.4）。
     """
-    numbers, couriers = _facts(lower)
+    facts = _facts(lower)
     ref_numbers: set[str] = set()
+    ref_durations: set[_DurationKey] = set()
     ref_couriers: set[str] = set()
     for text in reference:
-        n, c = _facts(text)
-        ref_numbers |= n
-        ref_couriers |= c
-    if numbers - ref_numbers or couriers - ref_couriers:
+        ref = _facts(text)
+        ref_numbers |= ref.numbers
+        ref_couriers |= ref.couriers
+        for keys in ref.durations:
+            ref_durations |= keys
+    if any(not keys & ref_durations for keys in facts.durations):
+        return True
+    if facts.plain_numbers - ref_numbers or facts.couriers - ref_couriers:
         return True
     lower_negative = bool(_NEGATIVE.search(lower or ""))
     return any(bool(_NEGATIVE.search(t or "")) != lower_negative for t in same_topic)

@@ -8,11 +8,12 @@
 | absolute_term | core.lexicon.find_absolute_terms（词表和例外；依据里原样有的成分标注放行） | 是 |
 | banned_word | ctx.config.banned_words（商家禁用词，附录 C 第 14 题） | 是 |
 | forbidden_claim | 当前商品和证据里商品卡片的 forbidden_claims（被否定时放行） | 是 |
-| number_mismatch | 回答里的数字必须出现在证据或买家自己的消息里（qa.numbers） | 是 |
-| time_promise | 明天 / 今天 / 马上到 / X 天内到……证据里没有就拦截（§7.2、§11.5） | 是 |
+| number_mismatch | 回答里的数字必须出现在证据里；买家说过的只放行身体尺寸（qa.numbers） | 是 |
+| time_promise | 明天 / 马上到 / 3 天左右到 / 30 号送达……证据里没有就拦截（§7.2、§11.5） | 是 |
 | unknown_evidence | draft.evidence_ids 引用了证据包里没有的来源 | 是 |
 
 内容检查都在"去掉 Markdown、截断之前"的全文上做：模型写了违规内容，哪怕被截断掉也要重新生成。
+时效承诺只看肯定的说法："没法确定明天能不能送到""不一定明天能到"是如实说明，不拦截。
 命中说明（detail）是具体的中文原因，展示给客服、带回重新生成；
 站外联系、数字片段先遮个人信息（qa.masking.mask_text），原因里不出现手机号原文。
 """
@@ -64,11 +65,11 @@ class EvidenceCorpus:
         self.numbers = NumberSet()
         for t in texts:
             self.numbers.add_text(t)
-        # 买家自己说的数字（身高体重、订单金额……）回答里复述不算编造
-        self.numbers.add_text(ctx.current.text)
+        # 买家自己说的身高体重、尺码，回答里复述不算编造；买家报的价格、时长不算依据（§5.5）
+        self.numbers.add_buyer_text(ctx.current.text)
         for turn in ctx.history:
             if turn.role == Role.BUYER:
-                self.numbers.add_text(turn.text)
+                self.numbers.add_buyer_text(turn.text)
 
     def contains(self, phrase: str) -> bool:
         return _norm(phrase) in self.evidence_text
@@ -84,17 +85,50 @@ _ARRIVE_WORDS = "到货|送到|送达|签收|到"
 _ARRIVE = rf"(?:{_ARRIVE_WORDS})"
 _MODAL = r"(?:就)?(?:能|会|可以)?"
 
+# 时长和到货之间可以有"内 / 左右 / 后"（"3 天内到""3 天左右可以到""3 天后就能到货"）
+_DURATION_QUALIFIER = r"(?:内|之内|以内|左右|前后|以后|后)?"
+
 # 从具体到一般；片段重叠时只报最具体的那条
-# 日期（"10 月 8 日到货"）不是时长；日期里的数字由数字一致性检查
+# 日期（"10 月 8 日到货"）不是时长；写了月份的日期由数字一致性检查
 _PROMISE_N_DAYS = re.compile(
     rf"(?<!月)(?<!月\s)(?<!\d)(?P<core>(?:\d+|{_CN_NUM})\s*(?:个)?\s*(?:小时|天|日|工作日))"
-    rf"\s*(?:内|之内|以内)?\s*{_MODAL}{_ARRIVE}"
+    rf"\s*{_DURATION_QUALIFIER}\s*{_MODAL}{_ARRIVE}"
 )
 _PROMISE_DAY_DELIVERY = re.compile(r"(?:\d+|[一二两三次当隔])日达")
+# 某月几号、星期几前到 / 发货（"30 号送达""周五前能到"）
+_PROMISE_DATE = re.compile(
+    rf"(?:(?<![\d.])(?<!月)(?<!月\s)(?P<day>\d{{1,2}})\s*号|(?:周|星期|礼拜)[一二三四五六日天末])"
+    rf"\s*(?:之前|以前|前)?\s*{_MODAL}(?:{_ARRIVE_WORDS}|发货|发出)"
+)
 _PROMISE_IMMEDIATE = re.compile(rf"(?:马上|立刻|立即|很快){_MODAL}(?:{_ARRIVE_WORDS}|发货|发出)")
 _PROMISE_DAY_WORD = re.compile(
     r"今天|今日|明天|明日|(?<!售)后天|今晚|今夜|明早|明晚|当天|当日|次日|隔天|隔日"
 )
+# 证据里的预计送达 / 发货时间（"平台预计送达时间 09-30 18:00""预计 10 月 8 日发货"）
+_ETA_IN_EVIDENCE = re.compile(r"预计.{0,8}(?:送达|到达|到货|发货)")
+
+# 否定、不确定的说法不是承诺："没法确定明天能不能送到""不一定明天能到""明天能不能到要看派送"
+_UNCERTAIN = (
+    r"没法确定|无法确定|不能确定|不确定|没办法确定|不一定|不能保证|没法保证|无法保证|"
+    r"没办法保证|不敢保证|不好说|说不准|说不好"
+)
+_UNCERTAIN_BEFORE = re.compile(rf"(?:{_UNCERTAIN})[^，。！？,.!?；;\n]{{0,8}}$")
+# 紧跟在承诺词后面（用 match(text, pos)，不能写 ^）
+_UNCERTAIN_AFTER = re.compile(rf"\s*(?:能不能|会不会|可不可以|是否|能否|{_UNCERTAIN})")
+
+
+def _uncertain(norm: str, m: re.Match[str]) -> bool:
+    before = norm[max(0, m.start() - 16) : m.start()]
+    return bool(_UNCERTAIN_BEFORE.search(before) or _UNCERTAIN_AFTER.match(norm, m.end()))
+
+
+def _date_promise_supported(m: re.Match[str], corpus: EvidenceCorpus) -> bool:
+    """ "30 号送达"：证据里有预计送达 / 发货时间，且有这一天的日期；"周五前到"：证据里原样有。"""
+    day = m.group("day")
+    if day is None:
+        return corpus.contains(m.group(0))
+    days = {d for _, d in corpus.numbers.dates}
+    return int(day) in days and corpus.search(_ETA_IN_EVIDENCE)
 
 
 def _time_promise_hits(text: str, corpus: EvidenceCorpus) -> list[HardRuleHit]:
@@ -109,16 +143,19 @@ def _time_promise_hits(text: str, corpus: EvidenceCorpus) -> list[HardRuleHit]:
         return True
 
     for m in _PROMISE_N_DAYS.finditer(norm):
-        if not claim(m):
+        if not claim(m) or _uncertain(norm, m):
             continue
         # "48 小时内发货"不能放行"48 小时内送达"：证据里要有同样的时长 + 送达
         core = re.escape(_norm(m.group("core")))
-        allowed = rf"{core}(?:内|之内|以内)?{_MODAL}{_ARRIVE}"
+        allowed = rf"{core}{_DURATION_QUALIFIER}{_MODAL}{_ARRIVE}"
         if not corpus.search(re.compile(allowed)):
+            found.append((m.start(), m.group(0)))
+    for m in _PROMISE_DATE.finditer(norm):
+        if claim(m) and not _uncertain(norm, m) and not _date_promise_supported(m, corpus):
             found.append((m.start(), m.group(0)))
     for pattern in (_PROMISE_DAY_DELIVERY, _PROMISE_IMMEDIATE, _PROMISE_DAY_WORD):
         for m in pattern.finditer(norm):
-            if claim(m) and not corpus.contains(m.group(0)):
+            if claim(m) and not _uncertain(norm, m) and not corpus.contains(m.group(0)):
                 found.append((m.start(), m.group(0)))
     found.sort()
     return [
