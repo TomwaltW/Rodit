@@ -102,11 +102,24 @@ def _activity_terms(text: str) -> tuple[set[tuple[Decimal, Decimal]], set[Decima
     return reductions, {Decimal(d) for d in _DISCOUNT.findall(norm)}
 
 
+_DENY = re.compile(r"(?:没有|暂无|暂不参加|不参加任何|无)(?:任何)?(?:店铺)?(?:满减|活动|优惠|折扣)")
+_OFFER = re.compile(
+    r"满\s*\d+(?:\.\d+)?\s*(?:元)?\s*-\s*\d|\d\s*件\s*(?:减|\d\s*折)|半价|买.{0,2}送|第[二2两]件"
+    r"|秒杀|特价|店铺券|新人券|红包"
+)
+
+
 def promotions_conflict(text: str, promotions: Sequence[str]) -> bool:
     """活动说法（店铺政策、FAQ、详情页）是否和实时活动配置冲突（§5.2.1 只在真冲突时覆盖）。"""
-    if not promotions:
-        return bool(_ACTIVITY.search(arabize(unicodedata.normalize("NFKC", text or ""))))
+    norm = arabize(unicodedata.normalize("NFKC", text or ""))
     reductions, discounts = _activity_terms(text or "")
+    offers = bool(reductions or discounts or _OFFER.search(norm))
+    if not promotions:
+        if _DENY.search(norm) and not offers:
+            return False
+        return offers or bool(_ACTIVITY.search(norm))
+    if _DENY.search(norm) and not offers:
+        return True
     live_reductions, live_discounts = _activity_terms("；".join(promotions))
     return bool(reductions - live_reductions or discounts - live_discounts)
 

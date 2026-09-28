@@ -80,3 +80,10 @@ def test_everyday_words_are_not_courier_names():
     assert not ev.contradicts("答：默认发中通，比京东便宜哦", reference=ref, same_topic=ref)
     assert ev.contradicts("答：默认发京东快递哦", reference=ref, same_topic=ref)
     assert ev.contradicts("答：默认发顺丰哦", reference=ref, same_topic=ref)
+
+
+def test_ship_with_jd_is_a_courier_statement():
+    """ "默认发京东""都是发京东的"是在说快递，和"默认发中通"冲突。"""
+    ref = ["默认快递：默认发中通快递"]
+    assert ev.contradicts("答：亲，默认发京东哦，次日达", reference=ref, same_topic=ref)
+    assert ev.contradicts("答：亲，我们都是发京东的", reference=ref, same_topic=ref)

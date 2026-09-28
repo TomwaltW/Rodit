@@ -180,3 +180,74 @@ def test_standalone_month_day_keeps_values_but_fmt_time_does_not():
     assert [t.text for t in unsupported_numbers("满 28 减 10，30 元", ns)] == ["28", "10", "30 元"]
     assert [t.text for t in unsupported_numbers("满 23 减 9", ns)] == ["23", "9"]
     assert unsupported_numbers("截至 09-28 10:30", ns) == []
+
+
+# ---------------------------------------------------------------- 复审第三轮（7f9a2c0 之后的回归）
+
+
+PRICE_AND_SIZE = (
+    "法式碎花连衣裙：售价 259.00 元，活动：店铺满 199 减 20；尺码建议：M 码适合 100–115 斤"
+)
+
+
+@pytest.mark.parametrize(
+    ("question", "answer"),
+    [
+        ("M码今天拍是239吗", "亲，M 码是 239 哦"),
+        ("M码到手239吗", "亲，M 码到手 239 哦"),
+        ("穿M码 周末239能拍吗", "亲，239 可以拍哦"),
+        ("M码能少点吗 239行不行", "亲，239 可以的"),
+    ],
+)
+def test_buyer_price_in_a_sizing_message_is_not_evidence(world, question, answer):
+    """问尺码的消息里买家报的价格（"今天 / 到手 / 周末 / 少点 239"）不能给回答里的价格当依据。"""
+    ctx = make_context(question, world, item_id="i_555")
+    assert ("number_mismatch", "239") in blocking(answer, ctx, text_evidence(PRICE_AND_SIZE))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "亲，现货是付款后 48 小时内发货，没法保证 48 小时内送到哦，要看快递派送",
+        "亲，不能保证 48 小时内送达哦，发货后以物流为准",
+        "亲，不一定 48 小时内能到哦",
+    ],
+)
+def test_hedge_before_a_spaced_number_is_not_a_promise(world, ev, text):
+    """ "没法保证 48 小时内送到"里汉字和数字之间的空格不打断不确定说法（§7.2 如实说明）。"""
+    ctx = make_context("48小时能送到吗？", world, order_id="o_1002")
+    bundle = EvidenceBundle(evidences=[ev.o_1002(), ev.policy("ship_time")])
+    assert [r for r in blocking(text, ctx, bundle) if r[0] == "time_promise"] == []
+
+
+@pytest.mark.parametrize("text", ["亲，我们周一到周五发货，周末不发哦", "亲，周一至周五发货哦"])
+def test_weekday_range_paraphrasing_evidence_is_not_a_promise(world, text):
+    ctx = make_context("周末发货吗", world)
+    bundle = text_evidence("现货付款后 48 小时内发货，周一至周五正常发货")
+    assert [r for r in blocking(text, ctx, bundle) if r[0] == "time_promise"] == []
+
+
+def test_weekday_promise_without_evidence_still_blocked(world, ev):
+    ctx = make_context("什么时候能到", world, order_id="o_1002")
+    bundle = EvidenceBundle(evidences=[ev.o_1002()])
+    assert any(r[0] == "time_promise" for r in blocking("亲，周五到周六能到哦", ctx, bundle))
+
+
+@pytest.mark.parametrize(
+    ("evidence", "answer"),
+    [
+        ("预售款 10-08 周三开始发货", "亲，预售款 10 月 8 日开始发货哦"),
+        ("国庆 10-01 至 10-07 期间暂停发货", "亲，10 月 7 日之后恢复发货哦"),
+        ("预售款 10-08 分批发货", "亲，预售款 10 月 8 日起分批发货哦"),
+    ],
+)
+def test_real_dates_followed_by_weekday_or_period_are_dates(world, evidence, answer):
+    ctx = make_context("什么时候发货", world)
+    assert blocking(answer, ctx, text_evidence(evidence)) == []
+
+
+def test_clock_time_before_exchange_is_not_a_ratio(world):
+    """ "20:00 兑换"是钟点，不是比例：20 不能给"立减 20 元"当依据。"""
+    ctx = make_context("有优惠吗", world)
+    hits = blocking("亲，现在下单立减 20 元哦", ctx, text_evidence("积分每天 20:00 兑换优惠券"))
+    assert ("number_mismatch", "20 元") in hits

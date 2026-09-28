@@ -192,3 +192,24 @@ def _policy(text: str) -> Candidate:
 def test_promotions_compared_by_activity_terms(promotions, policy, lost):
     _, got = resolve_conflicts([_price(promotions), _policy(policy)])
     assert got == lost
+
+
+@pytest.mark.parametrize(
+    ("item_id", "policy"),
+    [
+        ("i_555", "目前店铺没有满减活动"),  # 实时有满 199 减 20
+        ("i_888", "店铺满199-20，可以叠加平台券"),  # 实时没有活动
+        ("i_888", "第二件半价，可以叠加平台券"),
+        ("i_888", "店铺满 2 件减 10 元"),
+        ("i_888", "买一送一"),
+    ],
+)
+def test_promotions_policy_contradicting_realtime_is_overridden(item_id, policy):
+    b = _retrieve(item_id, policy=policy)
+    assert PROMO in b.overridden_ids, policy
+
+
+def test_policy_without_shop_activity_agrees_with_realtime_no_activity():
+    """实时没有活动、政策说"没有店铺活动，可以用平台优惠券"：一致，保留。"""
+    b = _retrieve("i_888", policy="目前没有店铺活动，可以使用平台优惠券")
+    assert PROMO not in b.overridden_ids

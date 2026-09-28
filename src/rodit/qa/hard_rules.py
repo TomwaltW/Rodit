@@ -127,13 +127,28 @@ _UNCERTAIN_AFTER = re.compile(rf"\s*(?:能不能|会不会|可不可以|是否|�
 
 def _uncertain(norm: str, m: re.Match[str]) -> bool:
     before = norm[max(0, m.start() - 16) : m.start()]
+    if m.group(0)[:1].isdigit():
+        before = before.rstrip()
     return bool(_UNCERTAIN_BEFORE.search(before) or _UNCERTAIN_AFTER.match(norm, m.end()))
+
+
+_WEEKDAY_RANGE_START = re.compile(r"((?:周|星期|礼拜)[一二三四五六日天末])\s*(?:到|至|-|~)\s*$")
+
+
+def _text_before(m: re.Match[str]) -> str:
+    return m.string[max(0, m.start() - 8) : m.start()]
 
 
 def _date_promise_supported(m: re.Match[str], corpus: EvidenceCorpus) -> bool:
     """ "30 号送达"：证据里有预计送达 / 发货时间，且有这一天的日期；"周五前到"：证据里原样有。"""
     day = m.group("day")
     if day is None:
+        # 星期范围的后一头（"周一到周五发货"）：证据里有同一个范围（到 / 至）就算有依据
+        start = _WEEKDAY_RANGE_START.search(_text_before(m))
+        if start is not None:
+            first, last = start.group(1), m.group(0)[:2]
+            if corpus.contains(f"{first}至{last}") or corpus.contains(f"{first}到{last}"):
+                return True
         return corpus.contains(m.group(0))
     days = {d for _, d in corpus.numbers.dates}
     return int(day) in days and corpus.search(_ETA_IN_EVIDENCE)

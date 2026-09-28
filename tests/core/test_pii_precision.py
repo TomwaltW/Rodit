@@ -165,3 +165,26 @@ def test_precision_fixes_are_idempotent():
 )
 def test_numbers_after_street_number_that_are_not_rooms(text, expected):
     assert mask_pii(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # 编号列表里的手机号照样遮（"2." 后面紧跟号码）
+        (
+            "收件信息改一下：1.张三 2.13812345678 3.样例路100号",
+            "收件信息改一下：1.张三 2.[手机号] 3.[地址]",
+        ),
+        ("联系方式：1.13812345678 2.13987654321", "联系方式：1.[手机号] 2.[手机号]"),
+        # 门牌号后面隔空格的楼宇名、名字里带"多"的楼宇、四位房号 + 号
+        ("地址改成样例路100号 阳光大厦1805室", "地址改成[地址]"),
+        ("寄到样例路100号多伦大厦1805室", "寄到[地址]"),
+        ("寄到样例路88号美多中心12楼", "寄到[地址]"),
+        ("寄到样例小区3栋1201号能送到吗", "寄到[地址]能送到吗"),
+        # 问句照样保留
+        ("寄到样例路100号 明天能到城里吗", "寄到[地址] 明天能到城里吗"),
+        ("改到样例路100号 多久能到市中心", "改到[地址] 多久能到市中心"),
+    ],
+)
+def test_rereview2_leaks_and_questions(text, expected):
+    assert mask_pii(text) == expected
