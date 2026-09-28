@@ -5,6 +5,8 @@
 
 - review：NEW → SUGGEST →（CONFIRM | VERIFY | EVIDENCE | PLATFORM），
   新建记录（expected_version=None）；已有记录时等同 refresh。
+- 商家在平台后台同意了退货（平台状态 WAIT_BUYER_RETURN）：任何环节读到都进 WAIT_RETURN，
+  不进 PLATFORM 终态——买家寄回后还要建议同意退款（R3 第二步）。
 - refresh：重读平台状态推进状态机——平台已处理 → PLATFORM；签收核查满 verify_hours → CONFIRM
   （建议同意）；凭证已补充 → CONFIRM（重新跑规则）；退货已寄回（WAIT_SELLER_CONFIRM）→ CONFIRM
   （建议同意退款）；待确认时平台状态或状态版本变了 → 重新跑规则。
@@ -30,7 +32,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from rodit.aftersale.advisor import AFTERSALE_STATUS_LABELS
-from rodit.aftersale.rules import ReviewSuggestion, evaluate
+from rodit.aftersale.rules import REASON_WAIT_SELLER_CONFIRM, ReviewSuggestion, evaluate
 from rodit.aftersale.state_machine import (
     TERMINAL_STATES,
     transition,
@@ -157,9 +159,13 @@ class ReviewAssistant:
             state=ReviewState.NEW,
         )
         rec = self._move(rec, ReviewState.SUGGEST, now, pending)
-        suggestion = self._evaluate(shop_id, info, now)
-        rec = self._apply(rec, suggestion, now, pending)
-        rec = self._move(rec, suggestion.next_state, now, pending)
+        if info.status == AfterSaleStatus.WAIT_BUYER_RETURN:
+            # 商家已在平台后台同意退货：等买家寄回，之后还要建议同意退款（R3 第二步）
+            rec = self._to_wait_return(rec, info, now, pending)
+        else:
+            suggestion = self._evaluate(shop_id, info, now)
+            rec = self._apply(rec, suggestion, now, pending)
+            rec = self._move(rec, suggestion.next_state, now, pending)
         saved = self._repo.save(rec, expected_version=None)
         self._flush(pending)
         return saved
@@ -460,7 +466,12 @@ class ReviewAssistant:
         now: datetime,
         pending: list[AuditEvent],
     ) -> AfterSaleReview:
-        """R1：平台已处理（或售后单已查不到）→ 不操作，同步状态。"""
+        """R1：平台已处理（或售后单已查不到）→ 不操作，同步状态。
+
+        平台状态是"等待买家退货"（商家在平台后台同意了退货）时不进终态，改进 WAIT_RETURN：
+        买家寄回后还要给"同意退款"的建议（§7.3.2 R3 仓库确认收到后同意退款）。"""
+        if info is not None and info.status == AfterSaleStatus.WAIT_BUYER_RETURN:
+            return self._to_wait_return(rec, info, now, pending)
         if info is not None:
             rec = _synced(rec, info)
             reason = f"售后单已是「{AFTERSALE_STATUS_LABELS[info.status]}」，不操作，只同步状态"
@@ -476,6 +487,37 @@ class ReviewAssistant:
         )
         rec = self._apply(rec, s, now, pending)
         return self._move(rec, ReviewState.PLATFORM, now, pending)
+
+    def _to_wait_return(
+        self,
+        rec: AfterSaleReview,
+        info: AfterSaleInfo,
+        now: datetime,
+        pending: list[AuditEvent],
+    ) -> AfterSaleReview:
+        """商家已在平台后台同意退货（平台状态 WAIT_BUYER_RETURN）→ WAIT_RETURN。
+
+        状态机里只有 CONFIRM 能进 WAIT_RETURN（REVIEW_TRANSITIONS）：其他状态先回到 CONFIRM。
+        买家寄回（WAIT_SELLER_CONFIRM）后 refresh 重新跑规则，给出 R3 第二步"同意退款"的建议。"""
+        rec = _synced(rec, info)
+        if rec.state == ReviewState.WAIT_RETURN:
+            return rec
+        reason = (
+            f"商家已在平台后台同意退货，等待买家寄回；{REASON_WAIT_SELLER_CONFIRM}（R3 第二步）"
+        )
+        s = ReviewSuggestion(
+            matched_rules=["R1"],
+            advice=ReviewAdvice.NONE,
+            next_state=ReviewState.WAIT_RETURN,
+            reason=reason,
+            requires_manager=rec.requires_manager,
+            risk_flags=list(rec.risk_flags),
+        )
+        rec = self._apply(rec, s, now, pending)
+        note = "平台上已同意退货"
+        if rec.state != ReviewState.CONFIRM:
+            rec = self._move(rec, ReviewState.CONFIRM, now, pending, note=note)
+        return self._move(rec, ReviewState.WAIT_RETURN, now, pending, note=note)
 
     def _verify_elapsed(self, rec: AfterSaleReview, now: datetime) -> bool:
         """R4 签收核查已经开始并满 verify_hours。"""
