@@ -7,11 +7,12 @@
   新建记录（expected_version=None）；已有记录时等同 refresh。
 - refresh：重读平台状态推进状态机——平台已处理 → PLATFORM；签收核查满 verify_hours → CONFIRM
   （建议同意）；凭证已补充 → CONFIRM（重新跑规则）；退货已寄回（WAIT_SELLER_CONFIRM）→ CONFIRM
-  （建议同意退款）；待确认时平台状态变了 → 重新跑规则。
+  （建议同意退款）；待确认时平台状态或状态版本变了 → 重新跑规则。
 - negotiate / negotiation_done：CONFIRM ⇄ NEGOTIATE，记住协商过（淘宝拒绝前置条件）。
 - confirm：只接受 HumanConfirmation；R6 要店长确认；平台规则（拼多多无拒绝接口、淘宝拒绝要先协商、
   抖店拒绝要原因码、未注入写接口）；调用前重读售后单：已不可操作 → PLATFORM、不调平台；
-  状态版本和客服确认时看到的不一致 → ActionNotAllowed；幂等键 = 售后单 + 操作 + 平台状态版本。
+  状态版本和客服确认时看到的不一致，或者建议是按旧版本给的（platform_status_version）
+  → ActionNotAllowed（请刷新）；幂等键 = 售后单 + 操作 + 平台状态版本。
 
 留痕：aftersale.suggest（规则建议）、aftersale.transition（每次迁移）、aftersale.confirm（谁确认了
 什么）、aftersale.action（平台返回结果）。审计 detail 不放买家原文（售后说明不进审计）。
@@ -89,6 +90,20 @@ MSG_DOUYIN_REFUSE = "抖店拒绝售后必须选择拒绝原因码"
 _NON_HUMAN = {"system", "bot", "auto"}
 
 
+def _synced(rec: AfterSaleReview, info: AfterSaleInfo) -> AfterSaleReview:
+    """记下刚读到的平台状态和状态版本。"""
+    return rec.model_copy(
+        update={"platform_status": info.status, "platform_status_version": info.status_version}
+    )
+
+
+def _platform_changed(rec: AfterSaleReview, info: AfterSaleInfo) -> bool:
+    """平台上的售后单和审核记录上次同步时相比变了（状态或状态版本）。"""
+    return info.status != rec.platform_status or info.status_version != (
+        rec.platform_status_version
+    )
+
+
 def _require_human(operator: str) -> None:
     if not operator or operator.strip().lower() in _NON_HUMAN:
         raise ActionNotAllowed("售后审核操作必须由人执行（§4.1 原则 3）")
@@ -138,6 +153,7 @@ class ReviewAssistant:
             shop_id=shop_id,
             aftersale_id=aftersale_id,
             platform_status=info.status,
+            platform_status_version=info.status_version,
             state=ReviewState.NEW,
         )
         rec = self._move(rec, ReviewState.SUGGEST, now, pending)
@@ -162,7 +178,7 @@ class ReviewAssistant:
         if info is None:
             rec = self._to_platform(rec, None, now, pending)
         else:
-            rec = rec.model_copy(update={"platform_status": info.status})
+            rec = _synced(rec, info)
             waiting_return = (
                 rec.state == ReviewState.WAIT_RETURN
                 and info.status == AfterSaleStatus.WAIT_BUYER_RETURN
@@ -177,9 +193,10 @@ class ReviewAssistant:
             elif rec.state == ReviewState.WAIT_RETURN and not waiting_return:
                 rec = self._apply(rec, self._evaluate(shop_id, info, now), now, pending)
                 rec = self._move(rec, ReviewState.CONFIRM, now, pending, note="买家已寄回")
-            elif rec.state == ReviewState.CONFIRM and info.status != current.platform_status:
-                # 待确认期间平台状态变了（如商家在后台同意退货、买家已寄回）：重新给建议
-                rec = self._apply(rec, self._evaluate(shop_id, info, now), now, pending)
+            elif rec.state == ReviewState.CONFIRM and _platform_changed(current, info):
+                # 待确认期间平台上的售后单变了（如商家在后台同意退货、买家改了金额、补了凭证）：
+                # 重新给建议
+                rec = self._reevaluate(rec, info, now, pending)
         if rec == current:
             return current
         saved = self._repo.save(rec, expected_version=current.version)
@@ -259,6 +276,9 @@ class ReviewAssistant:
             raise ActionNotAllowed("仅退款的售后单不需要同意退货，请选择同意退款")
         if confirmation.expected_status_version != info.status_version:
             raise ActionNotAllowed(MSG_STALE)
+        if _platform_changed(current, info):
+            # 客服看到的版本是新的，但建议是按旧版本的售后单给的：先刷新建议再确认
+            raise ActionNotAllowed(MSG_STALE)
         # R6 按重读到的金额再查一次：买家改了申请金额（状态不变、版本变了）也要店长确认
         if info.amount > shop_config.aftersale_amount_limit:
             self._check_manager(shop_config, confirmation)
@@ -311,7 +331,7 @@ class ReviewAssistant:
             },
         )
 
-        rec = with_result(current, result).model_copy(update={"platform_status": info.status})
+        rec = _synced(with_result(current, result), info)
         if result.ok:
             rec = rec.model_copy(update={"confirmed_by": confirmation.operator})
             rec = self._move(
@@ -442,7 +462,7 @@ class ReviewAssistant:
     ) -> AfterSaleReview:
         """R1：平台已处理（或售后单已查不到）→ 不操作，同步状态。"""
         if info is not None:
-            rec = rec.model_copy(update={"platform_status": info.status})
+            rec = _synced(rec, info)
             reason = f"售后单已是「{AFTERSALE_STATUS_LABELS[info.status]}」，不操作，只同步状态"
         else:
             reason = "售后单在平台已查不到，不操作"
@@ -457,32 +477,63 @@ class ReviewAssistant:
         rec = self._apply(rec, s, now, pending)
         return self._move(rec, ReviewState.PLATFORM, now, pending)
 
-    def _verify_timeout(
-        self, rec: AfterSaleReview, now: datetime, pending: list[AuditEvent]
-    ) -> AfterSaleReview:
-        """R4：签收核查满 verify_hours 仍未找到（售后单仍待处理）→ CONFIRM，建议同意。"""
-        hours = self._config.verify_hours
+    def _verify_elapsed(self, rec: AfterSaleReview, now: datetime) -> bool:
+        """R4 签收核查已经开始并满 verify_hours。"""
         started = rec.verify_started_at
-        if started is None or now - started < timedelta(hours=hours):
-            return rec
-        if "R7" in rec.matched_rules:
+        return started is not None and now - started >= timedelta(hours=self._config.verify_hours)
+
+    def _verify_done(
+        self, matched_rules: list[str], requires_manager: bool, risk_flags: list[str]
+    ) -> ReviewSuggestion:
+        """R4 签收核查满 verify_hours 仍未找到：建议同意；有 R7 标记时人工决定；R6 要店长确认。"""
+        hours = self._config.verify_hours
+        if "R7" in matched_rules:
             advice = ReviewAdvice.MANUAL
             reason = f"{hours} 小时后仍未找到；该买家有频繁售后风险标记，人工决定（R4、R7）"
         else:
             advice = ReviewAdvice.AGREE
             reason = f"{hours} 小时后仍未找到，建议同意（R4）"
-        if rec.requires_manager:
+        if requires_manager:
             reason += "；金额超过店铺上限，必须店长确认（R6）"
-        s = ReviewSuggestion(
-            matched_rules=list(rec.matched_rules),
+        return ReviewSuggestion(
+            matched_rules=list(matched_rules),
             advice=advice,
             next_state=ReviewState.CONFIRM,
             reason=reason,
-            requires_manager=rec.requires_manager,
-            risk_flags=list(rec.risk_flags),
+            requires_manager=requires_manager,
+            risk_flags=list(risk_flags),
         )
+
+    def _verify_timeout(
+        self, rec: AfterSaleReview, now: datetime, pending: list[AuditEvent]
+    ) -> AfterSaleReview:
+        """R4：签收核查满 verify_hours 仍未找到（售后单仍待处理）→ CONFIRM，建议同意。"""
+        if not self._verify_elapsed(rec, now):
+            return rec
+        s = self._verify_done(rec.matched_rules, rec.requires_manager, rec.risk_flags)
         rec = self._apply(rec, s, now, pending)
+        hours = self._config.verify_hours
         return self._move(rec, ReviewState.CONFIRM, now, pending, note=f"签收核查满 {hours} 小时")
+
+    def _reevaluate(
+        self,
+        rec: AfterSaleReview,
+        info: AfterSaleInfo,
+        now: datetime,
+        pending: list[AuditEvent],
+        *,
+        reason_prefix: str | None = None,
+    ) -> AfterSaleReview:
+        """待确认期间平台上的售后单变了：按新数据重新跑规则，留在 CONFIRM。
+
+        签收核查已经做完（R4 满 verify_hours）的不回到"先协商"，沿用核查结论，R6 / R7 按新数据。
+        """
+        s = self._evaluate(rec.shop_id, info, now)
+        if s.next_state == ReviewState.VERIFY and self._verify_elapsed(rec, now):
+            s = self._verify_done(s.matched_rules, s.requires_manager, s.risk_flags)
+        if reason_prefix:
+            s = s.model_copy(update={"reason": f"{reason_prefix}。{s.reason}"})
+        return self._apply(rec, s, now, pending)
 
     def _after_status_changed(
         self, rec: AfterSaleReview, now: datetime, pending: list[AuditEvent]
@@ -496,10 +547,8 @@ class ReviewAssistant:
             return rec.model_copy(update={"reason": f"{MSG_STALE}（{rec.reason or ''}）"})
         if latest is None or not is_actionable(latest.status):
             return self._to_platform(rec, latest, now, pending)
-        rec = rec.model_copy(update={"platform_status": latest.status})
-        s = self._evaluate(rec.shop_id, latest, now)
-        s = s.model_copy(update={"reason": f"{MSG_STALE}。{s.reason}"})
-        return self._apply(rec, s, now, pending)
+        rec = _synced(rec, latest)
+        return self._reevaluate(rec, latest, now, pending, reason_prefix=MSG_STALE)
 
     @staticmethod
     def _check_manager(shop_config: ShopConfig, confirmation: HumanConfirmation) -> None:

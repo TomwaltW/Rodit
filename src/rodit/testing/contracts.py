@@ -361,6 +361,7 @@ def check_aftersale_review_repository(make: Callable[[], AfterSaleReviewReposito
         saved.model_copy(
             update={
                 "state": ReviewState.CONFIRM,
+                "platform_status_version": "1700000000123",
                 "matched_rules": ["R3", "R6"],
                 "suggestion": ReviewAdvice.AGREE_RETURN,
                 "requires_manager": True,

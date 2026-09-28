@@ -9,7 +9,7 @@ import pytest
 from api_support import EVENTS_PATH, MERCHANT_A, Api
 
 from rodit.app.demo import taobao_event
-from rodit.core.enums import KnowledgeStatus, SuggestionStatus
+from rodit.core.enums import AfterSaleStatus, KnowledgeStatus, SuggestionStatus
 from rodit.core.errors import ToolUnavailable
 from rodit.core.pii import BuyerRefHasher
 from rodit.testing.fixtures import RAW_BUYERS, SHOP_A, SHOP_B, SHOP_D, TEST_SALT
@@ -407,6 +407,29 @@ def test_aftersale_review_negotiate_and_confirm(api: Api):
     assert r.status_code == 200, r.text
     assert r.json()["state"] == "wait_return" and r.json()["last_result"]["ok"] is True
     assert [c["aftersale_id"] for c in api.unit.action_port.calls] == ["as_2002"]
+
+
+def test_aftersale_changed_during_negotiation_needs_refresh(api: Api):
+    """协商期间平台上的售后单变了：视图提示先刷新；按新版本直接确认也会被拒（建议可能过期）。"""
+    url = f"{A}/aftersales/as_2002"
+    view = api.post(f"{url}/review", "agent_a").json()
+    assert view["platform_status_version"] == view["platform"]["status_version"]
+    assert view["needs_refresh"] is False
+    api.post(f"{url}/negotiate", "agent_a", json={"note": "先协商换码"})
+    api.unit.clock.advance(minutes=5)
+    api.unit.tools.set_aftersale_status(
+        SHOP_A, "as_2002", AfterSaleStatus.PENDING_REVIEW, at=api.unit.clock.now()
+    )
+    view = api.post(f"{url}/negotiation-done", "agent_a", json={"outcome": "买家坚持退货"}).json()
+    assert view["state"] == "confirm" and view["needs_refresh"] is True
+    latest = view["platform"]["status_version"]
+    body = {"action": "agree_return", "expected_status_version": latest}
+    assert api.post(f"{url}/confirm", "agent_a", json=body).status_code == 409
+    assert api.unit.action_port.calls == []
+    view = api.post(f"{url}/review", "agent_a").json()  # 刷新：按新版本重新给建议
+    assert view["needs_refresh"] is False and view["platform_status_version"] == latest
+    r = api.post(f"{url}/confirm", "agent_a", json=body)
+    assert r.status_code == 200 and r.json()["state"] == "wait_return"
 
 
 def test_aftersale_review_hides_buyer_note_and_ref(api: Api):

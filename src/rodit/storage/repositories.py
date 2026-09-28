@@ -644,6 +644,7 @@ class PgFeedbackRepository:
 
 _R_FIELDS = (
     "platform_status",
+    "platform_status_version",
     "state",
     "matched_rule",
     "suggestion",
@@ -664,6 +665,7 @@ def _review_values(review: AfterSaleReview) -> list[Any]:
             raise ValueError(f"非法的审核规则名：{rule!r}")
     data: dict[str, Any] = {
         "platform_status": review.platform_status,
+        "platform_status_version": review.platform_status_version,
         "state": review.state,
         "matched_rule": review.matched_rule,
         "suggestion": review.suggestion,
@@ -683,6 +685,7 @@ def _review(r: Row) -> AfterSaleReview:
         shop_id=r["shop_id"],
         aftersale_id=r["aftersale_id"],
         platform_status=r["platform_status"],
+        platform_status_version=r["platform_status_version"],
         state=r["state"],
         matched_rules=r["matched_rule"].split(",") if r["matched_rule"] else [],
         suggestion=r["suggestion"],

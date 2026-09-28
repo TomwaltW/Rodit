@@ -309,11 +309,14 @@ class AfterSaleReviewView(_View):
 
     platform 只在待客服确认（state=confirm）时给出，是接口层重读的平台当前状态；
     读不到平台数据时为空（审核本身不受影响）。
+    platform_status_version 是当前建议所依据的平台状态版本；needs_refresh 表示平台上的售后单
+    在那之后又变了（如协商期间买家改了申请）：建议可能过期，先调 review 刷新再确认。
     """
 
     aftersale_id: str
     state: ReviewState
     platform_status: AfterSaleStatus
+    platform_status_version: str | None = None
     matched_rules: list[str] = Field(default_factory=list)
     suggestion: ReviewAdvice | None = None
     reason: str | None = None
@@ -326,6 +329,7 @@ class AfterSaleReviewView(_View):
     history: list[ReviewStepView] = Field(default_factory=list)
     last_result: ActionResultView | None = None
     platform: AfterSaleSnapshotView | None = None
+    needs_refresh: bool = False
 
     @classmethod
     def from_review(
@@ -360,6 +364,7 @@ class AfterSaleReviewView(_View):
             aftersale_id=review.aftersale_id,
             state=review.state,
             platform_status=review.platform_status,
+            platform_status_version=review.platform_status_version,
             matched_rules=list(review.matched_rules),
             suggestion=review.suggestion,
             reason=review.reason,
@@ -372,6 +377,8 @@ class AfterSaleReviewView(_View):
             history=history,
             last_result=last_result,
             platform=AfterSaleSnapshotView.from_info(platform) if platform is not None else None,
+            needs_refresh=platform is not None
+            and platform.status_version != review.platform_status_version,
         )
 
 

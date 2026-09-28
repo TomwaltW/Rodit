@@ -314,7 +314,15 @@ def test_stale_confirmation_version(env):
         env.asst.confirm(SHOP_A, "as_2001", ACT.AGREE_REFUND, confirmation=conf)
     assert env.port.calls == []
     assert env.repo.get(SHOP_A, "as_2001").state == S.CONFIRM
-    # 刷新后按新版本确认即可
+    # 客服拿到新版本、但建议还是按旧版本给的：也要先刷新（建议可能已经过期）
+    with pytest.raises(ActionNotAllowed, match=MSG_STALE):
+        env.asst.confirm(SHOP_A, "as_2001", ACT.AGREE_REFUND, confirmation=env.conf("as_2001"))
+    assert env.port.calls == []
+    # 刷新后建议按新版本重新生成，再按新版本确认即可
+    refreshed = env.asst.refresh(SHOP_A, "as_2001")
+    latest = env.inner.get_aftersale(SHOP_A, "as_2001")
+    assert refreshed.state == S.CONFIRM
+    assert refreshed.platform_status_version == latest.status_version
     r = env.asst.confirm(SHOP_A, "as_2001", ACT.AGREE_REFUND, confirmation=env.conf("as_2001"))
     assert r.state == S.AGREED
 
@@ -382,6 +390,11 @@ def test_manager_required_when_amount_raised_after_review(env):
     env.w.aftersales[env.w.aftersales.index(a)] = a.model_copy(
         update={"amount": Decimal("800.00"), "status_version": "9999999999"}
     )
+    # 建议是按改金额之前的售后单给的：先要求刷新
+    with pytest.raises(ActionNotAllowed, match=MSG_STALE):
+        env.asst.confirm(SHOP_A, "as_2001", ACT.AGREE_REFUND, confirmation=env.conf("as_2001"))
+    refreshed = env.asst.refresh(SHOP_A, "as_2001")
+    assert refreshed.requires_manager and "R6" in refreshed.matched_rules
     with pytest.raises(ActionNotAllowed, match=MSG_MANAGER):
         env.asst.confirm(SHOP_A, "as_2001", ACT.AGREE_REFUND, confirmation=env.conf("as_2001"))
     assert env.port.calls == []

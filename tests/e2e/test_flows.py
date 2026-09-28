@@ -256,7 +256,8 @@ def test_11_3_reread_race_buyer_withdraws_before_confirm():
 
 
 def test_11_3_reread_race_status_version_changed():
-    """状态没变但版本变了（买家补充了凭证）：客服看到的是旧版本 → 不执行，按新版本重新确认。"""
+    """状态没变但版本变了（买家补充了凭证）：客服看到的是旧版本 → 不执行；
+    建议也是按旧版本给的 → 刷新后（签收核查的结论不丢）按新版本重新确认。"""
     service = _nr_service()
     unit = service.unit
     _to_confirm(service, "as_2003")
@@ -275,6 +276,19 @@ def test_11_3_reread_race_status_version_changed():
     assert unit.action_port.calls == []
     fresh = unit.tools.get_aftersale(SHOP_A, "as_2003")
     assert fresh.status_version != seen.status_version
+    with pytest.raises(ActionNotAllowed, match="状态已变化"):
+        service.confirm_aftersale(
+            SHOP_A,
+            "as_2003",
+            AfterSaleAction.AGREE_REFUND,
+            operator=AGENT,
+            expected_status_version=fresh.status_version,
+        )
+    assert unit.action_port.calls == []
+    refreshed = service.review_aftersale(SHOP_A, "as_2003")
+    assert refreshed.state == ReviewState.CONFIRM
+    assert refreshed.suggestion == ReviewAdvice.AGREE  # 核查已满 24 小时，不回到"先协商"
+    assert refreshed.platform_status_version == fresh.status_version
     done = service.confirm_aftersale(
         SHOP_A,
         "as_2003",

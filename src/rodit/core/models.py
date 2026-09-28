@@ -697,6 +697,9 @@ class AfterSaleReview(_Model):
     shop_id: str
     aftersale_id: str
     platform_status: AfterSaleStatus
+    # 最近一次和平台同步时的状态版本：当前建议就是按这个版本的售后单给的。
+    # 确认时平台版本已经变了 → 建议可能过期，要求刷新（§7.3.2 调用前重新读取）
+    platform_status_version: str | None = None
     state: ReviewState
     matched_rules: list[str] = Field(default_factory=list)  # 如 ["R2", "R6"]
     suggestion: ReviewAdvice | None = None

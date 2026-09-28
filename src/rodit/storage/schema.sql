@@ -16,7 +16,8 @@
 --   沙箱和部分平台 RDS 没有 pgvector，单店知识量小，候选在应用内算余弦（见 repositories.py）。
 --   平台 RDS 支持 pgvector 后换成 VECTOR(维度) + HNSW 索引（vector_cosine_ops）。
 -- - message 增加 sku_id；suggestion 增加 msg_id / question_text / item_id / kind；
---   aftersale_review 增加 reason / requires_manager / risk_flags / verify_started_at / updated_at，
+--   aftersale_review 增加 platform_status_version / reason / requires_manager / risk_flags /
+--   verify_started_at / updated_at，
 --   version 从 1 开始（新建即 1，每次写入 +1，乐观锁）。
 -- - 新增 knowledge_gap（知识缺失提醒）、labeled_sample（判断层标注集），见 §5.8。
 --
@@ -188,6 +189,7 @@ CREATE TABLE IF NOT EXISTS aftersale_review (
   shop_id           TEXT NOT NULL CHECK (shop_id <> ''),
   aftersale_id      TEXT NOT NULL,                    -- 平台售后单 ID
   platform_status   TEXT NOT NULL,
+  platform_status_version TEXT,                     -- 建议所依据的平台状态版本
   state             TEXT NOT NULL,                    -- 见 core.enums.ReviewState
   matched_rule      TEXT,                             -- ",".join(matched_rules)，如 "R3,R6"
   suggestion        TEXT,                             -- core.enums.ReviewAdvice
