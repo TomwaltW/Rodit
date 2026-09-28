@@ -123,13 +123,16 @@ class ReviewAssistant:
     # ================================================================ 公开接口
 
     def review(self, shop_id: str, aftersale_id: str) -> AfterSaleReview:
-        """拉取售后单并跑规则，新建审核记录。已有记录时等同 refresh。"""
+        """拉取售后单并跑规则，新建审核记录。已有记录时等同 refresh。
+
+        售后单不存在或不属于该店铺抛 KeyError（和知识候选等资源一致，接口层映射为 404）。
+        """
         if self._repo.get(shop_id, aftersale_id) is not None:
             return self.refresh(shop_id, aftersale_id)
         now = self._clock.now()
         info = self._read(shop_id, aftersale_id)
         if info is None:
-            raise ActionNotAllowed(f"售后单 {aftersale_id} 不存在或不属于店铺 {shop_id}")
+            raise KeyError(f"售后单 {aftersale_id} 不存在或不属于店铺 {shop_id}")
         pending: list[AuditEvent] = []
         rec = AfterSaleReview(
             shop_id=shop_id,

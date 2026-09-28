@@ -18,7 +18,6 @@ from e2e_support import (
 
 from rodit.app.offline import EvidenceEchoLLM
 from rodit.core.enums import Intent, RejectReason, RouteAction
-from rodit.core.errors import ActionNotAllowed
 from rodit.core.pii import ADDRESS_MASK, PHONE_MASK, mask_pii
 from rodit.testing.fixtures import AGENT, RAW_BUYERS, SHOP_A, SHOP_B
 
@@ -161,7 +160,7 @@ def test_same_item_and_buyer_in_two_shops_never_cross():
     for where, text in b_texts.items():
         assert not [s for s in A_ONLY if s in text], where
     # B 不能审核 A 的售后单；B 的侧边栏只有 B 的推荐
-    with pytest.raises(ActionNotAllowed):
+    with pytest.raises(KeyError):
         service.review_aftersale(SHOP_B, "as_2003")
     sidebar = unit.adapters.get(unit.platform, "B")
     assert sidebar.sidebar(SHOP_B, "c_iso") == b_order.suggestions

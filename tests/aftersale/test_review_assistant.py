@@ -183,10 +183,12 @@ def test_review_is_idempotent(env):
 
 
 def test_review_unknown_or_other_shop(env):
-    with pytest.raises(ActionNotAllowed):
+    with pytest.raises(KeyError):
         env.asst.review(SHOP_A, "as_nope")
-    with pytest.raises(ActionNotAllowed):
+    with pytest.raises(KeyError):
         env.asst.review(SHOP_B, "as_2001")  # A 店的售后单用 B 店身份查不到
+    with pytest.raises(KeyError):
+        env.asst.refresh(SHOP_B, "as_2001")  # 没有记录的 refresh 等同 review
     b = env.asst.review(SHOP_B, "as_9001")
     assert b.shop_id == SHOP_B and env.repo.get(SHOP_A, "as_9001") is None
 

@@ -427,14 +427,18 @@ def test_aftersale_errors_map_to_409(api: Api):
     assert r.status_code == 409  # 还没有审核记录
     r = api.post(f"{A}/aftersales/as_2003/negotiate", "agent_a")
     assert r.status_code == 409
-    r = api.post(f"{A}/aftersales/nope/review", "agent_a")
-    assert r.status_code == 409  # 审核助手把"不存在或不属于该店"当作不允许的操作
     r = api.post(
         f"{A}/aftersales/as_2002/confirm",
         "agent_a",
         json={"action": "delete", "expected_status_version": "1"},
     )
     assert r.status_code == 422
+
+
+def test_unknown_or_other_shop_aftersale_is_404(api: Api):
+    for aftersale_id in ("nope", "as_9001"):  # as_9001 是 B 店的售后单
+        r = api.post(f"{A}/aftersales/{aftersale_id}/review", "agent_a")
+        assert r.status_code == 404 and aftersale_id not in r.text
 
 
 class _DownTools:
