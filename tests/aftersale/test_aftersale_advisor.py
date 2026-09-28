@@ -119,3 +119,11 @@ def test_refund_progress_refunding_mentions_platform_rules(advisor, world):
     p = advisor.refund_progress(world.aftersale(SHOP_A, "as_2008"), world.now)
     assert p.summary.startswith("退款中：")
     assert "原路退回" in p.summary and "以平台规则为准" in p.summary
+
+
+def test_refund_progress_as_of_is_the_data_fetch_time(advisor, world):
+    """售后单带获取时间（平台故障时来自缓存）：进度写"截至 <获取时间>"，不能写成现在
+    （§12.2 用缓存数据并注明时间、§7.2 截至 {时间}）。"""
+    fetched = world.now - timedelta(hours=2)
+    info = world.aftersale(SHOP_A, "as_2008").model_copy(update={"fetched_at": fetched})
+    assert advisor.refund_progress(info, world.now).as_of == fetched

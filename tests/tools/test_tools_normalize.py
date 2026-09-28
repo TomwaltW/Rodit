@@ -210,3 +210,39 @@ def test_mask_platform_text_aftersale_note():
 def test_mask_platform_text_rejects_other_types():
     with pytest.raises(TypeError):
         mask_platform_text(build_demo_world().order(SHOP_A, "o_1001"))  # type: ignore[type-var]
+
+
+@pytest.mark.parametrize(
+    ("text", "code"),
+    [
+        ("您的快递已放入丰巢柜，取件码【60125477】", "60125477"),
+        ("取件码「A-12-3456」请尽快取件", "A-12-3456"),
+        ('取件码："5566"', "5566"),
+        ("取件码(7788)", "7788"),
+        ("请凭 8-2-3021 到幸福里驿站取件", "8-2-3021"),
+        ("凭8-2-3021取件", "8-2-3021"),
+        ("请凭 A12-3456 领取包裹", "A12-3456"),
+    ],
+)
+def test_scrub_pickup_code_brackets_and_keywordless(text, code):
+    """取件码带括号 / 引号，或者没有"取件码"字样的"凭 <码> 到…取件"，都要遮掉（§7.2）。"""
+    out = scrub_pickup_code(text)
+    assert code not in out and PICKUP_CODE_MASK in out, out
+    assert code not in (mask_free_text(text) or "")
+
+
+@pytest.mark.parametrize(
+    ("text", "parts"),
+    [("取件码 A12 3456", ("A12", "3456")), ("取件码是:5821 0934", ("5821", "0934"))],
+)
+def test_scrub_pickup_code_grouped_codes_fully(text, parts):
+    """用空格分组的取件码整段遮掉，不能只遮第一组、露出后半段。"""
+    out = scrub_pickup_code(text)
+    for part in parts:
+        assert part not in out, out
+    assert out.count(PICKUP_CODE_MASK) == 1
+
+
+@pytest.mark.parametrize("text", ["凭身份证取件", "请凭取件码取件", "已签收，快递柜代收"])
+def test_scrub_pickup_code_leaves_ordinary_text(text):
+    assert scrub_pickup_code(text) == text

@@ -293,16 +293,30 @@ def normalize_aftersale_reason(platform: Platform, code: object) -> AfterSaleRea
 # ---------------------------------------------------------------- 平台自由文本脱敏
 
 PICKUP_CODE_MASK = "[取件码]"
+# 码本身：字母数字开头，可带连字符；空格分开的几组（"A12 3456""5821 0934"）整段算一个码
+_CODE = r"[A-Za-z0-9][-A-Za-z0-9]{1,15}(?:[ \t]+[A-Za-z0-9][-A-Za-z0-9]{1,7}(?![-A-Za-z0-9]))*"
+_OPEN = r"[【\[(（「『\"'“‘<《]"
+_CLOSE = r"[】\])）」』\"'”’>》]"
+# 有关键词："取件码【60125477】""取件码是:5821 0934""取件码「A-12-3456」"
 _PICKUP_CODE = re.compile(
-    r"((?:取件码|取货码|提货码|取件号|开柜码)\s*(?:是|为)?\s*[:：]?\s*)[A-Za-z0-9][-A-Za-z0-9]{1,15}"
+    r"((?:取件码|取货码|提货码|取件号|开柜码|取件密码)\s*(?:是|为)?\s*[:：]?\s*)"
+    rf"(?:{_OPEN}\s*{_CODE}\s*{_CLOSE}|{_CODE})"
+)
+# 没有关键词："请凭 8-2-3021 到幸福里驿站取件""凭8-2-3021取件""凭 A12-3456 领取"
+_PICKUP_CODE_BARE = re.compile(
+    rf"(凭\s*)(?:{_OPEN}\s*{_CODE}\s*{_CLOSE}|{_CODE})(?=\s*(?:到|至|去|前往|取|领))"
 )
 
 
 def scrub_pickup_code(text: str | None) -> str | None:
-    """遮掉取件码的值，保留"取件码"字样（取件指引要提醒买家凭取件码取件）。"""
+    """遮掉取件码的值，保留"取件码"字样（取件指引要提醒买家凭取件码取件）。
+
+    认得的写法：关键词后直接跟码、码带括号 / 引号、空格分组的码（整段遮掉），
+    以及没有关键词的"凭 <码> 到 / 取 / 领…"。"""
     if not text:
         return text
-    return _PICKUP_CODE.sub(lambda m: m.group(1) + PICKUP_CODE_MASK, text)
+    out = _PICKUP_CODE.sub(lambda m: m.group(1) + PICKUP_CODE_MASK, text)
+    return _PICKUP_CODE_BARE.sub(lambda m: m.group(1) + PICKUP_CODE_MASK, out)
 
 
 def mask_free_text(text: str | None) -> str | None:

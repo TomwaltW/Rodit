@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from rodit.adapters import AdapterRegistry, AuthGuard
 from rodit.aftersale import DefaultAfterSaleAdvisor, ReviewAssistant
@@ -56,6 +57,10 @@ from rodit.knowledge import FaqSearcher, KnowledgeRetriever
 from rodit.qa import DefaultQualityGate
 from rodit.routing import DecisionRouter, RoutingPolicy
 from rodit.tools import CachingToolGateway, DefaultLogisticsAdvisor, DefaultToolEvidenceProvider
+
+TOOL_CACHE_MAX_STALE_S = 3600
+"""平台接口故障时最多用 1 小时内的缓存兜底（§12.2 用缓存数据并注明时间）；更旧的订单、售后、
+物流数据宁可推荐"我帮您查一下"，也不拿来回答。"""
 
 
 @dataclass
@@ -156,7 +161,10 @@ def build_unit(
         raise ValueError(f"平台工具属于 {tools.platform}，单元是 {platform}（§9.1 数据不跨云）")
     cache = cache or InMemoryCache(clock)
     embedder = embedder or HashingEmbedder()
-    gateway = CachingToolGateway(tools, cache, clock, ttl_s=config.logistics.cache_ttl_s)
+    ttl_s = config.logistics.cache_ttl_s
+    gateway = CachingToolGateway(
+        tools, cache, clock, ttl_s=ttl_s, max_stale_s=max(ttl_s, TOOL_CACHE_MAX_STALE_S)
+    )
     searcher = FaqSearcher(repos.knowledge, embedder)
     tool_evidence = DefaultToolEvidenceProvider(
         gateway,
@@ -164,6 +172,7 @@ def build_unit(
         DefaultLogisticsAdvisor(config.logistics),
         DefaultAfterSaleAdvisor(config.aftersale),
         clock,
+        stale_after=timedelta(seconds=ttl_s),  # 比 TTL 还旧的订单 / 售后单只能来自过期缓存
     )
     retriever = KnowledgeRetriever(
         repos.knowledge, searcher, config.generation, tool_provider=tool_evidence

@@ -668,3 +668,78 @@ def test_audit_details_contain_no_buyer_text(env):
     assert "13812345678" not in blob
     stored = json.dumps(env.repo.get(SHOP_A, "as_2003").model_dump(mode="json"), ensure_ascii=False)
     assert "13812345678" not in stored
+
+
+# ================================================================ 平台后台同意退货（R3 第二步）
+
+
+def _second_step_after_buyer_ships_back(env, aftersale_id: str) -> AfterSaleReview:
+    """买家寄回（WAIT_SELLER_CONFIRM）→ 刷新应回到待确认，建议同意退款（R3 第二步）。"""
+    env.clock.advance(days=1)
+    env.set_status(aftersale_id, RS.WAIT_SELLER_CONFIRM)
+    r = env.asst.refresh(SHOP_A, aftersale_id)
+    assert (r.state, r.suggestion) == (S.CONFIRM, A.AGREE)
+    assert "R3" in r.matched_rules and "仓库确认收货后同意退款" in (r.reason or "")
+    assert r.platform_status == RS.WAIT_SELLER_CONFIRM
+    return r
+
+
+def test_backend_agree_return_while_confirming_waits_for_return(env):
+    """待确认时商家在平台后台同意了退货（淘宝常见，短信验证）：审核进入等待退货，
+    不能进"平台已处理"终态——买家寄回后还要给"同意退款"的建议（§7.3.2 R3）。"""
+    r = env.asst.review(SHOP_A, "as_2002")
+    assert (r.state, r.suggestion) == (S.CONFIRM, A.AGREE_RETURN)
+    env.set_status("as_2002", RS.WAIT_BUYER_RETURN)
+    r = env.asst.refresh(SHOP_A, "as_2002")
+    assert r.state == S.WAIT_RETURN
+    assert r.platform_status == RS.WAIT_BUYER_RETURN
+    assert r.platform_status_version == env.w.aftersale(SHOP_A, "as_2002").status_version
+    # 买家还没寄回：保持等待退货
+    env.clock.advance(hours=12)
+    assert env.asst.refresh(SHOP_A, "as_2002").state == S.WAIT_RETURN
+
+    r = _second_step_after_buyer_ships_back(env, "as_2002")
+    r = env.asst.confirm(SHOP_A, "as_2002", ACT.AGREE_REFUND, confirmation=env.conf("as_2002"))
+    assert r.state == S.AGREED
+    assert [c["action"] for c in env.port.calls] == [ACT.AGREE_REFUND]
+    assert [h["to"] for h in history(r)] == [
+        "suggest",
+        "confirm",
+        "wait_return",
+        "confirm",
+        "agreed",
+    ]
+
+
+@pytest.mark.parametrize("path", ["evidence", "negotiate", "confirm", "new"])
+def test_backend_agree_return_from_other_states_waits_for_return(env, path):
+    """证据待补、协商中、客服确认时重读、首次审核时，平台已是等待买家退货：都进等待退货。"""
+    if path == "evidence":
+        env.asst.review(SHOP_A, "as_2004")  # R5 缺凭证 → EVIDENCE
+        env.set_status("as_2004", RS.WAIT_BUYER_RETURN)
+        r = env.asst.refresh(SHOP_A, "as_2004")
+    elif path == "negotiate":
+        env.asst.review(SHOP_A, "as_2004")
+        env.set_status("as_2004", RS.PENDING_REVIEW, evidence_count=2)
+        env.asst.refresh(SHOP_A, "as_2004")
+        env.asst.negotiate(SHOP_A, "as_2004", operator=AGENT)
+        env.set_status("as_2004", RS.WAIT_BUYER_RETURN)
+        r = env.asst.negotiation_done(SHOP_A, "as_2004", operator=AGENT, outcome="同意退货")
+    elif path == "confirm":
+        env.asst.review(SHOP_A, "as_2004")
+        env.set_status("as_2004", RS.PENDING_REVIEW, evidence_count=2)
+        env.asst.refresh(SHOP_A, "as_2004")
+        conf = env.conf("as_2004")
+        env.set_status("as_2004", RS.WAIT_BUYER_RETURN)
+        r = env.asst.confirm(SHOP_A, "as_2004", ACT.AGREE_RETURN, confirmation=conf)
+        assert env.port.calls == []  # 重读发现平台已处理：不调写接口
+    else:
+        env.set_status("as_2004", RS.WAIT_BUYER_RETURN)
+        r = env.asst.review(SHOP_A, "as_2004")
+    assert r.state == S.WAIT_RETURN, path
+    assert r.platform_status == RS.WAIT_BUYER_RETURN
+    assert history(r)[-1]["to"] == "wait_return"
+    env.set_status("as_2004", RS.WAIT_SELLER_CONFIRM)
+    env.clock.advance(hours=1)
+    r = env.asst.refresh(SHOP_A, "as_2004")
+    assert (r.state, r.suggestion, r.matched_rules[0]) == (S.CONFIRM, A.AGREE, "R3")

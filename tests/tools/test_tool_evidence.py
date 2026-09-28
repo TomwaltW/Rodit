@@ -9,11 +9,12 @@ import pytest
 
 from rodit.aftersale.advisor import DefaultAfterSaleAdvisor
 from rodit.core import evidence as ev
-from rodit.core.enums import EvidenceSource, Intent, LogisticsStatus
-from rodit.core.errors import TenantIsolationError
+from rodit.core.enums import EvidenceSource, Intent, LogisticsStatus, PolicyKey
+from rodit.core.errors import TenantIsolationError, ToolUnavailable
 from rodit.core.evidence import Need
 from rodit.core.models import (
     AfterSaleInfo,
+    Evidence,
     EvidenceBundle,
     LogisticsAnalysis,
     LogisticsTrace,
@@ -26,11 +27,13 @@ from rodit.core.models import (
 from rodit.core.pii import contains_pii
 from rodit.core.ports import ToolEvidenceProvider
 from rodit.inmemory import InMemoryCache
+from rodit.knowledge.conflict import Candidate, resolve_conflicts
 from rodit.testing.fakes import FakeClock, InMemoryToolGateway, make_context
 from rodit.testing.fixtures import (
     BUYER,
     BUYER_R3,
     BUYER_R5,
+    BUYER_R8,
     BUYER_REFUND,
     SHOP_A,
     SHOP_B,
@@ -184,7 +187,11 @@ def test_stock_item_level_summary(env):
     stock_ev = env.collect(Intent.STOCK, item_id="i_555").evidences[0]
     assert stock_ev.id == ev.tool_stock("i_555")
     assert stock_ev.topic == ev.topic_for_stock("i_555")
-    assert "有货，库存 35 件" in stock_ev.content
+    # 白色 S 缺货：不给整款合计"有货，库存 35 件"，逐个规格写清
+    assert "有货，库存 35 件" not in stock_ev.content
+    assert "部分规格有货" in stock_ev.content
+    assert "暂时缺货：白色 / S（预计 10 月 8 日补货）" in stock_ev.content
+    assert "黑色 / M 库存 12 件" in stock_ev.content
 
 
 def test_price_evidence(env):
@@ -192,7 +199,7 @@ def test_price_evidence(env):
     assert bundle.ids() == [ev.tool_price("i_555")]
     price_ev = bundle.evidences[0]
     assert price_ev.label == "实时数据 · 价格与活动"
-    assert price_ev.topic == ev.topic_for_price("i_555")
+    assert price_ev.topic == PolicyKey.PROMOTIONS.value  # 和店铺满减政策比较（§5.2.1）
     assert PriceInfo.model_validate(price_ev.data["price"]).promotions == ["店铺满 199 减 20"]
     assert "售价 259.00 元" in price_ev.content
     assert "当前没有活动" in env.collect(Intent.PRICE_PROMO, item_id="i_888").evidences[0].content
@@ -362,3 +369,172 @@ def test_evidence_contents_contain_no_pii(env):
             blob = e.content + json.dumps(e.data, ensure_ascii=False)
             for secret in (phone, addr, "3301"):
                 assert secret not in blob, (e.id, secret)
+
+
+# ---------------------------------------------------------------- 实时数据覆盖同主题说法（§5.2.1）
+
+
+def _lower(source: EvidenceSource, eid: str, content: str, topic: str) -> Candidate:
+    return Candidate(Evidence(id=eid, source=source, label=eid, content=content, topic=topic))
+
+
+def test_price_evidence_overrides_contradicting_promotions_policy(env):
+    """价格与活动证据的主题是 promotions：和店铺满减政策冲突时（i_888 当前没有活动），
+    政策被实时数据覆盖；一致时（i_555 参加满减）两者都保留。走真实的 provider 和冲突处理。"""
+    policy = env.w.policy_map(SHOP_A)[PolicyKey.PROMOTIONS.value].value
+    promo = _lower(EvidenceSource.POLICY, "policy:promotions", policy, PolicyKey.PROMOTIONS.value)
+    for item_id, expected_lost in (("i_888", ["policy:promotions"]), ("i_555", [])):
+        bundle = env.collect(Intent.PRICE_PROMO, item_id=item_id)
+        price_ev = bundle.get(ev.tool_price(item_id))
+        assert price_ev is not None and price_ev.topic == PolicyKey.PROMOTIONS.value
+        _, lost = resolve_conflicts([Candidate.of(price_ev), promo])
+        assert lost == expected_lost, item_id
+
+
+def test_not_returnable_eligibility_overrides_contradicting_faq(env):
+    """订单不能无理由退时，退换资格证据（主题 seven_day_return、否定说法）覆盖
+    "支持七天无理由退货"的 FAQ；可以退时不覆盖（政策原文里的否定词不能误删一致的 FAQ）。"""
+    faq = _lower(
+        EvidenceSource.FAQ,
+        "faq:99",
+        "问：能退货吗\n答：亲，支持七天无理由退货哦",
+        PolicyKey.SEVEN_DAY_RETURN.value,
+    )
+    for buyer, order_id, expected_lost in (
+        (BUYER_R8, "o_1007", ["faq:99"]),  # 定制款
+        (BUYER_R5, "o_1005", ["faq:99"]),  # 签收 23 天
+        (BUYER_R3, "o_1004", []),  # 签收 5 天，可以退
+    ):
+        bundle = env.collect(Intent.RETURN_POLICY, order_id=order_id, buyer_ref=buyer)
+        ret = bundle.get(ev.tool_return(order_id))
+        assert ret is not None
+        _, lost = resolve_conflicts([Candidate.of(ret), faq])
+        assert lost == expected_lost, order_id
+
+
+# ---------------------------------------------------------------- 过期缓存：获取时间与降级（§12.2）
+
+
+def test_stale_order_and_aftersale_keep_fetch_time_and_are_flagged():
+    env = Env(cached=True)
+    provider = DefaultToolEvidenceProvider(
+        env.gw,
+        env.w.policy_map,
+        DefaultLogisticsAdvisor(),
+        DefaultAfterSaleAdvisor(),
+        env.clock,
+        stale_after=timedelta(seconds=300),
+    )
+    needs = ev.needs_for(Intent.REFUND_PROGRESS)
+    ctx = make_context("退款什么时候到", env.w, buyer_ref=BUYER_REFUND)
+    fresh = provider.collect(ctx, Intent.REFUND_PROGRESS, needs)
+    fetched = env.clock.now()
+    assert fresh.unavailable == []
+    assert fresh.get(ev.tool_aftersale("as_2008")).fetched_at == fetched
+
+    # 4 分钟后：TTL 内命中缓存，不算降级，时间是当初的获取时间
+    env.clock.advance(minutes=4)
+    cached = provider.collect(ctx, Intent.REFUND_PROGRESS, needs)
+    assert cached.unavailable == []
+    assert cached.get(ev.tool_order("o_1012")).fetched_at == fetched
+
+    # 半小时后平台故障：过期缓存兜底，写原来的获取时间，并标降级（卡片提示客服核实）
+    env.clock.advance(minutes=26)
+    env.inner.fail_on = {"list_aftersales", "list_recent_orders", "get_order"}
+    stale = provider.collect(ctx, Intent.REFUND_PROGRESS, needs)
+    as_ev = stale.get(ev.tool_aftersale("as_2008"))
+    assert as_ev.fetched_at == fetched
+    assert RefundProgress.model_validate(as_ev.data["progress"]).as_of == fetched
+    assert stale.get(ev.tool_order("o_1012")).fetched_at == fetched
+    assert stale.unavailable == ["tool:order", "tool:aftersale"]
+
+
+def test_stale_order_card_is_flagged():
+    """会话理解给的订单卡片（经带缓存的网关取到）过期了：订单证据写原来的获取时间并标降级。"""
+    env = Env(cached=True)
+    provider = DefaultToolEvidenceProvider(
+        env.gw,
+        env.w.policy_map,
+        DefaultLogisticsAdvisor(),
+        DefaultAfterSaleAdvisor(),
+        env.clock,
+        stale_after=timedelta(seconds=300),
+    )
+    order = env.gw.get_order(SHOP_A, "o_1007")
+    fetched = env.clock.now()
+    env.clock.advance(hours=1)
+    ctx = make_context("能退吗", env.w, buyer_ref=BUYER_R8).model_copy(update={"order": order})
+    bundle = provider.collect(ctx, Intent.RETURN_POLICY, ev.needs_for(Intent.RETURN_POLICY))
+    assert bundle.get(ev.tool_order("o_1007")).fetched_at == fetched
+    assert bundle.get(ev.tool_return("o_1007")).fetched_at == fetched
+    assert bundle.unavailable == ["tool:order"]
+
+
+# ---------------------------------------------------------------- 库存：没定到 SKU 时逐个规格写
+
+
+def test_stock_without_sku_lists_out_of_stock_specs(env):
+    """买家问"M 码还有货吗"：对应黑色 M、白色 M 两个 SKU（会话理解定不到一个 SKU）：
+    整款合计"有货"会被当成 M 码有货，证据要写清哪些规格缺货。"""
+    for i, s in enumerate(env.w.stocks):
+        if s.item_id == "i_555":
+            qty = {"k_1": 0, "k_2": 3, "k_3": 0, "k_4": 0}[s.sku_id or ""]
+            env.w.stocks[i] = s.model_copy(update={"quantity": qty, "in_stock": qty > 0})
+    bundle = env.collect(Intent.STOCK, item_id="i_555")
+    [stock_ev] = bundle.evidences
+    assert stock_ev.id == ev.tool_stock("i_555")
+    assert stock_ev.topic == ev.topic_for_stock("i_555")
+    assert "有货，库存 3 件" not in stock_ev.content
+    assert "部分规格有货" in stock_ev.content
+    missing = stock_ev.content.split("暂时缺货：", 1)[1].split("；", 1)[0]
+    for spec in ("黑色 / M", "白色 / M", "白色 / S"):
+        assert spec in missing, stock_ev.content
+    assert "黑色 / L" not in missing
+    skus = [StockInfo.model_validate(s) for s in stock_ev.data["skus"]]
+    assert {s.sku_id: s.in_stock for s in skus} == {
+        "k_1": False,
+        "k_2": True,
+        "k_3": False,
+        "k_4": False,
+    }
+    assert StockInfo.model_validate(stock_ev.data["stock"]).in_stock is True
+
+
+def test_stock_without_sku_all_in_stock_keeps_summary(env):
+    for i, s in enumerate(env.w.stocks):
+        if s.item_id == "i_555":
+            env.w.stocks[i] = s.model_copy(update={"quantity": 5, "in_stock": True})
+    [stock_ev] = env.collect(Intent.STOCK, item_id="i_555").evidences
+    assert "有货，库存 20 件" in stock_ev.content and "缺货" not in stock_ev.content
+
+
+def test_stock_without_sku_per_sku_lookup_unavailable_is_labelled(env):
+    """按 SKU 查失败时只剩整款合计：写明是整款合计、没有区分规格，不能当成某个规格有货。"""
+    original = env.inner.get_stock
+
+    def flaky(shop_id, item_id, sku_id=None):
+        if sku_id is not None:
+            raise ToolUnavailable("限流（模拟）")
+        return original(shop_id, item_id, sku_id)
+
+    env.inner.get_stock = flaky  # type: ignore[method-assign]
+    [stock_ev] = env.collect(Intent.STOCK, item_id="i_555").evidences
+    assert "整款合计" in stock_ev.content and "未区分规格" in stock_ev.content
+
+
+# ---------------------------------------------------------------- 退货问题找订单要看当前商品
+
+
+def test_return_policy_order_must_contain_current_item(env):
+    """买家在看 i_888（没买过）问能不能退：不拿他别的订单（o_1010 牛仔裤）的退换资格。"""
+    bundle = env.collect(Intent.RETURN_POLICY, item_id="i_888", with_recent_orders=True)
+    assert bundle.evidences == []
+    assert bundle.missing == [] and bundle.clarify_question is None
+    # 买过当前商品：用含这件商品的那一单
+    bundle = env.collect(Intent.RETURN_POLICY, item_id="i_777", with_recent_orders=True)
+    assert bundle.ids() == [ev.tool_order("o_1010"), ev.tool_return("o_1010")]
+    bundle = env.collect(Intent.QUALITY_ISSUE, item_id="i_555", with_recent_orders=True)
+    assert bundle.get(ev.tool_order("o_1003")) is not None
+    # 没有当前商品：照旧按问题类型挑最近一单
+    bundle = env.collect(Intent.RETURN_POLICY, with_recent_orders=True)
+    assert bundle.get(ev.tool_return("o_1010")) is not None
