@@ -33,7 +33,7 @@ uv run pytest          # 跑测试
 uv run ruff check .    # lint
 ```
 
-基线：`uv run pytest` → `1 passed`。
+基线：`uv run pytest` → 见最近一次交付报告（T0 契约骨架完成时为 `25 passed`）。
 
 云端镜像自带 PostgreSQL 16 和 Redis 7，但默认不启动，需要时用 `service postgresql start` / `service redis-server start`；
 每个会话都要重新启动，数据不跨会话保留。
@@ -48,4 +48,13 @@ uv run ruff check .    # lint
 
 ## 选型记录
 
-（暂无）
+| 日期 | 组件 | 选择 | 原因 |
+|---|---|---|---|
+| 2026-09-28 | 数据模型 / 校验 | pydantic v2 | 标准会话格式、Jev 格式的请求响应、大模型 JSON 输出都要严格校验；类型即文档 |
+| 2026-09-28 | 配置 | PyYAML + pydantic | 方案 §6.6 的阈值本来就是 YAML；加载后按模型校验 |
+| 2026-09-28 | Web 框架 | FastAPI + uvicorn | 模式 C 独立话术助手和反馈、审核接口需要 HTTP；同步处理函数即可，和 pydantic 同源 |
+| 2026-09-28 | 数据库 | PostgreSQL 16 + psycopg 3 | 方案 §4.4、§10 按 PostgreSQL 设计；行级安全做租户隔离（§9.2）。沙箱没有 pgvector，向量先存 `REAL[]`、应用内算相似度（单店知识量小），平台 RDS 支持时再换 pgvector |
+| 2026-09-28 | 缓存 / 队列 | 暂不引入 Redis | MVP 只需要短时缓存，先用进程内实现，接口是 `core.ports.Cache`；多实例部署时再换 Redis |
+| 2026-09-28 | 并发模型 | 同步接口 | 核心接口都是同步的，简单、好测；投票等需要并行的地方在实现内部用线程池 |
+
+架构分层、模块归属和契约约定见 `docs/架构与分工.md`。
