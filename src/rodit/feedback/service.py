@@ -14,12 +14,19 @@
 留痕：每次操作写审计（actor = 客服子账号 / 商家），detail 只有 ID、类型、原因、相似度，
 不放买家原文和回答原文（§4.1 原则 6、§12.3 日志脱敏）。写进标注集、知识缺失、候选知识的买家问题
 和编辑后的回答都先做个人信息最小化（§5.3，见 minimize_text）。
+
+写到一半失败：先用比较后更新把推荐改成 SENT / EDITED_SENT / REJECTED（防重复反馈的"占位"），
+再写派生数据（标注、知识缺失、候选知识）和审计。后面任何一步失败，就把推荐记录退回展示中
+再抛出异常（补偿），客服重试能完整走一遍，派生数据和审计不会因为状态已改而永久丢失。
+重试时候选知识按内容去重；标注、知识缺失在"派生数据写成、审计失败"时可能多出一条（至少一次）。
 """
 
 from __future__ import annotations
 
+import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
@@ -73,6 +80,8 @@ _REALTIME_PREFIXES = tuple(
     )
 )
 _NOT_HUMAN = frozenset({"system", "bot", "auto"})
+
+_log = logging.getLogger(__name__)
 
 
 class FeedbackOutcome(BaseModel):
@@ -174,25 +183,26 @@ class FeedbackService:
                     }
                 )
             )
-            candidate, skipped = self._make_candidate(record, answer, now)
-            self._record(
-                AuditAction.FEEDBACK_EDITED,
-                actor,
-                record,
-                now,
-                edit_similarity=round(char_similarity(record.text, edited_text), 3),
-                candidate_id=candidate.id if candidate else None,
-                candidate_skipped=skipped,
-            )
-            if candidate is not None:
+            with self._undo_on_failure(record, updated):
+                candidate, skipped = self._make_candidate(record, answer, now)
                 self._record(
-                    AuditAction.KNOWLEDGE_CANDIDATE,
+                    AuditAction.FEEDBACK_EDITED,
                     actor,
                     record,
                     now,
-                    knowledge_id=candidate.id,
-                    item_id=candidate.item_id,
+                    edit_similarity=round(char_similarity(record.text, edited_text), 3),
+                    candidate_id=candidate.id if candidate else None,
+                    candidate_skipped=skipped,
                 )
+                if candidate is not None:
+                    self._record(
+                        AuditAction.KNOWLEDGE_CANDIDATE,
+                        actor,
+                        record,
+                        now,
+                        knowledge_id=candidate.id,
+                        item_id=candidate.item_id,
+                    )
             return FeedbackOutcome(record=updated, candidate=candidate, candidate_skipped=skipped)
 
     def record_rejected(
@@ -231,52 +241,53 @@ class FeedbackService:
                     }
                 )
             )
-            question = minimize_text(record.question_text) if record.question_text else None
-            gap: KnowledgeGap | None = None
-            label: LabeledSample | None = None
-            if reason == RejectReason.MISSING_KNOWLEDGE:
-                gap = KnowledgeGap(
-                    shop_id=record.shop_id,
-                    intent=record.intent,
-                    missing=_gap_marker(record),
-                    question_text=question,
-                    source="feedback",
-                    created_at=now,
-                )
-                self._feedback.add_gap(gap)
-            elif reason == RejectReason.WRONG_INTENT and question:
-                label = LabeledSample(
-                    shop_id=record.shop_id,
-                    text=question,
-                    predicted_intent=record.intent,
-                    true_intent=true_intent,
-                    source="feedback_reject",
-                    created_at=now,
-                )
-                self._feedback.add_label(label)
-            self._record(
-                AuditAction.FEEDBACK_REJECTED,
-                actor,
-                record,
-                now,
-                reason=reason.value,
-                true_intent=(
-                    true_intent.value
-                    if true_intent and reason == RejectReason.WRONG_INTENT
-                    else None
-                ),
-                evidence_ids=list(record.evidence_ids),
-                gap_missing=gap.missing if gap else None,
-                labeled=label is not None,
-            )
-            if reason == RejectReason.BAD_WORDING:
+            with self._undo_on_failure(record, updated):
+                question = minimize_text(record.question_text) if record.question_text else None
+                gap: KnowledgeGap | None = None
+                label: LabeledSample | None = None
+                if reason == RejectReason.MISSING_KNOWLEDGE:
+                    gap = KnowledgeGap(
+                        shop_id=record.shop_id,
+                        intent=record.intent,
+                        missing=_gap_marker(record),
+                        question_text=question,
+                        source="feedback",
+                        created_at=now,
+                    )
+                    self._feedback.add_gap(gap)
+                elif reason == RejectReason.WRONG_INTENT and question:
+                    label = LabeledSample(
+                        shop_id=record.shop_id,
+                        text=question,
+                        predicted_intent=record.intent,
+                        true_intent=true_intent,
+                        source="feedback_reject",
+                        created_at=now,
+                    )
+                    self._feedback.add_label(label)
                 self._record(
-                    AuditAction.FEEDBACK_BAD_WORDING,
+                    AuditAction.FEEDBACK_REJECTED,
                     actor,
                     record,
                     now,
-                    qa_scores=dict(record.qa_scores or {}),
+                    reason=reason.value,
+                    true_intent=(
+                        true_intent.value
+                        if true_intent and reason == RejectReason.WRONG_INTENT
+                        else None
+                    ),
+                    evidence_ids=list(record.evidence_ids),
+                    gap_missing=gap.missing if gap else None,
+                    labeled=label is not None,
                 )
+                if reason == RejectReason.BAD_WORDING:
+                    self._record(
+                        AuditAction.FEEDBACK_BAD_WORDING,
+                        actor,
+                        record,
+                        now,
+                        qa_scores=dict(record.qa_scores or {}),
+                    )
             return FeedbackOutcome(record=updated, gap=gap, label=label)
 
     # ------------------------------------------------------------ 商家审核候选知识
@@ -357,6 +368,27 @@ class FeedbackService:
         except ConcurrencyConflict as exc:
             raise ActionNotAllowed(f"推荐 {record.id} 的状态已经变化，请刷新后再操作") from exc
 
+    @contextmanager
+    def _undo_on_failure(
+        self, original: SuggestionRecord, updated: SuggestionRecord
+    ) -> Iterator[None]:
+        """补偿：推荐状态已改、后面的派生数据或审计没写成时，把推荐记录整条退回原样（展示中）
+        再抛出原来的异常，让客服重试能完整走一遍。退回也是比较后更新：期间状态又变了就不动；
+        退回本身失败（如存储仍不可用）只记日志，抛原来的异常。日志只带推荐 ID 和异常类型：
+        数据库异常的文字可能带着绑定参数（买家问题、回答原文）。"""
+        try:
+            yield
+        except Exception:
+            try:
+                self._suggestions.update(original, expected_status=updated.status)
+            except Exception as undo_error:
+                _log.warning(
+                    "反馈没写完，推荐 %s 退回展示中也失败了（%s）",
+                    original.id,
+                    type(undo_error).__name__,
+                )
+            raise
+
     def _mark_sent(
         self, record: SuggestionRecord, actor: str, *, edited_unchanged: bool
     ) -> FeedbackOutcome:
@@ -364,25 +396,26 @@ class FeedbackService:
         updated = self._update_shown(
             record.model_copy(update={"status": SuggestionStatus.SENT, "agent_id": actor})
         )
-        label: LabeledSample | None = None
-        if record.question_text and not self._is_split_message(record):
-            label = LabeledSample(
-                shop_id=record.shop_id,
-                text=minimize_text(record.question_text),
-                predicted_intent=record.intent,
-                true_intent=record.intent,
-                source="feedback_adopt",
-                created_at=now,
+        with self._undo_on_failure(record, updated):
+            label: LabeledSample | None = None
+            if record.question_text and not self._is_split_message(record):
+                label = LabeledSample(
+                    shop_id=record.shop_id,
+                    text=minimize_text(record.question_text),
+                    predicted_intent=record.intent,
+                    true_intent=record.intent,
+                    source="feedback_adopt",
+                    created_at=now,
+                )
+                self._feedback.add_label(label)
+            self._record(
+                AuditAction.FEEDBACK_SENT,
+                actor,
+                record,
+                now,
+                edited_unchanged=edited_unchanged,
+                labeled=label is not None,
             )
-            self._feedback.add_label(label)
-        self._record(
-            AuditAction.FEEDBACK_SENT,
-            actor,
-            record,
-            now,
-            edited_unchanged=edited_unchanged,
-            labeled=label is not None,
-        )
         return FeedbackOutcome(record=updated, label=label)
 
     def _is_split_message(self, record: SuggestionRecord) -> bool:
