@@ -12,7 +12,7 @@ from psycopg import sql
 
 from rodit.adapters import StandaloneAssistAdapter, TaobaoMockAdapter
 from rodit.app import AssistService, build_unit
-from rodit.app.demo import _SUPPORTED_ACTIONS, _seed, taobao_event
+from rodit.app.demo import SUPPORTED_ACTIONS, seed_unit, taobao_event
 from rodit.app.offline import EvidenceEchoLLM, HeuristicQAJudge
 from rodit.app.production import postgres_repos
 from rodit.core.audit import AuditAction
@@ -64,14 +64,14 @@ def pg_service(e2e_pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AssistServic
         ],
         action_port=FakeActionPort(
             Platform.TAOBAO,
-            supported=_SUPPORTED_ACTIONS[Platform.TAOBAO],
+            supported=SUPPORTED_ACTIONS[Platform.TAOBAO],
             gateway=tools,
             clock=clock,
         ),
         route_provider=RuleProvider(),
         qa_provider=HeuristicQAJudge(),
     )
-    _seed(unit, world)  # 演示世界里的淘宝店铺（A、B）：店铺、授权（加密落库）、政策、商品、FAQ
+    seed_unit(unit, world)  # 演示世界里的淘宝店铺（A、B）：店铺、授权（加密落库）、政策、商品、FAQ
     return AssistService(unit)
 
 

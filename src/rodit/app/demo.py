@@ -40,15 +40,15 @@ from rodit.testing.fixtures import (
     build_demo_world,
 )
 
-# 拼多多没有查到拒绝售后接口（§7.1），写接口只支持同意
-_SUPPORTED_ACTIONS = {
+# 演示用写接口支持的售后操作；拼多多没有查到拒绝售后接口（§7.1），只支持同意
+SUPPORTED_ACTIONS = {
     Platform.TAOBAO: frozenset(AfterSaleAction),
     Platform.DOUYIN: frozenset(AfterSaleAction),
     Platform.PDD: frozenset({AfterSaleAction.AGREE_REFUND, AfterSaleAction.AGREE_RETURN}),
 }
 
 
-def _seed(unit: Unit, world: DemoWorld) -> None:
+def seed_unit(unit: Unit, world: DemoWorld) -> None:
     """只把本平台的店铺、政策、商品、FAQ 写进本单元（§9.1），并给每家店铺一份演示授权。"""
     repo = unit.repos.knowledge
     shop_ids = {s.id for s in world.shops.values() if s.platform == unit.platform}
@@ -109,7 +109,7 @@ def build_demo_unit(
     elif platform == Platform.DOUYIN:
         adapters.append(DouyinMockAdapter(tools, clock, hasher, access="B"))
     action_port = (
-        FakeActionPort(platform, supported=_SUPPORTED_ACTIONS[platform], gateway=tools, clock=clock)
+        FakeActionPort(platform, supported=SUPPORTED_ACTIONS[platform], gateway=tools, clock=clock)
         if with_action_port
         else None
     )
@@ -126,7 +126,7 @@ def build_demo_unit(
         route_provider=route_provider,
         qa_provider=qa_provider,
     )
-    _seed(unit, world)
+    seed_unit(unit, world)
     return unit
 
 
