@@ -5,13 +5,17 @@
     买家消息 → 按会话串行（§8.3 按 conversation_id 保证顺序；晚到的旧消息由引擎按顺序处理）
     → 问答引擎（去重、懂→找→写→判）→ 结果：
        影子模式：什么都不展示（§13.4）；
-       否则：侧边栏展示推荐（模式 B，§5.6）；
+       否则：侧边栏展示推荐（模式 B，§5.6）；展示失败只记日志，全自动照常往下走；
        auto_reply：由适配器发送（只有模式 A 的全自动能发），发送成功记为已发送；
        发送失败（ok=False 或抛错）→ 转人工（§12.2 全自动模式下任何故障由客服接管）；
        transfer_to_human：请适配器转人工（§5.7）；转人工失败记错误日志（需要人工跟进）。
-    客服 / 机器人回声 → 写进会话（§5.3 最近几轮对话；和反馈、自动回复写回的同一条回复不重复存）；
-    撤回 → 从会话里去掉那条消息（不再进上下文，原文不留）。
-客服操作（§5.8）：发送 / 编辑后发送 / 不合适 → 反馈闭环；发出去的文字写回会话，作为下一轮上下文。
+    客服 / 机器人回声 → 写进会话（§5.3 最近几轮对话；和反馈、自动回复写回的同一次发送不重复存，
+    见 _store_outgoing）；
+    撤回 → 从会话里去掉那条消息（不再进上下文，原文不留）；写不进去时抛给平台重推。
+客服操作（§5.8）：发送 / 编辑后发送 / 不合适 → 反馈闭环；发出去的文字写回会话，作为下一轮上下文
+（反馈已经记下后写回失败只记日志，不报失败——报了客服重试也会被拒）。
+发出的文字写回会话（回声、反馈写回、全自动写回）和撤回都持有这个会话的锁，查重和写入之间不会插进
+另一份记录。锁的顺序固定：先店铺处理闸，再会话锁。
 取消订购（§8.4）与处理互斥：按店铺的读写闸，处理消息、客服 / 商家操作是读方，取消订购是写方——
 等在途的处理做完、期间不开始新的，删完数据再放行（之后的事件授权检查不过）。
 商家操作：审核候选知识、看缺失知识、填政策问卷（附录 C）、看报表（§12.4）。
@@ -22,7 +26,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Iterator, Mapping
+import unicodedata
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -52,7 +57,9 @@ from rodit.core.models import (
     KnowledgeItem,
     StandardMessage,
     StoredMessage,
+    strip_control_chars,
 )
+from rodit.core.pii import mask_pii
 from rodit.core.ports import MessageRecall, PlatformAdapter
 from rodit.feedback import (
     AdoptionReport,
@@ -66,10 +73,45 @@ from rodit.knowledge import apply_questionnaire, describe_gap, find_gaps
 logger = logging.getLogger(__name__)
 
 REASON_SEND_FAILED = "全自动回复发送失败，转人工（§12.2）"
-# 同一次回复可能有两份记录（反馈 / 自动回复写回的、平台推回来的回声）：这个时间范围内文字相同的
-# 客服 / 机器人消息算同一条
+# 同一次发送可能有两份记录：写回的（反馈 agent:{推荐 id}、全自动没有平台消息 ID 时 bot:{推荐 id}）
+# 和平台推回来的回声（平台消息 ID）。两份相隔不超过这个时间、文字相同、中间没有买家消息才算同一次
 _OUTGOING_DEDUPE_WINDOW = timedelta(minutes=2)
 _OUTGOING_DEDUPE_SCAN = 20
+_MIRRORED_PREFIXES = ("agent:", "bot:")
+
+
+def _is_mirrored(msg_id: str) -> bool:
+    """写回的记录（不是平台消息 ID）。"""
+    return msg_id.startswith(_MIRRORED_PREFIXES)
+
+
+def _reply_key(text: str | None) -> str:
+    """比较两份记录是不是同一句话的形式：去掉控制字符、NFKC 归一、遮掉个人信息、合并空白。
+    回声是原文，写回的记录可能做过个人信息最小化（[手机号]、[地址]）、全半角不同，按这个形式两边一致。"""
+    cleaned = unicodedata.normalize("NFKC", strip_control_chars(text or ""))
+    return " ".join(mask_pii(cleaned).split())
+
+
+def _same_send(
+    recent: Sequence[StoredMessage], *, msg_id: str, text: str, at: datetime
+) -> StoredMessage | None:
+    """recent 里和这条（msg_id、text、at）属于同一次发送的另一份记录；没有返回 None。
+
+    只配"写回的 ↔ 平台回声"：两条平台消息、两条写回的记录永远是两条；中间隔着买家消息的
+    不是同一次发送。有几条可配时取最早的（按发送顺序一一对上）。
+    """
+    mirrored = _is_mirrored(msg_id)
+    key = _reply_key(text)
+    for m in recent:
+        if m.role == Role.BUYER or _is_mirrored(m.msg_id) == mirrored:
+            continue
+        if abs(m.created_at - at) > _OUTGOING_DEDUPE_WINDOW or _reply_key(m.text) != key:
+            continue
+        lo, hi = sorted((m.created_at, at))
+        if any(b.role == Role.BUYER and lo < b.created_at < hi for b in recent):
+            continue
+        return m
+    return None
 
 
 @dataclass
@@ -206,29 +248,33 @@ class AssistService:
             return None
 
     def _record_echo(self, echo: StoredMessage) -> None:
-        """客服手打的回复（没用推荐）只能从回声里拿到：写进会话，作为最近几轮对话（§5.3）。"""
+        """客服手打的回复（没用推荐）只能从回声里拿到：写进会话，作为最近几轮对话（§5.3）。
+        调用方已持有店铺处理闸；这里再取会话锁（和反馈写回、全自动写回串行）。"""
         if echo.role == Role.BUYER or not (echo.text or "").strip():
             return
-        try:
-            self._store_outgoing(
-                shop_id=echo.shop_id,
-                conversation_id=echo.conversation_id,
-                msg_id=echo.msg_id,
-                role=echo.role,
-                text=echo.text or "",
-                at=echo.created_at,
-            )
-        except Exception as exc:  # noqa: BLE001 — 存不进去只少一轮上下文，不影响平台推送
-            logger.warning("客服回声写入会话失败（%s）", type(exc).__name__)
+        with self._locks.hold((echo.shop_id, echo.conversation_id)):
+            try:
+                self._store_outgoing(
+                    shop_id=echo.shop_id,
+                    conversation_id=echo.conversation_id,
+                    msg_id=echo.msg_id,
+                    role=echo.role,
+                    text=echo.text or "",
+                    at=echo.created_at,
+                )
+            except Exception as exc:  # noqa: BLE001 — 存不进去只少一轮上下文，不影响平台推送
+                logger.warning("客服回声写入会话失败（%s）", type(exc).__name__)
 
     def _record_recall(self, recall: MessageRecall) -> None:
-        """买家撤回：那条消息不再进上下文，原文不留（§5.3、§12.3 最小化）。"""
-        try:
+        """撤回：那条消息不再进上下文，原文不留（§5.3、§12.3 最小化）。
+
+        写不进去时异常向外抛（平台收到失败会重推；适配器不按 msg_id 挡掉重推的撤回，
+        recall_message 本身是幂等的）。持有会话锁：回声正在接替写回的记录时，等它换完再撤回。
+        """
+        with self._locks.hold((recall.shop_id, recall.conversation_id)):
             self.unit.repos.conversations.recall_message(
                 recall.shop_id, recall.conversation_id, recall.recalled_msg_id
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("撤回写入会话失败（%s）", type(exc).__name__)
 
     def ask_standalone(
         self,
@@ -274,7 +320,7 @@ class AssistService:
             if result is None:
                 return None
             if result.mode != Mode.SHADOW:
-                adapter.show_suggestions(msg.shop_id, msg.conversation_id, result.suggestions)
+                self._show(adapter, msg, result)
             reason = result.no_suggestion_reason or "转人工"
             if result.auto_reply is not None and result.mode == Mode.AUTO:
                 if not self._send_auto_reply(adapter, msg, result):
@@ -284,6 +330,19 @@ class AssistService:
             if result.transfer_to_human:
                 self._transfer(adapter, msg, reason)
             return result
+
+    def _show(self, adapter: PlatformAdapter, msg: StandardMessage, result: EngineResult) -> None:
+        """把推荐推到侧边栏 / 工作台。失败不抛给平台：消息已经存下，重推会被去重；
+        全自动照常发送（发送失败再转人工，§12.2），智能辅助下客服本来就在接待。"""
+        try:
+            adapter.show_suggestions(msg.shop_id, msg.conversation_id, result.suggestions)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "推荐展示失败（%s）：店铺 %s 会话 %s",
+                type(exc).__name__,
+                msg.shop_id,
+                msg.conversation_id,
+            )
 
     def _transfer(self, adapter: PlatformAdapter, msg: StandardMessage, reason: str) -> None:
         try:
@@ -309,7 +368,7 @@ class AssistService:
         self, adapter: PlatformAdapter, msg: StandardMessage, result: EngineResult
     ) -> bool:
         """发送全自动回复；发出去了返回 True。发送失败（ok=False、接入模式不能发、抛错）返回
-        False，推荐记录保持 SHOWN，留给接手的客服。"""
+        False，推荐记录保持 SHOWN，留给接手的客服。调用方（_process）已持有会话锁。"""
         reply = result.auto_reply
         assert reply is not None
         try:
@@ -359,20 +418,26 @@ class AssistService:
     ) -> bool:
         """客服 / 机器人发出的文字写回会话（§5.3 多轮上下文）。存了返回 True。
 
-        同一条回复可能有两份记录：客服点发送时的反馈（msg_id 为 agent:{推荐 id}）或全自动发送，
-        和平台推回来的回声（平台消息 ID）。按 msg_id 去重之外，_OUTGOING_DEDUPE_WINDOW 内已有
-        文字相同的客服 / 机器人消息时也不再存。
+        调用方必须持有这个会话的锁（self._locks，不可重入，所以不在这里取）：查重和写入之间
+        不能插进同一次发送的另一份记录。
+        同一次发送最多两份记录：写回的（反馈 agent:{推荐 id}、全自动没有平台消息 ID 时
+        bot:{推荐 id}）和平台回声（平台消息 ID），只有这两份之间去重（见 _same_send）：
+        - 回声先到：写回的不再存；
+        - 写回的先到：回声接替它——先撤回写回的那条，再按平台消息 ID 存回声的原文和时间
+          （角色沿用写回的，机器人仍记为机器人），之后撤回这个平台消息 ID 能找到它。
+        按原文比较会受脱敏影响，比较用 _reply_key。
         """
         repo = self.unit.repos.conversations
-        body = text.strip()
         recent = repo.recent_messages(shop_id, conversation_id, limit=_OUTGOING_DEDUPE_SCAN)
-        for m in recent:
-            if (
-                m.role != Role.BUYER
-                and (m.text or "").strip() == body
-                and abs(m.created_at - at) <= _OUTGOING_DEDUPE_WINDOW
-            ):
+        if any(m.msg_id == msg_id for m in recent):
+            return False
+        twin = _same_send(recent, msg_id=msg_id, text=text, at=at)
+        if twin is not None:
+            if _is_mirrored(msg_id):
                 return False
+            # 先撤回写回的那条（原文不留两份；这一步之后失败最多少一轮上下文），再存回声
+            repo.recall_message(shop_id, conversation_id, twin.msg_id)
+            role = twin.role
         return repo.add_outgoing(
             shop_id=shop_id,
             conversation_id=conversation_id,
@@ -385,16 +450,24 @@ class AssistService:
     # ================================================================ 客服反馈（§5.8）
 
     def _mirror_agent_reply(self, outcome: FeedbackOutcome, text: str) -> None:
-        """客服发出的文字写回会话，作为下一轮的多轮上下文（§5.3）。回声已经先到时不重复存。"""
+        """客服发出的文字写回会话，作为下一轮的多轮上下文（§5.3）。回声已经先到时不重复存。
+
+        反馈（状态、标注、审计）已经记下了：写回失败只记日志、不抛——抛出去客服会按提示重试，
+        而重试会被拒（推荐已不在展示中）；少这一轮上下文和回声写不进去一样，不影响下一轮出推荐。
+        """
         record = outcome.record
-        self._store_outgoing(
-            shop_id=record.shop_id,
-            conversation_id=record.conversation_id,
-            msg_id=f"agent:{record.id}",
-            role=Role.AGENT,
-            text=text,
-            at=self.unit.clock.now(),
-        )
+        with self._locks.hold((record.shop_id, record.conversation_id)):
+            try:
+                self._store_outgoing(
+                    shop_id=record.shop_id,
+                    conversation_id=record.conversation_id,
+                    msg_id=f"agent:{record.id}",
+                    role=Role.AGENT,
+                    text=text,
+                    at=self.unit.clock.now(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("客服回复写回会话失败（%s）", type(exc).__name__)
 
     def feedback_sent(self, shop_id: str, suggestion_id: int, *, agent_id: str) -> FeedbackOutcome:
         with self._gate.processing(shop_id):
@@ -409,8 +482,9 @@ class AssistService:
             outcome = self.unit.feedback.record_edited(
                 shop_id, suggestion_id, agent_id=agent_id, edited_text=edited_text
             )
-            sent_text = outcome.record.edited_text or outcome.record.text
-            self._mirror_agent_reply(outcome, sent_text)
+            # 写回实际发出去的文字（回声也是原文）；反馈记录里的 edited_text 做过个人信息最小化，
+            # 是给候选知识和标注用的。会话里的消息都存原文，进提示词时再脱敏（§5.3）
+            self._mirror_agent_reply(outcome, strip_control_chars(edited_text).strip())
             return outcome
 
     def feedback_rejected(
@@ -451,11 +525,16 @@ class AssistService:
     def apply_questionnaire(self, shop_id: str, answers: Mapping[int, str]) -> dict[str, Any]:
         """店铺政策问卷（附录 C）：写入政策，合并店铺配置覆盖项。"""
         repo = self.unit.repos.knowledge
+        # 店铺配置用 model_copy 更新（不走模型边界的清洗）：回答先去掉 NUL 等控制字符，
+        # 否则 PostgreSQL 的 JSONB 写不进去（内存实现照存，两种实现不一致）
+        cleaned = {
+            k: strip_control_chars(v) if isinstance(v, str) else v for k, v in answers.items()
+        }
         with self._gate.processing(shop_id):  # 读改写不能跨过取消订购（否则会把删掉的店铺写回来）
             shop = repo.get_shop(shop_id)
             if shop is None:
                 raise KeyError(shop_id)
-            entries, patch = apply_questionnaire(shop_id, dict(answers), self.unit.clock.now())
+            entries, patch = apply_questionnaire(shop_id, cleaned, self.unit.clock.now())
             for entry in entries:
                 repo.upsert_policy(entry)
             if patch:

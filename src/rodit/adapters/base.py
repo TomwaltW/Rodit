@@ -305,7 +305,8 @@ class BaseMockAdapter:
 
     def on_event(self, raw: dict) -> StandardMessage | StoredMessage | MessageRecall | None:
         """on_message 的完整版（core.ports.PlatformAdapter.on_event）：买家消息 → StandardMessage；
-        客服 / 机器人回声 → StoredMessage（role=AGENT）；撤回 → MessageRecall；其余返回 None。"""
+        客服 / 机器人回声 → StoredMessage（role=AGENT）；撤回 → MessageRecall；其余返回 None。
+        买家消息、回声按 msg_id 去重；撤回是幂等的，重推照样交出（应用层写失败时靠重推补上）。"""
         if not isinstance(raw, Mapping):
             return None
         try:
@@ -566,12 +567,13 @@ class BaseMockAdapter:
         return stored.model_copy()
 
     def _accept_recall(self, event: RawEvent) -> MessageRecall | None:
+        """撤回不按 msg_id 挡掉重推：应用层写会话失败时抛错让平台重推，这里要照样交出去。
+        撤回本身是幂等的（本地上下文再删一次没有变化；ConversationRepository.recall_message
+        对已经撤回的消息返回 False）。"""
         recalled = opt_str(event.recalled_msg_id)
         if recalled is None:
             return None
         with self._lock:
-            if not self._first_time(event.shop_id, event.msg_id):
-                return None
             conv = self._conversation(event.shop_id, event.conversation_id)
             if conv is not None:
                 kept = [m for m in conv.messages if m.msg_id != recalled]
