@@ -253,7 +253,7 @@ def test_state_builders_follow_doc_shape_and_mask_pii():
         "title": "法式碎花连衣裙",
     }
     assert state["order_card"] == {"order_id": "o_1001", "status": "paid"}
-    assert state["messages"][-1] == {"role": "buyer", "text": "我手机 [手机号],165 110斤穿什么码"}
+    assert state["messages"][-1] == {"role": "buyer", "text": "我手机 [手机号]，165 110斤穿什么码"}
     assert "13812345678" not in json.dumps(state, ensure_ascii=False)
     assert BUYER not in json.dumps(state, ensure_ascii=False)
     from rodit.core.enums import DraftKind

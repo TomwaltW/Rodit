@@ -48,10 +48,13 @@ _COMMUNITY_CORE = re.compile(
     r"(?:栋|幢|号楼|座|号)"
 )
 _ADDRESS_TAIL = re.compile(
-    rf"^(?:\s*(?:{_NUM}\s*(?:栋|幢|号楼|座|单元|层|楼|室|号)|[A-Za-z]\s*座))+(?:\s*\d{{3,4}}(?!\d))?"
+    rf"^(?:(?:\s*(?:{_NUM}\s*(?:栋|幢|号楼|座|单元|层|楼|室|号)|[A-Za-z]\s*座))+"
+    r"(?:\s*\d{3,4}(?!\d))?|\s*\d{3,4}(?!\d))"
 )
-# 地址前面常见的引导词：不属于地址，向前吸收时遇到就停
-_ADDRESS_STOP = set("改址到在住是成寄送发收为我的给往换填写：:，,。 \t\n")
+# 地址前面常见的引导词：不属于地址。_CUT_STOP 用来剪掉被正则吃进来的引导词（不含空白：
+# 空白只会出现在门牌号附近，属于地址本身）；_EXPAND_STOP 用来决定向前吸收省市区时在哪里停。
+_CUT_STOP = set("改址到在住是成寄送发收为我的给往换填写：:，,。")
+_EXPAND_STOP = _CUT_STOP | set(" \t\n\u3000")
 _MAX_PREFIX = 12
 
 
@@ -84,80 +87,114 @@ def _id_card_ok(s: str) -> bool:
     return s[17].upper() == check
 
 
-def _mask_long_digits(text: str) -> str:
-    def repl(m: re.Match[str]) -> str:
+_Span = tuple[int, int, str]  # 归一化文本上的 [start, end) 和替换文字
+
+
+def _normalize_with_map(text: str) -> tuple[str, list[int]]:
+    """逐字做 NFKC 归一，记录归一化文本每个字符对应的原文位置（用于把遮盖映射回原文）。"""
+    chars: list[str] = []
+    index: list[int] = []
+    for i, ch in enumerate(text):
+        for c in unicodedata.normalize("NFKC", ch):
+            chars.append(c)
+            index.append(i)
+    return "".join(chars), index
+
+
+def _long_digit_spans(norm: str) -> list[_Span]:
+    spans: list[_Span] = []
+    for m in _LONG_DIGITS.finditer(norm):
         s = m.group(0)
-        if _ORDER_HINT.search(text[max(0, m.start() - 8) : m.start()]):
-            return s  # 订单号、运单号保留
+        if _ORDER_HINT.search(norm[max(0, m.start() - 8) : m.start()]):
+            continue  # 订单号、运单号保留
         if len(s) == 18 and _id_card_ok(s):
-            return ID_MASK
-        if s.isdigit() and 16 <= len(s) <= 19 and _luhn_ok(s):
-            return CARD_MASK
-        return s
-
-    return _LONG_DIGITS.sub(repl, text)
+            spans.append((m.start(), m.end(), ID_MASK))
+        elif s.isdigit() and 16 <= len(s) <= 19 and _luhn_ok(s):
+            spans.append((m.start(), m.end(), CARD_MASK))
+    return spans
 
 
-def _mask_addresses(text: str) -> str:
-    spans: list[tuple[int, int]] = []
+def _address_spans(norm: str) -> list[_Span]:
+    raw: list[tuple[int, int]] = []
     for pattern in (_STREET_CORE, _COMMUNITY_CORE):
-        for m in pattern.finditer(text):
+        for m in pattern.finditer(norm):
             start, end = m.start(), m.end()
-            # 去掉被正则吃进来的引导词（如"住幸福里小区""地址到西湖区"）：从最后一个引导字之后开始
-            core = text[start:end]
-            cut = max((i for i, ch in enumerate(core[:9]) if ch in _ADDRESS_STOP), default=-1)
+            # 剪掉被正则吃进来的引导词（如"住幸福里小区""地址到西湖区"）：只看门牌数字之前的部分
+            core = norm[start:end]
+            digit = re.search(r"\d", core)
+            limit = digit.start() if digit else len(core)
+            cut = max((i for i, ch in enumerate(core[:limit]) if ch in _CUT_STOP), default=-1)
             start += cut + 1
-            # 向前吸收省、市、区等（最多 _MAX_PREFIX 个字，遇到引导词停）
+            # 向前吸收省、市、区等（最多 _MAX_PREFIX 个字，遇到引导词或空白停）
             steps = 0
             while start > 0 and steps < _MAX_PREFIX:
-                ch = text[start - 1]
-                if ch in _ADDRESS_STOP or not ("一" <= ch <= "龥"):
+                ch = norm[start - 1]
+                if ch in _EXPAND_STOP or not ("\u4e00" <= ch <= "\u9fa5"):
                     break
                 start -= 1
                 steps += 1
-            tail = _ADDRESS_TAIL.match(text[end:])
+            tail = _ADDRESS_TAIL.match(norm[end:])
             if tail:
                 end += tail.end()
-            spans.append((start, end))
-    if not spans:
-        return text
-    spans.sort()
-    merged: list[tuple[int, int]] = [spans[0]]
-    for s, e in spans[1:]:
-        if s <= merged[-1][1]:
+            raw.append((start, end))
+    raw.sort()
+    merged: list[tuple[int, int]] = []
+    for s, e in raw:
+        if merged and s <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
             merged.append((s, e))
-    out, last = [], 0
-    for s, e in merged:
-        out.append(text[last:s])
-        out.append(ADDRESS_MASK)
-        last = e
+    return [(s, e, ADDRESS_MASK) for s, e in merged]
+
+
+def _find_spans(norm: str) -> list[_Span]:
+    """按优先级收集要遮的片段，重叠的只保留优先级高的：
+    邮箱 → 微信 / QQ 号 → 长数字（证件号、银行卡；订单号保留）→ 手机 → 座机 → 地址。"""
+    groups: list[list[_Span]] = [
+        [(m.start(), m.end(), EMAIL_MASK) for m in _EMAIL.finditer(norm)],
+        [(m.start(2), m.end(2), CONTACT_MASK) for m in _IM_ID.finditer(norm)],
+        _long_digit_spans(norm),
+        [(m.start(), m.end(), PHONE_MASK) for m in _MOBILE.finditer(norm)],
+        [(m.start(), m.end(), PHONE_MASK) for m in _LANDLINE.finditer(norm)],
+        _address_spans(norm),
+    ]
+    accepted: list[_Span] = []
+    for group in groups:
+        for span in group:
+            if all(span[1] <= a[0] or span[0] >= a[1] for a in accepted):
+                accepted.append(span)
+    return sorted(accepted)
+
+
+def mask_pii(text: str) -> str:
+    """遮掉文本里的个人信息。
+
+    匹配在 NFKC 归一化后的文本上做（全角数字、字母也能识别），替换落回原文：
+    没有被遮的部分保持原样（中文全角标点不变），同一段文本重复调用结果不变。
+    """
+    if not text:
+        return text
+    norm, index = _normalize_with_map(text)
+    spans = _find_spans(norm)
+    if not spans:
+        return text
+    out: list[str] = []
+    last = 0
+    for s, e, token in spans:
+        orig_start, orig_end = index[s], index[e - 1] + 1
+        out.append(text[last:orig_start])
+        out.append(token)
+        last = orig_end
     out.append(text[last:])
     return "".join(out)
 
 
-def mask_pii(text: str) -> str:
-    """遮掉文本里的个人信息，返回 NFKC 归一后的文本（全角数字、字母会变成半角）。
-
-    顺序：邮箱 → 微信 / QQ 号 → 长数字（证件号、银行卡；订单号保留）→ 手机 → 座机 → 地址。
-    """
-    if not text:
-        return text
-    out = unicodedata.normalize("NFKC", text)
-    out = _EMAIL.sub(EMAIL_MASK, out)
-    out = _IM_ID.sub(lambda m: m.group(1) + CONTACT_MASK, out)
-    out = _mask_long_digits(out)
-    out = _MOBILE.sub(PHONE_MASK, out)
-    out = _LANDLINE.sub(PHONE_MASK, out)
-    out = _mask_addresses(out)
-    return out
-
-
 def contains_pii(text: str) -> bool:
-    """文本里是否有会被 mask_pii 遮掉的个人信息（忽略 NFKC 归一带来的变化）。"""
-    norm = unicodedata.normalize("NFKC", text or "")
-    return mask_pii(norm) != norm
+    """文本里是否有会被 mask_pii 遮掉的个人信息。"""
+    if not text:
+        return False
+    norm, _ = _normalize_with_map(text)
+    return bool(_find_spans(norm))
 
 
 # ---------------------------------------------------------------- buyer_ref

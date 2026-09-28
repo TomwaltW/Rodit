@@ -474,7 +474,7 @@ def test_missing_knowledge_gives_no_suggestion_and_records_gap(kit: Kit) -> None
     assert gap.missing == "policy:invoice"
     assert gap.intent == Intent.INVOICE_GIFT
     assert gap.source == "engine"
-    assert gap.question_text == "能开发票吗?我电话 [手机号]"  # mask_pii 做了 NFKC 归一
+    assert gap.question_text == "能开发票吗？我电话 [手机号]"  # 只遮个人信息，原文标点保留
     assert gap.created_at == kit.clock.now()
     assert kit.result_events()[0].detail["missing"] == ["policy:invoice"]
 
