@@ -18,6 +18,9 @@
 - 训练导出任务：单独的登录角色，只 GRANT rodit_trainer（见 schema.sql 开头的说明）。
 - 授权令牌在应用里加解密（PgShopAuthRepository），密钥和明文令牌不作为查询参数发给数据库，
   数据库的语句日志 / 慢查询日志里不会出现它们。
+- 请求用的 Database 要设 statement_timeout_ms / lock_timeout_ms（生产组装从环境变量读，
+  见 rodit.app.production）：库的默认值是不限时，语句被锁住或存储卡住时请求线程会一直挂着，
+  "超时 → KnowledgeUnavailable → 不推荐"（§12.2）也就触发不了。迁移用的连接不设。
 """
 
 from __future__ import annotations
@@ -86,6 +89,9 @@ class Database:
       （登录角色本身就是受行级安全约束的应用角色，或测试里用管理员身份直接读写）。
     - trainer_role：export 训练数据时切换的角色（session(None, trainer=True)）。
     - statement_timeout_ms：每个事务的语句超时（§12.1 检索 ≤ 0.5 秒），None 用库的默认值。
+    - lock_timeout_ms：每个事务等锁的上限（被清理、迁移等长事务挡住时尽快报错降级），
+      None 用库的默认值。超时都抛 psycopg.OperationalError 的子类，知识库仓储转成
+      KnowledgeUnavailable。
     """
 
     def __init__(
@@ -96,16 +102,28 @@ class Database:
         trainer_role: str | None = TRAINER_ROLE,
         connect_timeout_s: int = 5,
         statement_timeout_ms: int | None = None,
+        lock_timeout_ms: int | None = None,
     ) -> None:
         if not dsn:
             raise ValueError("数据库连接串不能为空")
         if statement_timeout_ms is not None and statement_timeout_ms <= 0:
             raise ValueError("statement_timeout_ms 必须为正数")
+        if lock_timeout_ms is not None and lock_timeout_ms <= 0:
+            raise ValueError("lock_timeout_ms 必须为正数")
         self._dsn = dsn
         self.app_role = app_role
         self.trainer_role = trainer_role
         self._connect_timeout_s = connect_timeout_s
         self._statement_timeout_ms = statement_timeout_ms
+        self._lock_timeout_ms = lock_timeout_ms
+
+    @property
+    def statement_timeout_ms(self) -> int | None:
+        return self._statement_timeout_ms
+
+    @property
+    def lock_timeout_ms(self) -> int | None:
+        return self._lock_timeout_ms
 
     def __repr__(self) -> str:  # 连接串可能含密码，不出现在日志里
         return f"Database(app_role={self.app_role!r}, dsn=***)"
@@ -145,11 +163,12 @@ class Database:
             if role is not None:
                 conn.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(role)))
             conn.execute("SELECT set_config(%s, %s, true)", (SHOP_SETTING, shop_id or ""))
-            if self._statement_timeout_ms is not None:
-                conn.execute(
-                    "SELECT set_config('statement_timeout', %s, true)",
-                    (str(self._statement_timeout_ms),),
-                )
+            for setting, value in (
+                ("statement_timeout", self._statement_timeout_ms),
+                ("lock_timeout", self._lock_timeout_ms),
+            ):
+                if value is not None:
+                    conn.execute("SELECT set_config(%s, %s, true)", (setting, str(value)))
             yield conn
 
     # ---------------------------------------------------------------- 迁移

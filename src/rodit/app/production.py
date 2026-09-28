@@ -8,11 +8,13 @@
   沙箱里调不通开放平台接口（CLAUDE.md：平台接口一律 mock），本仓库只有模拟实现。
 
 环境变量：RODIT_DATABASE_DSN、RODIT_TOKEN_KEY、RODIT_BUYER_SALT、
-RODIT_LLM_BASE_URL、RODIT_LLM_MODEL、RODIT_LLM_API_KEY、RODIT_LLM_TIMEOUT_S（可选）。
+RODIT_LLM_BASE_URL、RODIT_LLM_MODEL、RODIT_LLM_API_KEY、RODIT_LLM_TIMEOUT_S（可选）、
+RODIT_DB_STATEMENT_TIMEOUT_MS / RODIT_DB_LOCK_TIMEOUT_MS（可选，数据库语句 / 等锁超时，毫秒）。
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 
 from rodit.app.unit import Repos, Unit, build_unit
@@ -33,6 +35,36 @@ from rodit.storage import (
     PgSuggestionRepository,
 )
 
+DEFAULT_STATEMENT_TIMEOUT_MS = 2000
+"""请求用连接的语句超时。检索的目标是 ≤ 0.5 秒（§12.1），这里是兜底上限：远低于端到端 5 秒，
+超时就按知识库 / 存储故障降级（§12.2），不让请求线程一直挂着。"""
+DEFAULT_LOCK_TIMEOUT_MS = 1000
+"""请求用连接的等锁上限：被清理店铺数据、迁移等长事务挡住时尽快报错降级。"""
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise ValueError(f"环境变量 {name} 必须是正整数（毫秒），现在是 {raw!r}")
+    return value
+
+
+def production_database(dsn_env: str = "RODIT_DATABASE_DSN") -> Database:
+    """请求用的数据库：连接串、语句超时、等锁超时都从环境变量读（后两者有默认值）。"""
+    return Database.from_env(
+        dsn_env,
+        statement_timeout_ms=_positive_int_env(
+            "RODIT_DB_STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS
+        ),
+        lock_timeout_ms=_positive_int_env("RODIT_DB_LOCK_TIMEOUT_MS", DEFAULT_LOCK_TIMEOUT_MS),
+    )
+
 
 def postgres_repos(db: Database, *, clock: Clock, token_env: str = "RODIT_TOKEN_KEY") -> Repos:
     """一个单元的 PostgreSQL 仓储。令牌加密密钥从环境变量读（§8.4 令牌加密存储）。"""
@@ -48,7 +80,8 @@ def postgres_repos(db: Database, *, clock: Clock, token_env: str = "RODIT_TOKEN_
 
 
 def migrate(dsn_env: str = "RODIT_DATABASE_DSN") -> list[int]:
-    """部署步骤：以数据库属主身份建表、建角色、开行级安全（幂等）。返回本次应用的版本号。"""
+    """部署步骤：以数据库属主身份建表、建角色、开行级安全（幂等）。返回本次应用的版本号。
+    迁移可能比请求慢得多，不设请求级的语句 / 等锁超时。"""
     return Database.from_env(dsn_env).migrate()
 
 
@@ -66,7 +99,7 @@ def build_production_unit(
     MVP 只申请读权限（§8.4 最小权限），action_port 通常为空：售后审核只给建议。
     """
     clock = clock or SystemClock()
-    db = Database.from_env()
+    db = production_database()
     repos = postgres_repos(db, clock=clock)
     if config.llm.base_url and config.llm.model:
         client = OpenAICompatibleClient(
