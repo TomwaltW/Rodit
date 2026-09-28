@@ -71,3 +71,12 @@ def test_numbers_compare_by_value_not_spelling():
         "问：多少钱\n答：这款 259 元，满 199 减 20", reference=ref, same_topic=ref
     )
     assert ev.contradicts("问：多少钱\n答：这款 239 元", reference=ref, same_topic=ref)
+
+
+def test_everyday_words_are_not_courier_names():
+    """日常说法里的"天天""京东"不是快递公司，不和"默认发中通"冲突；真说了别的快递照常冲突。"""
+    ref = ["快递：默认发中通快递"]
+    assert not ev.contradicts("答：默认发中通，天天有车来揽收哦", reference=ref, same_topic=ref)
+    assert not ev.contradicts("答：默认发中通，比京东便宜哦", reference=ref, same_topic=ref)
+    assert ev.contradicts("答：默认发京东快递哦", reference=ref, same_topic=ref)
+    assert ev.contradicts("答：默认发顺丰哦", reference=ref, same_topic=ref)
