@@ -27,9 +27,15 @@ from rodit.core.enums import (
     Mode,
     RejectReason,
     Role,
+    ShopStatus,
     SuggestionStatus,
 )
-from rodit.core.errors import ActionNotAllowed, ConcurrencyConflict
+from rodit.core.errors import (
+    ActionNotAllowed,
+    ConcurrencyConflict,
+    ShopInactive,
+    TenantIsolationError,
+)
 from rodit.core.models import (
     AfterSaleReview,
     EngineResult,
@@ -58,16 +64,30 @@ class AssistService:
 
     # ================================================================ 买家消息
 
-    def handle_event(self, access: str, raw: Mapping[str, Any]) -> EngineResult | None:
+    def handle_event(
+        self, access: str, raw: Mapping[str, Any], *, expected_shop_id: str | None = None
+    ) -> EngineResult | None:
         """平台推送（模式 A）/ 插件上报（模式 B）的一条原始事件。不是买家消息、重复消息返回 None。
 
-        授权无效抛 AuthExpired（接口层映射成 403）；引擎本身不会因为 AI 故障抛错（§12.2）。
+        先不改状态地看事件属于哪家店（peek_shop_id），核对 expected_shop_id（调用方身份）和授权，
+        通过后才交给适配器处理——一个店铺的事件不能改动另一个店铺的状态（§9.2），
+        授权过期的店铺连去重记录都不留（§8.4）。
+        授权无效抛 AuthExpired；店铺不符抛 TenantIsolationError；
+        引擎本身不会因 AI 故障抛错（§12.2）。
         """
         adapter = self.unit.adapters.get(self.unit.platform, access)
-        msg = adapter.on_message(dict(raw))
+        event = dict(raw)
+        shop_id = adapter.peek_shop_id(event)
+        if shop_id is None:
+            return None
+        if expected_shop_id is not None and shop_id != expected_shop_id:
+            raise TenantIsolationError("事件不属于调用方的店铺")
+        self.unit.auth.require(shop_id)
+        msg = adapter.on_message(event)
         if msg is None:
             return None
-        self.unit.auth.require(msg.shop_id)
+        if msg.shop_id != shop_id:  # 适配器实现不一致时兜底
+            raise TenantIsolationError("事件解析前后店铺不一致")
         return self._process(adapter, msg)
 
     def ask_standalone(
@@ -85,6 +105,9 @@ class AssistService:
         adapter = self.unit.adapters.get(self.unit.platform, "C")
         if not isinstance(adapter, StandaloneAssistAdapter):
             raise ActionNotAllowed("本单元没有配置模式 C 独立话术助手")
+        shop = self.unit.repos.knowledge.get_shop(shop_id)
+        if shop is None or shop.status == ShopStatus.SUSPENDED:
+            raise ShopInactive(shop_id, shop.status if shop else None)
         raw: dict[str, Any] = {"shop_id": shop_id, "session_id": session_id, "question": question}
         for key, value in (
             ("item_id", item_id),

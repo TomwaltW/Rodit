@@ -16,9 +16,15 @@ from rodit.core.enums import (
     ReviewState,
     Role,
     RouteAction,
+    ShopStatus,
     SuggestionStatus,
 )
-from rodit.core.errors import ActionNotAllowed, AuthExpired
+from rodit.core.errors import (
+    ActionNotAllowed,
+    AuthExpired,
+    ShopInactive,
+    TenantIsolationError,
+)
 from rodit.testing.fixtures import AGENT, MANAGER, SHOP_A, SHOP_B, SHOP_C, SHOP_D
 
 
@@ -191,3 +197,46 @@ def test_demo_script_runs(capsys):
     assert main() == 0
     out = capsys.readouterr().out
     assert "§11.1" in out and "身高 160–165 cm" in out and "R6" in out
+
+
+def test_expired_auth_leaves_no_dedup_record(service: AssistService):
+    """§8.4 / §9.2：授权检查在适配器改状态之前；授权恢复后同一条消息仍能正常处理。"""
+    auth = service.unit.repos.auth.get(SHOP_A)
+    service.unit.repos.auth.delete(SHOP_A)
+    with pytest.raises(AuthExpired):
+        service.handle_event("B", _event("什么时候发货", 11))
+    adapter = service.unit.adapters.get(Platform.TAOBAO, "B")
+    assert adapter.get_context(SHOP_A, "conv_demo").recent_messages == []
+    service.unit.repos.auth.save(auth)
+    assert service.handle_event("B", _event("什么时候发货", 11)) is not None
+
+
+def test_event_for_other_shop_is_rejected_before_any_state_change(service: AssistService):
+    """§9.2：调用方身份和事件店铺不符时直接拒绝，不在另一个店铺留下去重或会话记录。"""
+    raw = _event("什么时候发货", 12, seller_id=SHOP_B)
+    with pytest.raises(TenantIsolationError):
+        service.handle_event("B", raw, expected_shop_id=SHOP_A)
+    adapter = service.unit.adapters.get(Platform.TAOBAO, "B")
+    assert adapter.get_context(SHOP_B, "conv_demo").recent_messages == []
+    assert service.unit.repos.audit.list_events(SHOP_B) == []
+    # 身份相符时正常处理（说明上面没被去重吃掉）
+    assert service.handle_event("B", raw, expected_shop_id=SHOP_B) is not None
+
+
+def test_unrecognizable_event_is_ignored(service: AssistService):
+    assert service.handle_event("B", {"foo": "bar"}) is None
+    assert service.handle_event("B", _event("在吗", 13, seller_id="")) is None
+
+
+@pytest.mark.parametrize("status", [None, ShopStatus.SUSPENDED])
+def test_standalone_rejects_missing_or_suspended_shop(status):
+    """模式 C 不需要平台授权，但店铺必须存在且没停用（§8.4）。"""
+    unit = build_demo_unit(Platform.TAOBAO)
+    service = AssistService(unit)
+    shop_id = "s_missing"
+    if status is not None:
+        shop_id = SHOP_A
+        shop = unit.repos.knowledge.get_shop(SHOP_A)
+        unit.repos.knowledge.upsert_shop(shop.model_copy(update={"status": status}))
+    with pytest.raises(ShopInactive):
+        service.ask_standalone(shop_id=shop_id, session_id="web_x", question="能开发票吗")

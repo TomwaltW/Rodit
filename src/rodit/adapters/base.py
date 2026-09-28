@@ -281,6 +281,18 @@ class BaseMockAdapter:
 
     # ------------------------------------------------------------ PlatformAdapter
 
+    def peek_shop_id(self, raw: dict) -> str | None:
+        """只解析、不改状态：事件所属店铺；不关心或无法识别的事件返回 None。"""
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            event = self._parse(raw)
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            return None
+        if event is None or not isinstance(event.shop_id, str) or not event.shop_id.strip():
+            return None
+        return event.shop_id
+
     def on_message(self, raw: dict) -> StandardMessage | None:
         """模式 A 平台推送 / 模式 B 插件上报 / 模式 C 网页工具提交 → 标准消息（§8.2、§8.3）。
 

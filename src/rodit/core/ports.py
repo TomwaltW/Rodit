@@ -240,6 +240,14 @@ class PlatformAdapter(Protocol):
 
     platform: Platform
 
+    def peek_shop_id(self, raw: dict) -> str | None:
+        """不改变任何状态地解析出事件所属店铺（不去重、不记上下文）；无法识别返回 None。
+
+        应用层在 on_message 之前用它核对店铺和授权，
+        避免一个店铺的事件改动另一个店铺的状态（§9.2）。
+        """
+        ...
+
     def on_message(self, raw: dict) -> StandardMessage | None: ...
 
     def get_context(self, shop_id: str, conversation_id: str) -> PlatformContext: ...

@@ -360,3 +360,18 @@ def test_concurrent_duplicates_are_accepted_once(plugin, tb):
         t.join()
     assert sum(r is not None for r in results) == 1
     assert len(plugin.get_context(SHOP_A, CONV).recent_messages) == 1
+
+
+def test_peek_shop_id_does_not_change_state(plugin, tb):
+    """peek_shop_id 只解析：不去重、不记上下文（应用层先用它核对店铺和授权，§9.2）。"""
+    raw = tb(msg_id="peek_1")
+    assert plugin.peek_shop_id(raw) == SHOP_A
+    assert plugin.peek_shop_id(raw) == SHOP_A
+    assert plugin.get_context(SHOP_A, CONV).recent_messages == []
+    assert plugin.on_message(raw) is not None  # 没被 peek 当成重复
+    assert plugin.on_message(raw) is None
+
+
+@pytest.mark.parametrize("raw", [None, [], "x", {}, {"seller_id": None}, {"seller_id": "  "}])
+def test_peek_shop_id_returns_none_for_unrecognizable_events(plugin, raw):
+    assert plugin.peek_shop_id(raw) is None

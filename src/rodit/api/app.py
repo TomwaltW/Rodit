@@ -22,7 +22,6 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, FastAPI, Path, Query, Request, Response
 from pydantic import AwareDatetime
 
-from rodit.adapters.base import BaseMockAdapter
 from rodit.api.auth import (
     CONSOLE_ROLES,
     HUMAN_ROLES,
@@ -185,20 +184,13 @@ def _review_view(service: AssistService, review: AfterSaleReview) -> AfterSaleRe
 def _event_shop_id(adapter: PlatformAdapter, raw: Mapping[str, Any]) -> str | None:
     """不改变适配器状态地解析出事件所属店铺；适配器不会处理的事件返回 None。
 
-    适配器实现了 peek_shop_id(raw) 就用它；模拟适配器（BaseMockAdapter）用它自己的解析函数
-    （纯函数，on_message 的第一步）。两者都没有时拒绝处理（无法在处理前核对店铺）。
+    用 PlatformAdapter.peek_shop_id（协议要求不改任何状态）；没有实现时拒绝处理
+    （无法在处理前核对店铺）。
     """
     peek = getattr(adapter, "peek_shop_id", None)
-    if callable(peek):
-        shop_id = peek(dict(raw))
-    elif isinstance(adapter, BaseMockAdapter):
-        try:
-            event = adapter._parse(raw)  # noqa: SLF001 — 见模块说明与回执 contract_issues
-        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
-            return None
-        shop_id = event.shop_id if event is not None else None
-    else:
+    if not callable(peek):
         raise TenantIsolationError(MSG_UNVERIFIABLE)
+    shop_id = peek(dict(raw))
     if not isinstance(shop_id, str) or not shop_id.strip():
         return None
     return shop_id
