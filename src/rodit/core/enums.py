@@ -196,13 +196,18 @@ class KnowledgeStatus(StrEnum):
 
 
 class EvidenceSource(StrEnum):
-    """证据来源；priority 越小优先级越高，冲突时高优先级覆盖低优先级（§5.2.1）。"""
+    """证据来源；priority 越小优先级越高，冲突时高优先级覆盖低优先级（§5.2.1）。
+
+    方案 §5.2.1 的五级之外加了"平台规则"（§5.1 modify_order / off_platform 的依据、
+    §7.3.1 申请售后指引和到账规则）：平台规则是硬约束，店铺政策不能覆盖，排在实时数据之后。
+    """
 
     REALTIME = "realtime"  # 1 实时接口：价格、库存、订单、物流、售后
-    POLICY = "policy"  # 2 店铺政策
-    ITEM = "item"  # 3 商品知识
-    FAQ = "faq"  # 4 FAQ 与优质回答
-    CATEGORY = "category"  # 5 类目通用知识
+    PLATFORM = "platform"  # 2 平台规则（我们按平台维护）
+    POLICY = "policy"  # 3 店铺政策
+    ITEM = "item"  # 4 商品知识
+    FAQ = "faq"  # 5 FAQ 与优质回答
+    CATEGORY = "category"  # 6 类目通用知识
 
     @property
     def priority(self) -> int:
@@ -211,10 +216,11 @@ class EvidenceSource(StrEnum):
 
 _EVIDENCE_PRIORITY = {
     EvidenceSource.REALTIME: 1,
-    EvidenceSource.POLICY: 2,
-    EvidenceSource.ITEM: 3,
-    EvidenceSource.FAQ: 4,
-    EvidenceSource.CATEGORY: 5,
+    EvidenceSource.PLATFORM: 2,
+    EvidenceSource.POLICY: 3,
+    EvidenceSource.ITEM: 4,
+    EvidenceSource.FAQ: 5,
+    EvidenceSource.CATEGORY: 6,
 }
 
 
@@ -283,7 +289,12 @@ class AfterSaleStatus(StrEnum):
 
 
 class ReviewState(StrEnum):
-    """售后审核状态机（§7.3.2）。"""
+    """售后审核状态机（§7.3.2），另加 WAIT_RETURN 表达 R3 的第二步。
+
+    R3 "建议同意退货；仓库确认收到后同意退款"：同意退货后进入 WAIT_RETURN（退货中），
+    平台状态变成 WAIT_SELLER_CONFIRM（买家已寄回）时回到 CONFIRM，建议同意退款。
+    完整的合法迁移见 REVIEW_TRANSITIONS。
+    """
 
     NEW = "new"  # 待审核
     SUGGEST = "suggest"  # 规则建议
@@ -291,9 +302,27 @@ class ReviewState(StrEnum):
     EVIDENCE = "evidence"  # 等待凭证
     CONFIRM = "confirm"  # 待客服确认
     NEGOTIATE = "negotiate"  # 协商中
+    WAIT_RETURN = "wait_return"  # 已同意退货，等买家寄回 / 仓库确认收货
     AGREED = "agreed"
     REFUSED = "refused"
     PLATFORM = "platform"  # 平台已处理（自动处理或买家撤销）
+
+
+_RS = ReviewState
+REVIEW_TRANSITIONS: dict[ReviewState, frozenset[ReviewState]] = {
+    _RS.NEW: frozenset({_RS.SUGGEST, _RS.PLATFORM}),
+    _RS.SUGGEST: frozenset({_RS.CONFIRM, _RS.VERIFY, _RS.EVIDENCE, _RS.PLATFORM}),
+    _RS.VERIFY: frozenset({_RS.CONFIRM, _RS.PLATFORM}),
+    _RS.EVIDENCE: frozenset({_RS.CONFIRM, _RS.PLATFORM}),
+    _RS.CONFIRM: frozenset({_RS.AGREED, _RS.NEGOTIATE, _RS.REFUSED, _RS.WAIT_RETURN, _RS.PLATFORM}),
+    _RS.NEGOTIATE: frozenset({_RS.CONFIRM, _RS.PLATFORM}),
+    _RS.WAIT_RETURN: frozenset({_RS.CONFIRM, _RS.PLATFORM}),
+    _RS.AGREED: frozenset(),
+    _RS.REFUSED: frozenset(),
+    _RS.PLATFORM: frozenset(),
+}
+"""§7.3.2 状态机的合法迁移。任何状态都可以因平台侧变化（买家撤销、平台自动处理）进入 PLATFORM，
+终态除外。"""
 
 
 class ReviewAdvice(StrEnum):
@@ -313,6 +342,24 @@ class AfterSaleAction(StrEnum):
     AGREE_REFUND = "agree_refund"
     AGREE_RETURN = "agree_return"
     REFUSE = "refuse"
+
+
+ACTIONABLE_STATUSES: dict[AfterSaleAction, frozenset[AfterSaleStatus]] = {
+    # 待审核时可以同意退款；退货退款在买家寄回后（等商家确认收货）同意退款（R3 第二步）
+    AfterSaleAction.AGREE_REFUND: frozenset(
+        {AfterSaleStatus.PENDING_REVIEW, AfterSaleStatus.WAIT_SELLER_CONFIRM}
+    ),
+    AfterSaleAction.AGREE_RETURN: frozenset({AfterSaleStatus.PENDING_REVIEW}),
+    AfterSaleAction.REFUSE: frozenset(
+        {AfterSaleStatus.PENDING_REVIEW, AfterSaleStatus.WAIT_SELLER_CONFIRM}
+    ),
+}
+"""每种写操作允许的平台状态。调用写接口前重读售后单，状态不在集合里就不操作（§7.3.2 防止误操作）；
+R1 "售后单已不是待审核状态" 指状态不在任何集合里。"""
+
+
+def is_actionable(status: AfterSaleStatus) -> bool:
+    return any(status in s for s in ACTIONABLE_STATUSES.values())
 
 
 class RouteAction(StrEnum):

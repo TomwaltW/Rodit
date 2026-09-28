@@ -13,7 +13,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from rodit.core.decision import DecisionResponse
 from rodit.core.enums import (
@@ -91,7 +91,10 @@ class StandardMessage(_Model):
 
 
 class ShopConfig(_Model):
-    """店铺可配置项（§9.3）。阈值由我们统一校准，不在这里。"""
+    """店铺的"生效配置"（§9.3）：平台默认 → 类目默认 → 店铺覆盖，逐层合并后的结果。
+
+    由 core.config.effective_shop_config 算出；阈值由我们统一校准，不在这里。
+    """
 
     display_name: str = ""  # 店铺名，用于提示词"你是{店铺名}的客服"
     tone: Literal["亲切", "专业", "简洁"] = "亲切"
@@ -101,22 +104,40 @@ class ShopConfig(_Model):
     disabled_intents: list[Intent] = Field(default_factory=list)  # 关闭的问题类型
     suggestion_count: int = Field(default=2, ge=1, le=3)  # 推荐条数 1–3（§5.4）
     aftersale_amount_limit: Decimal = Decimal("500")  # R6：超过必须店长确认
+    manager_ids: list[str] = Field(default_factory=list)  # 店长子账号（R6 必须店长确认）
+    shadow_mode: bool = False  # 影子模式：生成但不展示（§13.4 上线第一阶段）
     auto_reply_enabled: bool = False  # 全自动总开关（后期，且需平台准入）
 
 
+SHOP_CONFIG_FIELDS = frozenset(ShopConfig.model_fields)
+
+
 class Shop(_Model):
+    """店铺（§10 shop）。config_overrides 只存店铺自己改过的项（§10 shop.config JSONB），
+    生效配置要用 core.config.effective_shop_config 合并平台默认和类目默认后得到。"""
+
     id: str
     platform: Platform
     category: str | None = None  # 主营类目，如 "女装"
     status: ShopStatus = ShopStatus.ACTIVE
-    config: ShopConfig = Field(default_factory=ShopConfig)
+    config_overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("config_overrides")
+    @classmethod
+    def _check_overrides(cls, v: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(v) - SHOP_CONFIG_FIELDS
+        if unknown:
+            raise ValueError(f"未知的店铺配置项：{sorted(unknown)}")
+        ShopConfig.model_validate(v)  # 取值必须合法
+        return v
 
 
 class ShopAuth(_Model):
-    """店铺授权（§8.4）。access_token 只存放在对应平台云内，落库时加密。"""
+    """店铺授权（§8.4）。access_token 只存放在对应平台云内，落库时加密；
+    用 SecretStr 防止出现在 repr / 日志里。"""
 
     shop_id: str
-    access_token: str
+    access_token: SecretStr
     scopes: list[str]
     expires_at: AwareDatetime
 
@@ -312,7 +333,7 @@ class AfterSaleInfo(_Model):
     updated_at: AwareDatetime
     evidence_count: int = 0  # 买家上传的凭证（照片）数量
     status_version: str = "0"  # 平台状态版本（如修改时间戳），用于幂等键和重读校验
-    note: str | None = None  # 买家填写的说明（已做个人信息最小化）
+    note: str | None = None  # 买家填写的说明；ToolGateway 实现负责先过 mask_pii
 
 
 class ReturnEligibility(_Model):
@@ -333,8 +354,34 @@ class RefundProgress(_Model):
     as_of: AwareDatetime
 
 
+class HumanConfirmation(_Model):
+    """客服对一次售后写操作的确认（§4.1 原则 3、§7.3）。写接口只接受带确认的调用。
+
+    - operator 是确认人的客服子账号，不能是 system；
+    - expected_status_version 是客服确认时看到的平台状态版本，写接口实现重读后不一致就不操作；
+    - by_manager：R6 金额超过上限时必须店长确认（ShopConfig.manager_ids）。
+    """
+
+    operator: str = Field(min_length=1)
+    confirmed_at: AwareDatetime
+    expected_status_version: str
+    by_manager: bool = False
+
+    @field_validator("operator")
+    @classmethod
+    def _human(cls, v: str) -> str:
+        if v.strip().lower() in {"system", "bot", "auto"}:
+            raise ValueError("售后写操作必须由人确认")
+        return v
+
+
+def aftersale_idempotency_key(aftersale_id: str, action: str, status_version: str) -> str:
+    """幂等键 = 售后单 ID + 操作类型 + 平台状态版本（§7.3.2 防止误操作）。"""
+    return f"{aftersale_id}:{action}:{status_version}"
+
+
 class ActionResult(_Model):
-    """售后写操作的平台返回。"""
+    """售后写操作的平台返回。ok=False 时 platform_code 说明原因（如 STATUS_CHANGED）。"""
 
     ok: bool
     action: AfterSaleAction
@@ -349,7 +396,7 @@ class ActionResult(_Model):
 
 
 class Turn(_Model):
-    """一轮对话：同一角色的连发消息合并后的一条。"""
+    """一轮对话：同一角色的连发消息合并后的一条。text 是原文（指代、订单号识别要用原文）。"""
 
     role: Role
     text: str
@@ -360,13 +407,20 @@ class Turn(_Model):
 class ConversationContext(_Model):
     """问答引擎各步骤共享的会话上下文（由 engine 的会话理解构建）。
 
-    - text 是原文；任何要进提示词的文本都必须先过 core.pii.mask_pii。
+    - Turn.text 是原文；进判断层用 core.states 的构造函数（内部已脱敏），进生成提示词前
+      必须先过 core.pii.mask_pii。
+    - config 是店铺的生效配置（平台默认 → 类目默认 → 店铺覆盖），各步骤只读它，
+      不读 shop 上的覆盖项。
+    - mode 是本条消息的生效模式：店铺开了影子模式就是 SHADOW；
+      消息是 AUTO 且店铺开了全自动才是 AUTO；
+      其余为 ASSIST（由 engine 决定，不直接信任接入层）。
     - item / order 是指代理解之后的"当前商品 / 当前订单"。
     - candidate_item_ids 有多个且 item 为空时，说明商品不确定，需要澄清（§5.2.4）。
     """
 
     platform: Platform
     shop: Shop
+    config: ShopConfig
     conversation_id: str
     buyer_ref: str
     mode: Mode = Mode.ASSIST
@@ -390,15 +444,20 @@ class ConversationContext(_Model):
 
 
 class Evidence(_Model):
-    """一条依据。id 按 core.evidence 里的规则生成，回答的 evidence_ids 引用它。"""
+    """一条依据。id 按 core.evidence 里的规则生成，回答的 evidence_ids 引用它。
+
+    - topic 取 core.evidence.Topic 的值（或 None）；同一 topic 只保留优先级最高的来源（§5.2.1）。
+    - score 只用于 FAQ：查询与 FAQ 问题向量的余弦相似度（L2 归一化），截断到 [0, 1]；
+      和 GenerationConfig.faq_direct_min_score 比较，决定能否直接用标准回答。
+    """
 
     id: str
     source: EvidenceSource
     label: str  # 展示给客服的来源，如"商品属性 · 面料""店铺政策 · 发货时效"
     content: str  # 给大模型看的文字（已最小化）
     data: dict[str, Any] = Field(default_factory=dict)
-    topic: str | None = None  # 同一事实主题（如 "ship_time"），冲突时高优先级覆盖低优先级
-    score: float | None = None  # 语义检索相似度
+    topic: str | None = None
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
     fetched_at: AwareDatetime | None = None  # 实时数据的获取时间，回答里写"截至"
 
     @property
@@ -407,13 +466,20 @@ class Evidence(_Model):
 
 
 class EvidenceBundle(_Model):
-    """证据包：检索 + 工具调用的结果。"""
+    """证据包：检索 + 工具调用的结果。
+
+    - 被高优先级覆盖的证据从 evidences 里移除，只把 id 记在 overridden_ids（§5.2.1），
+      生成和质检只看 evidences。
+    - alerts 是查依据时发现的、要提醒客服的事，如物流停滞、疑难件（§7.2），
+      引擎并入推荐卡片的风险提示。
+    """
 
     evidences: list[Evidence] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)  # 缺的知识，如 "policy:invoice"
     unavailable: list[str] = Field(default_factory=list)  # 暂时查不到的工具，如 "tool:logistics"
     overridden_ids: list[str] = Field(default_factory=list)  # 被高优先级覆盖掉的证据
     clarify_question: str | None = None  # 商品 / 订单不确定时的澄清问题
+    alerts: list[str] = Field(default_factory=list)
 
     def ids(self) -> list[str]:
         return [e.id for e in self.evidences]
@@ -429,17 +495,37 @@ class EvidenceBundle(_Model):
 # ---------------------------------------------------------------- 路由（§6.6）
 
 
+class RoutePart(_Model):
+    """多问题消息里的一个问题（§6.6 规则 5 "按问题分条推荐"）。"""
+
+    intent: Intent
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
 class RouteDecision(_Model):
+    """路由结果。写 decision_log（stage=route）的是 Router 实现，不是引擎。
+
+    - top_intents：按概率降序的前两名，规则 7 澄清用。
+    - parts：action == SPLIT_MULTI 时由 Router 填写：
+      概率 ≥ routing.multi_intent_min_prob 的问题类型，
+      按概率降序，最多 routing.max_parts 个。引擎对每个 part 用
+      route.model_copy(update={"intent": part.intent, "parts": [],
+                               "action": ANSWER 或 HIGH_RISK_ANSWER})
+      分别检索、生成、质检，每个 part 出一条推荐。
+    - auto_eligible：规则 6 命中、达到该类型的自动阈值、该类型已开放自动、店铺开了全自动、没有降级。
+    """
+
     action: RouteAction
     rule: int = Field(ge=1, le=8)  # 命中的 §6.6 规则序号
     intent: Intent
     intent_confidence: float
-    top_intents: list[tuple[Intent, float]] = Field(default_factory=list)  # 前两名，澄清用
+    top_intents: list[tuple[Intent, float]] = Field(default_factory=list)
+    parts: list[RoutePart] = Field(default_factory=list)
     need_human: float = 0.0
     emotion: float = 0.0
     multi_intent: float = 0.0
     high_risk: bool = False
-    auto_eligible: bool = False  # 规则 6 且达到该类型的自动阈值、该类型已开放自动
+    auto_eligible: bool = False
     risk_hints: list[str] = Field(default_factory=list)  # 如"涉及价格承诺，请确认"
     alerts: list[str] = Field(default_factory=list)  # 给客服的提醒，如"买家要求人工，请优先处理"
     degraded: bool = False  # 判断层不可用，用关键词规则路由（§12.2）
@@ -477,6 +563,11 @@ class HardRuleHit(_Model):
 
 
 class QAResult(_Model):
+    """质检结果。写 decision_log（stage=qa）的是 QualityGate 实现，不是引擎。
+
+    hard_hits 里 format / length 是自动修正（改写 text），不算拦截；其余命中都拦截。
+    """
+
     passed: bool
     text: str  # 清洗后的文本（去 Markdown、超长截断）
     hard_hits: list[HardRuleHit] = Field(default_factory=list)
@@ -484,6 +575,11 @@ class QAResult(_Model):
     reasons: list[str] = Field(default_factory=list)  # 不通过的原因，展示给客服 / 带回重新生成
     model_checked: bool = False  # 是否跑了判断层质检（FAQ / 模板只跑硬规则）
     degraded: bool = False  # 判断层质检不可用
+    provider: str | None = None  # 实际使用的判断层实现
+    answers: DecisionResponse | None = None  # 判断层原始答案（模型质检时）
+
+
+NON_BLOCKING_HARD_RULES = frozenset({"format", "length"})
 
 
 # ---------------------------------------------------------------- 推荐与反馈（§5.6、§5.8、§10）
@@ -508,7 +604,12 @@ class SuggestionCard(_Model):
 
 
 class EngineResult(_Model):
-    """问答引擎处理一条买家消息的结果。"""
+    """问答引擎处理一条买家消息的结果。
+
+    - mode == SHADOW 时 suggestions 只用于事后对比，app 层不得展示给客服（§13.4）。
+    - auto_reply 只在全自动条件全部满足时出现，text 已带 AI 生成内容标识前缀
+      （GenerationConfig.auto_reply_prefix，§12.3），且带前缀后仍满足长度限制；前缀只由引擎添加。
+    """
 
     shop_id: str
     conversation_id: str
@@ -519,20 +620,26 @@ class EngineResult(_Model):
     alerts: list[str] = Field(default_factory=list)  # 标红提醒客服
     no_suggestion_reason: str | None = None
     missing_knowledge: list[str] = Field(default_factory=list)
-    auto_reply: SuggestionCard | None = None  # 全自动模式下直接发送的回复
+    auto_reply: SuggestionCard | None = None
     transfer_to_human: bool = False
     degraded: list[str] = Field(default_factory=list)  # 如 ["llm", "decision", "tool:logistics"]
     latency_ms: dict[str, int] = Field(default_factory=dict)  # 各环节耗时
 
 
 class SuggestionRecord(_Model):
-    """推荐记录（§10 suggestion）。"""
+    """推荐记录（§10 suggestion）。
+
+    由引擎在返回前为每张推荐卡片写入（SHOWN，影子模式为 SHADOW），
+    并回填 SuggestionCard.suggestion_id；
+    同一会话来了新的买家消息时，引擎把之前 SHOWN 的记录改成 EXPIRED。客服操作由反馈闭环更新。
+    """
 
     id: int | None = None
     shop_id: str
     conversation_id: str
     msg_id: str | None = None  # 触发推荐的买家消息
     question_text: str | None = None  # 买家问题（已做个人信息最小化），反馈闭环生成候选知识用
+    item_id: str | None = None  # 当前商品：采纳后生成的候选 FAQ 按商品限定范围
     intent: Intent
     text: str
     kind: DraftKind = DraftKind.LLM
@@ -585,7 +692,7 @@ class AfterSaleReview(_Model):
     verify_started_at: AwareDatetime | None = None  # R4 签收核查开始时间
     confirmed_by: str | None = None
     action_result: dict[str, Any] | None = None
-    version: int = 0  # 乐观锁，也用于幂等键
+    version: int = 0  # 乐观锁（幂等键用平台的 status_version，见 aftersale_idempotency_key）
     updated_at: AwareDatetime | None = None
 
     @property

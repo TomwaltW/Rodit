@@ -1,6 +1,6 @@
 """测试替身（CLAUDE.md：平台接口一律 mock；大模型测试用假 provider；单元测试不依赖网络）。
 
-各模块的单元测试共用这里的替身，保证大家对契约的理解一致。
+各模块的单元测试共用这里的替身，保证大家对契约的理解一致。仓储的内存实现在 rodit.inmemory。
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
+from rodit.core.config import EngineConfig, effective_shop_config
 from rodit.core.decision import (
     Answer,
     ChoiceAnswer,
@@ -22,6 +23,7 @@ from rodit.core.decision import (
     validate_response,
 )
 from rodit.core.enums import (
+    ACTIONABLE_STATUSES,
     AfterSaleAction,
     AfterSaleStatus,
     Intent,
@@ -34,6 +36,7 @@ from rodit.core.models import (
     ActionResult,
     AfterSaleInfo,
     ConversationContext,
+    HumanConfirmation,
     ItemRef,
     LogisticsTrace,
     OrderInfo,
@@ -55,13 +58,13 @@ from rodit.core.questions import (
     Q_PROMISE_RISK,
     Q_TONE,
 )
-from rodit.testing.fixtures import AGENT, BUYER, CONV, SHOP_A, DemoWorld
+from rodit.testing.fixtures import AGENT, BUYER, CONV, DEFAULT_NOW, SHOP_A, DemoWorld
 
 # ================================================================ 时间
 
 
 class FakeClock:
-    def __init__(self, now: datetime) -> None:
+    def __init__(self, now: datetime = DEFAULT_NOW) -> None:
         if now.tzinfo is None:
             raise ValueError("FakeClock 需要带时区的时间")
         self._now = now
@@ -89,7 +92,7 @@ class FakeLLMClient:
     - handler(request) → str / dict（自动转 JSON）/ LLMResponse / Exception（会被抛出）；
     - responses=[...]：按顺序依次返回，用完再调用抛 AssertionError。
 
-    calls 记录所有请求，测试可以断言提示词里没有个人信息等。
+    calls 记录所有请求，测试可以断言提示词里没有个人信息等。线程安全（投票会并发调用）。
     """
 
     def __init__(
@@ -193,8 +196,10 @@ class FakeDecisionProvider:
         *,
         name: str = "fake",
         fail: Exception | None = None,
+        accepts_buyer_data: bool = True,
     ) -> None:
         self.name = name
+        self.accepts_buyer_data = accepts_buyer_data
         self._answers = answers
         self.fail = fail
         self.requests: list[DecisionRequest] = []
@@ -217,7 +222,7 @@ class FakeDecisionProvider:
 
 
 class InMemoryToolGateway:
-    """基于演示世界的只读工具（§7.1）。按 shop_id 隔离。
+    """基于演示世界的只读工具（§7.1）。按 shop_id 隔离，排序遵守 ToolGateway 协议。
 
     - fail_on：方法名集合，调用时抛 ToolUnavailable（模拟限流 / 故障，§12.2）。
     - calls：记录 (方法名, shop_id, 参数)。
@@ -250,7 +255,7 @@ class InMemoryToolGateway:
     ) -> list[OrderInfo]:
         self._enter("list_recent_orders", shop_id, buyer_ref)
         orders = [o for o in self.world.orders if o.shop_id == shop_id and o.buyer_ref == buyer_ref]
-        orders.sort(key=lambda o: o.created_at, reverse=True)
+        orders.sort(key=lambda o: (o.created_at, o.order_id), reverse=True)
         return [o.model_copy(deep=True) for o in orders[:limit]]
 
     def get_logistics(self, shop_id: str, order_id: str) -> LogisticsTrace | None:
@@ -294,7 +299,7 @@ class InMemoryToolGateway:
             and (status is None or a.status == status)
             and (since is None or a.created_at >= since)
         ]
-        out.sort(key=lambda a: a.created_at)
+        out.sort(key=lambda a: (a.created_at, a.aftersale_id))
         return out
 
     def get_stock(self, shop_id: str, item_id: str, sku_id: str | None = None) -> StockInfo | None:
@@ -304,13 +309,20 @@ class InMemoryToolGateway:
             return next((s.model_copy() for s in rows if s.sku_id == sku_id), None)
         if not rows:
             return None
-        total = sum(s.quantity or 0 for s in rows)
+        if len(rows) == 1 and rows[0].sku_id is None:
+            return rows[0].model_copy()
+        in_stock = any(s.in_stock for s in rows)
+        quantity = (
+            None if any(s.quantity is None for s in rows) else sum(s.quantity or 0 for s in rows)
+        )
+        notes = [s.restock_note for s in rows if not s.in_stock and s.restock_note]
         return StockInfo(
             shop_id=shop_id,
             item_id=item_id,
-            quantity=total,
-            in_stock=total > 0,
-            fetched_at=rows[0].fetched_at,
+            quantity=quantity,
+            in_stock=in_stock,
+            restock_note=None if in_stock else (notes[0] if notes else None),
+            fetched_at=max(s.fetched_at for s in rows),
         )
 
     def get_price(self, shop_id: str, item_id: str) -> PriceInfo | None:
@@ -326,20 +338,27 @@ class InMemoryToolGateway:
 
     # ---- 测试辅助：模拟平台侧状态变化
     def set_aftersale_status(
-        self, shop_id: str, aftersale_id: str, status: AfterSaleStatus, *, at: datetime
+        self,
+        shop_id: str,
+        aftersale_id: str,
+        status: AfterSaleStatus,
+        *,
+        at: datetime,
+        evidence_count: int | None = None,
     ) -> AfterSaleInfo:
         for i, a in enumerate(self.world.aftersales):
             if a.shop_id == shop_id and a.aftersale_id == aftersale_id:
-                updated = a.model_copy(
-                    update={
-                        "status": status,
-                        "updated_at": at,
-                        "status_version": str(int(at.timestamp())),
-                    }
-                )
+                update: dict[str, Any] = {
+                    "status": status,
+                    "updated_at": at,
+                    "status_version": str(int(at.timestamp())),
+                }
+                if evidence_count is not None:
+                    update["evidence_count"] = evidence_count
+                updated = a.model_copy(update=update)
                 self.world.aftersales[i] = updated
                 return updated
-        raise KeyError(aftersale_id)
+        raise ActionNotAllowed(f"售后单 {aftersale_id} 不存在或不属于店铺 {shop_id}")
 
 
 _NEXT_STATUS = {
@@ -350,7 +369,15 @@ _NEXT_STATUS = {
 
 
 class FakeActionPort:
-    """假的售后写接口（§7.1）。记录调用，按幂等键去重；给了 gateway 时同步修改平台状态。"""
+    """假的售后写接口（§7.1），行为遵守 AfterSaleActionPort 协议：
+
+    - 不支持的操作 / 抖店拒绝缺原因码 / 售后单不存在或不属于该店 → ActionNotAllowed；
+    - 重读状态：不在 ACTIONABLE_STATUSES 里，或 status_version 和客服确认时看到的不一致
+      → ok=False、platform_code="STATUS_CHANGED"，不改平台状态；
+    - 同一幂等键只操作一次，重复调用返回 duplicate=True；
+    - fail_next=True 时下一次调用返回 ok=False、platform_code="PLATFORM_ERROR"（模拟平台报错）。
+    给了 gateway 时成功操作会同步修改演示世界里的平台状态。
+    """
 
     def __init__(
         self,
@@ -363,51 +390,95 @@ class FakeActionPort:
         self.platform = platform
         self.supported = frozenset(supported if supported is not None else AfterSaleAction)
         self.gateway = gateway
-        self.clock = clock
+        self.clock = clock or FakeClock()
+        self.fail_next = False
         self.calls: list[dict[str, Any]] = []
         self._done: dict[str, ActionResult] = {}
 
     def _do(
-        self, action: AfterSaleAction, shop_id: str, aftersale_id: str, key: str, **extra: Any
+        self,
+        action: AfterSaleAction,
+        shop_id: str,
+        aftersale_id: str,
+        key: str,
+        confirmation: HumanConfirmation,
+        **extra: Any,
     ) -> ActionResult:
         if action not in self.supported:
             raise ActionNotAllowed(f"{self.platform} 不支持 {action}")
+        if (
+            action == AfterSaleAction.REFUSE
+            and self.platform == Platform.DOUYIN
+            and not extra.get("reason_code")
+        ):
+            raise ActionNotAllowed("抖店拒绝售后必须传拒绝原因码")
         if key in self._done:
             return self._done[key].model_copy(update={"duplicate": True})
+        current = None
+        if self.gateway is not None:
+            current = next(
+                (
+                    a
+                    for a in self.gateway.world.aftersales
+                    if a.shop_id == shop_id and a.aftersale_id == aftersale_id
+                ),
+                None,
+            )
+            if current is None:
+                raise ActionNotAllowed(f"售后单 {aftersale_id} 不存在或不属于店铺 {shop_id}")
         self.calls.append(
             {
                 "action": action,
                 "shop_id": shop_id,
                 "aftersale_id": aftersale_id,
                 "key": key,
+                "operator": confirmation.operator,
                 **extra,
             }
         )
+        base = {"action": action, "aftersale_id": aftersale_id, "idempotency_key": key}
+        if self.fail_next:
+            self.fail_next = False
+            return ActionResult(
+                ok=False, platform_code="PLATFORM_ERROR", message="平台报错（模拟）", **base
+            )
+        if current is not None and (
+            current.status not in ACTIONABLE_STATUSES[action]
+            or current.status_version != confirmation.expected_status_version
+        ):
+            return ActionResult(
+                ok=False, platform_code="STATUS_CHANGED", message="售后单状态已变化", **base
+            )
         if self.gateway is not None:
-            at = self.clock.now() if self.clock else datetime.now().astimezone()
-            self.gateway.set_aftersale_status(shop_id, aftersale_id, _NEXT_STATUS[action], at=at)
-        result = ActionResult(
-            ok=True,
-            action=action,
-            aftersale_id=aftersale_id,
-            idempotency_key=key,
-            platform_code="0",
-        )
+            self.gateway.set_aftersale_status(
+                shop_id, aftersale_id, _NEXT_STATUS[action], at=self.clock.now()
+            )
+        result = ActionResult(ok=True, platform_code="0", **base)
         self._done[key] = result
         return result
 
     def agree_refund(
-        self, shop_id: str, aftersale_id: str, *, operator: str, idempotency_key: str
+        self,
+        shop_id: str,
+        aftersale_id: str,
+        *,
+        confirmation: HumanConfirmation,
+        idempotency_key: str,
     ) -> ActionResult:
         return self._do(
-            AfterSaleAction.AGREE_REFUND, shop_id, aftersale_id, idempotency_key, operator=operator
+            AfterSaleAction.AGREE_REFUND, shop_id, aftersale_id, idempotency_key, confirmation
         )
 
     def agree_return(
-        self, shop_id: str, aftersale_id: str, *, operator: str, idempotency_key: str
+        self,
+        shop_id: str,
+        aftersale_id: str,
+        *,
+        confirmation: HumanConfirmation,
+        idempotency_key: str,
     ) -> ActionResult:
         return self._do(
-            AfterSaleAction.AGREE_RETURN, shop_id, aftersale_id, idempotency_key, operator=operator
+            AfterSaleAction.AGREE_RETURN, shop_id, aftersale_id, idempotency_key, confirmation
         )
 
     def refuse(
@@ -415,7 +486,7 @@ class FakeActionPort:
         shop_id: str,
         aftersale_id: str,
         *,
-        operator: str,
+        confirmation: HumanConfirmation,
         idempotency_key: str,
         reason_code: str | None = None,
         reason_text: str | None = None,
@@ -425,7 +496,7 @@ class FakeActionPort:
             shop_id,
             aftersale_id,
             idempotency_key,
-            operator=operator,
+            confirmation,
             reason_code=reason_code,
             reason_text=reason_text,
         )
@@ -452,11 +523,11 @@ def make_message(
     agent_id: str | None = AGENT,
     mode: Mode = Mode.ASSIST,
 ) -> StandardMessage:
-    """构造一条标准买家消息（§8.3）。平台默认取演示世界里店铺的平台。"""
+    """构造一条标准买家消息（§8.3）。平台默认取演示世界里店铺的平台，时间默认 DEFAULT_NOW。"""
     if platform is None:
         platform = world.shop(shop_id).platform if world else Platform.TAOBAO
     if at is None:
-        at = world.now if world else datetime(2026, 9, 28, 10, 35).astimezone()
+        at = world.now if world else DEFAULT_NOW
     return StandardMessage(
         platform=platform,
         shop_id=shop_id,
@@ -486,10 +557,19 @@ def make_context(
     mode: Mode = Mode.ASSIST,
     unresolved_turns: int = 0,
     with_recent_orders: bool = False,
+    engine_config: EngineConfig | None = None,
+    config_update: Mapping[str, Any] | None = None,
 ) -> ConversationContext:
-    """直接构造"会话理解之后"的上下文，供路由、检索、生成、质检的单元测试使用。"""
+    """直接构造"会话理解之后"的上下文，供路由、检索、生成、质检的单元测试使用。
+
+    config 是生效配置：engine_config（默认 EngineConfig()）的分层 + 店铺覆盖项，
+    再叠加 config_update（测试里临时改配置用）。
+    """
     shop = world.shop(shop_id)
     now = world.now
+    config = effective_shop_config(engine_config or EngineConfig(), shop)
+    if config_update:
+        config = config.model_validate({**config.model_dump(), **dict(config_update)})
     turns = [
         Turn(role=role, text=t, at=now - timedelta(minutes=len(history or []) - i))
         for i, (role, t) in enumerate(history or [])
@@ -500,12 +580,13 @@ def make_context(
     if with_recent_orders:
         recent = sorted(
             (o for o in world.orders if o.shop_id == shop_id and o.buyer_ref == buyer_ref),
-            key=lambda o: o.created_at,
+            key=lambda o: (o.created_at, o.order_id),
             reverse=True,
         )[:5]
     return ConversationContext(
         platform=shop.platform,
         shop=shop,
+        config=config,
         conversation_id=CONV,
         buyer_ref=buyer_ref,
         mode=mode,
@@ -519,4 +600,16 @@ def make_context(
         recent_orders=recent,
         unresolved_turns=unresolved_turns,
         now=now,
+    )
+
+
+def confirmation_for(
+    info: AfterSaleInfo, *, operator: str = AGENT, at: datetime = DEFAULT_NOW, manager: bool = False
+) -> HumanConfirmation:
+    """按客服看到的售后单构造确认（测试用）。"""
+    return HumanConfirmation(
+        operator=operator,
+        confirmed_at=at,
+        expected_status_version=info.status_version,
+        by_manager=manager,
     )

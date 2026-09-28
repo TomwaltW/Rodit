@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from rodit.core.enums import Intent, Platform
-from rodit.core.models import ShopConfig
+from rodit.core.enums import Intent, Platform, ProviderName
+from rodit.core.lexicon import ABSOLUTE_TERM_EXCEPTIONS, ABSOLUTE_TERMS
+from rodit.core.models import Shop, ShopConfig
 
 
 class _Model(BaseModel):
@@ -21,11 +22,19 @@ class _Model(BaseModel):
 
 
 class DecisionConfig(_Model):
-    provider: str = "incloud_llm"  # incloud_llm / classifier / rules / jev
+    provider: ProviderName = ProviderName.INCLOUD_LLM
     vote_samples: int = Field(default=3, ge=1, le=7)  # 路由自一致性投票次数（§6.4）
     qa_vote_samples: int = Field(default=1, ge=1, le=7)  # 质检投票次数
     vote_temperature: float = 0.7
     timeout_s: float = 1.0  # 路由 ≤ 1 秒（§12.1）
+    # §6.3 四个条件全部满足、经法务确认后才能改成 True；否则 provider 不能是 jev（§6.2）
+    jev_production_approved: bool = False
+
+    @model_validator(mode="after")
+    def _jev_gate(self) -> DecisionConfig:
+        if self.provider == ProviderName.JEV and not self.jev_production_approved:
+            raise ValueError("Jev 暂不进入生产链路（方案 §6.2、§6.3）：provider 不能配置为 jev")
+        return self
 
 
 class RoutingConfig(_Model):
@@ -34,6 +43,8 @@ class RoutingConfig(_Model):
     emotion_escalate: float = 3.0
     multi_intent: float = 0.7
     clarify_max_gap: float = 0.2
+    multi_intent_min_prob: float = 0.2  # 规则 5 分条推荐：概率达到这个值的问题类型才单独成条
+    max_parts: int = Field(default=3, ge=2, le=5)
     assist_threshold: float = 0.6  # 智能辅助有人把关，阈值可以低
     auto_threshold: dict[Intent, float] = Field(  # 全自动只对列出的类型生效
         default_factory=lambda: {
@@ -62,23 +73,11 @@ class QAGateConfig(_Model):
     promise_risk_max: float = 0.3
     platform_violation_max: float = 0.2
     answers_question_min: float = 0.5
-    max_regenerations: int = 1  # 硬规则命中 → 带原因重新生成一次（§5.5）
-    absolute_terms: list[str] = Field(  # 绝对化用语（§5.5），商家可在 banned_words 里补充
-        default_factory=lambda: [
-            "最",
-            "第一",
-            "绝对",
-            "100%",
-            "百分百",
-            "顶级",
-            "极致",
-            "唯一",
-            "万能",
-            "永久",
-            "保证",
-            "一定",
-            "肯定",
-        ]
+    max_regenerations: int = 1  # 质检不通过 → 带原因重新生成一次（§5.5、§11.5）
+    # 绝对化用语（§5.5），匹配规则见 core.lexicon.find_absolute_terms；商家补充的词在 banned_words
+    absolute_terms: list[str] = Field(default_factory=lambda: list(ABSOLUTE_TERMS))
+    absolute_term_exceptions: list[str] = Field(
+        default_factory=lambda: list(ABSOLUTE_TERM_EXCEPTIONS)
     )
 
 
@@ -109,6 +108,11 @@ class AfterSaleConfig(_Model):
     repeat_threshold: int = 3  # R7
 
 
+class PrivacyConfig(_Model):
+    # buyer_ref 哈希的盐从这个环境变量读（§8.3）；生产部署必须设置，仓库里没有真实值
+    buyer_salt_env: str = "RODIT_BUYER_SALT"
+
+
 class EngineConfig(_Model):
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
@@ -117,6 +121,7 @@ class EngineConfig(_Model):
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     logistics: LogisticsConfig = Field(default_factory=LogisticsConfig)
     aftersale: AfterSaleConfig = Field(default_factory=AfterSaleConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     # 配置分层（§9.3）：平台默认 → 类目默认 → 店铺配置，下层覆盖上层
     shop_defaults_by_platform: dict[Platform, dict[str, Any]] = Field(default_factory=dict)
     shop_defaults_by_category: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -154,3 +159,13 @@ def resolve_shop_config(
         merged = _deep_merge(merged, config.shop_defaults_by_category.get(category, {}))
     merged = _deep_merge(merged, shop_override or {})
     return ShopConfig.model_validate(merged)
+
+
+def effective_shop_config(config: EngineConfig, shop: Shop) -> ShopConfig:
+    """店铺的生效配置：平台默认 → 类目默认 → shop.config_overrides（§9.3）。
+
+    会话理解（engine）构建 ConversationContext.config 时调用；售后审核等不经过会话的地方也用它。
+    """
+    return resolve_shop_config(
+        config, platform=shop.platform, category=shop.category, shop_override=shop.config_overrides
+    )

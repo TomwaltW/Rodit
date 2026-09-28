@@ -2,9 +2,9 @@
 
 一个"演示世界"覆盖方案里的主要场景：
 - 店铺 A（s_1001，淘宝，女装）：完整的政策、商品、FAQ、订单、物流、售后；
-- 店铺 B（s_2002，抖店）：故意和 A 用相同的 item_id / 买家哈希 / FAQ 问题，
-  但内容不同，用来做串店测试（§9.2）；
-- 店铺 C（s_3003，拼多多）：最小数据，测平台差异。
+- 店铺 B（s_2002，淘宝，男装）：和 A 在同一个平台单元（聚石塔）里，故意用相同的 item_id、
+  同一个买家（同平台的 buyer_ref 相同）、相同的 FAQ 问题，但内容不同，用来做串店测试（§9.2）；
+- 店铺 C（s_3003，拼多多）、店铺 D（s_4004，抖店）：最小数据，测平台差异和配置分层。
 
 售后单覆盖 §7.3.2 的 R1–R8；订单和物流覆盖 §7.2 的异常识别和 §11 的核心流程。
 店铺 A 的买家：BUYER 用于聊天场景（o_1001–o_1003、o_1006、o_1008–o_1010，售后只有
@@ -44,28 +44,53 @@ from rodit.core.models import (
     PolicyEntry,
     PriceInfo,
     Shop,
-    ShopConfig,
     Sku,
     StockInfo,
     TraceEvent,
 )
+from rodit.core.pii import hash_buyer_id
 
 DEFAULT_NOW = datetime(2026, 9, 28, 10, 35, tzinfo=CST)
 
 SHOP_A = "s_1001"
 SHOP_B = "s_2002"
 SHOP_C = "s_3003"
-BUYER = "b_7f3a91"  # 普通买家
-BUYER_RISKY = "b_c0ffee"  # 30 天内多次售后（R7）
-# 售后审核场景各用一个买家，避免同一买家售后次数叠加误触发 R7
-BUYER_R3 = "b_a2002"
-BUYER_R5 = "b_a2004"
-BUYER_R6 = "b_a2005"
-BUYER_R8 = "b_a2007"
-BUYER_REFUND = "b_a2008"  # 退款进度问答
+SHOP_D = "s_4004"
 AGENT = "kf_02"
 MANAGER = "kf_manager"
 CONV = "conv_889"
+
+TEST_SALT = "rodit-test-salt"  # 只用于测试；生产的盐从环境变量读（PrivacyConfig.buyer_salt_env）
+
+# 平台原始买家 ID（合成）→ buyer_ref。接入层适配器用同一个盐哈希，才能和演示订单对上。
+RAW_BUYERS: dict[str, tuple[str, str]] = {
+    "BUYER": ("taobao", "tb_demo_buyer_001"),  # 普通买家（聊天场景）
+    "BUYER_RISKY": ("taobao", "tb_demo_buyer_009"),  # 30 天内多次售后（R7）
+    # 售后审核场景各用一个买家，避免同一买家售后次数叠加误触发 R7
+    "BUYER_R3": ("taobao", "tb_demo_buyer_103"),
+    "BUYER_R5": ("taobao", "tb_demo_buyer_105"),
+    "BUYER_R6": ("taobao", "tb_demo_buyer_106"),
+    "BUYER_R8": ("taobao", "tb_demo_buyer_108"),
+    "BUYER_REFUND": ("taobao", "tb_demo_buyer_110"),  # 退款进度问答
+    "BUYER_DOUYIN": ("douyin", "dy_demo_buyer_001"),
+    "BUYER_PDD": ("pdd", "pdd_demo_buyer_001"),
+}
+
+
+def _ref(name: str) -> str:
+    platform, raw = RAW_BUYERS[name]
+    return hash_buyer_id(platform, raw, salt=TEST_SALT)
+
+
+BUYER = _ref("BUYER")
+BUYER_RISKY = _ref("BUYER_RISKY")
+BUYER_R3 = _ref("BUYER_R3")
+BUYER_R5 = _ref("BUYER_R5")
+BUYER_R6 = _ref("BUYER_R6")
+BUYER_R8 = _ref("BUYER_R8")
+BUYER_REFUND = _ref("BUYER_REFUND")
+BUYER_DOUYIN = _ref("BUYER_DOUYIN")
+BUYER_PDD = _ref("BUYER_PDD")
 
 
 def _t(days: float = 0, hours: float = 0, minutes: float = 0, *, now: datetime) -> datetime:
@@ -112,35 +137,45 @@ class DemoWorld:
 
 
 def _shops() -> dict[str, Shop]:
+    # config_overrides 只写店铺自己改过的项；生效配置 = 平台默认 → 类目默认 → 覆盖项（§9.3）
     return {
         SHOP_A: Shop(
             id=SHOP_A,
             platform=Platform.TAOBAO,
             category="女装",
             status=ShopStatus.ACTIVE,
-            config=ShopConfig(
-                display_name="小雅女装旗舰店",
-                tone="亲切",
-                salutation="亲",
-                max_answer_chars=120,
-                banned_words=["假一赔十", "全网最低"],
-                suggestion_count=2,
-                aftersale_amount_limit=Decimal("500"),
-            ),
+            config_overrides={
+                "display_name": "小雅女装旗舰店",
+                "tone": "亲切",
+                "salutation": "亲",
+                "max_answer_chars": 120,
+                "banned_words": ["假一赔十", "全网最低"],
+                "suggestion_count": 2,
+                "aftersale_amount_limit": "500",
+                "manager_ids": [MANAGER],
+            },
         ),
         SHOP_B: Shop(
             id=SHOP_B,
-            platform=Platform.DOUYIN,
+            platform=Platform.TAOBAO,
             category="男装",
             status=ShopStatus.ACTIVE,
-            config=ShopConfig(display_name="木棉男装", tone="专业", salutation="您"),
+            config_overrides={"display_name": "木棉男装", "tone": "专业", "salutation": "您"},
         ),
         SHOP_C: Shop(
             id=SHOP_C,
             platform=Platform.PDD,
             category="女装",
             status=ShopStatus.TRIAL,
-            config=ShopConfig(display_name="拼拼小铺", tone="简洁", salutation="亲"),
+            # 没有覆盖 max_answer_chars：生效值来自拼多多平台默认（config/rodit.yaml 为 100）
+            config_overrides={"display_name": "拼拼小铺", "tone": "简洁"},
+        ),
+        SHOP_D: Shop(
+            id=SHOP_D,
+            platform=Platform.DOUYIN,
+            category="女装",
+            status=ShopStatus.ACTIVE,
+            config_overrides={"display_name": "抖抖女装", "shadow_mode": True},
         ),
     }
 
@@ -177,10 +212,21 @@ _POLICIES_C: dict[PolicyKey, str] = {
     PolicyKey.SHIP_TIME: "付款后 24 小时内发货",
 }
 
+_POLICIES_D: dict[PolicyKey, str] = {
+    PolicyKey.SHIP_TIME: "付款后 48 小时内发货",
+    PolicyKey.COURIER: "默认发韵达快递",
+}
+
 
 def _policies(now: datetime) -> list[PolicyEntry]:
     out: list[PolicyEntry] = []
-    for shop_id, table in ((SHOP_A, _POLICIES_A), (SHOP_B, _POLICIES_B), (SHOP_C, _POLICIES_C)):
+    tables = (
+        (SHOP_A, _POLICIES_A),
+        (SHOP_B, _POLICIES_B),
+        (SHOP_C, _POLICIES_C),
+        (SHOP_D, _POLICIES_D),
+    )
+    for shop_id, table in tables:
         for key, value in table.items():
             out.append(
                 PolicyEntry(shop_id=shop_id, key=key.value, value=value, updated_at=_t(3, now=now))
@@ -258,7 +304,7 @@ def _items(now: datetime) -> list[ItemCard]:
     # 店铺 B：和 A 相同的 item_id，内容完全不同（串店测试）
     b_pants = ItemCard(
         shop_id=SHOP_B,
-        platform=Platform.DOUYIN,
+        platform=Platform.TAOBAO,
         item_id="i_555",
         title="男士休闲裤",
         category="男装/休闲裤",
@@ -276,7 +322,16 @@ def _items(now: datetime) -> list[ItemCard]:
         attributes={"面料": "棉 100%"},
         updated_at=_t(1, now=now),
     )
-    return [dress, jeans, shirt, b_pants, c_dress]
+    d_skirt = ItemCard(
+        shop_id=SHOP_D,
+        platform=Platform.DOUYIN,
+        item_id="i_d1",
+        title="百褶半身裙",
+        category="女装/半身裙",
+        attributes={"面料": "聚酯纤维 100%"},
+        updated_at=_t(1, now=now),
+    )
+    return [dress, jeans, shirt, b_pants, c_dress, d_skirt]
 
 
 # ================================================================ FAQ（§5.2.1 优先级 4）
@@ -379,6 +434,7 @@ def _orders(now: datetime) -> list[OrderInfo]:
         waybill: str | None = None,
         courier: str | None = "中通快递",
         seven_day_return: bool = True,
+        promised_ship_hours: float = 48,
     ) -> OrderInfo:
         paid_at = _t(paid_days, now=now)
         return OrderInfo(
@@ -395,7 +451,7 @@ def _orders(now: datetime) -> list[OrderInfo]:
             waybill_no=waybill,
             courier=courier if waybill else None,
             seven_day_return=seven_day_return,
-            promised_ship_by=paid_at + timedelta(hours=48),
+            promised_ship_by=paid_at + timedelta(hours=promised_ship_hours),
         )
 
     S = OrderStatus
@@ -448,7 +504,7 @@ def _orders(now: datetime) -> list[OrderInfo]:
             "o_1006",
             S.SHIPPED,
             [_line("i_555", "k_3", dress, "259.00")],
-            paid_days=5,
+            paid_days=5.2,
             shipped_days=4,
             waybill="ZT7300000005",
         ),
@@ -457,11 +513,12 @@ def _orders(now: datetime) -> list[OrderInfo]:
             "o_1007",
             S.SIGNED,
             [_line("i_888", "k_81", shirt, "459.00")],
-            paid_days=12,
+            paid_days=10,
             shipped_days=4,
             signed_days=2,
             waybill="ZT7300000006",
             seven_day_return=False,
+            promised_ship_hours=7 * 24,  # 定制款下单后 7 天内发货
             buyer_ref=BUYER_R8,
         ),
         # 疑难件（§7.2 异常）
@@ -487,7 +544,7 @@ def _orders(now: datetime) -> list[OrderInfo]:
             "o_1010",
             S.SIGNED,
             [_line("i_777", "k_72", jeans, "199.00")],
-            paid_days=3,
+            paid_days=2.9,
             shipped_days=2,
             signed_days=0.06,
             waybill="SF1400000009",
@@ -515,11 +572,22 @@ def _orders(now: datetime) -> list[OrderInfo]:
             waybill="ZT7300000011",
             buyer_ref=BUYER_REFUND,
         ),
-        # 高频售后买家（R7）
+        # 质量问题、凭证齐全（as_2009）
+        order(
+            "o_1013",
+            S.SIGNED,
+            [_line("i_777", "k_73", jeans, "199.00")],
+            paid_days=7,
+            shipped_days=6,
+            signed_days=1.5,
+            waybill="ZT7300000012",
+            buyer_ref=BUYER_R5,
+        ),
+        # 高频售后买家（R7）：前两单已退货退款成功，订单关闭
         *[
             order(
                 f"o_200{i}",
-                S.SIGNED,
+                S.CLOSED if i <= 2 else S.SIGNED,
                 [_line("i_777", "k_72", jeans, "199.00")],
                 buyer_ref=BUYER_RISKY,
                 paid_days=days + 4,
@@ -529,13 +597,22 @@ def _orders(now: datetime) -> list[OrderInfo]:
             )
             for i, days in ((1, 25), (2, 18), (3, 10), (4, 2))
         ],
-        # 店铺 B：同一个买家哈希、不同店铺（串店测试）
+        # 店铺 B：同一个买家、不同店铺（串店测试）
         order(
             "o_9001",
             S.PAID,
             [_line("i_555", "k_1", "男士休闲裤", "129.00")],
             shop_id=SHOP_B,
             paid_days=1,
+        ),
+        # 店铺 D（抖店）
+        order(
+            "o_d001",
+            S.PAID,
+            [_line("i_d1", None, "百褶半身裙", "89.00")],
+            shop_id=SHOP_D,
+            buyer_ref=BUYER_DOUYIN,
+            paid_days=0.5,
         ),
     ]
 
@@ -569,7 +646,7 @@ def _traces(now: datetime) -> list[LogisticsTrace]:
             fetched_at=now,
         )
 
-    last_1030 = now.replace(hour=10, minute=30)
+    last_event = now - timedelta(minutes=5)  # 默认 now 下是 10:30（§11.2 "截至 10:30"）
     return [
         trace(
             "o_1002",
@@ -579,7 +656,7 @@ def _traces(now: datetime) -> list[LogisticsTrace]:
                 _ev(now, 1.7, "快件已揽收", "广州市", "ACCEPT"),
                 _ev(now, 1.2, "已发往杭州转运中心", "广州转运中心", "TRANSPORT"),
                 TraceEvent(
-                    time=last_1030,
+                    time=last_event,
                     description="已到达杭州转运中心",
                     location="杭州转运中心",
                     raw_status="TRANSPORT",
@@ -666,8 +743,10 @@ def _aftersales(now: datetime) -> list[AfterSaleInfo]:
         shop_id: str = SHOP_A,
         evidence_count: int = 0,
         note: str | None = None,
+        updated_days: float | None = None,
     ) -> AfterSaleInfo:
         created = _t(days, now=now)
+        updated = _t(updated_days, now=now) if updated_days is not None else created
         return AfterSaleInfo(
             shop_id=shop_id,
             aftersale_id=aftersale_id,
@@ -678,9 +757,9 @@ def _aftersales(now: datetime) -> list[AfterSaleInfo]:
             status=status,
             amount=Decimal(amount),
             created_at=created,
-            updated_at=created,
+            updated_at=updated,
             evidence_count=evidence_count,
-            status_version=str(int(created.timestamp())),
+            status_version=str(int(updated.timestamp())),
             note=note,
         )
 
@@ -764,12 +843,13 @@ def _aftersales(now: datetime) -> list[AfterSaleInfo]:
             S.REFUNDING,
             "199.00",
             days=4,
+            updated_days=0.3,  # 仓库确认收货后同意退款，进入退款中
             buyer_ref=BUYER_REFUND,
         ),
         # 质量问题，凭证齐全（R5 → 客服查看后决定）
         aftersale(
             "as_2009",
-            "o_1005",
+            "o_1013",
             T.RETURN_REFUND,
             R.DAMAGED,
             S.PENDING_REVIEW,
@@ -854,11 +934,14 @@ def _stocks(now: datetime) -> list[StockInfo]:
         stock("i_777", "k_72", 0),
         stock("i_777", "k_73", 5),
         stock("i_888", "k_81", 99),
+        # 店铺 C：平台不给具体数量（quantity=None）
+        StockInfo(shop_id=SHOP_C, item_id="i_c1", quantity=None, in_stock=True, fetched_at=now),
     ]
 
 
 def _prices(now: datetime) -> list[PriceInfo]:
     promo = ["店铺满 199 减 20"]
+    # i_888 是定制款，不参加店铺满减（实时活动配置优先于店铺政策，§5.2.1）
     return [
         PriceInfo(
             shop_id=SHOP_A,

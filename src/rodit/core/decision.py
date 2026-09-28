@@ -143,9 +143,26 @@ class DecisionProvider(Protocol):
 
     - 只做判断，不写回答，也不触发任何操作（§6.1）。
     - 必须回答请求里的全部问题，否则抛 DecisionError（调用方据此降级）。
-    - state 里的文本在进入本接口前已经做过个人信息最小化（core.pii.mask_pii）。
+    - state 由 core.states 的构造函数生成（已做个人信息最小化），不要自己拼。
+    - accepts_buyer_data：能否处理买家数据。路由和质检处理的都是买家数据，
+      Router / QualityGate 实现在构造时必须拒绝 accepts_buyer_data=False 的实现
+      （抛 ComplianceError）。
+      Jev 在满足 §6.3 的全部条件前为 False（§6.2 结论：买家消息不能发给 Jev）。
+    - 一次 decide 对应一条审计记录；自一致性投票的多次采样不分别记录。
     """
 
     name: str
+    accepts_buyer_data: bool
 
     def decide(self, request: DecisionRequest) -> DecisionResponse: ...
+
+
+def require_buyer_data_ok(provider: DecisionProvider) -> None:
+    """Router / QualityGate 构造时调用：不能处理买家数据的实现直接拒绝（§6.2、§6.3）。"""
+    from rodit.core.errors import ComplianceError
+
+    if not getattr(provider, "accepts_buyer_data", False):
+        raise ComplianceError(
+            f"判断层实现 {getattr(provider, 'name', provider)!r} 不允许处理买家数据"
+            "（方案 §6.2、§6.3）"
+        )

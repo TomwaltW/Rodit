@@ -33,10 +33,11 @@ uv run pytest          # 跑测试
 uv run ruff check .    # lint
 ```
 
-基线：`uv run pytest` → 见最近一次交付报告（T0 契约骨架完成时为 `25 passed`）。
+基线：`uv run pytest` → 见最近一次交付报告（T0 契约骨架完成时为 `83 passed`）。
 
-云端镜像自带 PostgreSQL 16 和 Redis 7，但默认不启动，需要时用 `service postgresql start` / `service redis-server start`；
-每个会话都要重新启动，数据不跨会话保留。
+云端镜像自带 PostgreSQL 16 和 Redis 7，但默认不启动。PostgreSQL 用 `bash scripts/dev-pg.sh`
+（启动服务并给当前用户建角色，之后 psql / psycopg 直接连）；Redis 用 `service redis-server start`。
+每个会话都要重新启动，数据不跨会话保留。PostgreSQL 测试标了 `@pytest.mark.pg`，连不上时自动跳过。
 
 ## 工作约定
 
