@@ -18,7 +18,8 @@
 写到一半失败：先用比较后更新把推荐改成 SENT / EDITED_SENT / REJECTED（防重复反馈的"占位"），
 再写派生数据（标注、知识缺失、候选知识）和审计。后面任何一步失败，就把推荐记录退回展示中
 再抛出异常（补偿），客服重试能完整走一遍，派生数据和审计不会因为状态已改而永久丢失。
-重试时候选知识按内容去重；标注、知识缺失在"派生数据写成、审计失败"时可能多出一条（至少一次）。
+重试时候选知识按内容去重（归到上次写进去的那条，审计照常补上）；标注、知识缺失在"派生数据写成、
+审计失败"时可能多出一条（至少一次）。
 """
 
 from __future__ import annotations
@@ -66,7 +67,9 @@ KNOWLEDGE_RETIRED = AuditAction.KNOWLEDGE_RETIRED.value  # 兼容旧名
 # 候选知识没有生成的原因（FeedbackOutcome.candidate_skipped）
 SKIP_NO_QUESTION = "no_question"  # 推荐记录没有买家问题，生成不了 FAQ 的问题
 SKIP_REALTIME = "realtime_evidence"  # 回答依据实时数据（订单、物流、库存、价格……），不能沉淀成 FAQ
-SKIP_DUPLICATE = "duplicate"  # 同样的候选知识已在等商家审核
+# 同样的候选知识已在等商家审核。已不再产生：这种情况下这次反馈归到那条候选上（返回它、写审计），
+# 见 FeedbackService._make_candidate；保留常量给旧调用方
+SKIP_DUPLICATE = "duplicate"
 
 _REALTIME_PREFIXES = tuple(
     build("")
@@ -158,7 +161,8 @@ class FeedbackService:
 
         - 编辑后和推荐原文一样（去掉首尾空白）→ 按原样发送处理；
         - 候选知识：问题 = 推荐记录里的买家问题，回答 = 编辑后的文字（最小化），
-          来源 ADOPTED、状态 CANDIDATE，限定在推荐时的商品上；
+          来源 ADOPTED、状态 CANDIDATE，限定在推荐时的商品上；同样的候选已在等审核时不新建，
+          这次反馈归到那一条上（outcome.candidate 是它，审计照常记下它的 id）；
           依据里有实时数据（订单、物流、售后、退换资格、库存、价格）的不生成——这类回答因人因时而异，
           做成 FAQ 会把过期的实时数据当成标准答案（§5.2.1 实时数据优先）。
         """
@@ -436,14 +440,22 @@ class FeedbackService:
         pending = self._knowledge.list_knowledge(
             record.shop_id, status=KnowledgeStatus.CANDIDATE, item_id=record.item_id
         )
-        if any(
-            k.question == question
-            and k.answer == answer
-            and k.item_id == record.item_id
-            and k.intent == record.intent
-            for k in pending
-        ):
-            return None, SKIP_DUPLICATE
+        existing = next(
+            (
+                k
+                for k in pending
+                if k.question == question
+                and k.answer == answer
+                and k.item_id == record.item_id
+                and k.intent == record.intent
+            ),
+            None,
+        )
+        if existing is not None:
+            # 同样的候选已在等审核：这次反馈归到它上面，不再新建。它可能就是这次反馈上一次没写完
+            # （审计失败、推荐退回展示中）留下的——分不出来，所以一律当作这次反馈的候选，
+            # 由调用方照常写 candidate_id 和 knowledge.candidate 审计，候选知识不会没有来历
+            return existing, None
         saved = self._knowledge.add_knowledge(
             KnowledgeItem(
                 shop_id=record.shop_id,

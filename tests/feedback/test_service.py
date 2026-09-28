@@ -23,7 +23,6 @@ from rodit.core.models import KnowledgeItem, SuggestionRecord
 from rodit.core.pii import ADDRESS_MASK, PHONE_MASK
 from rodit.feedback import (
     KNOWLEDGE_RETIRED,
-    SKIP_DUPLICATE,
     SKIP_NO_QUESTION,
     SKIP_REALTIME,
     FeedbackService,
@@ -230,9 +229,13 @@ def test_record_edited_without_question_or_duplicate(env):
     first = env.add(msg_id="m_a")
     second = env.add(msg_id="m_b")
     edited = "亲，建议 M 码，偏小一码哦"
-    assert env.service.record_edited(SHOP_A, first.id, agent_id=AGENT, edited_text=edited).candidate
+    made = env.service.record_edited(SHOP_A, first.id, agent_id=AGENT, edited_text=edited)
+    assert made.candidate is not None
     dup = env.service.record_edited(SHOP_A, second.id, agent_id=AGENT, edited_text=edited)
-    assert dup.candidate is None and dup.candidate_skipped == SKIP_DUPLICATE
+    # 同样的候选已在等审核：不新建，这次反馈归到那一条上（审计里也记下它的 id）
+    assert dup.candidate is not None and dup.candidate.id == made.candidate.id
+    assert dup.candidate_skipped is None
+    assert [k.answer for k in env.service.pending_candidates(SHOP_A)].count(edited) == 1
     assert dup.record.status == SuggestionStatus.EDITED_SENT
 
 

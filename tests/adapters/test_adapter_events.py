@@ -42,7 +42,8 @@ def test_taobao_echo_and_recall_are_surfaced(taobao, tb):
     assert recall == MessageRecall(
         shop_id=SHOP_A, conversation_id=CONV, msg_id="r1", recalled_msg_id="b1"
     )
-    assert taobao.on_event(tb(msg_id="r1", msg_type="recall", recall_msg_id="b1")) is None
+    # 平台重推同一个撤回：照样交给应用层（撤回是幂等的；应用层上次没写进会话时靠重推补上）
+    assert taobao.on_event(tb(msg_id="r1", msg_type="recall", recall_msg_id="b1")) == recall
     assert [m.msg_id for m in taobao.get_context(SHOP_A, CONV).recent_messages] == ["a1"]
 
 

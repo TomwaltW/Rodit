@@ -545,9 +545,10 @@ def check_shop_auth_repository(make: Callable[[], ShopAuthRepository]) -> None:
     assert repo.get(SHOP_B) is None
     repo.save(auth.model_copy(update={"access_token": SecretStr("tok-2")}))
     assert repo.get(SHOP_A).access_token.get_secret_value() == "tok-2"
-    repo.delete(SHOP_A)
+    assert repo.delete(SHOP_A) is True
     assert repo.get(SHOP_A) is None
-    repo.delete(SHOP_A)  # 重复删除不报错
+    assert repo.delete(SHOP_A) is False  # 重复删除不报错，返回没有删到
+    assert repo.delete(SHOP_B) is False
 
 
 # ---------------------------------------------------------------- 串店测试（§9.2）

@@ -539,7 +539,10 @@ class ShopAuthRepository(Protocol):
 
     def save(self, auth: ShopAuth) -> None: ...
 
-    def delete(self, shop_id: str) -> None: ...
+    def delete(self, shop_id: str) -> bool:
+        """删除令牌：删掉了返回 True，本来就没有返回 False。
+        不解密：令牌读不出来（旧版加密、换过密钥）时也能删（取消订购，§8.4）。"""
+        ...
 
 
 # ================================================================ 3. 问答引擎的步骤
