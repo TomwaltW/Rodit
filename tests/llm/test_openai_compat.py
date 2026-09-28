@@ -14,7 +14,7 @@ import pytest
 
 from rodit.core.errors import LLMError, LLMTimeout
 from rodit.core.ports import LLMClient, LLMMessage, LLMRequest
-from rodit.llm import OpenAICompatibleClient, urllib_transport
+from rodit.llm import OpenAICompatibleClient, openai_compat, urllib_transport
 
 KEY = "sk-synthetic-test-key-not-real-0001"  # 合成密钥，只用于测试
 BASE = "https://llm.example.invalid/compatible-mode/v1"
@@ -378,7 +378,7 @@ def test_urllib_transport_success(monkeypatch):
         )
         return _FakeHTTPResponse(json.dumps(ok_body()).encode())
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(openai_compat, "_urlopen", fake_urlopen)
     status, body = urllib_transport(
         BASE + "/chat/completions", {"Authorization": "Bearer x"}, {"model": "m", "q": "中文"}, 2.0
     )
@@ -400,7 +400,7 @@ def test_urllib_transport_http_error_returns_status_and_body(monkeypatch, raw, e
     def fake_urlopen(request, timeout):
         raise urllib.error.HTTPError(request.full_url, 429, "Too Many", {}, io.BytesIO(raw))
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(openai_compat, "_urlopen", fake_urlopen)
     assert urllib_transport(BASE, {}, {}, 1.0) == (429, expected)
 
 
@@ -408,14 +408,14 @@ def test_urllib_transport_timeout_and_non_json(monkeypatch, api_key):
     def timeout_urlopen(request, timeout):
         raise urllib.error.URLError(TimeoutError("timed out"))
 
-    monkeypatch.setattr(urllib.request, "urlopen", timeout_urlopen)
+    monkeypatch.setattr(openai_compat, "_urlopen", timeout_urlopen)
     with pytest.raises(TimeoutError):
         urllib_transport(BASE, {}, {}, 1.0)
     with pytest.raises(LLMTimeout):
         OpenAICompatibleClient(base_url=BASE, model="m").complete(req())
 
     monkeypatch.setattr(
-        urllib.request, "urlopen", lambda request, timeout: _FakeHTTPResponse(b"not json")
+        openai_compat, "_urlopen", lambda request, timeout: _FakeHTTPResponse(b"not json")
     )
     with pytest.raises(ValueError):
         urllib_transport(BASE, {}, {}, 1.0)
