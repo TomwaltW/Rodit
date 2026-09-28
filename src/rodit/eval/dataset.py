@@ -334,7 +334,8 @@ CASES: list[EvalCase] = [
         "有赠品吗",
         I.INVOICE_GIFT,
         must_cite=[["policy:gift"]],
-        must_not_include=["送您", "有赠品"],
+        # 店铺政策原文是"目前没有赠品活动"：不能用子串"有赠品"（"没有赠品"也包含它），只拦肯定说法
+        must_not_include=["送您", "有赠品哦", "有赠品的"],
     ),
     _c(
         "inv-04",

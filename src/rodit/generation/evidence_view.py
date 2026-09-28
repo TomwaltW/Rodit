@@ -82,7 +82,8 @@ def logistics(
 def refund_progress(
     bundle: EvidenceBundle, ctx: ConversationContext
 ) -> tuple[Evidence, RefundProgress] | None:
-    """售后单证据和退款进度。有多条时优先当前订单的，其次最近更新的售后单。"""
+    """售后单证据和退款进度。有多条时优先当前订单的，其中取最近更新的售后单
+    （同一订单先撤销、再申请时，早先那张已关闭的不能拿来回答当前进度）。"""
     found: list[tuple[Evidence, RefundProgress, AfterSaleInfo | None]] = []
     for ev in bundle.evidences:
         if not ev.id.startswith(_AFTERSALE_PREFIX):
@@ -93,9 +94,8 @@ def refund_progress(
     if not found:
         return None
     if ctx.order is not None:
-        for ev, progress, info in found:
-            if info is not None and info.order_id == ctx.order.order_id:
-                return ev, progress
+        current = [x for x in found if x[2] is not None and x[2].order_id == ctx.order.order_id]
+        found = current or found
     ev, progress, _ = max(
         found, key=lambda x: (x[2].updated_at if x[2] is not None else x[1].as_of, x[1].as_of)
     )
