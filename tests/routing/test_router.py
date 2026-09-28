@@ -90,7 +90,7 @@ def test_route_builds_the_doc_request_and_logs_one_decision():
     assert request.state["platform"] == "taobao"
     assert request.state["messages"] == [
         {"role": "buyer", "text": "在吗"},
-        {"role": "agent", "text": "亲,在的"},  # 过 mask_pii 时做了 NFKC 归一
+        {"role": "agent", "text": "亲，在的"},  # mask_pii 只遮个人信息，原文标点保留
         {"role": "buyer", "text": "165 110斤穿什么码"},
     ]
     assert request.state["item_card"] == {
