@@ -12,8 +12,9 @@ CachingToolGateway 包在任意 ToolGateway 外面，本身也是 ToolGateway（
 注意：
 - Cache 的写入时间由缓存实现自己的时钟给出，缓存和网关要注入同一个 Clock，TTL 才准。
 - 售后审核重读（§7.3.2 防止误操作）不能读缓存：审核助手要用 uncached() 拿到内层网关。
-- OrderInfo / AfterSaleInfo 没有 fetched_at 字段，用过期缓存时无法把获取时间带给调用方
-  （物流、库存、价格可以）；见回执 contract_issues。
+- 平台的订单、售后单数据不带获取时间（OrderInfo / AfterSaleInfo.fetched_at 为空）：
+  网关在取到时记为当时的时间再缓存，用过期缓存兜底时调用方据此写"截至"、判断数据是否过期
+  （物流、库存、价格由平台数据自带 fetched_at）。
 """
 
 from __future__ import annotations
@@ -59,6 +60,15 @@ def _copy(value: Any) -> Any:
         return value.model_copy(deep=True)
     if isinstance(value, list):
         return [_copy(v) for v in value]
+    return value
+
+
+def _stamp(value: Any, now: datetime) -> Any:
+    """订单、售后单没带获取时间时记为 now（过期缓存兜底时仍是原来的获取时间）。"""
+    if isinstance(value, OrderInfo | AfterSaleInfo) and value.fetched_at is None:
+        return value.model_copy(update={"fetched_at": now})
+    if isinstance(value, list):
+        return [_stamp(v, now) for v in value]
     return value
 
 
@@ -145,6 +155,7 @@ class CachingToolGateway:
                 return _copy(hit[0])
             raise
         self._check_tenant(method, shop_id, value)
+        value = _stamp(value, now)
         self._cache.set(shop_id, key, _copy(value))
         return value
 

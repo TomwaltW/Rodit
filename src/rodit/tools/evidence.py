@@ -11,12 +11,28 @@ DefaultToolEvidenceProvider 实现 core.ports.ToolEvidenceProvider，只处理 c
    - logistics_track / not_received → 已发货或已签收的；urge_ship → 已付款未发货的；
    - refund_progress → 有售后单的（按该订单最近一张售后单的申请时间排）；
    - return_policy / quality_issue → 已签收或交易成功的；其他问题类型 → 全部最近订单；
+   - return_policy / quality_issue 且会话里有当前商品（ctx.item）→ 只看含这件商品的订单；
+     一单都没有就不找订单（买家问的是这件商品，按店铺政策回答，不拿别的订单的退换资格）；
    取最近的一单；如果还有别的候选和它的时间相差不超过 ambiguity_window（默认 24 小时），
    说明几单同样可能，给出澄清问题"请问您问的是哪个订单呢？"（不猜）；
 3. 一单都没有 → bundle.missing 标 MISSING_ORDER。
 
+冲突处理的主题（§5.2.1 实时接口优先级 1，覆盖同主题的政策 / 详情页 / FAQ）：
+- 价格与活动：promotions（和店铺满减政策比较；一次只查当前商品，不会互相覆盖）；
+- 退换资格：只有"不能无理由退货"时是 seven_day_return（否定说法，覆盖"支持七天无理由"）；
+  可以退 / 需要人工判断时不带主题——内容里引用的政策原文可能带否定词，比较会误删一致的说法；
+- 库存：topic_for_stock(item, sku)。
+
+库存没定到 SKU（ctx.sku_id 为空，如"M 码"对应黑色 M、白色 M）且商品有多个 SKU、整款合计有货时，
+逐个 SKU 再查（最多 MAX_SKU_STOCK_LOOKUPS 个），有缺货的规格就在证据里写清"部分规格有货"、
+哪些规格缺货；data 多一个 "skus"（各 SKU 的 StockInfo）。查不了逐个 SKU 时写明"整款合计、
+未区分规格"——整款合计的"有货"不能当成某个规格有货。
+
 降级（§12.2）：工具抛 ToolUnavailable 时在 bundle.unavailable 标 core.evidence.unavailable(kind)，
 不抛出（CachingToolGateway 已先用过期缓存兜底）。物流异常要提醒客服的话并入 bundle.alerts。
+订单、售后单用数据自己的获取时间（CachingToolGateway 记下的 fetched_at）写"截至"；
+比 stale_after 还旧，说明是平台故障时的过期缓存：同样在 bundle.unavailable 标该工具，
+卡片提示客服核实（§12.2 用缓存数据并注明时间）。
 
 个人信息（§5.3）：证据 content 只由结构化字段拼成，不放买家售后说明；轨迹描述、售后说明在进
 证据前再过一次 mask_platform_text（防御：ToolGateway 实现本应已脱敏）。
@@ -38,6 +54,7 @@ from rodit.core.enums import (
     EvidenceSource,
     Intent,
     OrderStatus,
+    PolicyKey,
 )
 from rodit.core.errors import TenantIsolationError, ToolUnavailable
 from rodit.core.evidence import Need
@@ -54,6 +71,7 @@ from rodit.core.models import (
     PriceInfo,
     RefundProgress,
     ReturnEligibility,
+    Sku,
     StockInfo,
 )
 from rodit.core.ports import AfterSaleAdvisor, LogisticsAdvisor, ToolGateway
@@ -73,6 +91,12 @@ INTENT_ORDER_STATUSES: dict[Intent, frozenset[OrderStatus]] = {
     Intent.QUALITY_ISSUE: frozenset({_O.SIGNED, _O.COMPLETED}),
 }
 """没有订单卡片时，各问题类型优先考虑的订单状态（refund_progress 按有没有售后单挑）。"""
+
+ITEM_SCOPED_INTENTS = frozenset({Intent.RETURN_POLICY, Intent.QUALITY_ISSUE})
+"""会话里有当前商品时，只从含这件商品的订单里找（问的是"这件"能不能退、有没有质量问题）。"""
+
+MAX_SKU_STOCK_LOOKUPS = 10
+"""没定到 SKU 时最多逐个查几个 SKU 的库存（平台接口有额度，§12.1）。"""
 
 ORDER_STATUS_LABELS: dict[OrderStatus, str] = {
     OrderStatus.UNPAID: "待付款",
@@ -223,6 +247,39 @@ def stock_content(stock: StockInfo, item: ItemCard | None, sku_id: str | None) -
     return f"{name}：{text}（截至 {fmt_time(stock.fetched_at)}）"
 
 
+def _spec(sku: Sku) -> str:
+    """规格的简称，如"黑色 / M"。"""
+    return " / ".join(str(v) for v in sku.props().values()) or sku.sku_id
+
+
+def sku_stock_content(
+    item: ItemCard, per_sku: Sequence[tuple[Sku, StockInfo]], fetched_at: datetime
+) -> str:
+    """没定到 SKU、有的规格缺货：逐个规格写清有没有货（不给整款合计，免得被当成某个规格有货）。"""
+    out: list[str] = []
+    has: list[str] = []
+    for sku, stock in per_sku:
+        if stock.in_stock:
+            qty = f" 库存 {stock.quantity} 件" if stock.quantity is not None else ""
+            has.append(_spec(sku) + qty)
+        else:
+            out.append(_spec(sku) + (f"（{stock.restock_note}）" if stock.restock_note else ""))
+    body = ["暂时缺货：" + "、".join(out)]
+    if has:
+        body.append("有货：" + "、".join(has))
+    head = "部分规格有货" if has else "各规格都暂时缺货"
+    return f"{item.title}：{head}。{'；'.join(body)}（截至 {fmt_time(fetched_at)}）"
+
+
+def aggregate_stock_content(stock: StockInfo, item: ItemCard) -> str:
+    """只拿到整款合计（逐个 SKU 查不了）：写明没有区分规格。"""
+    qty = f"，库存 {stock.quantity} 件" if stock.quantity is not None else ""
+    return (
+        f"{item.title}：整款合计有货{qty}（未区分规格，具体规格有没有货以下单页为准）"
+        f"（截至 {fmt_time(stock.fetched_at)}）"
+    )
+
+
 def price_content(price: PriceInfo, item: ItemCard | None) -> str:
     name = _item_name(item, price.item_id, None)
     promos = "；".join(price.promotions) if price.promotions else "当前没有活动"
@@ -249,7 +306,10 @@ class DefaultToolEvidenceProvider:
         *,
         ambiguity_window: timedelta = timedelta(hours=24),
         recent_limit: int = 5,
+        stale_after: timedelta | None = None,
     ) -> None:
+        """stale_after：订单、售后单的获取时间比这还旧，视为平台故障时的过期缓存（标降级）；
+        用 CachingToolGateway 时传它的 TTL。None 表示不判断。"""
         self._gateway = gateway
         self._policies = policies
         self._logistics = logistics
@@ -257,6 +317,7 @@ class DefaultToolEvidenceProvider:
         self._clock = clock
         self._window = ambiguity_window
         self._recent_limit = recent_limit
+        self._stale_after = stale_after
 
     def collect(
         self, ctx: ConversationContext, intent: Intent, needs: frozenset[Need]
@@ -318,6 +379,11 @@ class DefaultToolEvidenceProvider:
             run.order_fetched_at = run.now
         # 只考虑当前买家的订单（不回答别人的订单）
         orders = [o for o in orders if o.buyer_ref == ctx.buyer_ref]
+        if intent in ITEM_SCOPED_INTENTS and ctx.item is not None:
+            item_id = ctx.item.item_id
+            orders = [o for o in orders if any(ln.item_id == item_id for ln in o.lines)]
+            if not orders:
+                return None  # 没买过当前商品：按店铺政策回答，不拿别的订单的退换资格
 
         aftersales: list[AfterSaleInfo] = []
         if intent == Intent.REFUND_PROGRESS:
@@ -350,6 +416,20 @@ class DefaultToolEvidenceProvider:
         run.order_fetched_at = run.now
         return fetched
 
+    # ---------------------------------------------------------------- 获取时间与过期缓存
+
+    def _as_of(
+        self, run: _Run, fetched_at: datetime | None, fallback: datetime, kind: str
+    ) -> datetime:
+        """数据的获取时间（没有就用 fallback）；过期缓存（比 stale_after 还旧）标该工具降级。"""
+        at = fetched_at or fallback
+        if self._stale_after is not None and run.now - at >= self._stale_after:
+            _append_once(run.bundle.unavailable, ev.unavailable(kind))
+        return at
+
+    def _order_as_of(self, run: _Run, order: OrderInfo) -> datetime:
+        return self._as_of(run, order.fetched_at, run.order_fetched_at or run.now, "order")
+
     # ---------------------------------------------------------------- 各类证据
 
     def _add_order(self, run: _Run, order: OrderInfo) -> None:
@@ -360,7 +440,7 @@ class DefaultToolEvidenceProvider:
                 label=ev.tool_label("order"),
                 content=order_content(order),
                 data={"order": _dump(order)},
-                fetched_at=run.order_fetched_at or run.now,
+                fetched_at=self._order_as_of(run, order),
             )
         )
 
@@ -409,7 +489,8 @@ class DefaultToolEvidenceProvider:
             return
         for info in (a for a in listed if a.order_id == order.order_id):
             info = mask_platform_text(info)
-            progress = self._aftersale.refund_progress(info, run.now)
+            as_of = self._as_of(run, info.fetched_at, run.now, "aftersale")
+            progress = self._aftersale.refund_progress(info, as_of)
             run.bundle.evidences.append(
                 Evidence(
                     id=ev.tool_aftersale(info.aftersale_id),
@@ -417,7 +498,7 @@ class DefaultToolEvidenceProvider:
                     label=ev.tool_label("aftersale"),
                     content=aftersale_content(info, progress),
                     data={"aftersale": _dump(info), "progress": _dump(progress)},
-                    fetched_at=run.now,
+                    fetched_at=as_of,
                 )
             )
 
@@ -432,7 +513,8 @@ class DefaultToolEvidenceProvider:
                 label=ev.tool_label("return"),
                 content=return_content(eligibility),
                 data={"eligibility": _dump(eligibility)},
-                fetched_at=run.order_fetched_at or run.now,
+                topic=(PolicyKey.SEVEN_DAY_RETURN.value if eligibility.eligible is False else None),
+                fetched_at=self._order_as_of(run, order),
             )
         )
 
@@ -447,17 +529,46 @@ class DefaultToolEvidenceProvider:
         if stock is None:
             return
         self._check_shop(ctx.shop_id, stock)
+        content = stock_content(stock, item, sku_id)
+        data: dict[str, Any] = {"stock": _dump(stock)}
+        fetched_at = stock.fetched_at
+        if sku_id is None and len(item.skus) > 1 and stock.in_stock:
+            # 整款合计"有货"可能掩盖某些规格缺货（"M 码"对应的几个 SKU 都卖完了）
+            per_sku = self._sku_stocks(run, item)
+            if per_sku is None:
+                content = aggregate_stock_content(stock, item)
+            else:
+                data["skus"] = [_dump(s) for _, s in per_sku]
+                fetched_at = min([fetched_at, *(s.fetched_at for _, s in per_sku)])
+                if any(not s.in_stock for _, s in per_sku):
+                    content = sku_stock_content(item, per_sku, fetched_at)
         bundle.evidences.append(
             Evidence(
                 id=ev.tool_stock(item.item_id, sku_id),
                 source=EvidenceSource.REALTIME,
                 label=ev.tool_label("stock"),
-                content=stock_content(stock, item, sku_id),
-                data={"stock": _dump(stock)},
+                content=content,
+                data=data,
                 topic=ev.topic_for_stock(item.item_id, sku_id),
-                fetched_at=stock.fetched_at,
+                fetched_at=fetched_at,
             )
         )
+
+    def _sku_stocks(self, run: _Run, item: ItemCard) -> list[tuple[Sku, StockInfo]] | None:
+        """逐个 SKU 查库存；SKU 太多、查不了或一个都没查到时返回 None（只能用整款合计）。"""
+        if len(item.skus) > MAX_SKU_STOCK_LOOKUPS:
+            return None
+        out: list[tuple[Sku, StockInfo]] = []
+        for sku in item.skus:
+            try:
+                stock = self._gateway.get_stock(run.ctx.shop_id, item.item_id, sku.sku_id)
+            except ToolUnavailable:
+                return None
+            if stock is None:
+                continue
+            self._check_shop(run.ctx.shop_id, stock)
+            out.append((sku, stock))
+        return out or None
 
     def _add_price(self, run: _Run, item: ItemCard) -> None:
         ctx, bundle = run.ctx, run.bundle
@@ -476,7 +587,8 @@ class DefaultToolEvidenceProvider:
                 label=ev.tool_label("price"),
                 content=price_content(price, item),
                 data={"price": _dump(price)},
-                topic=ev.topic_for_price(item.item_id),
+                # 和店铺满减政策同主题：实时活动配置和政策冲突时覆盖政策（§5.2.1）
+                topic=PolicyKey.PROMOTIONS.value,
                 fetched_at=price.fetched_at,
             )
         )

@@ -195,3 +195,30 @@ def test_stats_per_shop_and_method(env):
     # 快照：改返回值不影响内部计数
     stats[SHOP_A]["get_order"].requests = 99
     assert gw.stats()[SHOP_A]["get_order"].requests == 2
+
+
+# ---------------------------------------------------------------- 订单 / 售后单的获取时间（§12.2）
+
+
+def test_order_and_aftersale_are_stamped_with_fetch_time(env):
+    """订单、售后单平台不带获取时间：网关在取到时记下，过期缓存兜底时仍是原来的时间，
+    回答才能写"截至 <真实时间>"（§12.2 用缓存数据并注明时间）。"""
+    w, clock, inner, gw = env
+    fetched = clock.now()
+    assert w.order(SHOP_A, "o_1001").fetched_at is None  # 平台数据本身没有
+    assert gw.get_order(SHOP_A, "o_1001").fetched_at == fetched
+    assert all(o.fetched_at == fetched for o in gw.list_recent_orders(SHOP_A, BUYER))
+    assert gw.get_aftersale(SHOP_A, "as_2001").fetched_at == fetched
+    listed = gw.list_aftersales(SHOP_A, buyer_ref=BUYER)
+    assert listed and all(a.fetched_at == fetched for a in listed)
+
+    clock.advance(hours=1)
+    inner.fail_on = {"get_order", "list_recent_orders", "get_aftersale", "list_aftersales"}
+    assert gw.get_order(SHOP_A, "o_1001").fetched_at == fetched
+    assert all(o.fetched_at == fetched for o in gw.list_recent_orders(SHOP_A, BUYER))
+    assert gw.get_aftersale(SHOP_A, "as_2001").fetched_at == fetched
+    assert all(a.fetched_at == fetched for a in gw.list_aftersales(SHOP_A, buyer_ref=BUYER))
+
+    # 平台恢复：重新取到的数据是新的获取时间
+    inner.fail_on = set()
+    assert gw.get_order(SHOP_A, "o_1001").fetched_at == clock.now()

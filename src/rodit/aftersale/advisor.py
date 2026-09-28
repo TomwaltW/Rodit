@@ -130,9 +130,14 @@ class DefaultAfterSaleAdvisor:
         return result(True, reason, days)
 
     def refund_progress(self, aftersale: AfterSaleInfo, now: datetime) -> RefundProgress:
+        """as_of 取售后单的获取时间（平台故障时来自缓存，§12.2 用缓存数据并注明时间），
+        没有获取时间才用 now。"""
         label = AFTERSALE_STATUS_LABELS[aftersale.status]
         text = _PROGRESS_TEXT[aftersale.status]
         summary = f"{label}：{text}（售后单更新于 {fmt_time(aftersale.updated_at)}）"
         return RefundProgress(
-            aftersale_id=aftersale.aftersale_id, status=aftersale.status, summary=summary, as_of=now
+            aftersale_id=aftersale.aftersale_id,
+            status=aftersale.status,
+            summary=summary,
+            as_of=aftersale.fetched_at or now,
         )
