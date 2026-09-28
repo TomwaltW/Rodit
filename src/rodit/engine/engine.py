@@ -545,7 +545,12 @@ class AssistEngine:
 
     def _run_unit(self, run: _Run, ctx: ConversationContext, unit: _Unit, plan: ActionPlan) -> None:
         route = unit.route
-        if plan.retrieve:
+        # 规则 3 不附回答时（关闭的类型、投诉、降级时的高风险类型）只出安抚话术：不检索，
+        # 不调平台工具，也不给关闭的类型记知识缺失
+        soothe_only = route.action == RouteAction.SOOTHE and not soothe_with_answer(
+            route, ctx.config.disabled_intents
+        )
+        if plan.retrieve and not soothe_only:
             t = time.perf_counter()
             bundle: EvidenceBundle | None = None
             try:
@@ -559,9 +564,13 @@ class AssistEngine:
                 unit.reason = REASON_RETRIEVER
             run.add_latency("retrieve", t)
             if bundle is None:
-                return
+                if route.action != RouteAction.OFF_PLATFORM_SCRIPT:
+                    return
+                # 站外交易标准话术不依赖依据（§11.4）：检索失败照常出话术，只是不带依据
+                bundle, unit.reason = EvidenceBundle(), None
+            else:
+                self._audit(run, AuditAction.RETRIEVE, _retrieve_detail(route, bundle))
             unit.bundle = bundle
-            self._audit(run, AuditAction.RETRIEVE, _retrieve_detail(route, bundle))
         bundle = unit.bundle
         for code in bundle.unavailable:
             run.degrade(code)

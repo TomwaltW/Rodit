@@ -79,6 +79,33 @@ def test_soothe_degraded_high_risk_keeps_only_the_script(kit: Kit) -> None:
     assert [c.text for c in result.suggestions] == [SOOTHE_SCRIPT]
 
 
+def test_gated_soothe_does_not_retrieve(kit: Kit) -> None:
+    """规则 3 不附回答时只出安抚话术：不检索、不调平台工具、不给关闭的类型记知识缺失。"""
+    kit.set_shop_config(SHOP_A, disabled_intents=["price_promo"])
+    kit.router.decide = make_route(
+        Intent.PRICE_PROMO, RouteAction.SOOTHE, rule=3, high_risk=True, alerts=[ALERT_EMOTION]
+    )
+    kit.generator.script = [_soothe_and_answer("亲，店铺满 199 减 20 哦")]
+    result = kit.engine().handle(kit.msg("太差了！！有券吗，垃圾"))
+    assert result is not None
+    assert kit.retriever.calls == []
+    assert [c.text for c in result.suggestions] == [SOOTHE_SCRIPT]
+    assert result.missing_knowledge == []
+
+
+def test_off_platform_script_survives_retrieval_failure(kit: Kit) -> None:
+    """站外交易标准话术不依赖依据（§11.4）：检索失败照常出话术。"""
+    kit.router.decide = make_route(
+        Intent.OFF_PLATFORM, RouteAction.OFF_PLATFORM_SCRIPT, rule=1, confidence=0.97
+    )
+    kit.retriever.error = RuntimeError("boom")
+    result = kit.engine().handle(kit.msg("加个微信吧，转账给你便宜点"))
+    assert result is not None
+    [card] = result.suggestions
+    assert card.kind == DraftKind.TEMPLATE and "站外" in card.text
+    assert result.no_suggestion_reason is None
+
+
 def test_soothe_open_intent_keeps_script_and_answer(kit: Kit) -> None:
     kit.router.decide = make_route(Intent.SHIPPING_POLICY, RouteAction.SOOTHE, rule=3)
     kit.generator.script = [_soothe_and_answer("亲，现货 48 小时内发货哦")]
