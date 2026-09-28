@@ -302,13 +302,30 @@ class PgKnowledgeRepository:
         status: KnowledgeStatus,
         *,
         approved_by: str | None = None,
+        expected_status: KnowledgeStatus | None = None,
     ) -> KnowledgeItem:
+        # 比较后更新：WHERE 里带上期望状态。并发的另一个事务先提交时，READ COMMITTED 下
+        # 这条 UPDATE 会按新行重新判断条件，状态已变就更新 0 行
+        cond, params = "shop_id = %s AND id = %s", [shop_id, knowledge_id]
+        if expected_status is not None:
+            cond += " AND status = %s"
+            params.append(expected_status)
         with self._session(shop_id) as conn:
             r = conn.execute(
                 "UPDATE knowledge_item SET status = %s, approved_by = COALESCE(%s, approved_by)"
-                f" WHERE shop_id = %s AND id = %s RETURNING {_K_COLS}",
-                (status, approved_by, shop_id, knowledge_id),
+                f" WHERE {cond} RETURNING {_K_COLS}",
+                [status, approved_by, *params],
             ).fetchone()
+            if r is None and expected_status is not None:
+                cur = conn.execute(
+                    "SELECT status FROM knowledge_item WHERE shop_id = %s AND id = %s",
+                    (shop_id, knowledge_id),
+                ).fetchone()
+                if cur is not None:
+                    raise ConcurrencyConflict(
+                        f"知识 {knowledge_id} 的状态已是 {cur['status']}，"
+                        f"不是 {KnowledgeStatus(expected_status).value}"
+                    )
         if r is None:
             raise KeyError(knowledge_id)
         return _knowledge(r)

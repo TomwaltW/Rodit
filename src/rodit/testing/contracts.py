@@ -175,6 +175,71 @@ def check_knowledge_repository(make: Callable[[], KnowledgeRepository]) -> None:
     assert repo.get_shop(SHOP_A) is not None
 
 
+def check_knowledge_status_compare_and_set(make: Callable[[], KnowledgeRepository]) -> None:
+    """set_knowledge_status 的 expected_status：当前状态不等于它就抛 ConcurrencyConflict、不写入。
+
+    多实例部署时商家子账号 A 审核通过、子账号 B 同时驳回同一条候选知识：只能有一个生效，
+    被驳回的候选不能因为"后写的赢"又变成已审核、拿去回答买家。
+    """
+    repo = make()
+
+    def candidate(question: str) -> KnowledgeItem:
+        return repo.add_knowledge(
+            KnowledgeItem(
+                shop_id=SHOP_A,
+                question=question,
+                answer="亲，发货前可以改哦~",
+                source=KnowledgeSource.ADOPTED,
+                status=KnowledgeStatus.CANDIDATE,
+            )
+        )
+
+    k = candidate("能改地址吗")
+    ok = repo.set_knowledge_status(
+        SHOP_A,
+        k.id,
+        KnowledgeStatus.APPROVED,
+        approved_by="merchant_a",
+        expected_status=KnowledgeStatus.CANDIDATE,
+    )
+    assert ok.status == KnowledgeStatus.APPROVED and ok.approved_by == "merchant_a"
+    try:  # 另一个实例还以为它是候选，要驳回
+        repo.set_knowledge_status(
+            SHOP_A, k.id, KnowledgeStatus.RETIRED, expected_status=KnowledgeStatus.CANDIDATE
+        )
+    except ConcurrencyConflict:
+        pass
+    else:
+        raise AssertionError("状态已变化时比较后更新应抛 ConcurrencyConflict")
+    got = repo.get_knowledge(SHOP_A, k.id)
+    assert got.status == KnowledgeStatus.APPROVED and got.approved_by == "merchant_a"
+
+    # 期望状态对得上：照常更新
+    retired = repo.set_knowledge_status(
+        SHOP_A, k.id, KnowledgeStatus.RETIRED, expected_status=KnowledgeStatus.APPROVED
+    )
+    assert retired.status == KnowledgeStatus.RETIRED
+
+    # 不存在、或属于别的店铺：仍是 KeyError（不暴露别的店铺有没有这条），不是 ConcurrencyConflict
+    other = candidate("发什么快递")
+    for shop_id, kid in ((SHOP_B, other.id), (SHOP_A, 987654)):
+        try:
+            repo.set_knowledge_status(
+                shop_id, kid, KnowledgeStatus.APPROVED, expected_status=KnowledgeStatus.CANDIDATE
+            )
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("不存在或跨店的比较后更新应抛 KeyError")
+    assert repo.get_knowledge(SHOP_A, other.id).status == KnowledgeStatus.CANDIDATE
+
+    # 不带 expected_status：无条件更新（原有语义）
+    assert (
+        repo.set_knowledge_status(SHOP_A, other.id, KnowledgeStatus.RETIRED).status
+        == KnowledgeStatus.RETIRED
+    )
+
+
 # ---------------------------------------------------------------- 会话
 
 

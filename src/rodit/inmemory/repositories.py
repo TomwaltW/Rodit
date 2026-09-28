@@ -143,11 +143,17 @@ class InMemoryKnowledgeRepository:
         status: KnowledgeStatus,
         *,
         approved_by: str | None = None,
+        expected_status: KnowledgeStatus | None = None,
     ) -> KnowledgeItem:
         with self._lock:
             item = self._knowledge.get(knowledge_id)
             if item is None or item.shop_id != shop_id:
                 raise KeyError(knowledge_id)
+            if expected_status is not None and item.status != expected_status:
+                raise ConcurrencyConflict(
+                    f"知识 {knowledge_id} 的状态已是 {item.status.value}，"
+                    f"不是 {expected_status.value}"
+                )
             update: dict[str, object] = {"status": status}
             if approved_by is not None:
                 update["approved_by"] = approved_by

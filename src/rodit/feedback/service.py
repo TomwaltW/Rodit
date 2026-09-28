@@ -299,9 +299,7 @@ class FeedbackService:
                 raise ActionNotAllowed(
                     f"知识 {knowledge_id} 是 {item.status.value}，只有候选知识能审核通过"
                 )
-            saved = self._knowledge.set_knowledge_status(
-                shop_id, knowledge_id, KnowledgeStatus.APPROVED, approved_by=actor
-            )
+            saved = self._set_knowledge_status(item, KnowledgeStatus.APPROVED, approved_by=actor)
             self._record_knowledge(AuditAction.KNOWLEDGE_APPROVED.value, actor, item)
         if self._on_approved is not None:
             self._on_approved(saved)
@@ -319,13 +317,28 @@ class FeedbackService:
                 raise KeyError(f"店铺 {shop_id} 没有知识 {knowledge_id}")
             if item.status == KnowledgeStatus.RETIRED:
                 raise ActionNotAllowed(f"知识 {knowledge_id} 已经下线")
-            saved = self._knowledge.set_knowledge_status(
-                shop_id, knowledge_id, KnowledgeStatus.RETIRED
-            )
+            saved = self._set_knowledge_status(item, KnowledgeStatus.RETIRED)
             self._record_knowledge(KNOWLEDGE_RETIRED, actor, item)
             return saved
 
     # ------------------------------------------------------------ 内部
+
+    def _set_knowledge_status(
+        self, item: KnowledgeItem, status: KnowledgeStatus, *, approved_by: str | None = None
+    ) -> KnowledgeItem:
+        """比较后更新：只有状态仍是刚读到的那个才写入。进程内的锁管不到别的实例，
+        多实例部署时商家审核通过和驳回同时发生，后写的不能覆盖先写的。"""
+        assert item.id is not None
+        try:
+            return self._knowledge.set_knowledge_status(
+                item.shop_id,
+                item.id,
+                status,
+                approved_by=approved_by,
+                expected_status=item.status,
+            )
+        except ConcurrencyConflict as exc:
+            raise ActionNotAllowed(f"知识 {item.id} 的状态已经变化，请刷新后再操作") from exc
 
     def _load_shown(self, shop_id: str, suggestion_id: int) -> SuggestionRecord:
         record = self._suggestions.get(shop_id, suggestion_id)
