@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ from rodit.app import AssistService
 from rodit.app.demo import build_demo_unit, taobao_event
 from rodit.core.enums import Platform, Role, SuggestionStatus
 from rodit.core.errors import ActionNotAllowed, StorageUnavailable
+from rodit.core.ports import RECALL_TOMBSTONE_TTL
 from rodit.engine.cards import RECALL_REFRESH_HINT
 from rodit.feedback import shadow_report
 from rodit.testing.fixtures import AGENT, SHOP_A
@@ -165,3 +167,18 @@ def test_shadow_shop_late_message_does_not_double_count_shadow_comparison():
     assert adapter.sidebar(SHOP_A, CONV) == []  # 影子模式什么都不展示
     report = shadow_report(_records(service), {"w2": "亲，48 小时内发货"})
     assert report.groups == len({(r.msg_id, r.intent) for r in records})
+
+
+def test_recall_tombstone_expiry_follows_the_unit_clock():
+    """撤回先到留下的标记按单元的时钟过期（组装时把时钟传给会话仓储）：
+    过了保留期才到的同 ID 消息照常保存、照常出推荐。"""
+    service = AssistService(build_demo_unit(Platform.TAOBAO))
+    clock = service.unit.clock
+    service.handle_event("B", _recall("r_early", "b_late"))
+    clock.set(clock.now() + RECALL_TOMBSTONE_TTL + timedelta(hours=1))
+    result = service.handle_event(
+        "B", taobao_event("什么时候发货", msg_id="b_late", send_time_ms=_ms(service))
+    )
+    assert result is not None and result.suggestions
+    stored = service.unit.repos.conversations.recent_messages(SHOP_A, CONV)
+    assert [m.msg_id for m in stored] == ["b_late"]

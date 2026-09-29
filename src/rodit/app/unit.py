@@ -90,7 +90,7 @@ class Repos:
 def in_memory_repos(clock: Clock) -> Repos:
     return Repos(
         knowledge=InMemoryKnowledgeRepository(clock),
-        conversations=InMemoryConversationRepository(),
+        conversations=InMemoryConversationRepository(clock=clock),
         suggestions=InMemorySuggestionRepository(),
         feedback=InMemoryFeedbackRepository(),
         reviews=InMemoryAfterSaleReviewRepository(),
