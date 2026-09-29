@@ -21,6 +21,7 @@ from dataclasses import replace
 from rodit.app.unit import Repos, Unit, build_unit
 from rodit.core.clock import Clock, SystemClock
 from rodit.core.config import EngineConfig
+from rodit.core.decision import DecisionProvider
 from rodit.core.enums import Platform
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import (
@@ -109,12 +110,16 @@ def build_production_unit(
     audit_wrapper: Callable[[AuditLog], AuditLog] | None = None,
     catalog: ItemCatalog | None = None,
     ocr: ImageTextExtractor | None = None,
+    route_provider: DecisionProvider | None = None,
 ) -> Unit:
     """生产单元：tools / adapters / action_port 由平台云里的实现注入（见模块说明）。
 
     MVP 只申请读权限（§8.4 最小权限），action_port 通常为空：售后审核只给建议。
     audit_wrapper：给审计套一层（部署入口用它采集运行指标，rodit.ops.instrument），
     单元里所有写审计的地方（引擎、判断层留痕、大模型计量）都经过套好的那一层。
+    route_provider：路由用的判断层，为空时按 config.decision 组装；decision.provider 是
+    classifier 时由部署入口从模型文件加载好传进来（§6.4 Phase 2）。质检仍按 config.decision
+    组装（classifier / rules 时质检用大模型，§6.4 "质检用硬规则 + 大模型"）。
     """
     clock = clock or SystemClock()
     db = production_database()
@@ -143,4 +148,5 @@ def build_production_unit(
         action_port=action_port,
         catalog=catalog,
         ocr=ocr,
+        route_provider=route_provider,
     )
