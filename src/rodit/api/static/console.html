@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Rodit 商家控制台</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assist/assist.css">
+<link rel="stylesheet" href="console/console.css">
+<script id="rodit-config" type="application/json">__RODIT_PAGE_CONFIG__</script>
+<script src="console/console.js" defer></script>
+</head>
+<body class="console-page">
+<a class="skip-link" href="#main">跳到正文</a>
+<header class="topbar">
+  <h1>Rodit 商家控制台 <span class="subtitle"><span id="platform-name">平台单元</span> · 知识、设置、上线与复核</span></h1>
+  <div class="topbar-end">
+    <a class="page-link" href="assist">话术助手（模式 C）</a>
+    <div id="whoami" class="whoami" hidden>
+      <span id="identity"></span>
+      <button type="button" id="sign-out" class="secondary">退出</button>
+    </div>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <noscript><p class="error">这个页面需要启用 JavaScript。</p></noscript>
+  <div id="error" class="error" role="alert" tabindex="-1" hidden></div>
+  <p id="live" class="visually-hidden" aria-live="polite"></p>
+
+  <section id="login" class="panel" aria-labelledby="login-title">
+    <h2 id="login-title">登录</h2>
+    <form id="login-form" novalidate>
+      <div class="field">
+        <label for="token">访问令牌</label>
+        <input id="token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="token-hint">
+        <p id="token-hint" class="hint">店长、商家、复核人员用自己的令牌登录；客服请用话术助手。令牌只保存在本标签页（sessionStorage），关闭标签页即失效，不会出现在网址里。</p>
+      </div>
+      <button type="submit" id="login-button">登录</button>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <div id="tabs" class="tabs" role="tablist" aria-label="控制台功能">
+      <button type="button" role="tab" id="tab-knowledge" data-tab="knowledge" aria-controls="panel-knowledge" aria-selected="false" tabindex="-1" hidden>知识</button>
+      <button type="button" role="tab" id="tab-policies" data-tab="policies" aria-controls="panel-policies" aria-selected="false" tabindex="-1" hidden>政策</button>
+      <button type="button" role="tab" id="tab-items" data-tab="items" aria-controls="panel-items" aria-selected="false" tabindex="-1" hidden>商品</button>
+      <button type="button" role="tab" id="tab-config" data-tab="config" aria-controls="panel-config" aria-selected="false" tabindex="-1" hidden>设置</button>
+      <button type="button" role="tab" id="tab-rollout" data-tab="rollout" aria-controls="panel-rollout" aria-selected="false" tabindex="-1" hidden>上线</button>
+      <button type="button" role="tab" id="tab-review" data-tab="review" aria-controls="panel-review" aria-selected="false" tabindex="-1" hidden>复核</button>
+      <button type="button" role="tab" id="tab-reports" data-tab="reports" aria-controls="panel-reports" aria-selected="false" tabindex="-1" hidden>报表</button>
+    </div>
+
+    <!-- ============================================================ 知识（§5.2 知识中心、§5.8 候选知识） -->
+    <section id="panel-knowledge" class="panel tab-panel" role="tabpanel" aria-labelledby="tab-knowledge" tabindex="-1" hidden>
+      <div class="section-head">
+        <h2>知识</h2>
+        <button type="button" class="secondary" data-refresh="knowledge">刷新</button>
+      </div>
+      <p class="readonly-note" data-readonly hidden>店长只能查看；新增、修改、审核和下线由商家操作。</p>
+      <div id="knowledge-result" class="result" tabindex="-1" data-dyn></div>
+
+      <h3 id="gaps-title">要补的知识</h3>
+      <div id="gaps" data-dyn></div>
+
+      <h3 id="candidates-title">候选知识（待审核）</h3>
+      <p class="hint">客服「编辑后发送」的回答会生成候选知识，商家审核通过后才用于回答（§5.8）。</p>
+      <div id="candidates" data-dyn></div>
+
+      <details id="faq-create" class="subpanel" data-write hidden>
+        <summary>新增 FAQ</summary>
+        <form id="faq-form" novalidate>
+          <div class="field">
+            <label for="faq-question">买家问题</label>
+            <textarea id="faq-question" rows="2" aria-describedby="faq-question-hint"></textarea>
+            <p id="faq-question-hint" class="hint">写买家常问的说法，如「发什么快递」。</p>
+          </div>
+          <div class="field">
+            <label for="faq-answer">标准回答</label>
+            <textarea id="faq-answer" rows="3" aria-describedby="faq-answer-hint"></textarea>
+            <p id="faq-answer-hint" class="hint">保存后直接上线；保存时会按回答时的质检规则检查，有问题会提醒（不拦截保存）。</p>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="faq-item">适用商品</label>
+              <select id="faq-item"><option value="">通用（不限商品）</option></select>
+            </div>
+            <div class="field">
+              <label for="faq-intent">问题类型</label>
+              <select id="faq-intent"><option value="">不限</option></select>
+            </div>
+          </div>
+          <button type="submit" id="faq-submit">保存并上线</button>
+        </form>
+        <div id="faq-result" class="result" tabindex="-1" data-dyn></div>
+      </details>
+
+      <div class="section-head list-head">
+        <h3 id="faqs-title">FAQ</h3>
+        <form id="faq-filter" class="inline-form" novalidate>
+          <label for="faq-status">状态</label>
+          <select id="faq-status"><option value="">全部</option></select>
+        </form>
+      </div>
+      <div id="faqs" data-dyn></div>
+    </section>
+
+    <!-- ============================================================ 政策（§5.2.1 优先级 2、附录 C） -->
+    <section id="panel-policies" class="panel tab-panel" role="tabpanel" aria-labelledby="tab-policies" tabindex="-1" hidden>
+      <div class="section-head">
+        <h2>店铺政策</h2>
+        <button type="button" class="secondary" data-refresh="policies">刷新</button>
+      </div>
+      <p class="readonly-note" data-readonly hidden>店长只能查看；政策由商家修改。</p>
+      <p class="hint">回答时店铺政策优先于商品详情和 FAQ（§5.2.1），改动即时生效。整份附录 C 问卷可以在<a href="assist">话术助手</a>页的「店铺数据」里填写。</p>
+      <p id="policy-summary" class="summary" data-dyn></p>
+      <div id="policies" data-dyn></div>
+    </section>
+
+    <!-- ============================================================ 商品（§5.2.2 商品卡片、§5.2.3 同步） -->
+    <section id="panel-items" class="panel tab-panel" role="tabpanel" aria-labelledby="tab-items" tabindex="-1" hidden>
+      <div class="section-head">
+        <h2>商品</h2>
+        <div class="actions tight">
+          <button type="button" id="sync-all" data-write hidden>同步商品</button>
+          <button type="button" class="secondary" data-refresh="items">刷新</button>
+        </div>
+      </div>
+      <p class="readonly-note" data-readonly hidden>店长只能查看；商品卡片由商家填写，同步由商家发起。</p>
+      <p class="hint">同步只更新平台字段（标题、属性、SKU、详情，含详情图识别的文字），商家填写的字段不动；已下架和平台上没有了的商品只提示、不删除（§5.2.3）。</p>
+      <div id="sync-report" class="result" tabindex="-1" data-dyn></div>
+      <div id="items" data-dyn></div>
+      <div id="item-detail" class="subpanel" tabindex="-1" data-dyn hidden></div>
+    </section>
+
+    <!-- ============================================================ 设置（§9.3 配置分层） -->
+    <section id="panel-config" class="panel tab-panel" role="tabpanel" aria-labelledby="tab-config" tabindex="-1" hidden>
+      <div class="section-head">
+        <h2>店铺设置</h2>
+        <button type="button" class="secondary" data-refresh="config">刷新</button>
+      </div>
+      <p class="readonly-note" data-readonly hidden>店长只能查看；设置由商家修改。</p>
+      <p class="hint">平台默认 → 类目默认 → 店铺设置，下层覆盖上层（§9.3）。「恢复默认」删掉店铺设置，回到平台 / 类目默认。判断阈值由我们统一校准，不开放修改。</p>
+      <div id="config" data-dyn></div>
+    </section>
+
+    <!-- ============================================================ 上线（§13.4） -->
+    <section id="panel-rollout" class="panel tab-panel" role="tabpanel" aria-labelledby="tab-rollout" tabindex="-1" hidden>
+      <div class="section-head">
+        <h2>上线节奏</h2>
+        <button type="button" class="secondary" data-refresh="rollout">刷新</button>
+      </div>
+      <p class="hint">影子模式（生成不展示，事后对比）→ 智能辅助（展示推荐，客服决定）→ 按类型评估半自动 / 全自动（§13.4）。这里只有计数和分数，没有对话内容。</p>
+      <div id="rollout" data-dyn></div>
+      <h3 id="stage-title">切换阶段</h3>
+      <div id="stage-controls" data-dyn></div>
+    </section>
+
+    <!-- ============================================================ 复核（§13.5、§13.2） -->
+    <section id="panel-review" class="panel tab-panel" role="tabpanel" aria-labelledby="tab-review" tabindex="-1" hidden>
+      <div class="section-head">
+        <h2>每周复核</h2>
+      </div>
+      <p class="notice access-notice"><strong>复核列表会显示推荐原文和买家问题（已打码），每次查看都会记录访问日志（§9.2）。</strong>只在需要复核时加载。</p>
+      <form id="review-form" class="inline-form review-form" novalidate>
+        <div class="field">
+          <label for="review-period">周期（ISO 周）</label>
+          <input id="review-period" type="week" placeholder="2026-W40" autocomplete="off" aria-describedby="review-period-hint">
+        </div>
+        <div class="field">
+          <label for="review-size">抽样条数</label>
+          <input id="review-size" type="number" inputmode="numeric" min="1" step="1">
+        </div>
+        <button type="submit" id="review-report-button" class="secondary">查看报表</button>
+        <button type="button" id="review-sample">抽样</button>
+      </form>
+      <p id="review-period-hint" class="hint">默认上一个完整周（东八区周一 0 点起）。抽样按问题类型分层；重复抽样只补不换。</p>
+      <p id="review-status" class="status" role="status" data-dyn></p>
+
+      <h3 id="review-report-title">复核报表</h3>
+      <div id="review-report" data-dyn></div>
+
+      <div class="section-head list-head">
+        <h3 id="review-queue-title">复核列表</h3>
+        <form id="review-list-form" class="inline-form" novalidate>
+          <label for="review-filter">状态</label>
+          <select id="review-filter"><option value="">全部</option></select>
+          <button type="submit" id="review-load">加载复核列表（记录访问）</button>
+        </form>
+      </div>
+      <div id="review-queue" data-dyn></div>
+    </section>
+
+    <!-- ============================================================ 报表（§12.4） -->
+    <section id="panel-reports" class="panel tab-panel" role="tabpanel" aria-labelledby="tab-reports" tabindex="-1" hidden>
+      <div class="section-head">
+        <h2>报表</h2>
+        <form id="report-form" class="inline-form" novalidate>
+          <label for="range">统计范围</label>
+          <select id="range">
+            <option value="7">近 7 天</option>
+            <option value="30">近 30 天</option>
+            <option value="">全部</option>
+          </select>
+          <button type="submit" class="secondary">刷新</button>
+        </form>
+      </div>
+      <h3>推荐采纳率</h3>
+      <div id="adoption" data-dyn></div>
+      <h3>质检与降级</h3>
+      <div id="qa-report" data-dyn></div>
+    </section>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,567 @@
+/* Rodit 商家控制台。基础样式（颜色变量、表单、按钮、表格）在 assist/assist.css，这里只加控制台特有的。
+   只用系统字体，不引用任何外部资源（平台云 / 内网里也能用）。 */
+
+.console-page main {
+  max-width: 72rem;
+}
+
+main:focus {
+  outline: none;
+}
+
+h4 {
+  font-size: 1rem;
+  margin: 1rem 0 0.4rem;
+  line-height: 1.35;
+}
+
+h5 {
+  font-size: 0.95rem;
+  margin: 0.75rem 0 0.25rem;
+  color: var(--muted);
+}
+
+.hint a {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.block {
+  display: block;
+}
+
+.pre {
+  white-space: pre-wrap;
+  background: var(--soft);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.75rem;
+  margin: 0;
+}
+
+.summary {
+  font-weight: 600;
+  margin: 0.5rem 0;
+}
+
+.warn-text {
+  color: var(--warn);
+}
+
+/* ---------------------------------------------------------------- 页签（WAI-ARIA tabs） */
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  overflow-x: auto;
+  margin-bottom: 1rem;
+  border-bottom: 2px solid var(--border);
+  scrollbar-width: thin;
+}
+
+.tabs [role="tab"] {
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid transparent;
+  border-bottom: 3px solid transparent;
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 0.45rem 1.1rem;
+  margin-bottom: -2px;
+}
+
+.tabs [role="tab"][aria-selected="true"] {
+  border-color: var(--border);
+  border-bottom-color: var(--accent);
+  background: var(--panel);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.tab-panel:focus {
+  outline: none;
+}
+
+.readonly-note {
+  background: var(--soft);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.75rem;
+  color: var(--muted);
+}
+
+.result:empty {
+  display: none;
+}
+
+.result {
+  margin: 0.5rem 0 1rem;
+}
+
+.result:focus {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.subpanel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+  background: var(--panel);
+}
+
+.subpanel > summary {
+  cursor: pointer;
+  font-weight: 600;
+  min-height: 2.75rem;
+  display: flex;
+  align-items: center;
+}
+
+.list-head {
+  margin-top: 1.25rem;
+}
+
+.list-head h3 {
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- 表单 */
+
+input[type="text"],
+input[type="number"],
+input[type="week"] {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  font: inherit;
+  font-size: 1rem;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.6rem;
+  min-height: 2.75rem;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 1rem;
+}
+
+.review-form {
+  align-items: flex-end;
+}
+
+.review-form .field {
+  margin-bottom: 0;
+}
+
+.review-form input[type="week"] {
+  width: 12rem;
+}
+
+.review-form input[type="number"] {
+  width: 7rem;
+}
+
+.actions.tight {
+  margin-top: 0.5rem;
+}
+
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--panel);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.25rem;
+}
+
+.check input {
+  width: 1.15rem;
+  height: 1.15rem;
+  margin: 0;
+}
+
+.check label {
+  font-weight: normal;
+  margin: 0;
+}
+
+.intent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: 0 0.75rem;
+}
+
+.intent-grid legend {
+  grid-column: 1 / -1;
+}
+
+.entry-panel:empty {
+  display: none;
+}
+
+.entry-form,
+.confirm,
+.gate-failure {
+  margin-top: 0.5rem;
+  padding: 0.75rem;
+  border-radius: var(--radius);
+  background: var(--soft);
+}
+
+.gate-failure {
+  border: 1px solid var(--danger);
+  background: var(--danger-bg);
+}
+
+.confirm p {
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- 徽标、提醒 */
+
+.badge.ok,
+.badge.st-approved,
+.badge.own,
+.badge.rv-scored {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.badge.bad {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.badge.st-candidate,
+.badge.rv-pending {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.badge.st-retired,
+.badge.rv-skipped {
+  color: var(--muted);
+}
+
+.warnings,
+.unchecked {
+  background: var(--warn-bg);
+  color: var(--fg);
+  border-left: 4px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.75rem;
+  margin: 0.5rem 0;
+}
+
+.warnings.blocking {
+  background: var(--danger-bg);
+  border-left-color: var(--danger);
+}
+
+.warnings-title {
+  font-weight: 700;
+  margin: 0 0 0.25rem;
+}
+
+.warnings ul,
+.unchecked ul {
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+}
+
+.warnings li.blocks {
+  color: var(--danger);
+}
+
+.warnings li.blocks .muted {
+  color: inherit;
+}
+
+.unchecked p {
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- 知识、政策 */
+
+.faq-list,
+.policy-list,
+.review-list,
+.config-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.faq {
+  border-top: 1px solid var(--border);
+  padding: 0.75rem 0;
+}
+
+.faq.st-retired .faq-answer,
+.faq.st-retired .faq-title {
+  opacity: 0.7;
+}
+
+.faq-title {
+  margin: 0 0 0.25rem;
+}
+
+.faq-id {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.faq-meta,
+.card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0 0 0.5rem;
+}
+
+.faq-answer {
+  margin: 0 0 0.25rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius);
+  background: var(--soft);
+  white-space: pre-wrap;
+}
+
+.policy {
+  border-top: 1px solid var(--border);
+  padding: 0.75rem 0 0.75rem 0.75rem;
+  border-left: 4px solid transparent;
+}
+
+.policy.unfilled {
+  border-left-color: var(--warn);
+}
+
+.policy-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+}
+
+.policy-label {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.policy-value {
+  margin: 0.25rem 0 0;
+  white-space: pre-wrap;
+}
+
+.policy-value.empty {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- 商品 */
+
+.chip.filled {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.chip.missing {
+  border-style: dashed;
+  color: var(--muted);
+}
+
+th.wrap,
+td.wrap {
+  white-space: normal;
+  min-width: 7rem;
+}
+
+/* ---------------------------------------------------------------- 设置 */
+
+.config-row {
+  border-top: 1px solid var(--border);
+  padding: 0.75rem 0;
+}
+
+.config-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.config-head h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.config-values {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.1rem 0.75rem;
+  margin: 0.4rem 0;
+}
+
+.config-values dt {
+  color: var(--muted);
+}
+
+.config-values dd {
+  margin: 0;
+}
+
+.config-form {
+  max-width: 36rem;
+}
+
+.locked {
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------- 上线 */
+
+.stage-card {
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  background: var(--soft);
+  border-left: 4px solid var(--accent);
+}
+
+.stage-card.stage-shadow {
+  border-left-color: var(--muted);
+}
+
+.stage-card.stage-auto {
+  border-left-color: var(--ok);
+}
+
+.stage-card p {
+  margin: 0.15rem 0;
+}
+
+.stage-now strong {
+  font-size: 1.3rem;
+}
+
+.gate {
+  margin: 0.75rem 0;
+}
+
+.gate-title {
+  margin: 0 0 0.25rem;
+}
+
+/* ---------------------------------------------------------------- 复核 */
+
+.access-notice {
+  margin-top: 0;
+}
+
+.review-list > li {
+  margin: 0.75rem 0;
+}
+
+.review-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  background: var(--panel);
+}
+
+.review-item.rv-scored,
+.review-item.rv-skipped {
+  border-style: dashed;
+}
+
+.review-item h4 {
+  margin-top: 0;
+}
+
+.rv-label {
+  margin: 0.5rem 0 0.15rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.card-text.edited {
+  border-left: 3px solid var(--ok);
+}
+
+.score-form {
+  margin-top: 0.75rem;
+}
+
+.score-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 0.75rem;
+}
+
+.score-dim .radio {
+  min-height: 2.25rem;
+}
+
+.gate-box {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  padding: 0.5rem 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.gate-box p {
+  margin: 0.15rem 0;
+}
+
+.gate-box.gate-passed {
+  border-left-color: var(--ok);
+}
+
+.gate-box.gate-failed {
+  border-left-color: var(--danger);
+}
+
+.gate-box.gate-insufficient_data {
+  border-left-color: var(--warn);
+}
+
+progress {
+  width: 100%;
+  height: 0.9rem;
+}
+
+.progress-text {
+  margin: 0.25rem 0 0.5rem;
+}
+
+/* ---------------------------------------------------------------- 手机宽度 */
+
+@media (max-width: 36rem) {
+  .field-row,
+  .score-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .review-form input[type="week"],
+  .review-form input[type="number"] {
+    width: 100%;
+  }
+
+  .review-form .field {
+    flex: 1 1 100%;
+  }
+
+  .tabs [role="tab"] {
+    padding: 0.45rem 0.6rem;
+  }
+}

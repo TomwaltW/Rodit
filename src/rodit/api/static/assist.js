@@ -33,6 +33,7 @@
   const HUMAN_ROLES = CONFIG.human_roles || ['agent', 'manager', 'merchant'];
   const CONSOLE_ROLES = CONFIG.console_roles || ['manager', 'merchant'];
   const MERCHANT_ROLES = CONFIG.merchant_roles || ['merchant'];
+  const REVIEWER_ROLES = CONFIG.reviewer_roles || ['reviewer'];
   const ADOPTION_TARGET = typeof CONFIG.adoption_target === 'number' ? CONFIG.adoption_target : 0.5;
   const ITEM_FILTER_MIN = 12; // 商品多于这个数时显示筛选框
   const MISSING_ITEM = 'item:?';
@@ -132,9 +133,11 @@
     }, 50);
   }
 
-  function showError(message) {
+  /** 页面顶部的错误区。link 可选：{href, text}，比如去商家控制台。 */
+  function showError(message, link) {
     const box = $('error');
     box.textContent = message;
+    if (link) box.append(' ', h('a', { href: link.href }, link.text));
     box.hidden = false;
   }
 
@@ -233,6 +236,18 @@
         showError(err.message);
       }
       $('token').focus();
+      return false;
+    }
+    if (me && REVIEWER_ROLES.includes(me.role)) {
+      // 复核人员的工作（每周复核、上线节奏）在商家控制台，这里不显示话术助手。
+      // 令牌留着（两个页面同一个键），同一标签页打开控制台时直接登录
+      state.token = null;
+      storage.set(STORAGE_TOKEN, token);
+      $('token').value = '';
+      showError('复核人员请使用商家控制台（每周复核、上线节奏），话术助手只给客服、店长和商家用。', {
+        href: 'console',
+        text: '打开商家控制台',
+      });
       return false;
     }
     if (!me || !HUMAN_ROLES.includes(me.role)) {

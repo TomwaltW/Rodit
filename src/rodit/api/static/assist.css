@@ -152,6 +152,26 @@ h3 {
   color: var(--muted);
 }
 
+/* 页头右侧：去另一个页面的链接（话术助手 ↔ 商家控制台）+ 当前身份 */
+.topbar-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.page-link,
+.error a {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.page-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+}
+
 main {
   max-width: 58rem;
   margin: 0 auto;
