@@ -15,7 +15,10 @@ from typing import Annotated, Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
+from rodit.api.auth import PrincipalRole
+from rodit.core import evidence as ev
 from rodit.core.enums import (
+    INTENT_LABELS,
     AfterSaleAction,
     AfterSaleReason,
     AfterSaleStatus,
@@ -26,6 +29,7 @@ from rodit.core.enums import (
     KnowledgeSource,
     KnowledgeStatus,
     Mode,
+    Platform,
     RejectReason,
     ReviewAdvice,
     ReviewState,
@@ -38,6 +42,7 @@ from rodit.core.models import (
     KnowledgeItem,
     SuggestionCard,
 )
+from rodit.knowledge import describe_gap
 
 MAX_TEXT_CHARS = 2000
 MAX_NOTE_CHARS = 500
@@ -119,6 +124,42 @@ class ConfirmRequest(_Request):
     reason_text: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
 
 
+# ================================================================ 缺失知识（§5.7、§5.8）
+
+
+class GapView(_View):
+    """要提醒商家补的知识（§5.2.3、§5.7、§5.8）。"""
+
+    marker: str  # 如 "policy:invoice"
+    description: str  # 如 "店铺政策 · 发票（问卷第 7 题）"
+
+
+def describe_missing(marker: str) -> str:
+    """缺失标记 → 给客服、商家看的说明。
+
+    知识类缺失沿用知识中心的说明（rodit.knowledge.describe_gap，
+    如"店铺政策 · 发票（问卷第 7 题）"）；
+    这里补上它不认识的几类：会话里没有订单、平台规则、说不清具体缺哪条（"knowledge:{intent}"）。
+    认不出的标记原样返回。
+    """
+    if marker == ev.MISSING_ORDER:
+        return "会话里没有订单信息"
+    kind, _, rest = marker.partition(":")
+    try:
+        if kind == "knowledge":
+            return f"「{INTENT_LABELS[Intent(rest)]}」相关的知识"
+        if kind == "platform":
+            platform, _, key = rest.partition(":")
+            return ev.platform_rule_label(platform, key)
+    except ValueError:
+        return marker
+    return describe_gap(marker)
+
+
+def gap_view(marker: str) -> GapView:
+    return GapView(marker=marker, description=describe_missing(marker))
+
+
 # ================================================================ 推荐（§5.6）
 
 
@@ -169,6 +210,7 @@ class EngineResultView(_View):
     alerts: list[str] = Field(default_factory=list)
     no_suggestion_reason: str | None = None
     missing_knowledge: list[str] = Field(default_factory=list)
+    missing_knowledge_details: list[GapView] = Field(default_factory=list)  # 同上，带中文说明
     auto_reply: SuggestionView | None = None
     transfer_to_human: bool = False
     degraded: list[str] = Field(default_factory=list)
@@ -191,6 +233,7 @@ class EngineResultView(_View):
             alerts=list(result.alerts),
             no_suggestion_reason=result.no_suggestion_reason,
             missing_knowledge=list(result.missing_knowledge),
+            missing_knowledge_details=[gap_view(m) for m in result.missing_knowledge],
             auto_reply=SuggestionView.from_card(auto) if auto is not None else None,
         )
 
@@ -236,13 +279,6 @@ class KnowledgeView(_View):
             approved_by=item.approved_by,
             created_at=item.created_at,
         )
-
-
-class GapView(_View):
-    """要提醒商家补的知识（§5.2.3、§5.7、§5.8）。"""
-
-    marker: str  # 如 "policy:invoice"
-    description: str  # 如 "店铺政策 · 发票（问卷第 7 题）"
 
 
 class QuestionnaireView(_View):
@@ -386,6 +422,25 @@ class HealthView(_View):
     status: str = "ok"
 
 
+# ================================================================ 模式 C 网页工具（§8.1）
+
+
+class MeView(_View):
+    """当前令牌对应的身份（网页工具登录用）。只有调用方自己的信息，没有令牌、没有店铺数据。"""
+
+    shop_id: str
+    user_id: str
+    role: PrincipalRole
+    platform: Platform  # 本平台单元（§9.1）
+
+
+class ItemSummaryView(_View):
+    """商品列表里的一项（模式 C 选当前商品，§5.3）：只有 ID 和标题。"""
+
+    item_id: str
+    title: str
+
+
 __all__ = [
     "ActionResultView",
     "AfterSaleReviewView",
@@ -398,7 +453,9 @@ __all__ = [
     "FeedbackView",
     "GapView",
     "HealthView",
+    "ItemSummaryView",
     "KnowledgeView",
+    "MeView",
     "NegotiateRequest",
     "NegotiationDoneRequest",
     "QuestionnaireRequest",
@@ -408,4 +465,6 @@ __all__ = [
     "RevokeView",
     "StandaloneAskRequest",
     "SuggestionView",
+    "describe_missing",
+    "gap_view",
 ]

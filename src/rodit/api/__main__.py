@@ -2,7 +2,8 @@
 
 - 平台单元用 rodit.app.demo.build_demo_unit（淘宝，合成数据、离线大模型替身，不联网、不需要密钥）；
 - 开发用令牌每次启动随机生成，打印在终端上，只在这个进程里有效；仓库里没有任何令牌；
-- 只监听本机地址。生产部署在平台云内，由平台的登录体系实现 Authenticator（§9.1、§12.3）。
+- 只监听本机地址。生产部署在平台云内，由平台的登录体系实现 Authenticator（§9.1、§12.3）；
+- 模式 C 网页工具（§8.1）在 /assist：用下面打印的客服 / 店长 / 商家令牌登录。
 """
 
 from __future__ import annotations
@@ -43,11 +44,20 @@ def build_demo_app() -> tuple[FastAPI, dict[str, Principal]]:
     return app, tokens
 
 
+def demo_page_url() -> str:
+    """模式 C 网页工具的本地地址。"""
+    return f"http://{DEMO_HOST}:{DEMO_PORT}/assist"
+
+
 def main(out: TextIO | None = None, *, run: Callable[..., Any] = uvicorn.run) -> int:
     out = out or sys.stdout
     app, tokens = build_demo_app()
     print("【仅本地演示】合成数据、离线大模型替身；令牌每次启动随机生成，不要用于生产。", file=out)
     print(f"接口地址：http://{DEMO_HOST}:{DEMO_PORT}（文档 /docs）", file=out)
+    print(
+        f"网页工具（模式 C）：{demo_page_url()}（用下面客服 / 店长 / 商家的令牌登录）",
+        file=out,
+    )
     for token, p in tokens.items():
         print(f"  {p.role:<11} 店铺 {p.shop_id}  账号 {p.user_id:<16} Bearer {token}", file=out)
     print(

@@ -3,7 +3,10 @@
 
 create_app 是应用工厂：一个 AssistService（一个平台单元，§9.1）+ 一个 Authenticator，没有全局状态。
 接口层只调用 AssistService，另外只读 Unit 的字段（店铺状态、店铺授权、审核记录、平台售后单、
-适配器注册表）做鉴权前置检查和展示。
+适配器注册表、商品卡片）做鉴权前置检查和展示。
+
+模式 C 网页工具（rodit.api.web）：GET / 和 /assist 是自带的静态页面，页面本身不含数据、不需要鉴权；
+页面脚本用 /v1/me 登录（令牌 → 身份），用 /v1/shops/{shop_id}/items 选商品，其余都是下面的接口。
 
 鉴权顺序（每个店铺范围的路由都一样，§9.2 串店测试覆盖全部路由）：
     令牌 → Principal（401）→ 路径 shop_id 与 principal.shop_id 一致（403 tenant_isolation）
@@ -41,7 +44,9 @@ from rodit.api.schemas import (
     FeedbackView,
     GapView,
     HealthView,
+    ItemSummaryView,
     KnowledgeView,
+    MeView,
     NegotiateRequest,
     NegotiationDoneRequest,
     QuestionnaireRequest,
@@ -50,6 +55,7 @@ from rodit.api.schemas import (
     RevokeView,
     StandaloneAskRequest,
 )
+from rodit.api.web import build_web_router
 from rodit.app.service import AssistService
 from rodit.core.enums import ReviewState, ShopStatus
 from rodit.core.errors import RoditError, ShopInactive, TenantIsolationError
@@ -98,6 +104,16 @@ def _integration(principal: PrincipalDep) -> Principal:
 
 
 IntegrationDep = Annotated[Principal, Depends(_integration)]
+
+
+def _human(principal: PrincipalDep) -> Principal:
+    """人的角色（客服、店长、商家）；平台对接的令牌不能登录网页工具。"""
+    if principal.role not in HUMAN_ROLES:
+        raise ApiError(403, "forbidden_role", MSG_FORBIDDEN_ROLE)
+    return principal
+
+
+HumanDep = Annotated[Principal, Depends(_human)]
 
 
 def _require_active_shop(service: AssistService, shop_id: str) -> None:
@@ -205,6 +221,34 @@ router = APIRouter()
 def healthz() -> HealthView:
     """存活检查（不需要鉴权，不返回任何店铺信息）。"""
     return HealthView()
+
+
+@router.get("/v1/me", response_model=MeView, tags=["模式 C"])
+def whoami(principal: HumanDep, service: ServiceDep) -> MeView:
+    """当前令牌对应的身份（模式 C 网页工具登录用）：店铺、账号、角色、平台单元。
+
+    只返回调用方自己的身份，不回显令牌、不读店铺数据；店铺停用时照常返回（之后的店铺接口是 403）。
+    """
+    return MeView(
+        shop_id=principal.shop_id,
+        user_id=principal.user_id,
+        role=principal.role,
+        platform=service.unit.platform,
+    )
+
+
+@router.get("/v1/shops/{shop_id}/items", response_model=list[ItemSummaryView], tags=["模式 C"])
+def list_items(principal: AgentDep, service: ServiceDep) -> list[ItemSummaryView]:
+    """本店的商品（按 item_id 升序，只有 ID 和标题）：模式 C 网页工具选当前商品（§5.3、§8.1）。
+
+    只读。
+    """
+    cards = service.unit.repos.knowledge.list_item_cards(principal.shop_id)
+    return [
+        ItemSummaryView(item_id=card.item_id, title=card.title)
+        for card in cards
+        if card.shop_id == principal.shop_id  # 纵深防御：仓储已按店铺隔离（§9.2）
+    ]
 
 
 @router.post(
@@ -509,10 +553,13 @@ def revoke(principal: RevokeDep, service: ServiceDep, body: EmptyBody = None) ->
 # ================================================================ 工厂
 
 
-def create_app(service: AssistService, *, authenticator: Authenticator) -> FastAPI:
+def create_app(
+    service: AssistService, *, authenticator: Authenticator, web_page: bool = True
+) -> FastAPI:
     """创建一个平台单元（§9.1）的 HTTP 应用。
 
     service 和 authenticator 挂在这个应用的 app.state 上，没有模块级的全局状态。
+    web_page：是否挂模式 C 网页工具（GET / 和 /assist，§8.1）；只做模式 A / B 的单元可以关掉。
     """
     if not isinstance(service, AssistService):
         raise TypeError("service 必须是 AssistService")
@@ -527,6 +574,8 @@ def create_app(service: AssistService, *, authenticator: Authenticator) -> FastA
     app.state.rodit_authenticator = authenticator
     install_error_handlers(app)
     app.include_router(router)
+    if web_page:
+        app.include_router(build_web_router(service.unit.platform))
     return app
 
 
