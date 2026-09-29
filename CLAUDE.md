@@ -33,10 +33,11 @@ uv run pytest          # 跑测试
 uv run ruff check .    # lint
 ```
 
-基线：`uv run pytest` → `1 passed`。
+基线：`uv run pytest` → 见最近一次交付报告（三轮审查修复合并后为 `2179 passed`，其中 PostgreSQL 测试 67 条）。
 
-云端镜像自带 PostgreSQL 16 和 Redis 7，但默认不启动，需要时用 `service postgresql start` / `service redis-server start`；
-每个会话都要重新启动，数据不跨会话保留。
+云端镜像自带 PostgreSQL 16 和 Redis 7，但默认不启动。PostgreSQL 用 `bash scripts/dev-pg.sh`
+（启动服务并给当前用户建角色，之后 psql / psycopg 直接连）；Redis 用 `service redis-server start`。
+每个会话都要重新启动，数据不跨会话保留。PostgreSQL 测试标了 `@pytest.mark.pg`，连不上时自动跳过。
 
 ## 工作约定
 
@@ -48,4 +49,15 @@ uv run ruff check .    # lint
 
 ## 选型记录
 
-（暂无）
+| 日期 | 组件 | 选择 | 原因 |
+|---|---|---|---|
+| 2026-09-28 | 数据模型 / 校验 | pydantic v2 | 标准会话格式、Jev 格式的请求响应、大模型 JSON 输出都要严格校验；类型即文档 |
+| 2026-09-28 | 配置 | PyYAML + pydantic | 方案 §6.6 的阈值本来就是 YAML；加载后按模型校验 |
+| 2026-09-28 | Web 框架 | FastAPI + uvicorn | 模式 C 独立话术助手和反馈、审核接口需要 HTTP；同步处理函数即可，和 pydantic 同源 |
+| 2026-09-28 | 数据库 | PostgreSQL 16 + psycopg 3 | 方案 §4.4、§10 按 PostgreSQL 设计；行级安全做租户隔离（§9.2）。沙箱没有 pgvector，向量先存 `REAL[]`、应用内算相似度（单店知识量小），平台 RDS 支持时再换 pgvector |
+| 2026-09-28 | 缓存 / 队列 | 暂不引入 Redis | MVP 只需要短时缓存，先用进程内实现，接口是 `core.ports.Cache`；多实例部署时再换 Redis |
+| 2026-09-28 | 并发模型 | 同步接口 | 核心接口都是同步的，简单、好测；投票等需要并行的地方在实现内部用线程池 |
+| 2026-09-28 | 大模型客户端 | 标准库 urllib + OpenAI 兼容 /chat/completions | 不加新依赖；多家境内已备案模型提供兼容接口，D5 定下来后只改地址和模型名 |
+| 2026-09-28 | 店铺令牌加密 | cryptography（AES-256-GCM，HKDF 派生密钥） | 在应用里加解密，密钥和明文令牌不作为 SQL 参数发给数据库（慢查询日志会记参数）；替换原来的 pgcrypto `pgp_sym_*`；店铺 ID 作附加认证数据，密文搬到别的店铺解不开 |
+
+架构分层、模块归属和契约约定见 `docs/架构与分工.md`。

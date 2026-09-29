@@ -1,0 +1,71 @@
+# Rodit 默认配置（方案 §6.6、§5.5、§7.2、§7.3.2、§9.3）。
+# 阈值是初始值，上线后按 §13.3 校准替换；阈值不开放给商家调整。
+# 这里不放任何密钥：大模型 key、平台 AppKey / AppSecret、店铺令牌都不进仓库。
+
+decision:
+  provider: incloud_llm        # incloud_llm / classifier / rules / jev
+  vote_samples: 3              # 路由自一致性投票
+  qa_vote_samples: 1
+  vote_temperature: 0.7
+  timeout_s: 1.0
+
+routing:
+  off_platform: 0.6
+  need_human: 0.7
+  emotion_escalate: 3.0
+  multi_intent: 0.7
+  clarify_max_gap: 0.2
+  assist_threshold: 0.6        # 智能辅助有人把关，阈值可以低
+  auto_threshold:              # 全自动只对列出的类型生效
+    greeting: 0.95
+    shipping_policy: 0.95
+    logistics_track: 0.95
+    invoice_gift: 0.95
+    return_policy: 0.97
+    product_spec: 0.97
+  high_risk: [price_promo, compare_authentic, modify_order, quality_issue, not_received, complaint]
+
+qa_gate:
+  grounded_min: 0.8
+  promise_risk_max: 0.3
+  platform_violation_max: 0.2
+  answers_question_min: 0.5
+  max_regenerations: 1
+
+generation:
+  history_rounds: 5
+  faq_direct_min_score: 0.85
+  faq_top_k: 5
+  max_evidence_chars: 1500
+  temperature: 0.3
+  max_tokens: 400
+  timeout_s: 2.5               # 生成 ≤ 2.5 秒（§12.1）
+  auto_reply_prefix: "【智能客服】"
+
+conversation:
+  merge_window_s: 2.0
+  unresolved_turns_alert: 2
+
+logistics:
+  stall_hours: 48
+  cache_ttl_s: 300
+
+aftersale:
+  seven_day_days: 7
+  verify_hours: 24
+  repeat_window_days: 30
+  repeat_threshold: 3
+
+# 境内已备案大模型（D5）：地址和模型名也可以用环境变量 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL 给；
+# 密钥只从环境变量读（下面写的是变量名，不是密钥）
+llm:
+  api_key_env: RODIT_LLM_API_KEY
+  timeout_s: 10.0
+
+# 配置分层（§9.3）：平台默认 → 类目默认 → 店铺配置，下层覆盖上层
+shop_defaults_by_platform:
+  taobao: {salutation: 亲}
+  douyin: {salutation: 亲}
+  pdd: {salutation: 亲, max_answer_chars: 100}
+shop_defaults_by_category:
+  女装: {tone: 亲切}

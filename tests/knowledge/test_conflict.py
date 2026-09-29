@@ -1,0 +1,194 @@
+"""冲突处理（§5.2.1）与长度预算（§14）的单元测试。"""
+
+from __future__ import annotations
+
+from rodit.core.enums import EvidenceSource
+from rodit.core.models import Evidence
+from rodit.knowledge.conflict import (
+    STRUCTURED_RANK,
+    Candidate,
+    content_chars,
+    dedupe,
+    line_chars,
+    ordered_topics,
+    resolve_conflicts,
+    trim_to_budget,
+)
+
+
+def _e(
+    eid: str,
+    source: EvidenceSource,
+    *,
+    topic: str | None = None,
+    chars: int = 10,
+    content: str | None = None,
+    **kw,
+):
+    text = content if content is not None else "字" * chars
+    return Evidence(id=eid, source=source, label=eid, content=text, topic=topic, **kw)
+
+
+def test_candidate_always_includes_evidence_topic():
+    c = Candidate(_e("policy:ship_time", EvidenceSource.POLICY, topic="ship_time"))
+    assert c.topics == {"ship_time"} and c.rank == STRUCTURED_RANK
+    c2 = Candidate(
+        _e("item:i:detail:0", EvidenceSource.ITEM, topic="ship_time"), topics={"courier"}
+    )
+    assert c2.topics == {"ship_time", "courier"}
+    tool = Candidate.of(_e("faq:1", EvidenceSource.FAQ, score=0.7))
+    assert tool.rank == 0.7 and tool.topics == frozenset()
+
+
+def test_higher_priority_wins_and_losers_are_recorded_in_order():
+    """§5.2.1：详情写 24 小时、FAQ 写 72 小时，政策改成 48 小时 → 以政策为准。"""
+    cands = [
+        Candidate(
+            _e("item:i:detail:1", EvidenceSource.ITEM, topic="ship_time", content="24 小时发货")
+        ),
+        Candidate(_e("faq:2", EvidenceSource.FAQ, topic="ship_time", content="72 小时内发货哦")),
+        Candidate(
+            _e(
+                "policy:ship_time",
+                EvidenceSource.POLICY,
+                topic="ship_time",
+                content="48 小时内发货",
+            )
+        ),
+        Candidate(_e("item:i:detail:2", EvidenceSource.ITEM)),
+    ]
+    kept, lost = resolve_conflicts(cands)
+    assert [c.evidence.id for c in kept] == ["policy:ship_time", "item:i:detail:2"]
+    assert lost == ["item:i:detail:1", "faq:2"]
+
+
+def test_agreeing_lower_priority_text_is_kept():
+    """内容一致时不覆盖：FAQ 标准回答和政策说的是同一件事，FAQ 仍可直接用（§5.4）。"""
+    cands = [
+        Candidate(
+            _e("faq:2", EvidenceSource.FAQ, topic="ship_time", content="亲，48 小时内发货哦~")
+        ),
+        Candidate(
+            _e(
+                "policy:ship_time",
+                EvidenceSource.POLICY,
+                topic="ship_time",
+                content="48 小时内发货",
+            )
+        ),
+    ]
+    kept, lost = resolve_conflicts(cands)
+    assert lost == [] and len(kept) == 2
+
+
+def test_polarity_mismatch_is_a_conflict():
+    cands = [
+        Candidate(_e("faq:9", EvidenceSource.FAQ, topic="gift", content="亲，下单有赠品哦")),
+        Candidate(
+            _e("policy:gift", EvidenceSource.POLICY, topic="gift", content="目前没有赠品活动")
+        ),
+    ]
+    kept, lost = resolve_conflicts(cands)
+    assert lost == ["faq:9"]
+
+
+def test_category_tip_always_yields_to_item_specific_info():
+    """类目通用知识是泛泛的建议：同主题有商品自己的说明就不再用它。"""
+    cands = [
+        Candidate(_e("category:wash", EvidenceSource.CATEGORY, topic="care", content="一般可机洗")),
+        Candidate(_e("item:i:care", EvidenceSource.ITEM, topic="care", content="建议手洗")),
+    ]
+    kept, lost = resolve_conflicts(cands)
+    assert lost == ["category:wash"]
+
+
+def test_same_priority_does_not_override():
+    cands = [
+        Candidate(_e("policy:a", EvidenceSource.POLICY, topic="x")),
+        Candidate(_e("policy:b", EvidenceSource.POLICY, topic="x")),
+    ]
+    kept, lost = resolve_conflicts(cands)
+    assert len(kept) == 2 and lost == []
+
+
+def test_multi_topic_sentence_removed_when_any_topic_is_taken():
+    seg = Candidate(
+        _e(
+            "item:i:detail:0", EvidenceSource.ITEM, topic="ship_time", content="24 小时发，默认圆通"
+        ),
+        topics=frozenset({"ship_time", "courier"}),
+    )
+    courier = Candidate(
+        _e("policy:courier", EvidenceSource.POLICY, topic="courier", content="默认发中通快递")
+    )
+    kept, lost = resolve_conflicts([seg, courier])
+    assert lost == ["item:i:detail:0"] and [c.evidence.id for c in kept] == ["policy:courier"]
+
+
+def test_realtime_overrides_policy_on_shared_topic():
+    kept, lost = resolve_conflicts(
+        [
+            Candidate(
+                _e(
+                    "policy:promotions",
+                    EvidenceSource.POLICY,
+                    topic="promotions",
+                    content="满 199 减 20",
+                )
+            ),
+            Candidate.of(
+                _e(
+                    "tool:price:i_1",
+                    EvidenceSource.REALTIME,
+                    topic="promotions",
+                    content="459 元，无活动",
+                )
+            ),
+        ]
+    )
+    assert lost == ["policy:promotions"] and kept[0].evidence.id == "tool:price:i_1"
+
+
+def test_dedupe_keeps_first():
+    a = Candidate(_e("x", EvidenceSource.ITEM, chars=1))
+    b = Candidate(_e("x", EvidenceSource.ITEM, chars=2))
+    assert dedupe([a, b]) == [a]
+
+
+def test_trim_drops_lowest_priority_then_lowest_rank_then_latest():
+    cands = [
+        Candidate(_e("policy:a", EvidenceSource.POLICY, chars=40)),
+        Candidate(_e("item:i:attr:a", EvidenceSource.ITEM, chars=40)),
+        Candidate(_e("item:i:detail:0", EvidenceSource.ITEM, chars=40), rank=0.9),
+        Candidate(_e("item:i:detail:1", EvidenceSource.ITEM, chars=40), rank=0.1),
+        Candidate(_e("faq:1", EvidenceSource.FAQ, chars=40), rank=0.9),
+        Candidate(_e("faq:2", EvidenceSource.FAQ, chars=40), rank=0.4),
+        Candidate(_e("category:c", EvidenceSource.CATEGORY, chars=40), rank=0.0),
+    ]
+    # 预算按提示词里的整行计（line_chars："[id] 标签：内容" + 行间换行），不只数 content
+    budget = line_chars(cands[:3])
+    kept = trim_to_budget(cands, budget)
+    assert [c.evidence.id for c in kept] == ["policy:a", "item:i:attr:a", "item:i:detail:0"]
+    assert line_chars(kept) <= budget
+    assert content_chars(kept) == 120
+    # 预算足够时原样返回
+    assert trim_to_budget(cands, 10_000) == cands
+    # 同优先级同 rank：靠后的先删
+    same = [Candidate(_e(f"item:i:attr:{n}", EvidenceSource.ITEM, chars=40)) for n in "abc"]
+    kept_same = trim_to_budget(same, line_chars(same[:2]))
+    assert [c.evidence.id for c in kept_same] == ["item:i:attr:a", "item:i:attr:b"]
+
+
+def test_trim_keeps_at_least_one_evidence():
+    cands = [
+        Candidate(_e("tool:order:o_1", EvidenceSource.REALTIME, chars=300)),
+        Candidate(_e("policy:a", EvidenceSource.POLICY, chars=300)),
+    ]
+    kept = trim_to_budget(cands, 10)
+    assert [c.evidence.id for c in kept] == ["tool:order:o_1"]
+    assert trim_to_budget([], 10) == []
+
+
+def test_ordered_topics_is_deterministic():
+    assert ordered_topics({"courier", "ship_time"}) == ["ship_time", "courier"]
+    assert ordered_topics({"zzz", "care", "presale"}) == ["presale", "care", "zzz"]

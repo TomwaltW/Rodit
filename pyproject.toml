@@ -3,10 +3,21 @@ name = "rodit"
 version = "0.0.1"
 description = "电商平台商家 AI 客服（淘宝 / 抖店 / 拼多多）"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "cryptography>=50.0.1",
+    "fastapi>=0.115",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.8",
+    "pyyaml>=6",
+    "uvicorn>=0.30",
+]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8",
+    "ruff>=0.6",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -17,7 +28,14 @@ packages = ["src/rodit"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+markers = [
+    "pg: 需要本机 PostgreSQL（service postgresql start）；连不上时自动跳过",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

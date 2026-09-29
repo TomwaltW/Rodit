@@ -1,0 +1,72 @@
+"""问答引擎编排（方案 §5.3、§5.6、§5.7、§12.2）：会话理解、懂→找→写→判、推荐卡片、兜底与降级。
+
+负责：T6。只依赖 rodit.core（其余步骤通过 core.ports 注入）。
+"""
+
+from rodit.engine.cards import (
+    HARD_RULE_LABELS,
+    build_card,
+    card_confidence,
+    degradation_note,
+    dropped_draft_alert,
+    evidence_views,
+)
+from rodit.engine.engine import (
+    DEGRADED_AUDIT,
+    DEGRADED_DECISION,
+    DEGRADED_DECISION_QA,
+    DEGRADED_ENGINE,
+    DEGRADED_GENERATOR,
+    DEGRADED_KNOWLEDGE,
+    DEGRADED_QA,
+    DEGRADED_RETRIEVER,
+    DEGRADED_ROUTER,
+    DEGRADED_STORAGE,
+    DEGRADED_UNDERSTANDING,
+    LATENCY_KEYS,
+    RESULT_DETAIL_KEYS,
+    AssistEngine,
+    missing_for_intent,
+)
+from rodit.engine.understanding import (
+    DEGRADED_TOOL_ORDER,
+    ConversationBuilder,
+    ShopInactive,
+    Understanding,
+    count_unresolved,
+    effective_mode,
+    keep_rounds,
+    merge_turns,
+)
+
+__all__ = [
+    "DEGRADED_AUDIT",
+    "DEGRADED_DECISION",
+    "DEGRADED_DECISION_QA",
+    "DEGRADED_ENGINE",
+    "DEGRADED_GENERATOR",
+    "DEGRADED_KNOWLEDGE",
+    "DEGRADED_QA",
+    "DEGRADED_RETRIEVER",
+    "DEGRADED_ROUTER",
+    "DEGRADED_STORAGE",
+    "DEGRADED_TOOL_ORDER",
+    "DEGRADED_UNDERSTANDING",
+    "HARD_RULE_LABELS",
+    "LATENCY_KEYS",
+    "RESULT_DETAIL_KEYS",
+    "AssistEngine",
+    "ConversationBuilder",
+    "ShopInactive",
+    "Understanding",
+    "build_card",
+    "card_confidence",
+    "count_unresolved",
+    "degradation_note",
+    "dropped_draft_alert",
+    "effective_mode",
+    "evidence_views",
+    "keep_rounds",
+    "merge_turns",
+    "missing_for_intent",
+]
