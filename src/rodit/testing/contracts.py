@@ -11,6 +11,7 @@ check_cross_shop_isolation 是方案 §9.2 要求的"串店测试"：
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -178,6 +179,98 @@ def check_knowledge_repository(make: Callable[[], KnowledgeRepository]) -> None:
     assert repo.get_shop(SHOP_B) is None and repo.list_knowledge(SHOP_B, status=None) == []
     assert repo.get_item_card(SHOP_B, "i_555") is None and repo.get_policies(SHOP_B) == {}
     assert repo.get_shop(SHOP_A) is not None
+
+
+def check_atomic_shop_and_card_updates(make: Callable[[], KnowledgeRepository]) -> None:
+    """update_shop_config / update_item_card：部分修改、校验失败不写、不新建，并发改不同的键
+    （商家改配置和复核人员切换影子模式、商家改尺码建议和商品同步改标题）两边都留下。"""
+    repo = make()
+    seed_knowledge(repo, build_demo_world())
+    before = repo.get_shop(SHOP_A)
+    assert before is not None
+    shop = repo.update_shop_config(SHOP_A, {"tone": "专业", "suggestion_count": 3})
+    assert shop is not None and shop.config_overrides["tone"] == "专业"
+    assert repo.get_shop(SHOP_A) == shop
+    shop = repo.update_shop_config(SHOP_A, {"tone": None})  # None：删掉覆盖项，回到默认
+    assert "tone" not in shop.config_overrides and shop.config_overrides["suggestion_count"] == 3
+    for bad in ({"no_such_key": 1}, {"suggestion_count": 9}):
+        try:
+            repo.update_shop_config(SHOP_A, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非法的配置修改应抛 ValueError：{bad}")
+    assert repo.get_shop(SHOP_A) == shop
+    assert repo.update_shop_config("s_9999", {"tone": "专业"}) is None
+    assert repo.get_shop("s_9999") is None
+    assert repo.get_shop(SHOP_B) == repo.get_shop(SHOP_B)  # 别的店铺不受影响
+    assert "suggestion_count" not in (repo.get_shop(SHOP_B) or before).config_overrides
+
+    card = repo.update_item_card(
+        SHOP_A, "i_555", {"size_advice": "正常码", "updated_at": NOW + timedelta(hours=1)}
+    )
+    assert card is not None and card.size_advice == "正常码"
+    assert card.title == "法式碎花连衣裙" and card.updated_at == NOW + timedelta(hours=1)
+    assert repo.get_item_card(SHOP_A, "i_555") == card
+    assert repo.get_item_card(SHOP_B, "i_555").size_advice == "B 店专用尺码建议：正常码"
+    for bad in ({"no_such_field": 1}, {"shop_id": SHOP_B}, {"skus": "x"}, {"care": "不是列表"}):
+        try:
+            repo.update_item_card(SHOP_A, "i_555", bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非法的卡片修改应抛 ValueError：{bad}")
+    assert repo.get_item_card(SHOP_A, "i_555") == card
+    assert repo.update_item_card(SHOP_A, "i_nope", {"size_advice": "x"}) is None
+    assert repo.get_item_card(SHOP_A, "i_nope") is None
+
+    # 并发改不同的键：每个线程只改自己的键，最后全都在
+    shop_changes = [
+        {"tone": "简洁"},
+        {"salutation": "您"},
+        {"max_answer_chars": 200},
+        {"banned_words": ["最便宜"]},
+        {"shadow_mode": True},
+        {"display_name": "测试店"},
+    ]
+    card_changes = [
+        {"size_advice": "偏小一码"},
+        {"title": "法式碎花连衣裙（同步后）"},
+        {"care": ["冷水手洗"]},
+        {"forbidden_claims": ["抗皱"]},
+        {"usage": ["先试穿"]},
+        {"detail_text": "同步来的详情"},
+    ]
+    barrier = threading.Barrier(len(shop_changes) + len(card_changes))
+    errors: list[BaseException] = []
+
+    def run(fn: Callable[[], object]) -> None:
+        try:
+            barrier.wait(timeout=10)
+            fn()
+        except BaseException as e:  # noqa: BLE001 — 线程里的异常带回主线程断言
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=run, args=(lambda c=c: repo.update_shop_config(SHOP_A, c),))
+        for c in shop_changes
+    ] + [
+        threading.Thread(target=run, args=(lambda c=c: repo.update_item_card(SHOP_A, "i_555", c),))
+        for c in card_changes
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == [], errors
+    overrides = repo.get_shop(SHOP_A).config_overrides
+    for change in shop_changes:
+        for key, value in change.items():
+            assert overrides[key] == value, (key, overrides)
+    final = repo.get_item_card(SHOP_A, "i_555")
+    for change in card_changes:
+        for key, value in change.items():
+            assert getattr(final, key) == value, (key, final)
 
 
 def check_knowledge_status_compare_and_set(make: Callable[[], KnowledgeRepository]) -> None:

@@ -109,3 +109,7 @@ def test_purge_is_idempotent_contract():
             quality_reviews=InMemoryQualityReviewRepository(),
         )
     )
+
+
+def test_atomic_shop_and_card_updates_contract():
+    contracts.check_atomic_shop_and_card_updates(lambda: InMemoryKnowledgeRepository(FakeClock()))

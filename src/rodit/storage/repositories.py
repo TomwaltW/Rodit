@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
@@ -62,6 +62,7 @@ from rodit.core.models import (
     StandardMessage,
     StoredMessage,
     SuggestionRecord,
+    merge_overrides,
     strip_control_chars,
 )
 from rodit.core.ports import RECALL_TOMBSTONE_TTL
@@ -113,6 +114,16 @@ def _knowledge(r: Row) -> KnowledgeItem:
     )
 
 
+def _shop(r: Row) -> Shop:
+    return Shop(
+        id=r["id"],
+        platform=r["platform"],
+        category=r["category"],
+        status=r["status"],
+        config_overrides=r["config"],
+    )
+
+
 def _item_card(r: Row) -> ItemCard:
     return ItemCard.model_validate(
         {
@@ -152,15 +163,7 @@ class PgKnowledgeRepository:
                 "SELECT id, platform, category, status, config FROM shop WHERE id = %s",
                 (shop_id,),
             ).fetchone()
-        if r is None:
-            return None
-        return Shop(
-            id=r["id"],
-            platform=r["platform"],
-            category=r["category"],
-            status=r["status"],
-            config_overrides=r["config"],
-        )
+        return _shop(r) if r is not None else None
 
     def upsert_shop(self, shop: Shop) -> None:
         with self._session(shop.id) as conn:
@@ -172,6 +175,26 @@ class PgKnowledgeRepository:
                 " config = EXCLUDED.config",
                 (shop.id, shop.platform, shop.category, shop.status, _jsonb(shop.config_overrides)),
             )
+
+    def update_shop_config(self, shop_id: str, changes: Mapping[str, Any]) -> Shop | None:
+        with self._session(shop_id) as conn:
+            r = conn.execute(
+                "SELECT id, platform, category, status, config FROM shop WHERE id = %s FOR UPDATE",
+                (shop_id,),
+            ).fetchone()
+            if r is None:
+                return None
+            shop = _shop(r)
+            updated = Shop.model_validate(
+                {**shop.model_dump(), "config_overrides": merge_overrides(shop, changes)}
+            )
+            row = conn.execute(
+                "UPDATE shop SET config = %s WHERE id = %s"
+                " RETURNING id, platform, category, status, config",
+                (_jsonb(updated.config_overrides), shop_id),
+            ).fetchone()
+        assert row is not None
+        return _shop(row)
 
     # ---- 政策
     def get_policies(self, shop_id: str) -> dict[str, PolicyEntry]:
@@ -230,6 +253,28 @@ class PgKnowledgeRepository:
                 " updated_at = EXCLUDED.updated_at",
                 (card.shop_id, card.item_id, _jsonb(body), card.updated_at),
             )
+
+    def update_item_card(
+        self, shop_id: str, item_id: str, changes: Mapping[str, Any]
+    ) -> ItemCard | None:
+        with self._session(shop_id) as conn:
+            r = conn.execute(
+                "SELECT shop_id, item_id, card, updated_at FROM item_card"
+                " WHERE shop_id = %s AND item_id = %s FOR UPDATE",
+                (shop_id, item_id),
+            ).fetchone()
+            if r is None:
+                return None
+            updated = _item_card(r).patched(changes)
+            body = updated.model_dump(mode="json", exclude=set(_CARD_COLUMNS))
+            row = conn.execute(
+                "UPDATE item_card SET card = %s, updated_at = %s"
+                " WHERE shop_id = %s AND item_id = %s"
+                " RETURNING shop_id, item_id, card, updated_at",
+                (_jsonb(body), updated.updated_at, shop_id, item_id),
+            ).fetchone()
+        assert row is not None
+        return _item_card(row)
 
     # ---- FAQ
     def add_knowledge(self, item: KnowledgeItem) -> KnowledgeItem:

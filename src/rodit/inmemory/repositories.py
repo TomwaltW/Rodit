@@ -10,8 +10,9 @@ from __future__ import annotations
 import itertools
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
+from typing import Any
 
 from rodit.core.clock import Clock, SystemClock
 from rodit.core.enums import (
@@ -37,6 +38,7 @@ from rodit.core.models import (
     StandardMessage,
     StoredMessage,
     SuggestionRecord,
+    merge_overrides,
 )
 from rodit.core.ports import RECALL_TOMBSTONE_TTL
 from rodit.inmemory.embedding import cosine
@@ -64,6 +66,17 @@ class InMemoryKnowledgeRepository:
         with self._lock:
             self._shops[shop.id] = shop.model_copy(deep=True)
 
+    def update_shop_config(self, shop_id: str, changes: Mapping[str, Any]) -> Shop | None:
+        with self._lock:
+            shop = self._shops.get(shop_id)
+            if shop is None:
+                return None
+            updated = shop.model_validate(
+                {**shop.model_dump(), "config_overrides": merge_overrides(shop, changes)}
+            )
+            self._shops[shop_id] = updated
+            return updated.model_copy(deep=True)
+
     # ---- 政策
     def get_policies(self, shop_id: str) -> dict[str, PolicyEntry]:
         with self._lock:
@@ -87,6 +100,17 @@ class InMemoryKnowledgeRepository:
     def upsert_item_card(self, card: ItemCard) -> None:
         with self._lock:
             self._items[(card.shop_id, card.item_id)] = card.model_copy(deep=True)
+
+    def update_item_card(
+        self, shop_id: str, item_id: str, changes: Mapping[str, Any]
+    ) -> ItemCard | None:
+        with self._lock:
+            card = self._items.get((shop_id, item_id))
+            if card is None:
+                return None
+            updated = card.patched(changes)
+            self._items[(shop_id, item_id)] = updated
+            return updated.model_copy(deep=True)
 
     # ---- FAQ
     def _pending_duplicate(self, item: KnowledgeItem, *, exclude_id: int | None = None) -> bool:

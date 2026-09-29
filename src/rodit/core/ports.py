@@ -18,9 +18,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -378,6 +378,13 @@ class KnowledgeRepository(Protocol):
 
     def upsert_shop(self, shop: Shop) -> None: ...
 
+    def update_shop_config(self, shop_id: str, changes: Mapping[str, Any]) -> Shop | None:
+        """原子地改店铺配置覆盖项（§9.3）：changes 里值为 None 的键删掉（回到类目 / 平台默认），
+        其余写入；合并后按 Shop 校验，未知的键、非法的取值抛 ValueError，什么都不写。
+        店铺不存在返回 None（不新建）。读改写在一把锁 / 一个事务里：并发改不同的键不会互相覆盖
+        （商家改配置、复核人员切换影子模式、填问卷可能同时发生）。返回更新后的店铺。"""
+        ...
+
     def get_policies(self, shop_id: str) -> dict[str, PolicyEntry]: ...
 
     def upsert_policy(self, entry: PolicyEntry) -> None: ...
@@ -389,6 +396,15 @@ class KnowledgeRepository(Protocol):
         ...
 
     def upsert_item_card(self, card: ItemCard) -> None: ...
+
+    def update_item_card(
+        self, shop_id: str, item_id: str, changes: Mapping[str, Any]
+    ) -> ItemCard | None:
+        """原子地改商品卡片的部分字段（商家改自己填的字段、商品同步改平台维护的字段，§5.2.3）：
+        changes 的键必须是 ItemCard 的字段，shop_id / item_id / platform 不能改；值按字段校验
+        （None 清空可选字段）。不合法抛 ValueError，什么都不写。卡片不存在返回 None（不新建）。
+        读改写在一把锁 / 一个事务里：商家改尺码建议和同步改标题同时发生，两边的修改都留下。"""
+        ...
 
     def add_knowledge(self, item: KnowledgeItem) -> KnowledgeItem:
         """新增 FAQ（忽略传入的 id），返回带新 id 的记录；created_at 为空时由实现补上。

@@ -115,3 +115,9 @@ def test_purge_is_idempotent_contract(pg_dsn, truncate, token_key):
             ),
         )
     )
+
+
+def test_atomic_shop_and_card_updates_contract(db, truncate):
+    contracts.check_atomic_shop_and_card_updates(
+        fresh(truncate, lambda: PgKnowledgeRepository(db, clock=FakeClock()))
+    )

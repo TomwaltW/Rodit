@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -187,6 +188,18 @@ class Shop(_Model):
         return v
 
 
+def merge_overrides(shop: Shop, changes: Mapping[str, Any]) -> dict[str, Any]:
+    """店铺配置覆盖项的合并规则（KnowledgeRepository.update_shop_config 共用）：
+    值为 None 的键删掉（回到默认），其余覆盖。不校验，校验交给 Shop。"""
+    merged = dict(shop.config_overrides)
+    for key, value in changes.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
+
+
 class ShopAuth(_Model):
     """店铺授权（§8.4）。access_token 只存放在对应平台云内，落库时加密；
     用 SecretStr 防止出现在 repr / 日志里。"""
@@ -239,6 +252,17 @@ class ItemCard(_Model):
 
     def find_sku(self, sku_id: str) -> Sku | None:
         return next((s for s in self.skus if s.sku_id == sku_id), None)
+
+    def patched(self, changes: Mapping[str, Any]) -> ItemCard:
+        """改部分字段后的新卡片（KnowledgeRepository.update_item_card 共用）：按模型重新校验，
+        不认识的字段、改归属（shop_id / item_id / platform）抛 ValueError。"""
+        unknown = set(changes) - set(ItemCard.model_fields)
+        if unknown:
+            raise ValueError(f"商品卡片没有这些字段：{sorted(unknown)}")
+        fixed = {"shop_id", "item_id", "platform"} & set(changes)
+        if fixed:
+            raise ValueError(f"商品卡片的归属不能改：{sorted(fixed)}")
+        return ItemCard.model_validate({**self.model_dump(), **changes})
 
 
 class PlatformItem(_Model):
