@@ -167,7 +167,11 @@ def test_console_page_in_a_real_browser(api: Api):
     assert any(k.answer == "亲，默认发中通快递，顺丰补 10 元哦~" for k in approved)
     assert by_id[6].status == KnowledgeStatus.RETIRED  # 审核时修改：候选下线、新条目上线
     assert any(k.answer == "亲，新疆可以发，补 15 元运费哦~" for k in approved)
-    assert repos.knowledge.get_policies(SHOP_A)["warranty"].value == "保修一年，联系客服寄回维修"
+    # 政策先填写、再清空（不再适用）：库里没有了，审计里两次都有
+    assert "warranty" not in repos.knowledge.get_policies(SHOP_A)
+    policy_events = repos.audit.list_events(SHOP_A, action="knowledge.policy_updated")
+    assert [e.detail.get("key") for e in policy_events][-2:] == ["warranty", "warranty"]
+    assert policy_events[-1].detail.get("cleared") is True
     card = repos.knowledge.get_item_card(SHOP_A, "i_777")
     assert card is not None and card.size_advice == "版型偏大，建议拍小一码"
     assert card.care == ["建议手洗", "不可暴晒"]

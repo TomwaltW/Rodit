@@ -113,3 +113,7 @@ def test_purge_is_idempotent_contract():
 
 def test_atomic_shop_and_card_updates_contract():
     contracts.check_atomic_shop_and_card_updates(lambda: InMemoryKnowledgeRepository(FakeClock()))
+
+
+def test_policy_delete_contract():
+    contracts.check_policy_delete(lambda: InMemoryKnowledgeRepository(FakeClock()))

@@ -389,6 +389,11 @@ class KnowledgeRepository(Protocol):
 
     def upsert_policy(self, entry: PolicyEntry) -> None: ...
 
+    def delete_policy(self, shop_id: str, key: str) -> bool:
+        """删掉一项店铺政策（商家清空已经不适用的政策，如赠品活动结束）。删了返回 True，
+        本来就没有返回 False。"""
+        ...
+
     def get_item_card(self, shop_id: str, item_id: str) -> ItemCard | None: ...
 
     def list_item_cards(self, shop_id: str) -> list[ItemCard]:

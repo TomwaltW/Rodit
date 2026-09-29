@@ -721,6 +721,24 @@ class KnowledgeAdmin:
         )
         return _policy_row(policy_key.value, entry)
 
+    def clear_policy(self, shop_id: str, key: str, *, merchant: str) -> PolicyRow:
+        """清空一项店铺政策（不再适用，如赠品活动结束）：之后回答不再引用它，缺了会提醒补（§5.2.3）。
+        本来就没填不写、不记审计。"""
+        actor = require_human(merchant, "商家")
+        try:
+            policy_key = PolicyKey(key)
+        except ValueError as exc:
+            raise ValueError("未知的店铺政策项") from exc
+        require_shop(self._repo, shop_id)
+        if self._repo.delete_policy(shop_id, policy_key.value):
+            self._record(
+                shop_id,
+                actor,
+                AuditAction.POLICY_UPDATED,
+                {"key": policy_key.value, "cleared": True},
+            )
+        return _policy_row(policy_key.value, None)
+
     # ================================================================ 商品卡片
 
     def list_item_cards(self, shop_id: str) -> list[ItemCard]:

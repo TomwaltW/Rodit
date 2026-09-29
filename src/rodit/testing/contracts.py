@@ -273,6 +273,21 @@ def check_atomic_shop_and_card_updates(make: Callable[[], KnowledgeRepository]) 
             assert getattr(final, key) == value, (key, final)
 
 
+def check_policy_delete(make: Callable[[], KnowledgeRepository]) -> None:
+    """delete_policy：只删这家店铺的这一项，重复删返回 False，别的店铺同名政策不动。"""
+    repo = make()
+    world = build_demo_world()
+    seed_knowledge(repo, world)
+    key = next(iter(repo.get_policies(SHOP_A)))
+    b_before = repo.get_policies(SHOP_B)
+    assert key in b_before, "合成数据里两家店铺要有同名政策"
+    assert repo.delete_policy(SHOP_A, key) is True
+    assert key not in repo.get_policies(SHOP_A)
+    assert repo.delete_policy(SHOP_A, key) is False
+    assert repo.delete_policy(SHOP_A, "no_such_policy") is False
+    assert repo.get_policies(SHOP_B) == b_before
+
+
 def check_knowledge_status_compare_and_set(make: Callable[[], KnowledgeRepository]) -> None:
     """set_knowledge_status 的 expected_status：当前状态不等于它就抛 ConcurrencyConflict、不写入。
 

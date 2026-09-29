@@ -26,6 +26,7 @@ ROUTES: tuple[Route, ...] = (
     ),
     Route("GET", f"{_C}/policies", roles=CONSOLE),
     Route("POST", f"{_C}/policies/invoice", {"value": "可以开电子普通发票"}, MERCHANT),
+    Route("POST", f"{_C}/policies/gift/clear", roles=MERCHANT),
     Route("GET", f"{_C}/items", roles=CONSOLE),
     Route("POST", f"{_C}/items/sync", roles=MERCHANT),
     Route("GET", f"{_C}/items/i_555", roles=CONSOLE),

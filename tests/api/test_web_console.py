@@ -243,6 +243,7 @@ MERCHANT_WRITES = {
     ("POST", "knowledge/candidates/{}/approve"),
     ("POST", "knowledge/{}/retire"),
     ("POST", "console/policies/{}"),
+    ("POST", "console/policies/{}/clear"),
     ("POST", "console/items/{}"),
     ("POST", "console/items/sync"),
     ("POST", "console/config"),

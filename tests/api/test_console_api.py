@@ -225,6 +225,26 @@ def test_policies_list_and_update(api: Api):
     assert api.post(f"{C}/policies/warranty", "merchant_a", json={"value": " "}).status_code == 422
 
 
+def test_policy_can_be_cleared_when_it_no_longer_applies(api: Api):
+    """清空一项政策：之后读不到、回答不再引用；本来就没填再清空不记审计；未知的政策项 422。"""
+    audit = api.unit.repos.audit
+    r = api.post(f"{C}/policies/warranty", "merchant_a", json={"value": "整机保修一年"})
+    assert r.status_code == 200
+    before = len(audit.list_events(SHOP_A, action="knowledge.policy_updated"))
+    r = api.post(f"{C}/policies/warranty/clear", "merchant_a")
+    assert r.status_code == 200
+    assert (r.json()["key"], r.json()["value"], r.json()["updated_at"]) == ("warranty", None, None)
+    assert "warranty" not in api.unit.repos.knowledge.get_policies(SHOP_A)
+    events = audit.list_events(SHOP_A, action="knowledge.policy_updated")
+    assert len(events) == before + 1 and events[-1].detail == {"key": "warranty", "cleared": True}
+    assert events[-1].actor == "owner_a"
+    assert api.post(f"{C}/policies/warranty/clear", "merchant_a").status_code == 200
+    assert len(audit.list_events(SHOP_A, action="knowledge.policy_updated")) == before + 1
+    assert api.post(f"{C}/policies/nope/clear", "merchant_a").status_code == 422
+    rows = api.get(f"{C}/policies", "manager_a").json()
+    assert next(row for row in rows if row["key"] == "warranty")["value"] is None
+
+
 def test_policy_change_is_effective_for_the_next_answer(api: Api):
     r = api.post(f"{C}/policies/ship_time", "merchant_a", json={"value": "付款后 72 小时内发货"})
     assert r.status_code == 200

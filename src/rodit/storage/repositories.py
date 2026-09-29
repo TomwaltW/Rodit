@@ -224,6 +224,13 @@ class PgKnowledgeRepository:
                 (entry.shop_id, entry.key, entry.value, entry.updated_at),
             )
 
+    def delete_policy(self, shop_id: str, key: str) -> bool:
+        with self._session(shop_id) as conn:
+            deleted = conn.execute(
+                "DELETE FROM shop_policy WHERE shop_id = %s AND key = %s", (shop_id, key)
+            ).rowcount
+        return deleted > 0
+
     # ---- 商品
     def get_item_card(self, shop_id: str, item_id: str) -> ItemCard | None:
         with self._session(shop_id) as conn:

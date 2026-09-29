@@ -86,6 +86,10 @@ class InMemoryKnowledgeRepository:
         with self._lock:
             self._policies.setdefault(entry.shop_id, {})[entry.key] = entry.model_copy()
 
+    def delete_policy(self, shop_id: str, key: str) -> bool:
+        with self._lock:
+            return self._policies.get(shop_id, {}).pop(key, None) is not None
+
     # ---- 商品
     def get_item_card(self, shop_id: str, item_id: str) -> ItemCard | None:
         with self._lock:

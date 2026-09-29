@@ -942,9 +942,55 @@
       const edit = h('button', { type: 'button', className: 'secondary', 'aria-describedby': titleId }, filled ? '修改' : '填写');
       edit.addEventListener('click', () => openPolicyEditor(ctx, edit));
       ctx.actions.append(edit);
+      if (filled) {
+        const clear = h('button', { type: 'button', className: 'secondary', 'aria-describedby': titleId }, '清空');
+        clear.addEventListener('click', () => openPolicyClear(ctx, clear));
+        ctx.actions.append(clear);
+      }
     }
     if (message) setStatus(ctx.status, message, 'ok');
     return ctx.node;
+  }
+
+  // 政策不再适用（如赠品活动结束）：清空后回答不再引用，"要补的知识"里会提醒
+  function openPolicyClear(ctx, opener) {
+    const label = ctx.row.label || ctx.row.key;
+    const confirm = h('button', { type: 'button', className: 'danger' }, '确认清空');
+    const cancel = h('button', { type: 'button', className: 'secondary' }, '取消');
+    const box = h('div', { className: 'confirm' }, [
+      h('p', null, `清空后回答不再引用「${label}」；以后需要时再填写。`),
+      h('div', { className: 'actions tight' }, [confirm, cancel]),
+    ]);
+    const close = () => {
+      ctx.panel.replaceChildren();
+      ctx.actions.hidden = false;
+      opener.focus();
+    };
+    cancel.addEventListener('click', close);
+    confirm.addEventListener('click', async () => {
+      const me = state.me;
+      clearError();
+      await busy(ctx, [confirm, cancel], async () => {
+        try {
+          const row = await api('POST', shopPath(`console/policies/${enc(ctx.row.key)}/clear`), {});
+          if (state.me !== me) return;
+          state.policies = state.policies.map((r) => (r.key === row.key ? row : r));
+          renderPolicySummary();
+          stale('knowledge');
+          const message = `已清空「${row.label}」。`;
+          const fresh = policyRow(row, message);
+          ctx.node.replaceWith(fresh);
+          fresh.querySelector('.status').focus();
+          announce(message);
+        } catch (err) {
+          if (state.me !== me) return;
+          reportFailure(ctx.status, '没有清空成功：', err);
+        }
+      });
+    });
+    ctx.actions.hidden = true;
+    ctx.panel.replaceChildren(box);
+    confirm.focus();
   }
 
   function openPolicyEditor(ctx, opener) {

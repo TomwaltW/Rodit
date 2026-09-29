@@ -13,6 +13,7 @@
 | POST | /candidates/{knowledge_id}/approve-edited | 商家 | 审核候选知识时修改 |
 | GET | /policies | 店长、商家 | 店铺政策 |
 | POST | /policies/{key} | 商家 | 改一项政策（即时生效） |
+| POST | /policies/{key}/clear | 商家 | 清空一项政策（不再适用时） |
 | GET | /items | 店长、商家 | 商品卡片列表 |
 | POST | /items/sync | 商家 | 平台商品同步 + 详情图 OCR |
 | GET | /items/{item_id} | 店长、商家 | 商品卡片 |
@@ -31,7 +32,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Path, Query
 
-from rodit.api.deps import ConsoleDep, KnowledgeId, MerchantDep, ServiceDep
+from rodit.api.deps import ConsoleDep, EmptyBody, KnowledgeId, MerchantDep, ServiceDep
 from rodit.api.errors import ApiError
 from rodit.api.schemas import KnowledgeView
 from rodit.api.schemas_console import (
@@ -140,6 +141,18 @@ def set_policy(
     row = service.console.set_policy(
         principal.shop_id, key.value, body.value, merchant=principal.user_id
     )
+    return PolicyView.of(row)
+
+
+@router.post(f"{_BASE}/policies/{{key}}/clear", response_model=PolicyView)
+def clear_policy(
+    key: Annotated[PolicyKey, Path()],
+    principal: MerchantDep,
+    service: ServiceDep,
+    body: EmptyBody = None,
+) -> PolicyView:
+    """清空一项店铺政策（不再适用时）：之后回答不再引用它，"要补的知识"里会提醒。"""
+    row = service.console.clear_policy(principal.shop_id, key.value, merchant=principal.user_id)
     return PolicyView.of(row)
 
 

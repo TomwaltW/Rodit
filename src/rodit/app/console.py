@@ -127,6 +127,10 @@ class ConsoleService:
         with self._processing(shop_id):
             return self.admin.set_policy(shop_id, key, value, merchant=merchant)
 
+    def clear_policy(self, shop_id: str, key: str, *, merchant: str) -> PolicyRow:
+        with self._processing(shop_id):
+            return self.admin.clear_policy(shop_id, key, merchant=merchant)
+
     # ================================================================ 商品卡片
 
     def list_items(self, shop_id: str) -> list[ItemCard]:

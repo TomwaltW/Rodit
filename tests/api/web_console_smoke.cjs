@@ -181,6 +181,12 @@ async function main() {
     await warranty.getByRole('button', { name: '保存' }).click();
     const saved = panel('policies').locator('.policy').filter({ hasText: '保修一年' });
     await saved.locator('.status.ok').filter({ hasText: '已保存「保修」' }).waitFor();
+    // 政策不再适用：清空（要确认），之后显示"未填写"
+    await saved.getByRole('button', { name: '清空' }).click();
+    await saved.getByRole('button', { name: '确认清空' }).click();
+    const cleared = panel('policies').locator('.policy').filter({ has: page.getByRole('heading', { name: '保修' }) });
+    await cleared.locator('.status.ok').filter({ hasText: '已清空「保修」' }).waitFor();
+    await cleared.locator('.policy-value.empty').filter({ hasText: '未填写' }).waitFor();
     steps.push('policies');
 
     // ---------------------------------------------------------------- 商家：商品卡片、同步

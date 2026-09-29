@@ -121,3 +121,9 @@ def test_atomic_shop_and_card_updates_contract(db, truncate):
     contracts.check_atomic_shop_and_card_updates(
         fresh(truncate, lambda: PgKnowledgeRepository(db, clock=FakeClock()))
     )
+
+
+def test_policy_delete_contract(db, truncate):
+    contracts.check_policy_delete(
+        fresh(truncate, lambda: PgKnowledgeRepository(db, clock=FakeClock()))
+    )
