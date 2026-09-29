@@ -16,6 +16,9 @@ uv run ruff check . && uv run ruff format --check .
 
 bash scripts/dev-pg.sh           # 可选：启动本机 PostgreSQL，跑存储层测试
 uv run python -m rodit.app.demo  # 用合成数据跑方案 §11 的核心流程（不需要任何密钥）
+uv run python -m rodit.api       # 本地接口 + 模式 C 网页工具 http://127.0.0.1:8000/assist
+                                 # （启动时打印仅本地演示用的合成令牌，粘贴到网页登录）
+uv run python -m rodit.eval      # §13 评测（324 条合成用例；--llm env 用真实大模型）
 ```
 
 演示默认用离线替身：路由用关键词规则、生成只复述依据、质检用启发式判断，所以能在没有大模型的
@@ -184,7 +187,9 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `rodit.engine` | 编排：会话理解、执行计划、推荐卡片、降级与兜底 | §5.3、§5.6、§5.7、§12.2 |
 | `rodit.storage` / `rodit.llm` | PostgreSQL（行级安全）存储；OpenAI 兼容大模型客户端与用量计量 | §9.2、§10、§12.4 |
 | `rodit.app` | 平台单元组装、应用服务、本地演示、生产组装 | §9.1 |
-| `rodit.eval` | 合成评测集、§13.2 评分、§13.3 阈值校准 | §13 |
+| `rodit.api` | HTTP 接口（按店铺鉴权、串店拦截）；模式 C 独立话术助手网页 `/assist` | §8.1、§8.4、§9.2 |
+| `rodit.ops` | 部署入口（`python -m rodit.ops`）、健康 / 就绪检查、Prometheus 指标、个人信息过滤的 JSON 日志 | §9.1、§12 |
+| `rodit.eval` | 合成评测集（324 条）、§13.2 评分、§13.3 阈值校准；离线替身或真实大模型、耗时与成本、回归比较 | §13、§12.1、§14 |
 
 ## 数据合规（摘自 CLAUDE.md）
 
