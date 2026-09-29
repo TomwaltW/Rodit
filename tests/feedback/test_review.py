@@ -133,7 +133,17 @@ def test_period_range_and_year_edges():
     assert period_range("2026-W01")[0] == datetime(2025, 12, 29, tzinfo=CST)  # ISO 年从周一开始
     assert period_range("2026-W53")[1] == datetime(2027, 1, 4, tzinfo=CST)  # 2026 有 53 周
     assert iso_period(datetime(2027, 1, 3, 12, tzinfo=CST)) == "2026-W53"
-    for bad in ("2025-W53", "2026-W54", "2026-W00", "2026W40", "2026-W4", "", "2026-W40\n"):
+    for bad in (
+        "2025-W53",
+        "2026-W54",
+        "2026-W00",
+        "2026W40",
+        "2026-W4",
+        "",
+        "2026-W40\n",
+        "２０２６-W39",  # 全角数字：库里的 CHECK 只认 ASCII，这里也不认
+        "9999-W52",  # 周的结束超出日期范围：按不合法处理，不是 500
+    ):
         with pytest.raises(ValueError):
             period_range(bad)
     assert check_period(W39) == W39

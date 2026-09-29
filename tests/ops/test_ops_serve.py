@@ -160,6 +160,15 @@ def test_production_rejects_mock_bindings(ops_env, token_file, monkeypatch):
         assert name in str(exc.value)
 
 
+def test_production_rejects_mock_item_catalog_and_ocr(ops_env, token_file, monkeypatch):
+    """商品同步的商品接口、OCR 也不能是模拟实现（合成数据会被同步进真实店铺的商品卡片）。"""
+    monkeypatch.setenv("RODIT_PLATFORM_BINDINGS", "ops_support:cloud_bindings_with_mock_catalog")
+    with pytest.raises(BindingError, match="模拟实现") as exc:
+        build_server(ServerSettings.from_env(), database=FakeReadinessDb())
+    for name in ("InMemoryItemCatalog", "FakeImageTextExtractor"):
+        assert name in str(exc.value)
+
+
 def test_bindings_and_mode_c_are_exclusive(ops_env, token_file, monkeypatch):
     monkeypatch.setenv("RODIT_PLATFORM_BINDINGS", "ops_support:cloud_bindings")
     monkeypatch.setenv("RODIT_MODE_C_ONLY", "1")

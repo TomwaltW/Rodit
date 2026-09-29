@@ -76,7 +76,7 @@ def test_status_and_report_are_readable_without_texts(api: Api, caller: str):
 
 
 def test_invalid_periods_are_rejected(api: Api):
-    for period in ("2026-W99", "2026-40", "2025-W53"):
+    for period in ("2026-W99", "2026-40", "2025-W53", "９９９９-W52", "9999-W52"):
         r = api.get(f"{BASE}/quality/report", "reviewer_a", params={"period": period})
         assert r.status_code == 422, (period, r.text)
         r = api.post(f"{BASE}/quality/sample", "reviewer_a", json={"period": period})

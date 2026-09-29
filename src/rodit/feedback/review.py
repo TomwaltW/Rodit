@@ -111,9 +111,11 @@ def check_period(period: str) -> str:
         raise ValueError("周期要写成 ISO 周，如 2026-W40")
     year, week = int(period[:4]), int(period[6:])
     try:
-        date.fromisocalendar(year, week, 1)
+        date.fromisocalendar(year, week, 1) + timedelta(days=7)  # 周的结束也要表示得出来
     except ValueError:
         raise ValueError(f"{year} 年没有第 {week} 周") from None
+    except OverflowError:
+        raise ValueError("周期超出支持的范围") from None
     return period
 
 

@@ -79,7 +79,25 @@ def test_recall_leaves_shadow_records_alone(kit: Kit) -> None:
     result = engine.handle(msg)
     assert result is not None and result.mode == Mode.SHADOW and result.suggestions
     assert engine.on_recall(SHOP_D, CONV, msg.msg_id) is None
-    assert {r.status for r in kit.suggestions.list(SHOP_D)} == {SuggestionStatus.SHADOW}
+    records = kit.suggestions.list(SHOP_D)
+    assert {r.status for r in records} == {SuggestionStatus.SHADOW}
+    # 状态不动，但撤回的消息原文不留（§5.3）：每周复核也看不到
+    assert all(r.question_text is None for r in records)
+
+
+def test_recall_forgets_the_question_on_records_the_agent_already_used(kit: Kit) -> None:
+    engine = kit.engine()
+    msg = kit.msg("什么时候发货")
+    engine.handle(msg)
+    [first, *_] = kit.suggestions.list(SHOP_A)
+    kit.suggestions.update(
+        first.model_copy(update={"status": SuggestionStatus.SENT}),
+        expected_status=SuggestionStatus.SHOWN,
+    )
+    engine.on_recall(SHOP_A, CONV, msg.msg_id)
+    records = {r.id: r for r in kit.suggestions.list(SHOP_A)}
+    assert records[first.id].status == SuggestionStatus.SENT  # 客服的操作为准
+    assert all(r.question_text is None for r in records.values())
 
 
 def test_recall_does_not_override_what_the_agent_just_did(kit: Kit, monkeypatch: Any) -> None:

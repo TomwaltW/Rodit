@@ -41,6 +41,7 @@ from rodit.core.models import (
     QualityReview,
     QualityScores,
     ShopAuth,
+    Sku,
     SuggestionRecord,
 )
 from rodit.core.ports import (
@@ -1186,3 +1187,22 @@ def check_text_sanitation(make: Callable[[], RepoSet]) -> None:
     assert scored.note == CLEAN_TEXT
     got_quality = repos.quality_reviews.get(SHOP_A, quality.id or 0)
     assert got_quality is not None and got_quality.note == CLEAN_TEXT
+
+    # 商品卡片（商品同步写进来的平台字段：类目、SKU 规格、尺码表）
+    dirty_card = ItemCard(
+        shop_id=SHOP_A,
+        platform=world.items[0].platform,
+        item_id="i_nul",
+        title=DIRTY_TEXT,
+        category="女装\x00/连衣裙",
+        skus=[Sku(sku_id="k\x001", 颜色="黑\x00色")],
+        size_chart=[{"尺码": "M\x00", "胸围cm": 88}],
+        detail_text=DIRTY_TEXT,
+        updated_at=NOW,
+    )
+    repos.knowledge.upsert_item_card(dirty_card)
+    got_card = repos.knowledge.get_item_card(SHOP_A, "i_nul")
+    assert got_card is not None and got_card == dirty_card
+    assert got_card.title == CLEAN_TEXT and got_card.category == "女装/连衣裙"
+    assert got_card.skus[0].sku_id == "k1" and got_card.skus[0].props() == {"颜色": "黑色"}
+    assert got_card.size_chart == [{"尺码": "M", "胸围cm": 88}]

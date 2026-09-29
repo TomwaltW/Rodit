@@ -149,6 +149,21 @@ def cloud_bindings(ctx: BindingContext) -> PlatformBindings:
     )
 
 
+def cloud_bindings_with_mock_catalog(ctx: BindingContext) -> PlatformBindings:
+    """平台工具、适配器是"平台云实现"，商品接口和 OCR 却是本仓库的模拟实现（生产模式必须拒绝）。"""
+    from dataclasses import replace
+
+    from rodit.testing.fakes import FakeImageTextExtractor, InMemoryItemCatalog
+    from rodit.testing.fixtures import demo_platform_items
+
+    world = build_demo_world(ctx.clock.now())
+    return replace(
+        cloud_bindings(ctx),
+        catalog=InMemoryItemCatalog(demo_platform_items(world), ctx.platform),
+        ocr=FakeImageTextExtractor({}),
+    )
+
+
 def mock_bindings(ctx: BindingContext) -> PlatformBindings:
     """直接交出本仓库的模拟实现（生产模式必须拒绝）。"""
     return demo_bindings(ctx)

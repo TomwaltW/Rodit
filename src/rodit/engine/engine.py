@@ -507,7 +507,9 @@ class AssistEngine:
 
         有推荐被过期时返回会话里仍在展示中的推荐卡片（侧边栏按它刷新；通常为空，即清空），
         没有改动返回 None（不用刷新）。客服刚好发送 / 反馈了的那条以客服的操作为准；
-        影子记录（SHADOW）没展示过，不动。存储失败向外抛：应用层让平台重推撤回，过期是幂等的。
+        影子记录（SHADOW）没展示过，不改状态。
+        所有状态的推荐记录都去掉抄下来的买家原文（question_text）：撤回的消息原文不留（§5.3），
+        每周复核（§13.5）也看不到。存储失败向外抛：应用层让平台重推撤回，两步都是幂等的。
         """
         expired = False
         shown = self._suggestions.list(
@@ -521,15 +523,37 @@ class AssistEngine:
                 continue
             try:
                 self._suggestions.update(
-                    record.model_copy(update={"status": SuggestionStatus.EXPIRED}),
+                    record.model_copy(
+                        update={"status": SuggestionStatus.EXPIRED, "question_text": None}
+                    ),
                     expected_status=SuggestionStatus.SHOWN,
                 )
             except ConcurrencyConflict:
                 continue
             expired = True
+        self._forget_recalled_text(shop_id, conversation_id, msg_id)
         if not expired:
             return None
         return [card_from_record(r) for r in remaining]
+
+    def _forget_recalled_text(self, shop_id: str, conversation_id: str, msg_id: str) -> None:
+        """撤回的消息触发的推荐记录（任何状态）去掉买家原文。和客服操作并发时按新状态再试。"""
+        for record in self._suggestions.list(shop_id, conversation_id=conversation_id):
+            if record.msg_id != msg_id or record.question_text is None:
+                continue
+            current: SuggestionRecord | None = record
+            for _ in range(3):
+                if current is None or current.question_text is None:
+                    break
+                try:
+                    self._suggestions.update(
+                        current.model_copy(update={"question_text": None}),
+                        expected_status=current.status,
+                    )
+                    break
+                except ConcurrencyConflict:
+                    assert current.id is not None
+                    current = self._suggestions.get(shop_id, current.id)
 
     # ------------------------------------------------------------ 执行计划
 

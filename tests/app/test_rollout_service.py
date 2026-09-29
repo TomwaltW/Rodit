@@ -576,3 +576,27 @@ def test_revoke_waits_for_in_flight_score(service: AssistService):
     )
     assert not errors and seen == [False]
     assert repo.list(SHOP_A) == [] and service.unit.repos.audit.list_events(SHOP_A) == []
+
+
+def test_stage_switch_is_undone_when_its_audit_cannot_be_written(service, monkeypatch):
+    """切换必须留痕：审计写不进去就撤回切换（覆盖项恢复原样），重试走完整流程、写上审计。"""
+    ro = service.rollout
+    before = overrides(service)
+    assert "shadow_mode" not in before  # 用的是默认值
+    audit = service.unit.repos.audit
+    original = audit.record
+    calls = {"n": 0}
+
+    def flaky(event):
+        if event.action == AuditAction.ROLLOUT_STAGE and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("审计库连不上")
+        return original(event)
+
+    monkeypatch.setattr(audit, "record", flaky)
+    with pytest.raises(RuntimeError):
+        ro.set_stage(SHOP_A, "shadow", operator=REVIEWER)
+    assert overrides(service) == before  # 键删掉了，回到默认，不是写成 False
+    change = ro.set_stage(SHOP_A, "shadow", operator=REVIEWER)
+    assert change.changed and overrides(service)["shadow_mode"] is True
+    assert len(events(service, AuditAction.ROLLOUT_STAGE)) == 1

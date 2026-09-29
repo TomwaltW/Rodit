@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
@@ -86,6 +87,8 @@ MSG_AUTO_ENABLED = (
 )
 MSG_FORCE_NOTE = "强制切换要写明原因（note）"
 MSG_STAGE = "只能切换到影子模式（shadow）或智能辅助（assist）；全自动的开关不在这里"
+
+logger = logging.getLogger(__name__)
 
 
 class RolloutGateNotPassed(ActionNotAllowed):
@@ -339,25 +342,39 @@ class RolloutService:
                         raise RolloutGateNotPassed(gate)
                     forced = True
             # 只写 shadow_mode 一个键（仓储里原子地读改写）：商家同时改别的配置也不会互相覆盖
+            previous_override = shop.config_overrides.get("shadow_mode")  # None：用的是默认值
             if (
                 repo.update_shop_config(shop_id, {"shadow_mode": target == RolloutStage.SHADOW})
                 is None
             ):
                 raise ShopInactive(shop_id)
-            self._audit(
-                shop_id,
-                operator,
-                AuditAction.ROLLOUT_STAGE,
-                {
-                    "from": current.value,
-                    "to": target.value,
-                    "role": role,
-                    "forced": forced,
-                    "force_requested": force,
-                    "gate": gate_summary(gate) if gate is not None else None,
-                    "note": clean_note,  # 强制切换的原因（已做个人信息最小化）
-                },
-            )
+            try:
+                self._audit(
+                    shop_id,
+                    operator,
+                    AuditAction.ROLLOUT_STAGE,
+                    {
+                        "from": current.value,
+                        "to": target.value,
+                        "role": role,
+                        "forced": forced,
+                        "force_requested": force,
+                        "gate": gate_summary(gate) if gate is not None else None,
+                        "note": clean_note,  # 强制切换的原因（已做个人信息最小化）
+                    },
+                )
+            except Exception:
+                # 审计写不进去就撤回切换（覆盖项恢复原样，None 删掉键回到默认）：切换必须留痕；
+                # 重试时阶段还没变，会重新检查门槛、重新写审计，而不是"已经切过了"的空操作
+                try:
+                    repo.update_shop_config(shop_id, {"shadow_mode": previous_override})
+                except Exception as undo_error:  # noqa: BLE001 — 撤回失败只记日志，原异常照抛
+                    logger.error(
+                        "阶段切换的审计没写成，撤回切换也失败（店铺 %s，%s）",
+                        shop_id,
+                        type(undo_error).__name__,
+                    )
+                raise
             return StageChange(
                 shop_id=shop_id,
                 previous=current,

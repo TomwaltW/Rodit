@@ -125,10 +125,18 @@ def validate_bindings(
             raise BindingError(f"适配器 {type(adapter).__name__} 不属于本单元的平台")
     if isinstance(bindings.tools, NullToolGateway) and not bindings.mode_c_only:
         raise BindingError("NullToolGateway 只能用于模式 C 单独部署（RODIT_MODE_C_ONLY=1）")
+    if bindings.catalog is not None and getattr(bindings.catalog, "platform", None) != platform:
+        raise BindingError(f"商品接口不属于本单元的平台 {platform.value}")
     if not allow_mock:
         mocks = [
             type(obj).__name__
-            for obj in (bindings.tools, *adapters, bindings.action_port)
+            for obj in (
+                bindings.tools,
+                *adapters,
+                bindings.action_port,
+                bindings.catalog,
+                bindings.ocr,
+            )
             if obj is not None and is_mock(obj)
         ]
         if mocks:

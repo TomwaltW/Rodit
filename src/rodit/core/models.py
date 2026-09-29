@@ -94,6 +94,8 @@ CleanText = Annotated[str, AfterValidator(strip_control_chars)]
 """会写进存储的自由文本：去掉 NUL 等控制字符。"""
 CleanJson = Annotated[dict[str, Any], AfterValidator(_strip_json)]
 """会写进 JSONB 的 dict：字符串逐个清洗。"""
+SizeRow = Annotated[dict[str, str | int | float], AfterValidator(_strip_json)]
+"""尺码表的一行（写进 JSONB）：字符串逐个清洗。"""
 
 
 # 约定：模型里的 dict[str, Any] 字段（Shop.config_overrides、Evidence.data、
@@ -225,8 +227,15 @@ class Sku(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    sku_id: str
+    sku_id: CleanText
     stock_source: str = "realtime"
+
+    @model_validator(mode="after")
+    def _clean_props(self) -> Sku:
+        # 规格属性来自平台商品接口（商品同步），会写进 JSONB：键和值都去掉 NUL 等控制字符
+        if self.__pydantic_extra__:
+            self.__pydantic_extra__ = _strip_json(self.__pydantic_extra__)
+        return self
 
     def props(self) -> dict[str, str]:
         return {k: str(v) for k, v in (self.model_extra or {}).items()}
@@ -239,10 +248,10 @@ class ItemCard(_Model):
     platform: Platform
     item_id: str
     title: CleanText
-    category: str | None = None
+    category: CleanText | None = None
     attributes: dict[str, CleanText] = Field(default_factory=dict)
     skus: list[Sku] = Field(default_factory=list)
-    size_chart: list[dict[str, str | int | float]] = Field(default_factory=list)
+    size_chart: list[SizeRow] = Field(default_factory=list)
     size_advice: CleanText | None = None  # 商家填写，尺码推荐最重要的依据
     care: list[CleanText] = Field(default_factory=list)
     usage: list[CleanText] = Field(default_factory=list)  # 使用 / 安装说明
@@ -281,10 +290,10 @@ class PlatformItem(_Model):
     platform: Platform
     item_id: str
     title: CleanText
-    category: str | None = None
+    category: CleanText | None = None
     attributes: dict[str, CleanText] = Field(default_factory=dict)
     skus: list[Sku] = Field(default_factory=list)
-    size_chart: list[dict[str, str | int | float]] = Field(default_factory=list)
+    size_chart: list[SizeRow] = Field(default_factory=list)
     detail_text: CleanText | None = None
     detail_images: list[str] = Field(default_factory=list)
     on_sale: bool = True  # 已下架的商品同步时不删卡片，只报告出来
@@ -351,8 +360,9 @@ class QualityScores(_Model):
     expression: int = Field(ge=0, le=2)  # 表达
 
 
-QUALITY_PERIOD_PATTERN = r"^\d{4}-W(0[1-9]|[1-4]\d|5[0-3])$"
-"""复核周期：ISO 周，如 "2026-W40"（datetime.isocalendar() 的年和周）。"""
+QUALITY_PERIOD_PATTERN = r"^[0-9]{4}-W(0[1-9]|[1-4][0-9]|5[0-3])$"
+"""复核周期：ISO 周，如 "2026-W40"（datetime.isocalendar() 的年和周）。只认 ASCII 数字，
+和库里 quality_review 的 CHECK 一致（正则的数字类会放过全角数字）。"""
 
 
 class QualityReview(_Model):
