@@ -383,9 +383,11 @@ AFTERSALE_CASES: list[EvalCase] = [
         test=True,
         order_id="o_1001",
         acceptable_intents=[I.URGE_SHIP, I.SHIPPING_POLICY],
+        # modify_order 是高风险类型：§6.6 规则 4 先于规则 5，按它回答时不会分条，依据是订单工具 +
+        # 改单政策（§5.1）；主类型判成可接受的催发货 / 发货政策时可以分条，依据含指定快递政策。
+        # 几条路都算对
         expected_actions=[A.HIGH_RISK_ANSWER, A.SPLIT_MULTI, A.ANSWER],
-        must_cite=[["policy:courier_choice", "faq:1"]],
-        must_include=["10"],
+        must_cite=[["policy:modify_order", "tool:order:o_1001", "policy:courier_choice", "faq:1"]],
         tags=["multi"],
     ),
     # ================================================ 退换政策 return_policy
@@ -427,8 +429,8 @@ AFTERSALE_CASES: list[EvalCase] = [
         "质量问题退货运费谁出",
         I.RETURN_POLICY,
         acceptable_intents=[I.QUALITY_ISSUE],
+        # 回答按店铺口吻称"我们"（提示词要求称呼买家为"您"），不要求政策原文里的"店铺"
         must_cite=[["policy:return_shipping"]],
-        must_include=["店铺"],
     ),
     case(
         "ret-11",
@@ -506,7 +508,7 @@ AFTERSALE_CASES: list[EvalCase] = [
         I.RETURN_POLICY,
         test=True,
         must_cite=[["policy:return_shipping"]],
-        must_include=["买家"],
+        must_include=["承担"],  # 回答称"您"，不会照抄政策里的"买家"
         tags=["colloquial"],
     ),
     case(
@@ -526,7 +528,7 @@ AFTERSALE_CASES: list[EvalCase] = [
         acceptable_intents=[I.REFUND_PROGRESS],
         expected_actions=MULTI,
         must_cite=[["policy:return_shipping"]],
-        must_include=["买家"],
+        must_include=["承担"],
         tags=["multi"],
     ),
     case(

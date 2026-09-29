@@ -765,7 +765,8 @@ PRESALE_CASES: list[EvalCase] = [
         test=True,
         acceptable_intents=[I.PRICE_PROMO],
         must_cite=[["policy:gift"]],
-        must_not_include=["送您"],
+        # 政策：目前没有赠品活动。"送您运费险"是真的，只拦"有小礼品 / 有赠品"这类说法
+        must_not_include=["有小礼品", "送您小礼品", "有赠品"],
     ),
     case(
         "inv-08",
@@ -933,8 +934,8 @@ PRESALE_CASES: list[EvalCase] = [
         I.PRICE_PROMO,
         item_id="i_555",
         acceptable_intents=[I.SHIPPING_POLICY],
+        # 按 price_promo（高风险）回答时规则 4 先于规则 5、不分条，拿不到顺丰加价的依据：不要求"10"
         expected_actions=[A.HIGH_RISK_ANSWER, A.SPLIT_MULTI],
-        must_include=["10"],
         must_not_include=["给您便宜", "打折给您"],
         tags=["multi"],
     ),

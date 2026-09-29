@@ -147,11 +147,20 @@ def test_select_cases_by_intent_limit_and_seed():
 # ---------------------------------------------------------------- §13.5 回归比较
 
 
-def _row(id: str, split: str = "dev", *, intent_ok=True, factual=2, compliance=2) -> dict:  # noqa: A002
+def _row(  # noqa: PLR0913
+    id: str,  # noqa: A002
+    split: str = "dev",
+    *,
+    intent_ok=True,
+    action_ok=True,
+    factual=2,
+    compliance=2,
+) -> dict:
     return {
         "id": id,
         "split": split,
         "intent_ok": intent_ok,
+        "action_ok": action_ok,
         "scores": {"factual": factual, "on_topic": 2, "compliance": compliance, "expression": 2},
     }
 
@@ -190,6 +199,23 @@ def test_compare_to_baseline_on_common_cases():
         compare_to_baseline([_row("x")], base)
     with pytest.raises(ValueError, match="容差"):
         compare_to_baseline([_row("a")], base, tolerance=1.5)
+
+
+def test_routing_regression_alone_fails_the_check():
+    """升级判断层后不再提醒人工（human_priority 变成 answer）：类型、事实、合规都没变，
+    只有路由动作退步——也要算回归（§13.5、§5.7）。"""
+    base = [_row("human-01"), _row("emo-01", "test"), _row("ship-01", "test")]
+    current = [
+        _row("human-01", action_ok=False),
+        _row("emo-01", "test", action_ok=False),
+        _row("ship-01", "test"),
+    ]
+    check = compare_to_baseline(current, base)
+    assert not check.passed
+    assert {(d.scope, d.metric) for d in check.regressions} == {
+        ("all", "action_accuracy"),
+        ("test", "action_accuracy"),
+    }
 
 
 def test_load_baseline_errors(tmp_path):

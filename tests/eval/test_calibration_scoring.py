@@ -136,3 +136,31 @@ def test_no_suggestion_cases_and_gate():
     report = summarize([s1, s3], [cmp, ship])
     assert not report.passes_gate and len(report.failures) == 1
     assert report.confusion["complaint"]["complaint"] == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "phrase", "said"),
+    [
+        ("亲，现货付款后 48 小时内发货，不能保证明天发出哦", "保证明天", False),
+        ("亲，这款不是纯棉的哦，面料是棉 95%", "纯棉的哦", False),
+        ("亲，这款没有抗皱功能哦", "抗皱", False),
+        ("亲，客服这边没法额外给您打折哦", "给您打折", False),
+        ("亲，目前没有赠品活动", "有赠品", False),
+        ("亲，这款是纯棉的哦", "纯棉的哦", True),
+        ("亲，保证明天到", "保证明天", True),
+        ("亲，不一定今天到，但保证明天到", "保证明天", True),  # 否定不跨小句
+        ("亲，不过保证明天到", "保证明天", True),  # "不过"是转折，不是否定
+    ],
+)
+def test_must_not_include_ignores_negated_or_uncertain_mentions(text, phrase, said):
+    """和质检硬规则一致：否定、不确定说法里提到的错误说法不算说了这句错话。"""
+    from rodit.eval.scoring import _says
+
+    assert _says(text, phrase) is said
+
+
+def test_must_include_ignores_spacing():
+    case = next(c for c in CASES if c.id == "ship-01")
+    case = case.model_copy(update={"must_include": ["10 月 8 日"], "must_cite": []})
+    result = _result(case, "亲，预计10月8日补货哦")
+    assert score_case(case, result).factual == 2

@@ -3,6 +3,9 @@
 §13.2 的四个维度（0 / 1 / 2 分）在合成评测集上按标注自动打分，是人工抽检之前的代理指标：
 - 事实正确：出现 must_not_include 里的错误事实 → 0；
   must_include 要点和 must_cite 依据全满足 → 2；否则 1；
+  文字比对前两边都做 NFKC、去空白（"10 月 8 日" = "10月8日"）；错误说法前面同一小句里紧挨着否定或
+  不确定的说法（"不能保证明天发出""这款不是纯棉的哦""没有抗皱功能"）不算说了这句错话——和质检硬规则
+  对否定、不确定说法的放行一致；
 - 切题：问题类型（或允许的类型）和路由结果都对且有推荐 → 2；有推荐但类型不对 → 1；该答没答 → 0；
 - 合规：回答里有站外引流或绝对化用语 → 0（core.lexicon，与质检硬规则同一份词表；
   商品卡片上原样有的成分标注如"桑蚕丝 100%"不算绝对化用语）；否则 2；
@@ -14,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Sequence
 
@@ -26,6 +30,29 @@ from rodit.eval.dataset import EvalCase
 
 _MARKDOWN = re.compile(r"\*\*|__|^#+\s|`|\[[^\]]+\]\([^)]+\)", re.M)
 _ANSWER_ACTIONS = {RouteAction.ANSWER, RouteAction.HIGH_RISK_ANSWER, RouteAction.SPLIT_MULTI}
+_SPACES = re.compile(r"\s+")
+# 往回看只看同一小句：标点、"但 / 不过 / 可是 / 然而"之后是另一句
+_CLAUSE_BREAK = re.compile(r"[，,。.！!？?；;~～…]|但|不过|可是|然而")
+_NEGATED_BEFORE = re.compile(r"不(?!过)|没|无|非|别|暂无|不一定|不确定|说不准|说不好|不好说")
+_LOOKBACK = 8
+
+
+def _norm(text: str) -> str:
+    return _SPACES.sub("", unicodedata.normalize("NFKC", text or ""))
+
+
+def _says(text: str, phrase: str) -> bool:
+    """回答里有没有肯定地说了 phrase（出现在否定、不确定说法后面的不算）。"""
+    haystack, needle = _norm(text), _norm(phrase)
+    if not needle:
+        return False
+    start = haystack.find(needle)
+    while start >= 0:
+        before = _CLAUSE_BREAK.split(haystack[max(0, start - _LOOKBACK) : start])[-1]
+        if not _NEGATED_BEFORE.search(before):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
 
 
 class CaseScore(BaseModel):
@@ -86,8 +113,8 @@ def score_case(
     cited = {e.id for c in cards for e in c.evidence}
 
     # 事实正确
-    wrong = [s for s in case.must_not_include if s in all_text]
-    missing_points = [s for s in case.must_include if s not in all_text]
+    wrong = [s for s in case.must_not_include if _says(all_text, s)]
+    missing_points = [s for s in case.must_include if _norm(s) not in _norm(all_text)]
     missing_cites = [group for group in case.must_cite if not cited.intersection(group)]
     if wrong:
         factual = 0

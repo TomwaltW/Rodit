@@ -6,7 +6,8 @@
 只比较两次都有的用例（按用例 ID）：基线可以是全量，本次用 --limit / --intent 只跑一部分，
 比较的就是这一部分；两次的用例集合不同也不会把"换了题"当成"变好 / 变差"。
 
-比较三项：问题类型准确率、事实正确满分率、合规满分率（§13.2 上线门槛的两项 + 路由）。
+比较四项：问题类型准确率、路由准确率（动作对不对：该提醒人工的有没有提醒、该安抚的有没有安抚，
+§5.7、§6.6——升级判断层时最容易退步的就是它）、事实正确满分率、合规满分率（§13.2 上线门槛的两项）。
 范围：共同用例全部（all）；其中有测试集用例时另比测试集（test，§13.1 留出、§13.5 看这部分）。
 任一项在任一范围里比基线低超过容差（tolerance，比例，0.02 = 2 个百分点）就算回归，
 命令行以退出码 1 结束。默认容差 0：§13.5 要求指标不下降；真实大模型有采样波动，
@@ -22,8 +23,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-REGRESSION_METRICS = ("intent_accuracy", "factual", "compliance")
-METRIC_LABELS = {"intent_accuracy": "类型准确率", "factual": "事实正确", "compliance": "合规"}
+REGRESSION_METRICS = ("intent_accuracy", "action_accuracy", "factual", "compliance")
+METRIC_LABELS = {
+    "intent_accuracy": "类型准确率",
+    "action_accuracy": "路由",
+    "factual": "事实正确",
+    "compliance": "合规",
+}
 _EPS = 1e-9
 
 
@@ -59,6 +65,10 @@ def _intent_ok(row: Mapping[str, Any]) -> bool:
     return row.get("intent_ok") is True
 
 
+def _action_ok(row: Mapping[str, Any]) -> bool:
+    return row.get("action_ok") is True
+
+
 def _full(dim: str) -> Callable[[Mapping[str, Any]], bool]:
     def check(row: Mapping[str, Any]) -> bool:
         scores = row.get("scores")
@@ -69,6 +79,7 @@ def _full(dim: str) -> Callable[[Mapping[str, Any]], bool]:
 
 _CHECKS: dict[str, Callable[[Mapping[str, Any]], bool]] = {
     "intent_accuracy": _intent_ok,
+    "action_accuracy": _action_ok,
     "factual": _full("factual"),
     "compliance": _full("compliance"),
 }
