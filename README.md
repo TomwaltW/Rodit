@@ -16,7 +16,7 @@ uv run ruff check . && uv run ruff format --check .
 
 bash scripts/dev-pg.sh           # 可选：启动本机 PostgreSQL，跑存储层测试
 uv run python -m rodit.app.demo  # 用合成数据跑方案 §11 的核心流程（不需要任何密钥）
-uv run python -m rodit.api       # 本地接口 + 模式 C 网页工具 http://127.0.0.1:8000/assist
+uv run python -m rodit.api       # 本地接口 + 模式 C 网页工具 http://127.0.0.1:8000/assist、商家控制台 /console
                                  # （启动时打印仅本地演示用的合成令牌，粘贴到网页登录）
 uv run python -m rodit.eval      # §13 评测（324 条合成用例；--llm env 用真实大模型）
 ```
@@ -189,6 +189,8 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | 切换影子 / 智能辅助（§13.4）：切到智能辅助要过门槛，没过要强制并写明原因 | `rollout/stage` | 切回影子：商家、复核人员；切到智能辅助：复核人员 |
 | 每周人工复核（§13.5）：按问题类型分层抽 50 条、按 §13.2 四个维度打分、报表（事实正确和合规满分率 ≥ 95%） | `quality/sample`、`quality/reviews`、`quality/reviews/{id}`、`quality/report` | 复核人员；报表店长、商家也能看 |
 
+网页控制台 `/console`（和 `/assist` 同样的技术和安全约束：原生 HTML / JS / CSS、严格 CSP、令牌只放请求头和
+sessionStorage）按角色显示知识、政策、商品、设置、上线、复核、报表页签；两个页面共用登录状态，互相有链接。
 复核人员（`reviewer` 角色）是我们的质检人员，按店铺签发令牌；看推荐原文每次都记访问审计（§9.2）。
 写操作都和取消订购互斥；店铺配置和商品卡片的修改在仓储里原子地只改涉及的字段，并发修改不会互相覆盖。
 
@@ -216,7 +218,7 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `rodit.engine` | 编排：会话理解、执行计划、推荐卡片、降级与兜底 | §5.3、§5.6、§5.7、§12.2 |
 | `rodit.storage` / `rodit.llm` | PostgreSQL（行级安全）存储；OpenAI 兼容大模型客户端与用量计量 | §9.2、§10、§12.4 |
 | `rodit.app` | 平台单元组装、应用服务、本地演示、生产组装 | §9.1 |
-| `rodit.api` | HTTP 接口（按店铺鉴权、串店拦截）；商家控制台、上线节奏与复核接口；模式 C 独立话术助手网页 `/assist` | §8.1、§8.4、§9.1、§9.2、§13.4 |
+| `rodit.api` | HTTP 接口（按店铺鉴权、串店拦截）；商家控制台、上线节奏与复核接口；模式 C 独立话术助手网页 `/assist`、商家 / 复核控制台网页 `/console` | §8.1、§8.4、§9.1、§9.2、§13.4 |
 | `rodit.ops` | 部署入口（`python -m rodit.ops`）、健康 / 就绪检查、Prometheus 指标、个人信息过滤的 JSON 日志 | §9.1、§12 |
 | `rodit.eval` | 合成评测集（324 条）、§13.2 评分、§13.3 阈值校准；离线替身或真实大模型、耗时与成本、回归比较；每月阈值重算、路由分类器训练 | §13、§12.1、§14、§6.4 |
 
