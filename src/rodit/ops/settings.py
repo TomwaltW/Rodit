@@ -20,6 +20,10 @@
 | RODIT_AUTH_EXPIRY_WARN_DAYS | 7 | 授权在这么多天内到期就告警（§12.4） |
 | RODIT_AUTH_EXPIRY_CHECK_S | 300 | 授权检查的最短间隔（秒） |
 | RODIT_READINESS_CACHE_S | 2 | /readyz 结果缓存（秒） |
+| RODIT_CLASSIFIER_PATH | | 路由分类器模型文件（provider 是 classifier 时必填） |
+
+离线任务 recalibrate / train-classifier 不用 ServerSettings（不需要 RODIT_PLATFORM），标注从
+RODIT_TRAINER_DSN 读（只属于 rodit_trainer 的登录账号，见 rodit.ops.serve）。
 """
 
 from __future__ import annotations
@@ -88,6 +92,7 @@ class ServerSettings(BaseModel):
     auth_expiry_warn_days: float = Field(default=7.0, gt=0)
     auth_expiry_check_s: float = Field(default=300.0, ge=0)
     readiness_cache_s: float = Field(default=2.0, ge=0)
+    classifier_path: str = ""  # 路由分类器模型文件；只在 decision.provider: classifier 时加载
 
     @property
     def is_production(self) -> bool:
@@ -124,6 +129,7 @@ class ServerSettings(BaseModel):
                 auth_expiry_warn_days=_number(env, "RODIT_AUTH_EXPIRY_WARN_DAYS", 7.0),
                 auth_expiry_check_s=_number(env, "RODIT_AUTH_EXPIRY_CHECK_S", 300.0),
                 readiness_cache_s=_number(env, "RODIT_READINESS_CACHE_S", 2.0),
+                classifier_path=env.get("RODIT_CLASSIFIER_PATH", "").strip(),
             )
         except ValidationError as e:
             fields = sorted({".".join(str(p) for p in err["loc"]) for err in e.errors()})

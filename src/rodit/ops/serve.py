@@ -4,6 +4,8 @@
     python -m rodit.ops.serve migrate     迁移数据库（属主账号；幂等，可以每次发布前跑）
     python -m rodit.ops.serve issue-token 签发访问令牌（打印一次原文 + 令牌文件条目）
     python -m rodit.ops.serve local-init  本地试用：迁移 + 写入合成演示数据 + 生成令牌文件
+    python -m rodit.ops.serve recalibrate 每月用采纳反馈重算阈值（§13.5，只输出建议）
+    python -m rodit.ops.serve train-classifier --out FILE  训练路由分类器（§6.4 Phase 2）
 
 serve 的组装：
     rodit.app.production.build_production_unit（PostgreSQL、境内大模型，审计套上指标采集）
@@ -16,8 +18,33 @@ serve 的组装：
 /metrics 既没有抓取令牌也没有明确允许公开。
 本地试用（RODIT_ENV=local）允许合成数据的平台绑定，没配大模型时用离线替身（rodit.app.offline）。
 
+decision.provider 是 classifier 时，serve 从 RODIT_CLASSIFIER_PATH 加载路由分类器的模型文件
+（train-classifier 生成）当路由判断层，质检仍用大模型（§6.4）；没设、文件不存在或校验不过都
+拒绝启动（退出码 2），日志里写明原因。
+
 一个进程一个平台单元，单进程运行：会话串行锁、适配器的去重记录、短时缓存都在进程内
 （CLAUDE.md 选型记录：多实例部署时再换 Redis）。
+
+离线任务（在平台单元内跑，不需要 RODIT_PLATFORM；结果都由人确认后才上线）：
+
+    recalibrate [--since ISO] [--until ISO] [--min-support N] [--out FILE] [--config YAML]
+        读标注（默认最近 30 天）→ 中文摘要打到标准输出；只含要修改的类型的配置片段写到 --out
+        （没给就接在摘要后面）。不改任何配置文件。
+    train-classifier --out FILE [--min-samples N] [--force] [--overwrite] [--min-support N]
+                     [--config YAML]
+        读标注 → 训练、和关键词规则对比、留出集校准阈值 → 原子写入模型文件（临时文件 + 改名）。
+        --out 已存在时拒绝（线上可能正在用它：重启就会加载一个没跑过回归的模型；请用带日期的
+        新文件名，回归通过后再改 RODIT_CLASSIFIER_PATH）；--overwrite 才覆盖，而且已有文件的
+        训练时间比这次新时仍然拒绝。可用标注少于 --min-samples（默认 200）时拒绝，除非 --force。
+
+    标注从 FeedbackRepository.export_training_labels() 读（本单元所有店铺的 labeled_sample，
+    唯一的跨店读路径）：连接串在 RODIT_TRAINER_DSN，这个登录账号要能 SET ROLE rodit_trainer
+    （GRANT rodit_trainer TO 该账号），只属于训练任务，不是商家侧服务的 rodit_app 账号
+    （见 rodit.storage.db）。--config 默认 $RODIT_CONFIG，都没有时用内置默认值。
+    两个任务都提醒：上线前按 §13.5 先跑回归（python -m rodit.eval --baseline …）。
+
+    退出码：0 完成；1 数据库不可用（连不上、没有 rodit_trainer 权限）；2 参数或配置不对、
+    缺 RODIT_TRAINER_DSN、标注不够（train-classifier 没加 --force）、输出文件已存在 / 写不进去。
 """
 
 from __future__ import annotations
@@ -29,9 +56,11 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, TextIO
 
 import psycopg
+import yaml
 from fastapi import FastAPI
 
 from rodit.adapters import NullToolGateway
@@ -40,12 +69,17 @@ from rodit.api.auth import PrincipalRole
 from rodit.app.production import build_production_unit, migrate, production_database
 from rodit.app.service import AssistService
 from rodit.app.unit import Repos, Unit, build_unit
-from rodit.core.clock import Clock, SystemClock
+from rodit.core.clock import CST, Clock, SystemClock
 from rodit.core.config import EngineConfig, load_config
 from rodit.core.enums import ProviderName
 from rodit.core.errors import StorageUnavailable
+from rodit.core.models import LabeledSample
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import AuditLog, ToolGateway
+from rodit.core.questions import ROUTER_QUESTIONS_VER
+from rodit.decision import ClassifierArtifactError, ClassifierProvider, RuleProvider
+from rodit.eval.recalibrate import DEFAULT_MIN_SUPPORT
+from rodit.eval.train import DEFAULT_MIN_SAMPLES
 from rodit.llm import MeteredLLMClient
 from rodit.ops.bindings import (
     BindingContext,
@@ -86,7 +120,7 @@ from rodit.ops.tokens import (
     issue_principal_token,
     write_token_file,
 )
-from rodit.storage import APP_ROLE, Database
+from rodit.storage import APP_ROLE, Database, PgFeedbackRepository
 
 logger = logging.getLogger("rodit.ops")
 
@@ -94,8 +128,14 @@ LLM_ENV_PREFIX = "RODIT_LLM_"
 MIGRATE_DSN_ENV = "RODIT_MIGRATE_DSN"
 DATABASE_DSN_ENV = "RODIT_DATABASE_DSN"
 TOKEN_KEY_ENV = "RODIT_TOKEN_KEY"
+TRAINER_DSN_ENV = "RODIT_TRAINER_DSN"
+CLASSIFIER_PATH_ENV = "RODIT_CLASSIFIER_PATH"
 EXIT_FAILURE = 1
 EXIT_STARTUP = 2
+
+LabelSource = Callable[[], Sequence[LabeledSample]]
+"""离线任务的标注来源：默认 PostgreSQL 的 export_training_labels（trainer_label_source）；
+测试注入假的。"""
 
 
 class StartupError(RuntimeError):
@@ -165,6 +205,49 @@ def resolve_bindings(
     return validate_bindings(bindings, settings.platform, allow_mock=not settings.is_production)
 
 
+def load_route_classifier(
+    settings: ServerSettings, config: EngineConfig
+) -> ClassifierProvider | None:
+    """decision.provider 是 classifier 时加载路由分类器的模型文件（§6.4 Phase 2），否则返回 None。
+
+    没设 RODIT_CLASSIFIER_PATH、文件不存在、格式 / 版本 / 校验和 / 问题类型不对都拒绝启动
+    （StartupError，消息里只有变量名、路径和原因）。intent 以外的路由问题交给关键词规则。"""
+    if config.decision.provider != ProviderName.CLASSIFIER:
+        if settings.classifier_path:
+            logger.warning(
+                "设置了 %s，但 decision.provider 是 %s：不加载路由分类器",
+                CLASSIFIER_PATH_ENV,
+                config.decision.provider.value,
+            )
+        return None
+    if not settings.classifier_path:
+        raise StartupError(
+            f"decision.provider 是 classifier，缺少环境变量 {CLASSIFIER_PATH_ENV}"
+            "（路由分类器模型文件，由 python -m rodit.ops train-classifier 生成）"
+        )
+    try:
+        classifier = ClassifierProvider.load(settings.classifier_path, fallback=RuleProvider())
+    except ClassifierArtifactError as exc:
+        raise StartupError(f"路由分类器模型文件不能用（{CLASSIFIER_PATH_ENV}）：{exc}") from None
+    meta = classifier.meta
+    assert meta is not None
+    logger.info(
+        "路由分类器已加载：训练时间 %s，训练样本 %d 条，问题类型 %d 个，sha256 %s",
+        meta.trained_at.astimezone(CST).isoformat(timespec="minutes"),
+        meta.samples,
+        len(classifier.classes),
+        classifier.artifact_sha256,
+    )
+    if meta.questions_version != ROUTER_QUESTIONS_VER:
+        logger.warning(
+            "路由分类器训练时的路由问题定义版本 %s 和当前 %s 不同："
+            "问题分类改过的话请重新训练并跑回归",
+            meta.questions_version,
+            ROUTER_QUESTIONS_VER,
+        )
+    return classifier
+
+
 # ================================================================ 组装
 
 
@@ -191,6 +274,7 @@ def compose_unit(
     env = os.environ if environ is None else environ
     config = load_config(settings.config_path or None)
     preflight(settings, config, env)
+    classifier = load_route_classifier(settings, config)
     clock = clock or SystemClock()
     hasher = BuyerRefHasher.from_env(config.privacy.buyer_salt_env)
     ctx = BindingContext(platform=settings.platform, config=config, clock=clock, hasher=hasher)
@@ -217,10 +301,13 @@ def compose_unit(
             audit_wrapper=observe,
             catalog=bindings.catalog,
             ocr=bindings.ocr,
+            route_provider=classifier,
         )
         probe = llm_probe(config.llm, environ=env, env_prefix=LLM_ENV_PREFIX)
     else:
-        unit = _offline_unit(settings, config, clock, hasher, bindings, tools, observe, repos)
+        unit = _offline_unit(
+            settings, config, clock, hasher, bindings, tools, observe, repos, classifier
+        )
         probe = static_probe("llm", CheckResult(True, {"offline": True}))
     return _Composed(unit=unit, bindings=bindings, metrics=metrics, llm_probe=probe)
 
@@ -234,18 +321,20 @@ def _offline_unit(
     tools: ToolGateway,
     observe: Callable[[AuditLog], AuditLog],
     repos: Repos | None,
+    classifier: ClassifierProvider | None = None,
 ) -> Unit:
-    """本地试用、没配大模型：离线替身（关键词路由、复述依据、启发式质检），仓储默认 PostgreSQL。"""
+    """本地试用、没配大模型：离线替身（关键词路由、复述依据、启发式质检），仓储默认 PostgreSQL。
+    配置了路由分类器（decision.provider: classifier）时路由用它，否则用关键词规则。"""
     from rodit.app.offline import EvidenceEchoLLM, HeuristicQAJudge
     from rodit.app.production import postgres_repos
-    from rodit.decision import RuleProvider
 
     logger.warning("本地试用：没有配置大模型，使用离线替身（回答只复述依据，仅供试用）")
     base = repos if repos is not None else postgres_repos(production_database(), clock=clock)
     repos = replace(base, audit=observe(base.audit))
-    config = config.model_copy(
-        update={"decision": config.decision.model_copy(update={"provider": ProviderName.RULES})}
-    )
+    if classifier is None:
+        config = config.model_copy(
+            update={"decision": config.decision.model_copy(update={"provider": ProviderName.RULES})}
+        )
     return build_unit(
         platform=settings.platform,
         config=config,
@@ -256,7 +345,7 @@ def _offline_unit(
         tools=tools,
         adapters=list(bindings.adapters),
         action_port=bindings.action_port,
-        route_provider=RuleProvider(),
+        route_provider=classifier or RuleProvider(),
         qa_provider=HeuristicQAJudge(),
         catalog=bindings.catalog,
         ocr=bindings.ocr,
@@ -465,6 +554,135 @@ def local_init(settings: ServerSettings, out: TextIO, *, clock: Clock | None = N
     return 0
 
 
+# ================================================================ 离线任务：阈值重算、分类器训练
+
+
+def trainer_label_source(environ: Mapping[str, str] | None = None) -> LabelSource:
+    """默认的标注来源：PostgreSQL 的 export_training_labels（本单元所有店铺，rodit_trainer 角色）。
+
+    连接串在 RODIT_TRAINER_DSN：这个登录账号要能 SET ROLE rodit_trainer，只属于训练任务
+    （见 rodit.storage.db）。离线任务不设请求级的语句超时。连接在调用时才建。"""
+    env = os.environ if environ is None else environ
+    dsn = env.get(TRAINER_DSN_ENV, "").strip()
+    if not dsn:
+        raise StartupError(
+            f"缺少必需的环境变量：{TRAINER_DSN_ENV}"
+            "（训练导出用的登录账号，要能 SET ROLE rodit_trainer）"
+        )
+    return PgFeedbackRepository(Database(dsn)).export_training_labels
+
+
+def _job_config(args: argparse.Namespace) -> tuple[EngineConfig, str]:
+    """离线任务对照的配置：--config，其次 RODIT_CONFIG，都没有时用内置默认值。"""
+    path = (args.config or os.environ.get("RODIT_CONFIG", "")).strip()
+    if path:
+        return load_config(path), path
+    return load_config(None), "内置默认值（没有 --config，也没有 RODIT_CONFIG）"
+
+
+def recalibrate_command(
+    args: argparse.Namespace, out: TextIO, *, labels: LabelSource, clock: Clock
+) -> int:
+    """§13.5 阈值重算：摘要打到 out，配置片段写到 --out（没给就接在摘要后面）。不改任何配置。"""
+    from rodit.eval.recalibrate import recalibrate, render_text
+
+    config, source = _job_config(args)
+    report = recalibrate(
+        labels(),
+        config.routing,
+        now=clock.now(),
+        since=args.since,
+        until=args.until,
+        min_support=args.min_support,
+    )
+    print(render_text(report, config_source=source), file=out)
+    if args.out:
+        Path(args.out).write_text(report.yaml, encoding="utf-8")
+        print(f"配置片段已写入：{args.out}（只是建议，人工确认后再合并进部署配置）", file=out)
+    else:
+        print("", file=out)
+        print(report.yaml, end="", file=out)
+    return 0
+
+
+def _refuse_newer_artifact(target: Path, trained_at: datetime) -> None:
+    """--overwrite 时：已有的模型文件比这次训练的新就不覆盖；读不出来的文件照常覆盖。"""
+    from rodit.decision import read_artifact
+
+    try:
+        existing = read_artifact(target)
+    except ClassifierArtifactError as exc:
+        logger.warning("已有的模型文件读不出来，按 --overwrite 覆盖：%s", exc)
+        return
+    previous = datetime.fromisoformat(existing["metadata"]["trained_at"])
+    if previous > trained_at:
+        raise StartupError(
+            f"已有的模型文件更新（训练时间 {previous.astimezone(CST):%Y-%m-%d %H:%M}，"
+            f"晚于这次的 {trained_at.astimezone(CST):%Y-%m-%d %H:%M}），不覆盖：{target}"
+        )
+
+
+def train_classifier_command(
+    args: argparse.Namespace, out: TextIO, *, labels: LabelSource, clock: Clock
+) -> int:
+    """§6.4 Phase 2：训练路由分类器，原子写入模型文件（覆盖规则见模块说明），摘要打到 out。"""
+    from rodit.decision import write_artifact
+    from rodit.eval.train import render_text, train_classifier
+
+    target = Path(args.out)
+    if target.exists() and not args.overwrite:
+        raise StartupError(
+            f"模型文件已存在：{target}（线上可能正在用它；换一个带日期的文件名，"
+            "回归通过后再改 RODIT_CLASSIFIER_PATH；确实要覆盖时加 --overwrite）"
+        )
+    if not target.parent.is_dir():
+        raise StartupError(f"输出目录不存在：{target.parent}")
+    config, _ = _job_config(args)
+    now = clock.now()
+    result = train_classifier(
+        labels(),
+        now=now,
+        routing=config.routing,
+        min_samples=args.min_samples,
+        force=args.force,
+        min_support=args.min_support,
+    )
+    if target.exists():
+        _refuse_newer_artifact(target, now)
+    write_artifact(target, result.artifact)
+    print(render_text(result.report), file=out)
+    print(f"已写入模型文件：{target}", file=out)
+    return 0
+
+
+def _run_job(
+    command: str,
+    args: argparse.Namespace,
+    out: TextIO,
+    *,
+    label_source: LabelSource | None,
+    clock: Clock | None,
+) -> int:
+    """跑离线任务，按模块说明映射退出码。数据库的错误只记类型（说明里可能有主机名、账号）。"""
+    try:
+        labels = label_source or trainer_label_source()
+        run = recalibrate_command if command == "recalibrate" else train_classifier_command
+        return run(args, out, labels=labels, clock=clock or SystemClock())
+    except (StorageUnavailable, psycopg.Error) as exc:
+        if isinstance(exc, psycopg.errors.InsufficientPrivilege):
+            logger.error(
+                "导出标注失败：没有权限（%s）；%s 的登录账号要能 SET ROLE rodit_trainer",
+                type(exc).__name__,
+                TRAINER_DSN_ENV,
+            )
+        else:
+            logger.error("数据库不可用：%s", type(exc).__name__)
+        return EXIT_FAILURE
+    except (StartupError, ValueError, OSError, yaml.YAMLError) as exc:
+        logger.error("%s 没有完成：%s", command, exc)
+        return EXIT_STARTUP
+
+
 # ================================================================ 容器健康检查
 
 
@@ -510,7 +728,59 @@ def _parser() -> argparse.ArgumentParser:
     issue.add_argument("--name", help="抓取令牌的名字（--metrics 时）")
     issue.add_argument("--expires-days", type=float, default=0, help="有效天数（0 = 不过期）")
     issue.add_argument("--append", metavar="FILE", help="直接写进这个令牌文件（没有就新建）")
+    config_help = "对照的部署配置（默认 RODIT_CONFIG，都没有时用内置默认值）"
+    recal = sub.add_parser("recalibrate", help="§13.5 用采纳反馈重算阈值（只输出建议）")
+    recal.add_argument("--since", type=_iso_time, help="标注时间窗起点（默认 --until 前 30 天）")
+    recal.add_argument("--until", type=_iso_time, help="标注时间窗终点（不含；默认现在）")
+    recal.add_argument(
+        "--min-support",
+        type=_positive_int,
+        default=DEFAULT_MIN_SUPPORT,
+        help=f"预测为该类型的标注少于这个数就不给建议（默认 {DEFAULT_MIN_SUPPORT}）",
+    )
+    recal.add_argument("--out", metavar="FILE", help="配置片段写到这个文件（默认接在摘要后面）")
+    recal.add_argument("--config", metavar="YAML", help=config_help)
+    train = sub.add_parser("train-classifier", help="§6.4 Phase 2 训练路由分类器，生成模型文件")
+    train.add_argument("--out", metavar="FILE", required=True, help="模型文件（JSON）")
+    train.add_argument(
+        "--min-samples",
+        type=_positive_int,
+        default=DEFAULT_MIN_SAMPLES,
+        help=f"去重后的可用标注少于这个数就拒绝训练（默认 {DEFAULT_MIN_SAMPLES}）",
+    )
+    train.add_argument("--force", action="store_true", help="标注不够也训练（只用于试验）")
+    train.add_argument(
+        "--overwrite", action="store_true", help="覆盖已有的模型文件（比这次新的仍不覆盖）"
+    )
+    train.add_argument(
+        "--min-support",
+        type=_positive_int,
+        default=DEFAULT_MIN_SUPPORT,
+        help=f"留出集上预测为该类型的样本少于这个数就不校准（默认 {DEFAULT_MIN_SUPPORT}）",
+    )
+    train.add_argument("--config", metavar="YAML", help=config_help)
     return parser
+
+
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("必须是正整数") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return value
+
+
+def _iso_time(text: str) -> datetime:
+    """ISO 8601 时间；没写时区的按东八区。"""
+    try:
+        value = datetime.fromisoformat(text.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "应为 ISO 8601 时间，如 2026-09-01 或 2026-09-01T00:00+08:00"
+        ) from None
+    return value if value.tzinfo is not None else value.replace(tzinfo=CST)
 
 
 def _early_logging(environ: Mapping[str, str]) -> None:
@@ -527,14 +797,21 @@ def main(
     *,
     run: Callable[..., Any] | None = None,
     out: TextIO | None = None,
+    label_source: LabelSource | None = None,
+    clock: Clock | None = None,
 ) -> int:
-    """命令行入口。run 默认是 uvicorn.run（测试注入假的）。返回进程退出码。"""
+    """命令行入口。run 默认是 uvicorn.run（测试注入假的）。返回进程退出码。
+
+    label_source / clock 只给离线任务（recalibrate、train-classifier）用：默认从 PostgreSQL 读
+    标注（trainer_label_source）、用系统时间；测试注入假的，不连数据库。"""
     out = out or sys.stdout
     args = _parser().parse_args(list(argv) if argv is not None else None)
     command = args.command or "serve"
     if command == "healthcheck":
         return healthcheck()
     _early_logging(os.environ)
+    if command in ("recalibrate", "train-classifier"):
+        return _run_job(command, args, out, label_source=label_source, clock=clock)
     try:
         if command == "issue-token":
             return issue_token_command(args, out)
