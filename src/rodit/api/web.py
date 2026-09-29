@@ -134,6 +134,10 @@ SECURITY_HEADERS: dict[str, str] = {
     "Cache-Control": "no-cache",
 }
 
+PAGE_HEADERS: dict[str, str] = {**SECURITY_HEADERS, "Cache-Control": "no-store"}
+"""两个页面本身不进缓存：退出后按后退不从缓存恢复出上一位的界面（纵深防御；Chrome 的往返缓存
+对 no-store 的页面照样可能恢复，所以页面脚本另外在 pageshow 时核对 sessionStorage 里的令牌）。"""
+
 CONFIDENCE_LABELS: dict[Confidence, str] = {Confidence.HIGH: "高", Confidence.MEDIUM: "中"}
 
 DRAFT_KIND_LABELS: dict[DraftKind, str] = {
@@ -463,9 +467,11 @@ _ASSET_GROUPS: tuple[tuple[str, dict[str, str]], ...] = (
 )
 
 
-def _responder(body: bytes, media_type: str) -> Callable[[], Response]:
+def _responder(
+    body: bytes, media_type: str, headers: dict[str, str] = SECURITY_HEADERS
+) -> Callable[[], Response]:
     def serve() -> Response:
-        return Response(content=body, media_type=media_type, headers=SECURITY_HEADERS)
+        return Response(content=body, media_type=media_type, headers=headers)
 
     return serve
 
@@ -474,7 +480,7 @@ def build_web_router(platform: Platform) -> APIRouter:
     """网页工具的路由（不进 OpenAPI 文档）。文件在这里读一次，之后只从内存返回。"""
     router = APIRouter(include_in_schema=False)
     for paths, render in _PAGES:
-        page = _responder(render(platform), "text/html")
+        page = _responder(render(platform), "text/html", PAGE_HEADERS)
         for path in paths:
             router.add_api_route(path, page, methods=["GET"], name=f"web_page{path}")
     for prefix, assets in _ASSET_GROUPS:
@@ -497,6 +503,7 @@ __all__ = [
     "CONSOLE_TABS",
     "CONTENT_SECURITY_POLICY",
     "HARD_RULE_LABELS",
+    "PAGE_HEADERS",
     "PAGE_PATHS",
     "PHASE0_ADOPTION_TARGET",
     "SECURITY_HEADERS",

@@ -85,6 +85,9 @@ def test_page_is_served_without_auth_with_strict_headers(api: Api, path: str):
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["x-frame-options"] == "DENY"
     assert r.headers["referrer-policy"] == "no-referrer"
+    # 页面不进缓存：退出后按后退不从缓存恢复上一位的界面（纵深防御；Chrome 的往返缓存照样可能
+    # 恢复 no-store 的页面，页面脚本另外在 pageshow 时核对令牌）
+    assert r.headers["cache-control"] == "no-store"
     assert "set-cookie" not in r.headers
     assert r.text.startswith("<!doctype html>")
 
@@ -107,6 +110,7 @@ def test_assets_are_served_with_types_and_headers(api: Api, path: str, content_t
     assert r.status_code == 200 and r.headers["content-type"] == content_type
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["content-security-policy"] == CONTENT_SECURITY_POLICY
+    assert r.headers["cache-control"] == "no-cache"
 
 
 @pytest.mark.parametrize(
@@ -231,7 +235,7 @@ def test_script_keeps_token_in_session_storage_and_headers_only(api: Api):
     js = api.get(JS).text
     assert "localStorage" not in js and "document.cookie" not in js
     assert "sessionStorage" in js
-    assert "console." not in js  # 不打日志
+    assert not re.search(r"(?<![\w.])console\.", js)  # 不打日志（"rodit.console.tab" 是存储键）
     assert "Authorization" in js and "Bearer ${token}" in js
     # 令牌不拼进地址：只在 Authorization 头里出现（api() 发请求时取一次 state.token）
     uses = [line for line in js.splitlines() if "token" in line and "`" in line and "${" in line]
@@ -329,16 +333,29 @@ def test_script_drops_responses_that_arrive_after_a_different_sign_in(api: Api):
     for fn in ("loadItems", "ask", "loadConsole"):
         body = js.split(f"async function {fn}(", 1)[1].split("\n  }\n", 1)[0]
         assert "const me = state.me" in body and "state.me !== me" in body, fn
+    # 同一块区域只用最近一次请求的结果（换统计范围、提交问卷后重新加载时，晚回来的旧响应丢掉）
+    for fn, key in (("loadItems", "items"), ("loadConsole", "console")):
+        body = js.split(f"async function {fn}(", 1)[1].split("\n  }\n", 1)[0]
+        assert f"const run = nextRun('{key}');" in body and f"latest('{key}', run)" in body, fn
+    # 提问、问卷的按钮：上一位没回来的请求不改下一位的按钮（退出时复位）
+    ask = js.split("async function ask(", 1)[1].split("\n  }\n", 1)[0]
+    assert "if (state.me === me) setBusy(false);" in ask.split("finally", 1)[1]
+    submit = js.split("async function submitQuestionnaire(", 1)[1].split("\n  }\n", 1)[0]
+    assert "if (state.me === me) button.disabled = false;" in submit.split("finally", 1)[1]
+    sign_out = js.split("function signOut(opts = {})", 1)[1].split("\n  }\n", 1)[0]
+    assert "setBusy(false);" in sign_out
+    assert "$('questionnaire-button').disabled = false;" in sign_out
 
 
 def test_assist_page_links_to_the_console_and_sends_reviewers_there(api: Api):
     """页头有去商家控制台的链接；复核人员在这里登录只看到去控制台的提示，不显示话术助手
-    （令牌留着，同一标签页打开控制台直接登录）。"""
+    （令牌留着，同一标签页打开控制台直接登录；页头显示是谁、有「退出」）。"""
     page = _parse(api.get("/assist").text)
     assert [a["href"] for a in page.find("a") if a.get("class") == "page-link"] == ["console"]
     js = api.get(JS).text
     body = js.split("async function signIn(", 1)[1].split("\n  }\n", 1)[0]
     reviewer = body.split("REVIEWER_ROLES.includes(me.role)", 1)[1].split("return false;", 1)[0]
-    assert "state.token = null;" in reviewer and "storage.set(STORAGE_TOKEN, token);" in reviewer
+    assert "state.token = null;" in reviewer and "keepToken(token);" in reviewer
+    assert "showIdentity(me);" in reviewer
     assert "href: 'console'" in reviewer and "enterApp" not in reviewer
     assert body.index("REVIEWER_ROLES.includes") < body.index("enterApp()")

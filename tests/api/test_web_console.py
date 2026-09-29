@@ -52,6 +52,7 @@ def test_console_is_served_without_auth_with_strict_headers(api: Api):
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["x-frame-options"] == "DENY"
     assert r.headers["referrer-policy"] == "no-referrer"
+    assert r.headers["cache-control"] == "no-store"  # 退出后按后退不从缓存恢复（纵深防御）
     assert "set-cookie" not in r.headers
     assert r.text.startswith("<!doctype html>")
 
@@ -65,6 +66,7 @@ def test_console_assets_are_served_with_types_and_headers(api: Api, path: str, c
     assert r.status_code == 200 and r.headers["content-type"] == content_type
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["content-security-policy"] == CONTENT_SECURITY_POLICY
+    assert r.headers["cache-control"] == "no-cache"  # 脚本、样式可以缓存，每次核对新旧
 
 
 @pytest.mark.parametrize(
@@ -182,10 +184,13 @@ def test_console_script_keeps_token_in_session_storage_and_headers_only(api: Api
     assert uses == ["    if (token) headers.Authorization = `Bearer ${token}`;"]
     assert "const token = state.token;" in js and "credentials: 'omit'" in js
     # 和话术助手页同一个存储键：同一标签页里两个页面互相跳转不用重新登录；退出时都清掉
+    # （只清本页自己的令牌，见 test_pages_only_clear_their_own_stored_token）
     assert "const STORAGE_TOKEN = 'rodit.assist.token';" in js
-    sign_out = js.split("function signOut()", 1)[1].split("\n  }\n", 1)[0]
+    sign_out = _functions(js, "")["signOut"]
+    assert "if (!opts.keepStorage) forgetToken(state.stored);" in sign_out
+    forget = _functions(js, "")["forgetToken"]
     for key in ("STORAGE_TOKEN", "STORAGE_SESSION", "STORAGE_TAB"):
-        assert f"storage.remove({key})" in sign_out
+        assert f"storage.remove({key})" in forget
     assert "document.querySelectorAll('[data-dyn]')" in sign_out  # 退出后不留上一位的数据
 
 
@@ -215,6 +220,177 @@ def test_console_drops_responses_that_arrive_after_a_different_sign_in(api: Api)
     plain = _functions(js, "")
     for name in ("approveCandidate", "openRetire"):
         assert "runEntryAction(" in plain[name] and "api('" in plain[name], name
+
+
+# ================================================================ 共用令牌：往返缓存、只清自己的
+
+BOTH_SCRIPTS = pytest.mark.parametrize("path", ["/assist/assist.js", JS])
+
+
+@BOTH_SCRIPTS
+def test_pages_only_clear_their_own_stored_token(api: Api, path: str):
+    """两个页面共用 sessionStorage 里的令牌：退出、401、令牌无效时，只在存着的还是本页的令牌时
+    才清（同一标签页里另一个页面后来登录的人不被登出）；令牌只经 keepToken 写进去，记为本页的。"""
+    js = api.get(path).text
+    plain = _functions(js, "")
+    forget = plain["forgetToken"]
+    first = forget.split("{\n", 1)[1].strip().splitlines()[0]
+    assert first == "if (!token || storage.get(STORAGE_TOKEN) !== token) return;"
+    # 整个脚本里清存储只在 forgetToken 里（三个键）；写令牌只在 keepToken 里
+    assert js.count("storage.remove(") == 3 == forget.count("storage.remove(")
+    assert js.count("storage.set(STORAGE_TOKEN") == 1
+    keep = plain["keepToken"]
+    assert "storage.set(STORAGE_TOKEN, token);" in keep
+    assert "state.stored = storage.get(STORAGE_TOKEN) === token ? token : null;" in keep
+    # 退出：默认只清本页自己的令牌；keepStorage 时完全不动 sessionStorage
+    sign_out = plain["signOut"]
+    assert "function signOut(opts = {})" in js
+    assert sign_out.count("forgetToken(") == 1
+    assert "if (!opts.keepStorage) forgetToken(state.stored);" in sign_out
+    assert "state.stored = null;" in sign_out and "signIns += 1;" in sign_out
+    assert "dropRuns();" in sign_out
+    # 登录失败（令牌无效、不是网页工具的角色）也只清这个令牌自己
+    sign_in = _functions(js, "async ")["signIn"]
+    assert sign_in.count("forgetToken(token);") == 2 and "storage.remove" not in sign_in
+    assert "if (run !== signIns) return false;" in sign_in  # 期间退出或后退恢复：这次登录作废
+    # 401 只登出发请求的那一位（signOut 里再核对存着的令牌）
+    unauthorized = "if (resp.status === 401 && state.me && state.token === token) {"
+    assert f"{unauthorized}\n        signOut();" in js
+
+
+@BOTH_SCRIPTS
+def test_pages_recheck_the_stored_token_when_restored_from_the_bfcache(api: Api, path: str):
+    """从往返缓存恢复（pageshow persisted）：存着的令牌不是本页的（另一个页面退出或换人登录），
+    先只清本页内存里的身份（不动 sessionStorage），有令牌再用它登录。"""
+    js = api.get(path).text
+    assert "window.addEventListener('pageshow', onPageShow);" in js
+    handler = _functions(js, "")["onPageShow"].split("{\n", 1)[1]
+    lines = [line.strip() for line in handler.splitlines() if line.strip()]
+    assert lines[:4] == [
+        "if (!event.persisted) return;",
+        "const stored = storage.get(STORAGE_TOKEN);",
+        "if (stored === state.stored) return;",
+        "const wasSignedIn = Boolean(state.stored);",
+    ]
+    local = handler.index("signOut({ keepStorage: true });")
+    assert local < handler.index("if (stored) signIn(stored);")
+    for banned in ("signOut()", "forgetToken", "storage.remove"):
+        assert banned not in handler, banned
+    assert "已在另一个页面退出登录" in handler
+    assert "unload" not in js  # unload 处理函数会让页面进不了往返缓存，也不可靠
+
+
+@BOTH_SCRIPTS
+def test_refused_roles_see_who_is_signed_in_and_can_sign_out(api: Api, path: str):
+    """控制台拒绝客服、话术助手拒绝复核人员：令牌留给另一个页面（同一标签页跳过去直接登录），
+    页头显示是谁、有「退出」（不然看起来没登录，下一位点页头链接就以这个身份登录了）。"""
+    js = api.get(path).text
+    sign_in = _functions(js, "async ")["signIn"]
+    marker = "REVIEWER_ROLES.includes(me.role)" if "assist" in path else "!tabsFor(me.role).length"
+    refused = sign_in.split(marker, 1)[1].split("return false;", 1)[0]
+    assert "state.token = null;" in refused and "keepToken(token);" in refused
+    assert "showIdentity(me);" in refused and "enterApp" not in refused
+    assert "$('whoami').hidden = false;" in _functions(js, "")["showIdentity"]
+    # 退出按钮同时清掉错误区（拒绝时的提示）
+    click = js.split("$('sign-out').addEventListener('click', () => {", 1)[1].split("});", 1)[0]
+    assert [line.strip() for line in click.strip().splitlines()] == [
+        "signOut();",
+        "clearError();",
+        "announce('已退出');",
+    ]
+
+
+# ================================================================ 请求顺序、防重复提交、写后刷新
+
+ASYNC_LOADERS = {
+    "fetchItems",
+    "loadKnowledge",
+    "loadGaps",
+    "loadPolicies",
+    "loadItemsTab",
+    "refreshItemTable",
+    "loadItemDetail",
+    "loadConfig",
+    "refreshConfig",
+    "loadRollout",
+    "loadShadowDetail",
+    "loadQualityReport",
+    "loadQueue",
+    "loadReports",
+}
+"""取数的异步函数：响应回来时既要核对身份（换人登录），也要核对是不是这块区域最近一次的请求。"""
+
+
+def test_console_loaders_keep_only_the_latest_response(api: Api):
+    """同一块区域（FAQ 列表、商品卡片、复核报表、报表……）只显示最近一次请求的结果：
+    换筛选、换商品、换周期后，晚回来的旧响应不覆盖新的。"""
+    js = api.get(JS).text
+    functions = _functions(js, "async ")
+    loaders = {n for n in functions if re.match(r"(load|refresh|fetch)[A-Z]", n)}
+    assert loaders == ASYNC_LOADERS
+    for name in loaders:
+        body = functions[name]
+        assert "state.me !== me" in body or "state.me === me" in body, name
+        if name == "fetchItems":
+            # 共用的商品列表缓存：比已经用上的那次新才用
+            assert "const run = (itemRuns.sent += 1);" in body and "run > itemRuns.used" in body
+            continue
+        started = set(re.findall(r"nextRun\('(\w+)'\)", body))
+        checked = set(re.findall(r"latest\('(\w+)', \w+\)", body))
+        assert started and started == checked, (name, started, checked)
+    # 收起商品卡片、退出时作废还没回来的加载
+    assert "nextRun('item'); // 还没回来的商品卡片不再显示" in js
+    assert "dropRuns();" in _functions(js, "")["signOut"]
+
+
+def test_console_busy_contexts_belong_to_the_person_who_started_them(api: Api):
+    """防重复提交的标记记下发起的身份和第几次：退出后不挡下一位，上一位的请求晚回来也不改下一位的按钮。"""
+    js = api.get(JS).text
+    plain = _functions(js, "")
+    body = _functions(js, "async ")["busy"]
+    assert "if (ctx.busy && ctx.owner === state.me) return undefined;" in body
+    assert "ctx.owner = state.me;" in body
+    assert "if (ctx.run === run) {" in body.split("finally", 1)[1]
+    # 页面上固定的按钮共用的标记都登记过，退出时复位并重新启用按钮
+    assert not re.search(r"\n  const \w+ = \{ busy: false \};", js)
+    shared = dict(re.findall(r"\n  const (\w+Ctx) = sharedCtx\(([^)]*)\);", js))
+    assert set(shared) == {"faqCreateCtx", "syncCtx", "sampleCtx", "queueCtx"}
+    html = api.get(PAGE).text
+    for ids in shared.values():
+        for control in re.findall(r"'([\w-]+)'", ids):
+            assert f'id="{control}"' in html, control
+    assert "resetBusy();" in plain["signOut"]
+    assert "$(id).disabled = false;" in plain["resetBusy"]
+
+
+def test_console_refreshes_the_tab_that_is_shown_without_closing_editors(api: Api):
+    """写操作回来时用户已经切到受影响的页签：马上原地刷新（不再等下次切换）；
+    知识页有打开的修改面板时只刷新「要补的知识」，设置页留着正在改的行。"""
+    js = api.get(JS).text
+    stale = _functions(js, "")["stale"]
+    assert "if (id !== state.tab) state.loaded[id] = false;" in stale
+    assert "(REFRESHERS[id] || LOADERS[id])();" in stale
+    refreshers = js.split("const REFRESHERS = {", 1)[1].split("\n  };\n", 1)[0]
+    assert "busyEditing('#candidates, #faqs') ? loadGaps() : loadKnowledge()" in refreshers
+    assert "config: refreshConfig," in refreshers
+    assert "loadRollout(busyEditing('#stage-controls'))" in refreshers
+    assert "if (old && rowEdited(old)) continue;" in _functions(js, "async ")["refreshConfig"]
+    # 每处 stale(...) 的页签都有加载函数
+    tabs = set(re.findall(r"stale\('(\w+)'\)", js))
+    assert tabs and tabs <= set(CONSOLE_TABS)
+
+
+def test_console_sync_keeps_unsaved_item_edits(api: Api):
+    """同步后重新显示打开的商品卡片（平台字段可能变了）：商家改过、还没保存的字段放回输入框并提示，
+    不替商家保存，也不丢。"""
+    js = api.get(JS).text
+    sync = _functions(js, "async ")["syncItems"]
+    assert "await loadItemDetail(shown, state.itemOpener, false, itemDrafts());" in sync
+    drafts = _functions(js, "")["itemDrafts"]
+    assert "area.value !== area.defaultValue" in drafts
+    form = _functions(js, "")["itemForm"]
+    assert "area.defaultValue = " in form and "area.value = drafts[f];" in form
+    assert "还没保存" in form
 
 
 # ================================================================ 脚本调用的接口都存在，角色对得上

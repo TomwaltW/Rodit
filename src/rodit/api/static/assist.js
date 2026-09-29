@@ -5,7 +5,10 @@
  * - 服务端和用户给的文字一律用 textContent / 文本节点写进页面，从不按 HTML 解析（防 XSS）；
  * - 令牌只放 sessionStorage，只放进 Authorization 请求头，不进网址、不打日志；
  * - 接口地址用相对路径（页面在 / 和 /assist 下都能用）；
- * - 错误码和说明来自接口的统一错误格式 {"error", "message"}（rodit.api.errors）。
+ * - 错误码和说明来自接口的统一错误格式 {"error", "message"}（rodit.api.errors）；
+ * - 和商家控制台共用 sessionStorage 里的令牌：退出、令牌无效时只在存着的还是本页的令牌时才清
+ *   （forgetToken）；从往返缓存（bfcache）恢复时存着的令牌变了，先丢掉本页内存里的身份再重新登录；
+ * - 同一块区域的加载按请求编号只用最近一次的结果（nextRun / latest）。
  */
 'use strict';
 
@@ -40,9 +43,11 @@
 
   const STORAGE_TOKEN = 'rodit.assist.token';
   const STORAGE_SESSION = 'rodit.assist.session';
+  const STORAGE_TAB = 'rodit.console.tab'; // 商家控制台的页签偏好：退出时一并清掉
 
   const state = {
     token: null,
+    stored: null, // 本页写进 sessionStorage 的令牌（退出时只清自己的；存不了时为 null）
     me: null,
     items: [],
     sessionId: null,
@@ -97,6 +102,38 @@
       }
     },
   };
+
+  /** 把登录用的令牌存进 sessionStorage，记下是本页存的（存不了时不记：两个页面本来也共用不了）。 */
+  function keepToken(token) {
+    storage.set(STORAGE_TOKEN, token);
+    state.stored = storage.get(STORAGE_TOKEN) === token ? token : null;
+  }
+
+  /**
+   * 清掉 sessionStorage 里的令牌、会话和控制台的页签偏好——只在存着的还是这个令牌时才清：
+   * 另一个页面后来登录的人（同一标签页里后退、前进回来时）不受本页退出或 401 的影响。
+   */
+  function forgetToken(token) {
+    if (!token || storage.get(STORAGE_TOKEN) !== token) return;
+    storage.remove(STORAGE_TOKEN);
+    storage.remove(STORAGE_SESSION);
+    storage.remove(STORAGE_TAB);
+  }
+
+  // 请求顺序：同一块区域只用最近一次请求的结果（晚回来的旧响应丢掉）
+  const runs = {};
+
+  function nextRun(key) {
+    runs[key] = (runs[key] || 0) + 1;
+    return runs[key];
+  }
+
+  const latest = (key, run) => runs[key] === run;
+
+  /** 作废所有区域还没回来的加载（退出时）。 */
+  function dropRuns() {
+    for (const key of Object.keys(runs)) nextRun(key);
+  }
 
   function randomId(prefix) {
     const bytes = new Uint8Array(8);
@@ -220,16 +257,20 @@
 
   // ================================================================ 登录
 
+  let signIns = 0; // 第几次登录：退出、后退恢复时加一，还没回来的登录作废
+
   async function signIn(token) {
+    const run = (signIns += 1);
     clearError();
     state.token = token;
     let me;
     try {
       me = await api('GET', 'v1/me');
     } catch (err) {
+      if (run !== signIns) return false; // 期间又登录、退出或后退恢复时换了令牌：这次登录作废
       state.token = null;
       // 令牌无效才丢掉；网络、服务故障时留着，刷新后还能直接登录
-      if (err.status === 401 || err.status === 403) storage.remove(STORAGE_TOKEN);
+      if (err.status === 401 || err.status === 403) forgetToken(token);
       if (err.code === 'forbidden_role') {
         showError('这个令牌是平台对接用的，不能登录网页工具；请用客服、店长或商家的令牌。');
       } else {
@@ -238,12 +279,15 @@
       $('token').focus();
       return false;
     }
+    if (run !== signIns) return false;
     if (me && REVIEWER_ROLES.includes(me.role)) {
       // 复核人员的工作（每周复核、上线节奏）在商家控制台，这里不显示话术助手。
-      // 令牌留着（两个页面同一个键），同一标签页打开控制台时直接登录
+      // 令牌留着（两个页面同一个键），同一标签页打开控制台时直接登录；
+      // 页头显示是谁、给「退出」按钮，不想交给控制台时可以丢掉
       state.token = null;
-      storage.set(STORAGE_TOKEN, token);
+      keepToken(token);
       $('token').value = '';
+      showIdentity(me);
       showError('复核人员请使用商家控制台（每周复核、上线节奏），话术助手只给客服、店长和商家用。', {
         href: 'console',
         text: '打开商家控制台',
@@ -252,14 +296,19 @@
     }
     if (!me || !HUMAN_ROLES.includes(me.role)) {
       state.token = null;
-      storage.remove(STORAGE_TOKEN);
+      forgetToken(token);
       showError('这个令牌不能登录网页工具。');
       return false;
     }
     state.me = me;
-    storage.set(STORAGE_TOKEN, token);
+    keepToken(token);
     enterApp();
     return true;
+  }
+
+  function showIdentity(me) {
+    $('whoami').hidden = false;
+    $('identity').textContent = `${label(LABELS.roles, me.role)} ${me.user_id} · 店铺 ${me.shop_id}`;
   }
 
   function enterApp() {
@@ -268,8 +317,7 @@
     $('notice').open = false; // 登录后收起须知，摘要里的协议要求一直可见
     $('login').hidden = true;
     $('assist').hidden = false;
-    $('whoami').hidden = false;
-    $('identity').textContent = `${label(LABELS.roles, me.role)} ${me.user_id} · 店铺 ${me.shop_id}`;
+    showIdentity(me);
     restoreSession();
     loadItems();
     const isConsole = CONSOLE_ROLES.includes(me.role);
@@ -280,15 +328,23 @@
     announce(`已登录：${$('identity').textContent}`);
   }
 
-  function signOut() {
+  /**
+   * 退出：清掉本页的身份、会话记录和表单。sessionStorage 只在存着的还是本页的令牌时才清（forgetToken）；
+   * opts.keepStorage：只清本页（后退恢复时发现另一个页面已经退出或换人登录，存着的令牌归那边）。
+   */
+  function signOut(opts = {}) {
+    if (!opts.keepStorage) forgetToken(state.stored);
+    signIns += 1; // 还没回来的登录作废
     state.token = null;
+    state.stored = null;
     state.me = null;
     state.items = [];
     state.cards = [];
     state.sessionId = null;
     state.asked = 0;
-    storage.remove(STORAGE_TOKEN);
-    storage.remove(STORAGE_SESSION);
+    dropRuns();
+    setBusy(false); // 上一位还没回来的提问不挡下一位
+    $('questionnaire-button').disabled = false;
     $('turns').replaceChildren();
     $('question').value = '';
     $('item-filter').value = '';
@@ -361,13 +417,14 @@
   async function loadItems() {
     const hint = $('item-hint');
     const me = state.me; // 每次登录换一个对象：响应回来时已经退出或换人登录就丢掉
+    const run = nextRun('items');
     try {
       const items = await api('GET', shopPath('items'));
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('items', run)) return;
       state.items = Array.isArray(items) ? items : [];
       hint.textContent = '买家问的是某件商品（面料、尺码……）时选上，回答更准。';
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('items', run)) return;
       state.items = [];
       hint.textContent = `商品列表没有加载出来：${err.message}`;
     }
@@ -450,7 +507,7 @@
         h('p', { className: 'error-inline', role: 'alert' }, `没有提交成功：${err.message}`),
       );
     } finally {
-      setBusy(false);
+      if (state.me === me) setBusy(false); // 期间退出过：退出时已经复位，不动下一位的按钮
     }
   }
 
@@ -839,6 +896,7 @@
   async function loadConsole() {
     if (!state.me || !CONSOLE_ROLES.includes(state.me.role)) return;
     const me = state.me;
+    const run = nextRun('console');
     $('adoption').replaceChildren(h('p', { className: 'muted' }, '加载中…'));
     $('gaps').replaceChildren(h('p', { className: 'muted' }, '加载中…'));
     const [adoption, gaps] = await Promise.allSettled([
@@ -846,6 +904,7 @@
       api('GET', shopPath('knowledge/gaps')),
     ]);
     if (state.me !== me) return; // 期间登录失效或换人登录：不把上一位店铺的报表显示给下一位
+    if (!latest('console', run)) return; // 期间又换了统计范围或提交了问卷：以后一次为准
     if (adoption.status === 'fulfilled') renderAdoption(adoption.value);
     else $('adoption').replaceChildren(h('p', { className: 'error-inline' }, adoption.reason.message));
     if (gaps.status === 'fulfilled') renderGaps(gaps.value);
@@ -970,11 +1029,28 @@
       status.textContent = `没有保存成功：${err.message}`;
       status.className = 'status error';
     } finally {
-      button.disabled = false;
+      if (state.me === me) button.disabled = false; // 期间退出过：退出时已经复位
     }
   }
 
   // ================================================================ 启动
+
+  /**
+   * 从往返缓存（bfcache）恢复：离开期间另一个页面退出或换人登录了（sessionStorage 里的令牌变了），
+   * 本页内存里还是原来的身份。先丢掉它（不动 sessionStorage，那是另一个页面的），有令牌再用它登录。
+   */
+  function onPageShow(event) {
+    if (!event.persisted) return;
+    const stored = storage.get(STORAGE_TOKEN);
+    if (stored === state.stored) return;
+    const wasSignedIn = Boolean(state.stored);
+    signOut({ keepStorage: true });
+    if (stored) signIn(stored);
+    else if (wasSignedIn) {
+      showError('已在另一个页面退出登录，这个页面也已退出。请重新登录。');
+      announce('已退出');
+    }
+  }
 
   function init() {
     if (CONFIG.platform_name) $('platform-name').textContent = CONFIG.platform_name;
@@ -993,8 +1069,10 @@
     });
     $('sign-out').addEventListener('click', () => {
       signOut();
+      clearError();
       announce('已退出');
     });
+    window.addEventListener('pageshow', onPageShow);
     $('new-session').addEventListener('click', () => {
       newSession();
       $('question').focus();

@@ -5,7 +5,10 @@
 - web_smoke.cjs：话术助手的登录、提问、三种反馈、过期、缺失知识、XSS、影子模式和 503 的显示、
   手机宽度、退出、商家报表和问卷；
 - web_console_smoke.cjs：控制台的登录限制（平台对接、客服）、店长只读、商家的知识 / 政策 / 商品 /
-  同步 / 设置 / 切回影子 / 报表、复核人员的抽样打分和强制切换、复核人员在话术助手页的提示。
+  同步 / 设置 / 切回影子 / 报表、复核人员的抽样打分和强制切换、复核人员在话术助手页的提示；
+- web_state_smoke.cjs（完整版 Chromium，打开往返缓存）：一个页面退出或换人登录后按「后退」，
+  另一个页面不再用旧令牌；拒绝的角色能退出；写操作回来时原地刷新正显示的页签；晚回来的旧响应
+  不覆盖新的；上一位没完成的同步不挡下一位；同步后保留还没保存的商家字段。
 没有 node / playwright 模块 / 浏览器时跳过（不新增 Python 依赖：用镜像里全局安装的
 Node 版 Playwright）。
 """
@@ -34,6 +37,7 @@ from rodit.testing.fixtures import AGENT, SHOP_A
 NODE = shutil.which("node")
 SCRIPT = Path(__file__).with_name("web_smoke.cjs")
 CONSOLE_SCRIPT = Path(__file__).with_name("web_console_smoke.cjs")
+STATE_SCRIPT = Path(__file__).with_name("web_state_smoke.cjs")
 SKIP_EXIT = 77
 TIMEOUT_S = 180
 
@@ -203,3 +207,40 @@ def test_console_page_in_a_real_browser(api: Api):
     }
     viewed = repos.audit.list_events(SHOP_A, action=AuditAction.QUALITY_VIEWED.value)
     assert viewed and {e.actor for e in viewed} == {"qa_reviewer_01"}  # 看原文留了访问记录
+
+
+@pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
+def test_sign_in_state_and_request_order_in_a_real_browser(api: Api):
+    """往返缓存恢复后不用旧令牌、拒绝的角色能退出、写后原地刷新、只用最近一次的响应、
+    退出后不挡下一位、同步保留草稿（web_state_smoke.cjs，完整版 Chromium、打开往返缓存）。"""
+    repos = api.unit.repos
+    before = repos.knowledge.get_item_card(SHOP_A, "i_555")
+    assert before is not None
+    tokens = {
+        "merchant": TOKENS["merchant_a"],
+        "manager": TOKENS["manager_a"],
+        "agent": TOKENS["agent_a"],
+        "reviewer": TOKENS["reviewer_a"],
+        "merchant_b": TOKENS["merchant_b"],
+    }
+    result = _run_smoke(api, STATE_SCRIPT, RODIT_SMOKE_TOKENS=json.dumps(tokens))
+    assert result["steps"] == [
+        "bfcache-console-signed-out",
+        "bfcache-console-switched",
+        "bfcache-assist-signed-out",
+        "refused-role",
+        "stale-current-tab",
+        "latest-response",
+        "busy-sign-out",
+        "sync-keeps-drafts",
+    ]
+
+    # 慢请求放行后照常落库；修改面板里写了一半的回答、同步时的草稿都没有替商家保存
+    card = repos.knowledge.get_item_card(SHOP_A, "i_777")
+    assert card is not None and card.size_advice == "合成：版型偏大，建议拍小一码"
+    after = repos.knowledge.get_item_card(SHOP_A, "i_555")
+    assert after is not None and after.size_advice == before.size_advice
+    assert "gift" not in repos.knowledge.get_policies(SHOP_A)
+    faqs = repos.knowledge.list_knowledge(SHOP_A, status=None)
+    assert not [k for k in faqs if "写了一半" in k.answer]
+    assert {k.id: k.status for k in faqs}[1] == KnowledgeStatus.APPROVED

@@ -97,6 +97,9 @@ async function main() {
     await page.locator('#error').filter({ hasText: '话术助手' }).waitFor();
     check((await page.locator('#error a').getAttribute('href')) === 'assist', '客服：给出去话术助手的链接');
     check(await page.locator('#app').isHidden(), '客服看不到控制台');
+    // 令牌留给话术助手，但页头显示是谁、可以退出（不然看起来没登录）
+    check((await page.locator('#identity').textContent()).includes('客服'), '客服：页头显示身份');
+    check(await page.getByRole('button', { name: '退出' }).isVisible(), '客服：有退出按钮');
     steps.push('login-guards');
 
     // ---------------------------------------------------------------- 店长：只读
@@ -329,6 +332,7 @@ async function main() {
     await page.goto(`${BASE}/assist`);
     await page.locator('#error').filter({ hasText: '复核人员请使用商家控制台' }).waitFor();
     check(await page.locator('#assist').isHidden(), '话术助手页不给复核人员显示工具');
+    check(await page.getByRole('button', { name: '退出' }).isVisible(), '复核人员：话术助手页有退出按钮');
     await page.locator('#error a').click();
     await page.locator('#identity').filter({ hasText: '复核人员' }).waitFor();
     check(page.url() === `${BASE}/console`, '回到控制台');

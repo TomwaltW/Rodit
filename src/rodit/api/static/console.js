@@ -9,6 +9,11 @@
  * - 接口地址用相对路径；店铺接口一律写成 shopPath('字面路径', 查询参数)，测试据此核对接口清单；
  * - 每次登录换一个 state.me 对象：响应回来时已经退出或换人登录就丢掉，不写进下一位的界面；
  *   401 只在发请求的令牌还是当前令牌时才登出；
+ * - 两个页面共用 sessionStorage 里的令牌：退出、令牌无效时只在存着的还是本页的令牌时才清（forgetToken），
+ *   不清掉另一个页面后来登录的人；从往返缓存（bfcache）恢复时存着的令牌变了（另一个页面退出或换人登录），
+ *   先丢掉本页内存里的身份（不动 sessionStorage），有令牌再用它登录；
+ * - 同一块区域的加载按请求编号只用最近一次的结果（nextRun / latest）：换筛选、换商品、换周期后，
+ *   晚回来的旧响应不覆盖新的；防重复提交的 busy 记下发起的身份，退出后不影响下一位的按钮；
  * - 错误码和说明来自接口的统一错误格式 {"error", "message"}（rodit.api.errors）；
  * - 页签按角色显示（配置块 tabs），写操作的按钮只给商家（配置块 role_groups.merchant），
  *   真正的权限检查在接口上（§9.2）。
@@ -68,6 +73,7 @@
 
   const state = {
     token: null,
+    stored: null, // 本页写进 sessionStorage 的令牌（退出时只清自己的；存不了时为 null）
     me: null,
     signingIn: false,
     tab: null,
@@ -127,6 +133,23 @@
       }
     },
   };
+
+  /** 把登录用的令牌存进 sessionStorage，记下是本页存的（存不了时不记：两个页面本来也共用不了）。 */
+  function keepToken(token) {
+    storage.set(STORAGE_TOKEN, token);
+    state.stored = storage.get(STORAGE_TOKEN) === token ? token : null;
+  }
+
+  /**
+   * 清掉 sessionStorage 里的令牌、话术助手的会话和页签偏好——只在存着的还是这个令牌时才清：
+   * 另一个页面后来登录的人（同一标签页里后退、前进回来时）不受本页退出或 401 的影响。
+   */
+  function forgetToken(token) {
+    if (!token || storage.get(STORAGE_TOKEN) !== token) return;
+    storage.remove(STORAGE_TOKEN);
+    storage.remove(STORAGE_SESSION);
+    storage.remove(STORAGE_TAB);
+  }
 
   const enc = encodeURIComponent;
   const has = (map, key) => Object.prototype.hasOwnProperty.call(map, key);
@@ -237,18 +260,77 @@
     showError(message);
   }
 
-  /** 防重复提交：同一个 ctx 上一次还没完成时直接返回；执行期间禁用 controls。 */
+  /**
+   * 防重复提交：同一个 ctx 上一次还没完成时直接返回；执行期间禁用 controls。
+   * ctx 记下发起的身份和第几次：退出或换人登录后，上一位没完成的那次不挡下一位，
+   * 它晚回来时也不再改按钮和标记（只有最近一次能收尾）。
+   */
   async function busy(ctx, controls, task) {
-    if (ctx.busy) return undefined;
+    if (ctx.busy && ctx.owner === state.me) return undefined;
+    const run = (ctx.run = (ctx.run || 0) + 1);
     ctx.busy = true;
+    ctx.owner = state.me;
     const list = controls.filter(Boolean);
     for (const control of list) control.disabled = true;
     try {
       return await task();
     } finally {
-      ctx.busy = false;
-      for (const control of list) control.disabled = false;
+      if (ctx.run === run) {
+        ctx.busy = false;
+        ctx.owner = null;
+        for (const control of list) control.disabled = false;
+      }
     }
+  }
+
+  // 页面上固定的按钮（不随列表重建）共用的防重复提交标记：退出时复位，按钮重新可用
+  const sharedBusy = [];
+
+  function sharedCtx(...controlIds) {
+    const ctx = { busy: false, controlIds };
+    sharedBusy.push(ctx);
+    return ctx;
+  }
+
+  function resetBusy() {
+    for (const ctx of sharedBusy) {
+      ctx.run = (ctx.run || 0) + 1; // 上一位没完成的那次晚回来时不再收尾
+      ctx.busy = false;
+      ctx.owner = null;
+      for (const id of ctx.controlIds) $(id).disabled = false;
+    }
+  }
+
+  // 请求顺序：同一块区域只用最近一次请求的结果（换筛选、换商品、换周期、收起之后，晚回来的旧响应丢掉）
+  const runs = {};
+
+  function nextRun(key) {
+    runs[key] = (runs[key] || 0) + 1;
+    return runs[key];
+  }
+
+  const latest = (key, run) => runs[key] === run;
+
+  /** 作废所有区域还没回来的加载（退出时）。 */
+  function dropRuns() {
+    for (const key of Object.keys(runs)) nextRun(key);
+  }
+
+  /** 表单里各输入框的当前值（判断有没有没保存的改动）。 */
+  function formValues(root) {
+    return JSON.stringify(
+      Array.from(root.querySelectorAll('input, select, textarea'), (c) =>
+        c.type === 'checkbox' || c.type === 'radio' ? c.checked : c.value,
+      ),
+    );
+  }
+
+  /** 区域里有打开的面板（修改、确认），或者焦点在里面：原地刷新会丢掉正在写的内容。 */
+  function busyEditing(selector) {
+    for (const root of document.querySelectorAll(selector)) {
+      if (root.querySelector('.entry-panel > *') || root.contains(document.activeElement)) return true;
+    }
+    return false;
   }
 
   function loading(node) {
@@ -389,8 +471,11 @@
   const tabButtons = () => Array.from(document.querySelectorAll('#tabs [role="tab"]'));
   const tabsFor = (role) => TAB_IDS.filter((id) => Array.isArray(TAB_ROLES[id]) && TAB_ROLES[id].includes(role));
 
+  let signIns = 0; // 第几次登录：退出、后退恢复时加一，还没回来的登录作废
+
   async function signIn(token) {
     if (state.signingIn) return false;
+    const run = (signIns += 1);
     state.signingIn = true;
     clearError();
     state.token = token;
@@ -400,9 +485,10 @@
     try {
       me = await api('GET', 'v1/me');
     } catch (err) {
+      if (run !== signIns) return false; // 期间退出或后退恢复时换了令牌：这次登录作废
       state.token = null;
       // 令牌无效才丢掉；网络、服务故障时留着，刷新后还能直接登录
-      if (err.status === 401 || err.status === 403) storage.remove(STORAGE_TOKEN);
+      if (err.status === 401 || err.status === 403) forgetToken(token);
       if (err.code === 'forbidden_role') {
         showError('这个令牌是平台对接用的，不能登录网页工具；请用店长、商家或复核人员的令牌。');
       } else {
@@ -411,21 +497,26 @@
       $('token').focus();
       return false;
     } finally {
-      state.signingIn = false;
-      button.disabled = false;
+      if (run === signIns) {
+        state.signingIn = false;
+        button.disabled = false;
+      }
     }
+    if (run !== signIns) return false;
     if (!me || !inGroup('person', me.role)) {
       state.token = null;
-      storage.remove(STORAGE_TOKEN);
+      forgetToken(token);
       showError('这个令牌不能登录网页工具。');
       $('token').focus();
       return false;
     }
     if (!tabsFor(me.role).length) {
-      // 客服：控制台没有可用的功能。令牌留着，同一标签页打开话术助手时直接登录
+      // 客服：控制台没有可用的功能。令牌留着，同一标签页打开话术助手时直接登录；
+      // 页头显示是谁、给「退出」按钮，不想交给话术助手时可以丢掉
       state.token = null;
-      storage.set(STORAGE_TOKEN, token);
+      keepToken(token);
       $('token').value = '';
+      showIdentity(me);
       showError(`${label(L.roles, me.role)}请使用话术助手，控制台只给店长、商家和复核人员用。`, {
         href: 'assist',
         text: '打开话术助手',
@@ -433,9 +524,14 @@
       return false;
     }
     state.me = me;
-    storage.set(STORAGE_TOKEN, token);
+    keepToken(token);
     enterApp();
     return true;
+  }
+
+  function showIdentity(me) {
+    $('whoami').hidden = false;
+    $('identity').textContent = `${label(L.roles, me.role)} ${me.user_id} · 店铺 ${me.shop_id}`;
   }
 
   function enterApp() {
@@ -443,8 +539,7 @@
     $('token').value = '';
     $('login').hidden = true;
     $('app').hidden = false;
-    $('whoami').hidden = false;
-    $('identity').textContent = `${label(L.roles, me.role)} ${me.user_id} · 店铺 ${me.shop_id}`;
+    showIdentity(me);
     const merchant = isMerchant();
     for (const node of document.querySelectorAll('[data-write]')) node.hidden = !merchant;
     for (const node of document.querySelectorAll('[data-readonly]')) node.hidden = merchant;
@@ -459,8 +554,17 @@
     announce(`已登录：${$('identity').textContent}`);
   }
 
-  function signOut() {
+  /**
+   * 退出：清掉本页的身份、数据和表单。sessionStorage 只在存着的还是本页的令牌时才清（forgetToken）；
+   * opts.keepStorage：只清本页（后退恢复时发现另一个页面已经退出或换人登录，存着的令牌归那边）。
+   */
+  function signOut(opts = {}) {
+    if (!opts.keepStorage) forgetToken(state.stored);
+    signIns += 1; // 还没回来的登录作废
+    state.signingIn = false;
+    $('login-button').disabled = false;
     state.token = null;
+    state.stored = null;
     state.me = null;
     state.tab = null;
     state.loaded = {};
@@ -470,9 +574,8 @@
     state.stageMessage = null;
     state.review = { period: null, items: [] };
     state.itemOpener = null;
-    storage.remove(STORAGE_TOKEN);
-    storage.remove(STORAGE_SESSION);
-    storage.remove(STORAGE_TAB);
+    dropRuns();
+    resetBusy();
     for (const node of document.querySelectorAll('[data-dyn]')) put(node);
     for (const node of document.querySelectorAll('#app .status')) setStatus(node, '', '');
     $('item-detail').hidden = true;
@@ -509,9 +612,15 @@
     }
   }
 
-  /** 写操作影响了别的页签的数据（比如补了政策，「要补的知识」会变）：下次切过去时重新加载。 */
+  /**
+   * 写操作影响了别的页签的数据（比如补了政策，「要补的知识」会变）：别的页签下次切过去时重新加载；
+   * 写操作还没回来时已经切过去的（正显示的页签）马上原地刷新，不关掉正在编辑的表单（REFRESHERS）。
+   */
   function stale(...ids) {
-    for (const id of ids) if (id !== state.tab) state.loaded[id] = false;
+    for (const id of ids) {
+      if (id !== state.tab) state.loaded[id] = false;
+      else if (state.loaded[id]) (REFRESHERS[id] || LOADERS[id])();
+    }
   }
 
   /** 页签的键盘操作（WAI-ARIA tabs）：左右方向键、Home、End 切换并聚焦。 */
@@ -532,10 +641,15 @@
 
   // ================================================================ 商品列表（知识页的下拉框、商品页共用）
 
+  // 商品列表是知识页、商品页共用的缓存：比已经用上的那次请求新才用（晚回来的旧列表不覆盖新的）
+  const itemRuns = { sent: 0, used: 0 };
+
   async function fetchItems() {
     const me = state.me;
+    const run = (itemRuns.sent += 1);
     const list = await api('GET', shopPath('console/items'));
-    if (state.me === me) {
+    if (state.me === me && run > itemRuns.used) {
+      itemRuns.used = run;
       state.items = Array.isArray(list) ? list : [];
       renderItemOptions();
     }
@@ -565,10 +679,12 @@
 
   // ================================================================ 知识（§5.2、§5.8）
 
-  const faqCreateCtx = { busy: false };
+  const faqCreateCtx = sharedCtx('faq-submit');
 
   async function loadKnowledge() {
     const me = state.me;
+    const gapsRun = nextRun('gaps');
+    const listRun = nextRun('faqs');
     for (const id of ['gaps', 'candidates', 'faqs']) loading($(id));
     const [gaps, candidates, faqs] = await Promise.allSettled([
       api('GET', shopPath('knowledge/gaps')),
@@ -577,12 +693,30 @@
       fetchItems().catch(() => null), // 下拉框和商品名用；失败时显示商品 ID
     ]);
     if (state.me !== me) return; // 期间退出或换人登录：不把上一位店铺的数据显示给下一位
-    if (gaps.status === 'fulfilled') renderGaps(gaps.value);
-    else loadFailed($('gaps'), '要补的知识', gaps.reason);
+    if (latest('gaps', gapsRun)) {
+      if (gaps.status === 'fulfilled') renderGaps(gaps.value);
+      else loadFailed($('gaps'), '要补的知识', gaps.reason);
+    }
+    if (!latest('faqs', listRun)) return; // 期间又换了筛选条件：以后一次为准
     if (candidates.status === 'fulfilled') renderFaqList($('candidates'), candidates.value, '没有待审核的候选知识。');
     else loadFailed($('candidates'), '候选知识', candidates.reason);
     if (faqs.status === 'fulfilled') renderFaqList($('faqs'), faqs.value, '没有符合条件的 FAQ。');
     else loadFailed($('faqs'), 'FAQ 列表', faqs.reason);
+  }
+
+  /** 只刷新「要补的知识」（知识页有打开的修改面板时，别的列表不动）。 */
+  async function loadGaps() {
+    const me = state.me;
+    const run = nextRun('gaps');
+    loading($('gaps'));
+    try {
+      const gaps = await api('GET', shopPath('knowledge/gaps'));
+      if (state.me !== me || !latest('gaps', run)) return;
+      renderGaps(gaps);
+    } catch (err) {
+      if (state.me !== me || !latest('gaps', run)) return;
+      loadFailed($('gaps'), '要补的知识', err);
+    }
   }
 
   function renderGaps(gaps) {
@@ -888,16 +1022,17 @@
 
   async function loadPolicies() {
     const me = state.me;
+    const run = nextRun('policies');
     loading($('policies'));
     put($('policy-summary'));
     try {
       const rows = await api('GET', shopPath('console/policies'));
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('policies', run)) return;
       state.policies = Array.isArray(rows) ? rows : [];
       renderPolicySummary();
       put($('policies'), h('ul', { className: 'policy-list' }, state.policies.map((row) => policyRow(row))));
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('policies', run)) return;
       loadFailed($('policies'), '店铺政策', err);
     }
   }
@@ -1059,17 +1194,18 @@
 
   // ================================================================ 商品卡片与同步（§5.2.2、§5.2.3）
 
-  const syncCtx = { busy: false };
+  const syncCtx = sharedCtx('sync-all');
 
   async function loadItemsTab() {
     const me = state.me;
+    const run = nextRun('itemTable');
     loading($('items'));
     try {
       await fetchItems();
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('itemTable', run)) return;
       renderItemTable();
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('itemTable', run)) return;
       loadFailed($('items'), '商品列表', err);
     }
   }
@@ -1107,8 +1243,10 @@
     put($('items'), table('商品卡片', ['商品', '类目', '商家填写', '更新时间', '操作'], rows, true));
   }
 
-  async function loadItemDetail(itemId, opener, focus = true) {
+  /** 打开商品卡片。drafts：同步前商家改过、还没保存的字段（{字段: 输入框里的文字}），重新显示后放回去。 */
+  async function loadItemDetail(itemId, opener, focus = true, drafts = null) {
     const me = state.me;
+    const run = nextRun('item');
     const box = $('item-detail');
     state.itemOpener = opener || null;
     box.hidden = false;
@@ -1116,13 +1254,24 @@
     loading(box);
     try {
       const card = await api('GET', shopPath(`console/items/${enc(itemId)}`));
-      if (state.me !== me) return;
-      renderItemDetail(card);
+      if (state.me !== me || !latest('item', run)) return; // 期间点了别的商品或收起：以后一次为准
+      renderItemDetail(card, null, drafts);
       if (focus) box.focus();
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('item', run)) return;
       loadFailed(box, `商品 ${itemId}`, err);
     }
+  }
+
+  /** 打开的商品卡片里商家改过、还没保存的字段（和显示时的内容比）。 */
+  function itemDrafts() {
+    const box = $('item-detail');
+    const drafts = {};
+    if (box.hidden) return drafts;
+    for (const area of box.querySelectorAll('.item-form textarea[data-field]')) {
+      if (area.value !== area.defaultValue) drafts[area.dataset.field] = area.value;
+    }
+    return drafts;
   }
 
   function kvList(title, map) {
@@ -1140,11 +1289,12 @@
     return table(title, keys.map((k) => rename[k] || k), body);
   }
 
-  function renderItemDetail(card, message) {
+  function renderItemDetail(card, message, drafts) {
     const box = $('item-detail');
     const titleId = uid('item-title');
     const close = h('button', { type: 'button', className: 'secondary' }, '收起');
     close.addEventListener('click', () => {
+      nextRun('item'); // 还没回来的商品卡片不再显示
       box.hidden = true;
       delete box.dataset.itemId;
       put(box);
@@ -1162,7 +1312,7 @@
       rowsTable('尺码表', card.size_chart, [], {}),
       card.detail_text ? [h('h5', null, '详情文字（含详情图识别的文字）'), h('p', { className: 'pre' }, card.detail_text)] : null,
     ]);
-    const merchant = isMerchant() ? itemForm(card, message) : itemReadonly(card);
+    const merchant = isMerchant() ? itemForm(card, message, drafts) : itemReadonly(card);
     box.setAttribute('role', 'region');
     box.setAttribute('aria-labelledby', titleId);
     put(box, h('div', { className: 'section-head' }, [h('h3', { id: titleId }, `商品卡片：${card.title}（${card.item_id}）`), close]), platform, merchant);
@@ -1179,15 +1329,21 @@
     return h('div', { className: 'item-merchant' }, [h('h4', null, '商家填写'), h('dl', { className: 'stats' }, rows)]);
   }
 
-  function itemForm(card, message) {
+  function itemForm(card, message, drafts) {
     const areas = {};
+    const kept = []; // 同步后放回去的、还没保存的字段
     const nodes = Object.keys(L.itemFields).map((f) => {
       const id = uid(`item-${f}`);
       const lim = ITEM_LIMITS[f] || {};
       const isList = f !== 'size_advice';
-      const area = h('textarea', { id, rows: isList ? '3' : '2' });
+      const area = h('textarea', { id, rows: isList ? '3' : '2', 'data-field': f });
       if (!isList && lim.max_chars) area.maxLength = lim.max_chars;
-      area.value = isList ? (Array.isArray(card[f]) ? card[f].join('\n') : '') : card[f] || '';
+      // defaultValue 是服务端的内容：和 value 不同就是商家改过、还没保存
+      area.defaultValue = isList ? (Array.isArray(card[f]) ? card[f].join('\n') : '') : card[f] || '';
+      if (drafts && has(drafts, f) && drafts[f] !== area.defaultValue) {
+        area.value = drafts[f];
+        kept.push(label(L.itemFields, f));
+      }
       areas[f] = area;
       const hint = isList
         ? `每行一条，最多 ${lim.max_items} 条、每条 ${lim.max_chars} 个字；全部清空表示删掉。`
@@ -1235,7 +1391,13 @@
       });
     });
     sync.addEventListener('click', () => syncItems(card.item_id, [save, sync]));
-    if (message) setStatus(status, message, 'ok');
+    if (kept.length) {
+      const note = `平台字段已按同步结果更新；你改过的「${kept.join('」「')}」还没保存，已保留在输入框里，确认后点「保存商家填写的字段」。`;
+      setStatus(status, note, 'warn');
+      announce(note);
+    } else if (message) {
+      setStatus(status, message, 'ok');
+    }
     return form;
   }
 
@@ -1262,9 +1424,11 @@
   }
 
   async function refreshItemTable(me) {
+    const run = nextRun('itemTable');
     try {
       await fetchItems();
-      if (state.me === me) renderItemTable();
+      if (state.me !== me || !latest('itemTable', run)) return;
+      renderItemTable();
     } catch (err) {
       /* 列表下次刷新时再取；详情已经是最新的 */
     }
@@ -1293,7 +1457,10 @@
         await refreshItemTable(me);
         const detail = $('item-detail');
         const shown = detail.hidden ? null : detail.dataset.itemId;
-        if (shown && state.me === me) await loadItemDetail(shown, state.itemOpener, false); // 平台字段可能变了
+        if (shown && state.me === me) {
+          // 平台字段可能变了：重新显示卡片，商家改过、还没保存的字段放回输入框（不替商家保存，也不丢）
+          await loadItemDetail(shown, state.itemOpener, false, itemDrafts());
+        }
       } catch (err) {
         if (state.me !== me) return;
         const message = syncFailure(err);
@@ -1325,15 +1492,52 @@
 
   async function loadConfig() {
     const me = state.me;
+    const run = nextRun('config');
     loading($('config'));
     try {
       const view = await api('GET', shopPath('console/config'));
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('config', run)) return;
       state.config = view;
       put($('config'), h('div', { className: 'config-list' }, CONFIG_FIELDS.map((f) => configRow(f))));
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('config', run)) return;
       loadFailed($('config'), '店铺设置', err);
+    }
+  }
+
+  const pristine = new WeakMap(); // 设置行的编辑表单 → 刚显示时的输入值
+
+  /** 这一行有没保存的改动，或者焦点在里面：原地刷新时留着不换。 */
+  function rowEdited(row) {
+    if (row.contains(document.activeElement)) return true;
+    const form = row.querySelector('form');
+    return Boolean(form && pristine.has(form) && pristine.get(form) !== formValues(form));
+  }
+
+  /** 设置页正显示时原地刷新（比如切换阶段后影子模式的开关变了）：只换掉没在编辑的行。 */
+  async function refreshConfig() {
+    const me = state.me;
+    const run = nextRun('config');
+    try {
+      const view = await api('GET', shopPath('console/config'));
+      if (state.me !== me || !latest('config', run)) return;
+      state.config = view;
+      const list = $('config').querySelector('.config-list');
+      if (!list) {
+        put($('config'), h('div', { className: 'config-list' }, CONFIG_FIELDS.map((f) => configRow(f))));
+        return;
+      }
+      for (const fieldDef of CONFIG_FIELDS) {
+        const old = list.querySelector(`[data-key="${fieldDef.key}"]`);
+        if (old && rowEdited(old)) continue; // 正在改的行留着：保存时只提交这一项
+        const fresh = configRow(fieldDef);
+        if (old) old.replaceWith(fresh);
+        else list.append(fresh);
+      }
+    } catch (err) {
+      if (state.me !== me || !latest('config', run)) return;
+      if ($('config').querySelector('.config-list')) showError(`店铺设置没有刷新：${err.message}`);
+      else loadFailed($('config'), '店铺设置', err);
     }
   }
 
@@ -1471,6 +1675,7 @@
     const save = h('button', { type: 'submit', 'aria-describedby': titleId }, '保存');
     const reset = overridden ? h('button', { type: 'button', className: 'secondary', 'aria-describedby': titleId }, '恢复默认') : null;
     const form = h('form', { className: 'config-form', novalidate: true }, [control, h('div', { className: 'actions tight' }, [save, reset])]);
+    pristine.set(form, formValues(form));
     const ctx = { busy: false };
     form.addEventListener('submit', (event) => {
       event.preventDefault();
@@ -1512,17 +1717,20 @@
 
   // ================================================================ 上线节奏（§13.4）
 
-  async function loadRollout() {
+  /** 上线状态。keepControls：切换阶段的面板打开着时只刷新上面的状态（抽样、打分后原地刷新）。 */
+  async function loadRollout(keepControls = false) {
     const me = state.me;
+    const run = nextRun('rollout');
+    const controlsRun = keepControls ? null : nextRun('stage');
     loading($('rollout'));
-    put($('stage-controls'));
+    if (!keepControls) put($('stage-controls'));
     try {
       const status = await api('GET', shopPath('rollout/status'));
       if (state.me !== me) return;
-      renderRollout(status);
-      renderStageControls(status);
+      if (latest('rollout', run)) renderRollout(status);
+      if (!keepControls && latest('stage', controlsRun)) renderStageControls(status);
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('rollout', run)) return;
       loadFailed($('rollout'), '上线状态', err);
     }
   }
@@ -1669,10 +1877,11 @@
 
   async function loadShadowDetail(box) {
     const me = state.me;
+    const run = nextRun('shadow');
     loading(box);
     try {
       const view = await api('GET', shopPath('rollout/shadow'));
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('shadow', run)) return;
       const items = Array.isArray(view.items) ? view.items : [];
       if (!items.length) {
         put(box, h('p', { className: 'muted' }, `${fmtRange(view.since, view.until)} 没有影子推荐。`));
@@ -1687,7 +1896,7 @@
       );
       put(box, table(`影子对比明细（${fmtRange(view.since, view.until)}）`, ['推荐', '问题类型', '和客服回复的重合度'], rows));
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('shadow', run)) return;
       loadFailed(box, '影子对比明细', err);
     }
   }
@@ -1827,8 +2036,8 @@
 
   // ================================================================ 每周复核（§13.5，按 §13.2 打分）
 
-  const sampleCtx = { busy: false };
-  const queueCtx = { busy: false };
+  const sampleCtx = sharedCtx('review-sample', 'review-report-button');
+  const queueCtx = sharedCtx('review-load');
 
   function periodValue() {
     const text = $('review-period').value.trim();
@@ -1847,15 +2056,16 @@
 
   async function loadQualityReport(period, fillPeriod) {
     const me = state.me;
+    const run = nextRun('qualityReport');
     const box = $('review-report');
     loading(box);
     try {
       const report = await api('GET', shopPath('quality/report', { period }));
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('qualityReport', run)) return; // 期间又查了别的周期：以后一次为准
       if (fillPeriod && report.period && !$('review-period').value) $('review-period').value = report.period;
       renderQualityReport(report);
     } catch (err) {
-      if (state.me !== me) return;
+      if (state.me !== me || !latest('qualityReport', run)) return;
       loadFailed(box, '复核报表', err);
     }
   }
@@ -1974,15 +2184,16 @@
     const box = $('review-queue');
     clearError();
     await busy(queueCtx, [$('review-load')], async () => {
+      const run = nextRun('queue');
       loading(box);
       try {
         const list = await api('GET', shopPath('quality/reviews', { period: p.value, status: $('review-filter').value }));
-        if (state.me !== me) return;
+        if (state.me !== me || !latest('queue', run)) return;
         state.review = { period: list.period, items: Array.isArray(list.items) ? list.items : [] };
         renderQueue(list);
         if (!periodOverride) await loadQualityReport(list.period); // 报表和列表看同一个周期
       } catch (err) {
-        if (state.me !== me) return;
+        if (state.me !== me || !latest('queue', run)) return;
         loadFailed(box, '复核列表', err);
       }
     });
@@ -2137,6 +2348,7 @@
 
   async function loadReports() {
     const me = state.me;
+    const run = nextRun('reports');
     loading($('adoption'));
     loading($('qa-report'));
     const since = sinceParam();
@@ -2144,7 +2356,7 @@
       api('GET', shopPath('reports/adoption', { since })),
       api('GET', shopPath('reports/qa', { since })),
     ]);
-    if (state.me !== me) return;
+    if (state.me !== me || !latest('reports', run)) return; // 期间又换了统计范围：以后一次为准
     if (adoption.status === 'fulfilled') renderAdoption(adoption.value);
     else loadFailed($('adoption'), '采纳率报表', adoption.reason);
     if (qa.status === 'fulfilled') renderQa(qa.value);
@@ -2254,6 +2466,31 @@
     reports: loadReports,
   };
 
+  /** 正显示的页签原地刷新（stale）：不关掉正在编辑的表单。没列出的页签直接重新加载。 */
+  const REFRESHERS = {
+    // 列表里有打开的修改、确认面板（或焦点在列表里）时只刷新「要补的知识」，面板里写了一半的内容不丢
+    knowledge: () => (busyEditing('#candidates, #faqs') ? loadGaps() : loadKnowledge()),
+    config: refreshConfig,
+    rollout: () => loadRollout(busyEditing('#stage-controls')),
+  };
+
+  /**
+   * 从往返缓存（bfcache）恢复：离开期间另一个页面退出或换人登录了（sessionStorage 里的令牌变了），
+   * 本页内存里还是原来的身份。先丢掉它（不动 sessionStorage，那是另一个页面的），有令牌再用它登录。
+   */
+  function onPageShow(event) {
+    if (!event.persisted) return;
+    const stored = storage.get(STORAGE_TOKEN);
+    if (stored === state.stored) return;
+    const wasSignedIn = Boolean(state.stored);
+    signOut({ keepStorage: true });
+    if (stored) signIn(stored);
+    else if (wasSignedIn) {
+      showError('已在另一个页面退出登录，这个页面也已退出。请重新登录。');
+      announce('已退出');
+    }
+  }
+
   function init() {
     if (CONFIG.platform_name) $('platform-name').textContent = CONFIG.platform_name;
     fillOptions($('faq-status'), L.knowledgeStatus);
@@ -2281,6 +2518,7 @@
       clearError();
       announce('已退出');
     });
+    window.addEventListener('pageshow', onPageShow);
     for (const button of tabButtons()) button.addEventListener('click', () => selectTab(button.dataset.tab));
     $('tabs').addEventListener('keydown', onTabKey);
     for (const button of document.querySelectorAll('[data-refresh]')) {
