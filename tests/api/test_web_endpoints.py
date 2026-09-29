@@ -1,6 +1,7 @@
 """模式 C 网页工具用到的接口（§8.1 模式 C、§5.3、§5.6、§5.8、§12.4）。
 
-- /v1/me：令牌 → 身份（网页登录）；/v1/shops/{shop_id}/items：选商品（只读、按店铺隔离）；
+- /v1/me：令牌 → 身份（话术助手和商家控制台登录；具体的人都能用，含复核人员，平台对接不行）；
+  /v1/shops/{shop_id}/items：选商品（只读、按店铺隔离）；
   这两个接口的 401 / 串店 403 / 角色 403 也在 test_api_auth 的全路由矩阵里
   （api_support.SHOP_ROUTES）。
 - 端到端：按页面脚本的调用方式（同样的路径、请求体）走一遍
@@ -32,7 +33,9 @@ def _ask(api: Api, question: str, session: str = "web-e2e", who: str = "agent_a"
 # ================================================================ /v1/me
 
 
-@pytest.mark.parametrize("caller", ["agent_a", "manager_a", "merchant_a", "agent_b"])
+@pytest.mark.parametrize(
+    "caller", ["agent_a", "manager_a", "merchant_a", "agent_b", "reviewer_a", "reviewer_b"]
+)
 def test_me_returns_the_callers_own_identity(api: Api, caller: str):
     r = api.get("/v1/me", caller)
     assert r.status_code == 200, r.text
@@ -57,9 +60,27 @@ def test_me_rejects_missing_or_unknown_token(api: Api, headers):
     assert r.headers["www-authenticate"] == "Bearer"
 
 
-def test_me_is_for_people_not_platform_integration(api: Api):
-    r = api.get("/v1/me", "integration_a")
+@pytest.mark.parametrize("caller", ["integration_a", "integration_b", "integration_d"])
+def test_me_is_for_people_not_platform_integration(api: Api, caller: str):
+    r = api.get("/v1/me", caller)
     assert r.status_code == 403 and r.json()["error"] == "forbidden_role"
+    assert CALLERS[caller].shop_id not in r.text and TOKENS[caller] not in r.text
+
+
+def test_reviewer_signs_in_but_only_reaches_reviewer_endpoints(api: Api):
+    """复核人员能用 /v1/me 登录控制台；登录不扩大权限：模式 C 提问、商家控制台的读写照样 403。"""
+    me = api.get("/v1/me", "reviewer_a").json()
+    assert me["role"] == "reviewer" and me["shop_id"] == SHOP_A
+    for method, path in (
+        ("POST", f"{A}/standalone/ask"),
+        ("GET", f"{A}/items"),
+        ("GET", f"{A}/console/faqs"),
+        ("GET", f"{A}/reports/adoption"),
+    ):
+        r = api.call(method, path, "reviewer_a", json={"session_id": "r", "question": "在吗"})
+        assert r.status_code == 403 and r.json()["error"] == "forbidden_role", path
+    assert api.get(f"{A}/quality/report", "reviewer_a").status_code == 200
+    assert api.get(f"{A}/rollout/status", "reviewer_a").status_code == 200
 
 
 def test_me_does_not_read_shop_state(api: Api):

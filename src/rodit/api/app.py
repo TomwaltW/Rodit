@@ -25,16 +25,17 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, FastAPI, Path, Response
 
 from rodit.api import routes_console, routes_rollout
-from rodit.api.auth import Authenticator, Principal
+from rodit.api.auth import PERSON_ROLES, Authenticator, Principal
 from rodit.api.deps import (
+    MSG_FORBIDDEN_ROLE,
     AfterSaleId,
     AgentDep,
     ConsoleDep,
     EmptyBody,
-    HumanDep,
     IntegrationDep,
     KnowledgeId,
     MerchantDep,
+    PrincipalDep,
     RevokeDep,
     ServiceDep,
     Since,
@@ -151,11 +152,17 @@ def healthz() -> HealthView:
 
 
 @router.get("/v1/me", response_model=MeView, tags=["模式 C"])
-def whoami(principal: HumanDep, service: ServiceDep) -> MeView:
-    """当前令牌对应的身份（模式 C 网页工具登录用）：店铺、账号、角色、平台单元。
+def whoami(principal: PrincipalDep, service: ServiceDep) -> MeView:
+    """当前令牌对应的身份（网页工具登录用：模式 C 话术助手、商家控制台）：
+    店铺、账号、角色、平台单元。
 
+    具体的人（PERSON_ROLES：客服、店长、商家、复核人员）都能用；平台对接的令牌不是人，
+    不能登录网页工具（403 forbidden_role）。各页面按角色决定显示什么：复核人员在话术助手页只看到
+    去控制台的提示，客服在控制台只看到去话术助手的提示。
     只返回调用方自己的身份，不回显令牌、不读店铺数据；店铺停用时照常返回（之后的店铺接口是 403）。
     """
+    if principal.role not in PERSON_ROLES:
+        raise ApiError(403, "forbidden_role", MSG_FORBIDDEN_ROLE)
     return MeView(
         shop_id=principal.shop_id,
         user_id=principal.user_id,

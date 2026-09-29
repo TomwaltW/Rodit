@@ -1,9 +1,13 @@
-"""模式 C 网页工具的真浏览器冒烟测试（Chromium + Playwright，§8.1）。
+"""网页工具的真浏览器冒烟测试（Chromium + Playwright）：模式 C 话术助手（§8.1）和商家控制台
+（§9.1、§5.2、§9.3、§13.4、§13.5）。
 
-在本进程里起一个只监听 127.0.0.1 随机端口的服务器（合成演示数据、离线替身，不联网），
-用 node 跑 web_smoke.cjs：登录、提问、三种反馈、过期、缺失知识、XSS、影子模式和 503 的显示、
-手机宽度、退出、商家报表和问卷。没有 node / playwright 模块 / 浏览器时跳过（不新增 Python 依赖：
-用镜像里全局安装的 Node 版 Playwright）。
+在本进程里起一个只监听 127.0.0.1 随机端口的服务器（合成演示数据、离线替身，不联网），用 node 跑：
+- web_smoke.cjs：话术助手的登录、提问、三种反馈、过期、缺失知识、XSS、影子模式和 503 的显示、
+  手机宽度、退出、商家报表和问卷；
+- web_console_smoke.cjs：控制台的登录限制（平台对接、客服）、店长只读、商家的知识 / 政策 / 商品 /
+  同步 / 设置 / 切回影子 / 报表、复核人员的抽样打分和强制切换、复核人员在话术助手页的提示。
+没有 node / playwright 模块 / 浏览器时跳过（不新增 Python 依赖：用镜像里全局安装的
+Node 版 Playwright）。
 """
 
 from __future__ import annotations
@@ -22,11 +26,14 @@ import pytest
 import uvicorn
 from api_support import TOKENS, Api
 
-from rodit.core.enums import SuggestionStatus
+from rodit.core.audit import AuditAction
+from rodit.core.enums import KnowledgeStatus, QualityReviewStatus, SuggestionStatus
+from rodit.feedback.review import iso_period, previous_period
 from rodit.testing.fixtures import AGENT, SHOP_A
 
 NODE = shutil.which("node")
 SCRIPT = Path(__file__).with_name("web_smoke.cjs")
+CONSOLE_SCRIPT = Path(__file__).with_name("web_console_smoke.cjs")
 SKIP_EXIT = 77
 TIMEOUT_S = 180
 
@@ -62,18 +69,13 @@ def _serve(app) -> Iterator[str]:
         thread.join(timeout=10)
 
 
-@pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
-def test_assist_page_in_a_real_browser(api: Api):
+def _run_smoke(api: Api, script: Path, **env_extra: str) -> dict:
+    """起服务器、用 node 跑冒烟脚本，返回脚本最后一行的 JSON 结果（没有 Playwright 时跳过）。"""
     env = _node_env()
-    tokens = {
-        "agent": TOKENS["agent_a"],
-        "merchant": TOKENS["merchant_a"],
-        "integration": TOKENS["integration_a"],
-    }
     with _serve(api.client.app) as base:
-        env.update(RODIT_BASE_URL=base, RODIT_SMOKE_TOKENS=json.dumps(tokens))
+        env.update(RODIT_BASE_URL=base, **env_extra)
         proc = subprocess.run(
-            [str(NODE), str(SCRIPT)],
+            [str(NODE), str(script)],
             env=env,
             capture_output=True,
             text=True,
@@ -84,6 +86,17 @@ def test_assist_page_in_a_real_browser(api: Api):
     lines = proc.stdout.strip().splitlines()
     result = json.loads(lines[-1]) if lines else {"ok": False, "error": proc.stderr}
     assert proc.returncode == 0 and result["ok"], result.get("error") or proc.stderr
+    return result
+
+
+@pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
+def test_assist_page_in_a_real_browser(api: Api):
+    tokens = {
+        "agent": TOKENS["agent_a"],
+        "merchant": TOKENS["merchant_a"],
+        "integration": TOKENS["integration_a"],
+    }
+    result = _run_smoke(api, SCRIPT, RODIT_SMOKE_TOKENS=json.dumps(tokens))
     assert result["steps"][-1] == "merchant"
 
     # 页面上的操作都落到了服务端（客服账号取自令牌对应的身份）
@@ -97,3 +110,92 @@ def test_assist_page_in_a_real_browser(api: Api):
     assert acted and {r.agent_id for r in acted} == {AGENT}
     policies = api.unit.repos.knowledge.get_policies(SHOP_A)
     assert policies["warranty"].value == "保修一年，联系客服寄回维修"
+
+
+SEED_QUESTIONS = ("能开发票吗", "什么时候发货", "有运费险吗")
+
+
+@pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
+def test_console_page_in_a_real_browser(api: Api):
+    """控制台：店长只读；商家改知识、政策、商品、设置、切回影子；复核人员抽样打分、强制切到智能辅助。"""
+    base = f"/v1/shops/{SHOP_A}"
+    # 复核要有推荐可抽：按话术助手的调用方式提几个问题（本周生成，演示时钟固定）
+    for i, question in enumerate(SEED_QUESTIONS):
+        r = api.post(
+            f"{base}/standalone/ask",
+            "agent_a",
+            json={"session_id": f"seed-{i}", "question": question, "request_id": f"seed-{i}"},
+        )
+        assert r.status_code == 200 and r.json()["suggestions"], r.text
+    now = api.unit.clock.now()
+    tokens = {
+        "merchant": TOKENS["merchant_a"],
+        "manager": TOKENS["manager_a"],
+        "reviewer": TOKENS["reviewer_a"],
+        "agent": TOKENS["agent_a"],
+        "integration": TOKENS["integration_a"],
+    }
+    result = _run_smoke(
+        api,
+        CONSOLE_SCRIPT,
+        RODIT_SMOKE_TOKENS=json.dumps(tokens),
+        RODIT_SMOKE_PERIOD=iso_period(now),
+        RODIT_SMOKE_DEFAULT_PERIOD=previous_period(now),
+    )
+    assert result["steps"] == [
+        "login-guards",
+        "manager",
+        "knowledge",
+        "policies",
+        "items",
+        "config",
+        "merchant",
+        "review",
+        "stage",
+        "assist-link",
+    ]
+
+    # 页面上的操作都落到了服务端，操作人取自令牌对应的身份
+    repos = api.unit.repos
+    faqs = repos.knowledge.list_knowledge(SHOP_A, status=None)
+    by_id = {k.id: k for k in faqs}
+    approved = [k for k in faqs if k.status == KnowledgeStatus.APPROVED]
+    created = [k for k in approved if "发票抬头可以写公司吗" in k.question]
+    assert len(created) == 1 and created[0].approved_by == "owner_a"
+    assert created[0].intent is not None and created[0].intent.value == "invoice_gift"
+    assert by_id[1].status == KnowledgeStatus.RETIRED  # 修改：旧条目下线
+    assert any(k.answer == "亲，默认发中通快递，顺丰补 10 元哦~" for k in approved)
+    assert by_id[6].status == KnowledgeStatus.RETIRED  # 审核时修改：候选下线、新条目上线
+    assert any(k.answer == "亲，新疆可以发，补 15 元运费哦~" for k in approved)
+    assert repos.knowledge.get_policies(SHOP_A)["warranty"].value == "保修一年，联系客服寄回维修"
+    card = repos.knowledge.get_item_card(SHOP_A, "i_777")
+    assert card is not None and card.size_advice == "版型偏大，建议拍小一码"
+    assert card.care == ["建议手洗", "不可暴晒"]
+    assert repos.knowledge.get_item_card(SHOP_A, "i_999") is not None  # 同步新建的商品
+    shop = repos.knowledge.get_shop(SHOP_A)
+    assert shop is not None
+    overrides = shop.config_overrides
+    assert overrides["tone"] == "专业" and "suggestion_count" not in overrides
+    assert overrides["disabled_intents"] == ["greeting"]
+    assert overrides.get("shadow_mode") is False  # 商家切回影子 → 复核人员强制切到智能辅助
+    stages = repos.audit.list_events(SHOP_A, action=AuditAction.ROLLOUT_STAGE.value)
+    assert [(e.actor, e.detail["to"], e.detail["forced"]) for e in stages] == [
+        ("owner_a", "shadow", False),
+        ("qa_reviewer_01", "assist", True),
+    ]
+    assert stages[-1].detail["note"] == "测试集已人工确认达标"
+    reviews = repos.quality_reviews.list(SHOP_A, period=iso_period(now))
+    assert len(reviews) == result["samples"]
+    done = {q.status: q for q in reviews if q.status != QualityReviewStatus.PENDING}
+    assert set(done) == {QualityReviewStatus.SCORED, QualityReviewStatus.SKIPPED}
+    scored = done[QualityReviewStatus.SCORED]
+    assert scored.reviewer == "qa_reviewer_01" and scored.note == "表达略生硬"
+    assert scored.scores is not None
+    assert scored.scores.model_dump() == {
+        "factual": 2,
+        "relevance": 2,
+        "compliance": 2,
+        "expression": 1,
+    }
+    viewed = repos.audit.list_events(SHOP_A, action=AuditAction.QUALITY_VIEWED.value)
+    assert viewed and {e.actor for e in viewed} == {"qa_reviewer_01"}  # 看原文留了访问记录

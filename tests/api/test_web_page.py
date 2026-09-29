@@ -274,6 +274,8 @@ def test_page_config_matches_server_definitions(api: Api):
     assert config["human_roles"] == ["agent", "manager", "merchant"]
     assert config["console_roles"] == ["manager", "merchant"]
     assert config["merchant_roles"] == ["merchant"]
+    assert config["reviewer_roles"] == ["reviewer"]
+    assert config["roles"]["reviewer"] == "复核人员"
     assert config["adoption_target"] == 0.5
 
 
@@ -327,3 +329,16 @@ def test_script_drops_responses_that_arrive_after_a_different_sign_in(api: Api):
     for fn in ("loadItems", "ask", "loadConsole"):
         body = js.split(f"async function {fn}(", 1)[1].split("\n  }\n", 1)[0]
         assert "const me = state.me" in body and "state.me !== me" in body, fn
+
+
+def test_assist_page_links_to_the_console_and_sends_reviewers_there(api: Api):
+    """页头有去商家控制台的链接；复核人员在这里登录只看到去控制台的提示，不显示话术助手
+    （令牌留着，同一标签页打开控制台直接登录）。"""
+    page = _parse(api.get("/assist").text)
+    assert [a["href"] for a in page.find("a") if a.get("class") == "page-link"] == ["console"]
+    js = api.get(JS).text
+    body = js.split("async function signIn(", 1)[1].split("\n  }\n", 1)[0]
+    reviewer = body.split("REVIEWER_ROLES.includes(me.role)", 1)[1].split("return false;", 1)[0]
+    assert "state.token = null;" in reviewer and "storage.set(STORAGE_TOKEN, token);" in reviewer
+    assert "href: 'console'" in reviewer and "enterApp" not in reviewer
+    assert body.index("REVIEWER_ROLES.includes") < body.index("enterApp()")
