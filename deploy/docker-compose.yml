@@ -1,0 +1,81 @@
+# 本地试用（只用合成数据，不用于生产）：一个平台单元（默认淘宝）+ PostgreSQL 16。
+#
+#   cp deploy/env.example deploy/.env       # 填随机值：openssl rand -hex 32
+#   docker compose -f deploy/docker-compose.yml up --build -d
+#   docker compose -f deploy/docker-compose.yml logs init   # 试用令牌只在第一次初始化时打印
+#   curl -s http://127.0.0.1:8000/readyz
+#
+# - init：迁移（属主账号）→ 写入合成演示数据（rodit.testing.fixtures）→ 生成令牌文件（只存哈希）；
+#   可以重复执行，已有数据和令牌文件不会覆盖。docker compose down -v 清掉全部数据和令牌。
+# - app：RODIT_ENV=local，平台数据来自合成演示世界 + 模拟适配器；deploy/.env 里没配大模型时
+#   用离线替身（只复述依据）。应用用 rodit_login 账号连库（非超级用户，属于 rodit_app，
+#   行级安全生效，§9.2）。
+# - 密钥都在 deploy/.env（已被 .gitignore 忽略），compose 文件里只有变量引用。
+# - 只监听本机 127.0.0.1:8000；数据库不对宿主机开放端口。
+
+name: rodit-local
+
+x-app-env: &app-env
+  RODIT_ENV: local
+  RODIT_PLATFORM: ${RODIT_PLATFORM:-taobao}
+  RODIT_DATABASE_DSN: postgresql://rodit_login:${RODIT_DB_APP_PASSWORD:?在 deploy/.env 里设置 RODIT_DB_APP_PASSWORD}@db:5432/rodit
+  RODIT_TOKENS_FILE: /var/lib/rodit/tokens.json
+  RODIT_LOG_FORMAT: json
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: rodit
+      POSTGRES_USER: rodit_owner
+      POSTGRES_PASSWORD: ${RODIT_DB_OWNER_PASSWORD:?在 deploy/.env 里设置 RODIT_DB_OWNER_PASSWORD}
+      RODIT_DB_APP_PASSWORD: ${RODIT_DB_APP_PASSWORD:?在 deploy/.env 里设置 RODIT_DB_APP_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rodit_owner -d rodit"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  init:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rodit:local
+    command: ["local-init"]
+    env_file: [.env]
+    environment:
+      <<: *app-env
+      RODIT_MIGRATE_DSN: postgresql://rodit_owner:${RODIT_DB_OWNER_PASSWORD:?在 deploy/.env 里设置 RODIT_DB_OWNER_PASSWORD}@db:5432/rodit
+    volumes:
+      - rodit-secrets:/var/lib/rodit
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    image: rodit:local
+    command: ["serve"]
+    env_file: [.env]
+    environment: *app-env
+    volumes:
+      - rodit-secrets:/var/lib/rodit:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  rodit-secrets:

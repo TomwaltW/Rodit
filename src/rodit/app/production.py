@@ -15,14 +15,15 @@ RODIT_DB_STATEMENT_TIMEOUT_MS / RODIT_DB_LOCK_TIMEOUT_MS（可选，数据库语
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import replace
 
 from rodit.app.unit import Repos, Unit, build_unit
 from rodit.core.clock import Clock, SystemClock
 from rodit.core.config import EngineConfig
 from rodit.core.enums import Platform
 from rodit.core.pii import BuyerRefHasher
-from rodit.core.ports import AfterSaleActionPort, PlatformAdapter, ToolGateway
+from rodit.core.ports import AfterSaleActionPort, AuditLog, PlatformAdapter, ToolGateway
 from rodit.llm import MeteredLLMClient, OpenAICompatibleClient
 from rodit.storage import (
     Database,
@@ -96,14 +97,19 @@ def build_production_unit(
     adapters: Iterable[PlatformAdapter],
     action_port: AfterSaleActionPort | None = None,
     clock: Clock | None = None,
+    audit_wrapper: Callable[[AuditLog], AuditLog] | None = None,
 ) -> Unit:
     """生产单元：tools / adapters / action_port 由平台云里的实现注入（见模块说明）。
 
     MVP 只申请读权限（§8.4 最小权限），action_port 通常为空：售后审核只给建议。
+    audit_wrapper：给审计套一层（部署入口用它采集运行指标，rodit.ops.instrument），
+    单元里所有写审计的地方（引擎、判断层留痕、大模型计量）都经过套好的那一层。
     """
     clock = clock or SystemClock()
     db = production_database()
     repos = postgres_repos(db, clock=clock)
+    if audit_wrapper is not None:
+        repos = replace(repos, audit=audit_wrapper(repos.audit))
     if config.llm.base_url and config.llm.model:
         client = OpenAICompatibleClient(
             base_url=config.llm.base_url,
