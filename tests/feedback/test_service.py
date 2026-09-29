@@ -74,6 +74,7 @@ class Env:
             "item_id": "i_555",
             "intent": Intent.SIZE_ADVICE,
             "intent_confidence": 0.72,
+            "route_rule": 6,
             "text": "亲，建议您选 M 码哦~",
             "kind": DraftKind.LLM,
             "evidence_ids": [ev.item_size_advice("i_555"), ev.item_size_chart("i_555")],
@@ -181,7 +182,15 @@ def test_record_edited_creates_candidate_for_merchant_review(env):
     [cand_event] = env.events(AuditAction.KNOWLEDGE_CANDIDATE)
     assert cand_event["knowledge_id"] == cand.id and cand_event["item_id"] == "i_555"
     assert edited not in _audit_dump(env)
-    assert env.feedback.list_labels(SHOP_A) == []
+    # 编辑后发送：类型判断对了，记一条 feedback_edit 正样本（§5.8、§6.4），带置信度和路由规则
+    [label] = env.feedback.list_labels(SHOP_A)
+    assert label == out.label
+    assert (label.predicted_intent, label.true_intent, label.source) == (
+        Intent.SIZE_ADVICE,
+        Intent.SIZE_ADVICE,
+        "feedback_edit",
+    )
+    assert (label.predicted_confidence, label.route_rule) == (0.72, 6)
 
 
 def test_record_edited_masks_personal_info(env):

@@ -797,6 +797,7 @@ class AssistEngine:
                 item_id=item_id,
                 intent=card.intent,
                 intent_confidence=min(1.0, max(0.0, confidence)),
+                route_rule=run.route.rule if run.route is not None else None,
                 text=card.text,
                 kind=card.kind,
                 evidence_ids=dedupe(draft.evidence_ids),

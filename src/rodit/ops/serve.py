@@ -57,7 +57,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Protocol, TextIO
 
 import psycopg
 import yaml
@@ -133,9 +133,14 @@ CLASSIFIER_PATH_ENV = "RODIT_CLASSIFIER_PATH"
 EXIT_FAILURE = 1
 EXIT_STARTUP = 2
 
-LabelSource = Callable[[], Sequence[LabeledSample]]
-"""离线任务的标注来源：默认 PostgreSQL 的 export_training_labels（trainer_label_source）；
-测试注入假的。"""
+
+class LabelSource(Protocol):
+    """离线任务的标注来源：默认 PostgreSQL 的 export_training_labels（trainer_label_source）；
+    测试注入假的。since ≤ created_at < until；不给就是全部（训练用全部，重算只要时间窗里的）。"""
+
+    def __call__(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> Sequence[LabeledSample]: ...
 
 
 class StartupError(RuntimeError):
@@ -584,15 +589,17 @@ def recalibrate_command(
     args: argparse.Namespace, out: TextIO, *, labels: LabelSource, clock: Clock
 ) -> int:
     """§13.5 阈值重算：摘要打到 out，配置片段写到 --out（没给就接在摘要后面）。不改任何配置。"""
-    from rodit.eval.recalibrate import recalibrate, render_text
+    from rodit.eval.recalibrate import recalibrate, render_text, resolve_window
 
     config, source = _job_config(args)
+    now = clock.now()
+    since, until = resolve_window(now, args.since, args.until)
     report = recalibrate(
-        labels(),
+        labels(since=since, until=until),  # 只导出时间窗里的标注（库里按 created_at 过滤）
         config.routing,
-        now=clock.now(),
-        since=args.since,
-        until=args.until,
+        now=now,
+        since=since,
+        until=until,
         min_support=args.min_support,
     )
     print(render_text(report, config_source=source), file=out)

@@ -105,6 +105,27 @@ def test_build_samples_follows_label_sources():
     assert stats.shops == 2
 
 
+def test_edited_labels_count_as_correct_and_non_assist_rules_are_skipped():
+    """编辑后发送 = 类型对了；记了路由规则的标注只用规则 6（安抚、分条不看辅助阈值）。"""
+    edited = _label(X, 0.75, true=X, source="feedback_edit")
+    soothe = _label(X, 0.3, true=None, source="feedback_reject").model_copy(
+        update={"route_rule": 3}
+    )
+    split = _label(X, 0.4, true=Y, source="feedback_reject").model_copy(update={"route_rule": 5})
+    rule6 = _label(X, 0.8).model_copy(update={"route_rule": 6})
+    legacy = _label(X, 0.85)  # 旧标注没记规则：照常使用
+    samples, stats = build_samples(
+        [edited, soothe, split, rule6, legacy], since=NOW - timedelta(days=30), until=NOW
+    )
+    assert samples == [
+        Sample("size_advice", 0.75, "size_advice"),
+        Sample("size_advice", 0.8, "size_advice"),
+        Sample("size_advice", 0.85, "size_advice"),
+    ]
+    assert stats.skipped_other_rule == 2 and stats.used == 3
+    assert stats.by_source == {"feedback_adopt": 2, "feedback_edit": 1}
+
+
 def test_window_is_half_open():
     since, until = NOW - timedelta(days=30), NOW
     at_since = _label(X, 0.8, days_ago=30)
@@ -242,15 +263,15 @@ def test_target_reachable_only_with_too_few_samples_is_unreachable():
 
 
 def test_ties_go_to_the_lowest_threshold():
-    """覆盖率相同取更低的阈值（§13.3）。pick_threshold 用四舍五入后的覆盖率比较并列，
-    1/3 这类往下舍的值会把并列判给更高的阈值，这里按条数精确比较。"""
+    """覆盖率相同取更低的阈值（§13.3）：按条数精确比较，1/3 这类四舍五入往下舍的覆盖率
+    不会把并列判给更高的阈值（重算和 pick_threshold 一致）。"""
     rows = [Sample(X.value, 0.55, Y.value), Sample(X.value, 0.95, X.value)]
     rows += [Sample(Y.value, 0.9, X.value)] * 2
     routing = RoutingConfig(assist_threshold_by_intent={X: 0.99})
     p = _assist(plan_thresholds(rows, routing, min_support=1, ratchet=False), X)
     assert p.status == ProposalStatus.CHANGE and p.proposed == 0.56
     assert p.picked == 1 and p.coverage == round(1 / 3, 4)
-    assert pick_threshold(rows, X.value, 0.9).threshold == 0.95  # 现有实现的并列问题（见回执）
+    assert pick_threshold(rows, X.value, 0.9).threshold == 0.56
 
 
 def test_equivalent_threshold_prefers_current():

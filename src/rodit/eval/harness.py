@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from rodit.app.demo import build_demo_unit
 from rodit.core.audit import InMemoryAuditSink
 from rodit.core.config import EngineConfig
+from rodit.core.decision import DecisionProvider
 from rodit.core.enums import Platform
 from rodit.core.errors import LLMError
 from rodit.core.pii import mask_pii
@@ -93,12 +94,17 @@ class DemoHarness:
     drafts: DraftRecorder | None = None
 
 
-def demo_harness(config: EngineConfig | None = None) -> DemoHarness:
+def demo_harness(
+    config: EngineConfig | None = None, route_provider: DecisionProvider | None = None
+) -> DemoHarness:
     """离线替身单元（见模块说明）。
 
-    config 里的 decision.provider 会被换成 rules（build_demo_unit 的离线接线）。"""
+    config 里的 decision.provider 会被换成 rules（build_demo_unit 的离线接线）；route_provider
+    给了就用它路由（如训练好的分类器，§6.4），质检照旧。"""
     world = build_demo_world()
-    unit = build_demo_unit(DEMO_PLATFORM, world=world, config=config)  # 淘宝单元：店铺 A、B
+    unit = build_demo_unit(  # 淘宝单元：店铺 A、B
+        DEMO_PLATFORM, world=world, config=config, route_provider=route_provider
+    )
     return DemoHarness(
         engine=unit.engine,
         conversations=unit.repos.conversations,
@@ -107,13 +113,20 @@ def demo_harness(config: EngineConfig | None = None) -> DemoHarness:
     )
 
 
-def llm_harness(client: LLMClient, config: EngineConfig | None = None) -> DemoHarness:
-    """接大模型的单元（见模块说明）。client 在各用例之间共用，计量和草稿按用例分开。"""
+def llm_harness(
+    client: LLMClient,
+    config: EngineConfig | None = None,
+    route_provider: DecisionProvider | None = None,
+) -> DemoHarness:
+    """接大模型的单元（见模块说明）。client 在各用例之间共用，计量和草稿按用例分开。
+    route_provider 给了就用它路由（如训练好的分类器），生成和质检照旧用大模型。"""
     world = build_demo_world()
     usage = InMemoryAuditSink()
     recorder = DraftRecorder(client)
     metered = MeteredLLMClient(recorder, usage, FakeClock(world.now))
-    unit = build_demo_unit(DEMO_PLATFORM, world=world, config=config, llm=metered)
+    unit = build_demo_unit(
+        DEMO_PLATFORM, world=world, config=config, llm=metered, route_provider=route_provider
+    )
     return DemoHarness(
         engine=unit.engine,
         conversations=unit.repos.conversations,

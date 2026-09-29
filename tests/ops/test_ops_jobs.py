@@ -104,12 +104,19 @@ class Source:
         self.labels = labels or []
         self.error = error
         self.calls = 0
+        self.windows: list[tuple[Any, Any]] = []
 
-    def __call__(self) -> list[LabeledSample]:
+    def __call__(self, *, since=None, until=None) -> list[LabeledSample]:
         self.calls += 1
+        self.windows.append((since, until))
         if self.error is not None:
             raise self.error
-        return self.labels
+        return [
+            label
+            for label in self.labels
+            if (since is None or label.created_at >= since)
+            and (until is None or label.created_at < until)
+        ]
 
 
 def _run(argv: list[str], source: Source, *, now=NOW) -> tuple[int, str]:
@@ -468,7 +475,8 @@ def test_jobs_read_labels_through_trainer_role(jobs_env, ops_pg_dsn, monkeypatch
     out = io.StringIO()
     assert main(["recalibrate"], out=out, clock=FakeClock(NOW)) == 0
     text = out.getvalue()
-    assert "导出 180 条" in text and "来自 2 家店铺" in text and "上调" in text
+    # 库里按时间窗导出（[since, until)，created_at 正好等于 now 的那条不在窗里）
+    assert "导出 179 条，时间窗内 179 条" in text and "来自 2 家店铺" in text and "上调" in text
     target = tmp_path / "classifier.json"
     out = io.StringIO()
     argv = ["train-classifier", "--out", str(target), "--min-samples", "20"]

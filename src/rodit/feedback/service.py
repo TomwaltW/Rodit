@@ -33,7 +33,7 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -162,7 +162,8 @@ class FeedbackService:
     def record_edited(
         self, shop_id: str, suggestion_id: int, *, agent_id: str, edited_text: str
     ) -> FeedbackOutcome:
-        """编辑后发送 → EDITED_SENT，保存编辑后的文字（已脱敏），生成候选知识等商家审核。
+        """编辑后发送 → EDITED_SENT，保存编辑后的文字（已脱敏），生成候选知识等商家审核；
+        问题类型判断对了（客服只改了说法），记一条 feedback_edit 标注（§5.8、§6.4）。
 
         - 编辑后和推荐原文一样（去掉首尾空白）→ 按原样发送处理；
         - 候选知识：问题 = 推荐记录里的买家问题，回答 = 编辑后的文字（最小化），
@@ -193,6 +194,7 @@ class FeedbackService:
                 )
             )
             with self._undo_on_failure(record, updated):
+                label = self._confirmed_label(record, "feedback_edit", now)
                 candidate, skipped = self._make_candidate(record, answer, now)
                 self._record(
                     AuditAction.FEEDBACK_EDITED,
@@ -212,7 +214,9 @@ class FeedbackService:
                         knowledge_id=candidate.id,
                         item_id=candidate.item_id,
                     )
-            return FeedbackOutcome(record=updated, candidate=candidate, candidate_skipped=skipped)
+            return FeedbackOutcome(
+                record=updated, candidate=candidate, candidate_skipped=skipped, label=label
+            )
 
     def record_rejected(
         self,
@@ -270,6 +274,7 @@ class FeedbackService:
                         text=question,
                         predicted_intent=record.intent,
                         predicted_confidence=record.intent_confidence,
+                        route_rule=record.route_rule,
                         true_intent=true_intent,
                         source="feedback_reject",
                         created_at=now,
@@ -407,18 +412,7 @@ class FeedbackService:
             record.model_copy(update={"status": SuggestionStatus.SENT, "agent_id": actor})
         )
         with self._undo_on_failure(record, updated):
-            label: LabeledSample | None = None
-            if record.question_text and not self._is_split_message(record):
-                label = LabeledSample(
-                    shop_id=record.shop_id,
-                    text=minimize_text(record.question_text),
-                    predicted_intent=record.intent,
-                    predicted_confidence=record.intent_confidence,
-                    true_intent=record.intent,
-                    source="feedback_adopt",
-                    created_at=now,
-                )
-                self._feedback.add_label(label)
+            label = self._confirmed_label(record, "feedback_adopt", now)
             self._record(
                 AuditAction.FEEDBACK_SENT,
                 actor,
@@ -428,6 +422,29 @@ class FeedbackService:
                 labeled=label is not None,
             )
         return FeedbackOutcome(record=updated, label=label)
+
+    def _confirmed_label(
+        self,
+        record: SuggestionRecord,
+        source: Literal["feedback_adopt", "feedback_edit"],
+        now: datetime,
+    ) -> LabeledSample | None:
+        """客服发出去了（原样或编辑后）：问题类型判断对了 → 正样本（§5.8、§6.4）。
+        多问题消息分条的推荐不记（整条消息的文字对不上单个类型）。"""
+        if not record.question_text or self._is_split_message(record):
+            return None
+        label = LabeledSample(
+            shop_id=record.shop_id,
+            text=minimize_text(record.question_text),
+            predicted_intent=record.intent,
+            predicted_confidence=record.intent_confidence,
+            route_rule=record.route_rule,
+            true_intent=record.intent,
+            source=source,
+            created_at=now,
+        )
+        self._feedback.add_label(label)
+        return label
 
     def _is_split_message(self, record: SuggestionRecord) -> bool:
         """同一条买家消息还有别的类型的推荐：多问题分条（§6.6 规则 5）。"""

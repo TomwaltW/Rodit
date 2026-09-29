@@ -654,6 +654,7 @@ _S_FIELDS = (
     "item_id",
     "intent",
     "intent_confidence",
+    "route_rule",
     "text",
     "kind",
     "evidence_ids",
@@ -770,7 +771,8 @@ class PgSuggestionRepository:
 
 _GAP_COLS = "shop_id, intent, missing, question_text, source, created_at"
 _LABEL_COLS = (
-    "shop_id, text, predicted_intent, predicted_confidence, true_intent, source, created_at"
+    "shop_id, text, predicted_intent, predicted_confidence, route_rule, true_intent, source,"
+    " created_at"
 )
 
 
@@ -817,12 +819,14 @@ class PgFeedbackRepository:
     def add_label(self, sample: LabeledSample) -> None:
         with self._db.session(sample.shop_id) as conn:
             conn.execute(
-                f"INSERT INTO labeled_sample ({_LABEL_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                f"INSERT INTO labeled_sample ({_LABEL_COLS})"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     sample.shop_id,
                     sample.text,
                     sample.predicted_intent,
                     sample.predicted_confidence,
+                    sample.route_rule,
                     sample.true_intent,
                     sample.source,
                     sample.created_at,
@@ -838,10 +842,22 @@ class PgFeedbackRepository:
             ).fetchall()
         return [_label(r) for r in rows]
 
-    def export_training_labels(self) -> list[LabeledSample]:
+    def export_training_labels(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> list[LabeledSample]:
+        conds: list[str] = []
+        params: list[object] = []
+        if since is not None:
+            conds.append("created_at >= %s")
+            params.append(since)
+        if until is not None:
+            conds.append("created_at < %s")
+            params.append(until)
+        where = f" WHERE {' AND '.join(conds)}" if conds else ""
         with self._db.session(None, trainer=True) as conn:
             rows = conn.execute(
-                f"SELECT {_LABEL_COLS} FROM labeled_sample ORDER BY created_at, id"
+                f"SELECT {_LABEL_COLS} FROM labeled_sample{where} ORDER BY created_at, id",
+                params,
             ).fetchall()
         return [_label(r) for r in rows]
 

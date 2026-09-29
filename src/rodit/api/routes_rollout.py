@@ -20,11 +20,17 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Path, Query
 
-from rodit.api.auth import CONSOLE_ROLES, MERCHANT_ROLES, REVIEWER_ROLES, Principal
-from rodit.api.deps import MSG_FORBIDDEN_ROLE, ReviewerDep, ServiceDep, Since, shop_guard
+from rodit.api.auth import REVIEWER_ROLES
+from rodit.api.deps import (
+    MSG_FORBIDDEN_ROLE,
+    ReviewerDep,
+    RolloutReadDep,
+    ServiceDep,
+    Since,
+    StageDep,
+)
 from rodit.api.errors import ApiError
 from rodit.api.schemas_rollout import (
     QualityReviewView,
@@ -41,10 +47,6 @@ from rodit.feedback.rollout import RolloutStage, RolloutStatus
 
 ERROR_GATE_NOT_PASSED = "gate_not_passed"
 
-RolloutReadDep = Annotated[Principal, Depends(shop_guard(CONSOLE_ROLES | REVIEWER_ROLES))]
-"""看上线状态、影子对比、复核报表（没有文字）：店长、商家、复核人员。"""
-StageDep = Annotated[Principal, Depends(shop_guard(MERCHANT_ROLES | REVIEWER_ROLES))]
-"""切换阶段：商家（只能切回影子）、复核人员。"""
 
 Period = Annotated[
     str | None,
@@ -84,9 +86,7 @@ def rollout_shadow(
     responses=_GATE_409,
     tags=["上线节奏"],
 )
-def rollout_stage(
-    body: StageRequest, principal: StageDep, service: ServiceDep
-) -> StageChange | JSONResponse:
+def rollout_stage(body: StageRequest, principal: StageDep, service: ServiceDep) -> StageChange:
     """切换影子模式 / 智能辅助（§13.4）。切到影子（不再展示推荐）商家和复核人员都可以；
     切到智能辅助只有复核人员可以，要过门槛，没过时 force=true 并写明原因才切。"""
     target = RolloutStage(body.stage)
@@ -102,14 +102,9 @@ def rollout_stage(
             role=principal.role,
         )
     except RolloutGateNotPassed as exc:
-        return JSONResponse(
-            {
-                "error": ERROR_GATE_NOT_PASSED,
-                "message": str(exc),
-                "gate": exc.gate.model_dump(mode="json"),
-            },
-            status_code=409,
-        )
+        raise ApiError(
+            409, ERROR_GATE_NOT_PASSED, str(exc), extra={"gate": exc.gate.model_dump(mode="json")}
+        ) from None
 
 
 # ---------------------------------------------------------------- 每周人工复核（§13.5）

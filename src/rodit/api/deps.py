@@ -102,6 +102,10 @@ ConsoleDep = Annotated[Principal, Depends(shop_guard(CONSOLE_ROLES))]
 MerchantDep = Annotated[Principal, Depends(shop_guard(MERCHANT_ROLES))]
 RevokeDep = Annotated[Principal, Depends(shop_guard(MERCHANT_ROLES, require_active=False))]
 ReviewerDep = Annotated[Principal, Depends(shop_guard(REVIEWER_ROLES))]
+RolloutReadDep = Annotated[Principal, Depends(shop_guard(CONSOLE_ROLES | REVIEWER_ROLES))]
+"""看上线状态、影子对比、复核报表（没有文字）：店长、商家、复核人员。"""
+StageDep = Annotated[Principal, Depends(shop_guard(MERCHANT_ROLES | REVIEWER_ROLES))]
+"""切换阶段：商家（只能切回影子）、复核人员。"""
 """§13.5 每周人工复核、§13.4 上线阶段切换：我们的复核人员（按店铺授权，查看要留访问记录）。"""
 
 SuggestionId = Annotated[int, Path(ge=1)]
@@ -125,6 +129,8 @@ __all__ = [
     "MerchantDep",
     "PrincipalDep",
     "ReviewerDep",
+    "RolloutReadDep",
+    "StageDep",
     "RevokeDep",
     "ServiceDep",
     "Since",

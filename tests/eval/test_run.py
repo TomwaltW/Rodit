@@ -149,3 +149,38 @@ def test_module_entry_point(monkeypatch, capsys):
     assert exit_info.value.code == 0
     out = capsys.readouterr().out
     assert "上线门槛" in out and "仅供参考" in out  # 只跑测试集时阈值用测试集算，要提示
+
+
+# ================================================================ --classifier（§6.4、§13.5）
+
+
+def _train_classifier(path) -> None:
+    """用开发集的合成问句训练一个分类器（只为测试接线；真实训练见 rodit.eval.train）。"""
+    from datetime import datetime
+
+    from rodit.core.clock import CST
+    from rodit.decision import ClassifierProvider, RuleProvider
+
+    pairs = [(c.text, c.expected_intent) for c in cases("dev")]
+    model = ClassifierProvider(RuleProvider()).fit(pairs, seed_examples=True)
+    model.save(path, trained_at=datetime(2026, 9, 28, 10, 0, tzinfo=CST))
+
+
+def test_classifier_option_routes_with_the_trained_model(tmp_path):
+    target = tmp_path / "classifier.json"
+    _train_classifier(target)
+    out = io.StringIO()
+    argv = ["--split", "test", "--limit", "12", "--classifier", str(target), "--json"]
+    assert main(argv, out=out) == 0
+    report = json.loads(out.getvalue())
+    assert report["llm"]["decision_provider"] == "classifier"
+    assert report["cases"] and all(c["predicted_intent"] for c in report["cases"])
+
+
+def test_classifier_option_rejects_a_broken_model_file(tmp_path):
+    target = tmp_path / "classifier.json"
+    _train_classifier(target)
+    target.write_text(target.read_text(encoding="utf-8").replace('"alpha"', '"alpha2"'))
+    err = io.StringIO()
+    assert main(["--classifier", str(target)], out=io.StringIO(), err=err) == 2
+    assert "路由分类器模型文件不能用" in err.getvalue()

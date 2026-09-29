@@ -65,7 +65,9 @@ MSG_VALIDATION = "请求参数不合法"
 
 
 class ApiError(Exception):
-    """接口层自己判定的错误（鉴权、角色、跨店）。message 是固定文字，不含请求内容。"""
+    """接口层自己判定的错误（鉴权、角色、跨店、门槛没过）。message 是固定文字，不含请求内容；
+    extra 是给调用方看的结构化补充（如 §13.4 门槛结果），并进响应 JSON，
+    不能有 error / message 键。"""
 
     def __init__(
         self,
@@ -74,12 +76,16 @@ class ApiError(Exception):
         message: str,
         *,
         headers: Mapping[str, str] | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
+        if extra and {"error", "message"} & set(extra):
+            raise ValueError("extra 不能覆盖 error / message")
         self.status_code = status_code
         self.code = code
         self.message = message
         self.headers = dict(headers or {})
+        self.extra = dict(extra or {})
 
 
 def unauthorized() -> ApiError:
@@ -104,10 +110,16 @@ def safe_message(text: object, fallback: str) -> str:
 
 
 def error_response(
-    status_code: int, code: str, message: str, headers: Mapping[str, str] | None = None
+    status_code: int,
+    code: str,
+    message: str,
+    headers: Mapping[str, str] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
-        {"error": code, "message": message}, status_code=status_code, headers=dict(headers or {})
+        {"error": code, "message": message, **(extra or {})},
+        status_code=status_code,
+        headers=dict(headers or {}),
     )
 
 
@@ -160,7 +172,7 @@ def _rodit_handler(status_code: int, code: str, use_message: bool, fallback: str
 
 async def _api_error(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, ApiError)
-    return error_response(exc.status_code, exc.code, exc.message, exc.headers)
+    return error_response(exc.status_code, exc.code, exc.message, exc.headers, exc.extra)
 
 
 async def _key_error(request: Request, exc: Exception) -> JSONResponse:

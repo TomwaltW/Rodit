@@ -329,8 +329,13 @@ class LabeledSample(_Model):
     # 路由给 predicted_intent 的置信度（SuggestionRecord.intent_confidence），§13.5 每月按采纳反馈
     # 重算阈值用（§13.3 的 (预测类型, 置信度, 真实类型) 三元组）；手工标注、旧数据为 None
     predicted_confidence: float | None = Field(default=None, ge=0, le=1)
+    # 这条推荐走的 §6.6 路由规则（SuggestionRecord.route_rule）：重算阈值只用规则 6
+    # （按置信度出推荐）的样本，安抚话术（规则 3）、分条（规则 5）不看辅助阈值
+    route_rule: int | None = Field(default=None, ge=1, le=8)
     true_intent: Intent | None = None
-    source: Literal["feedback_reject", "feedback_adopt", "manual"] = "manual"
+    # feedback_adopt 原样发送、feedback_edit 编辑后发送（类型判断对了、只是改了说法）、
+    # feedback_reject 点了"理解错误"
+    source: Literal["feedback_reject", "feedback_adopt", "feedback_edit", "manual"] = "manual"
     created_at: AwareDatetime
 
 
@@ -801,6 +806,7 @@ class SuggestionRecord(_Model):
     intent: Intent
     # 路由给 intent 的置信度（多问题分条时是这一条的概率，§6.6 规则 5）；§13.5 重算阈值用
     intent_confidence: float | None = Field(default=None, ge=0, le=1)
+    route_rule: int | None = Field(default=None, ge=1, le=8)  # 命中的 §6.6 路由规则（整条消息的）
     text: CleanText
     kind: DraftKind = DraftKind.LLM
     evidence_ids: list[str] = Field(default_factory=list)

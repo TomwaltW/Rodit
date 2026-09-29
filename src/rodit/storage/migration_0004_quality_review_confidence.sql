@@ -4,8 +4,9 @@
 --    （ISO 周，如 2026-W40）、同一推荐只有一条。
 -- 2. 每月按采纳反馈重算阈值（§13.5、§13.3 的 (预测类型, 置信度, 真实类型) 三元组）：
 --    suggestion.intent_confidence 记路由给这条推荐的置信度，labeled_sample.predicted_confidence
---    由反馈闭环从推荐记录抄过来（训练导出角色 rodit_trainer 只读 labeled_sample，够用）。
---    旧数据为 NULL（重算时跳过）。
+--    由反馈闭环从推荐记录抄过来（训练导出角色 rodit_trainer 只读 labeled_sample，够用）；
+--    route_rule 记这条推荐走的 §6.6 路由规则，重算辅助阈值只用规则 6 的样本。
+--    旧数据为 NULL（重算时跳过置信度为空的）。
 --
 -- 版本 1–3 已发布，不再修改。与之前的版本一样可以重复执行（IF NOT EXISTS、DROP POLICY IF EXISTS）。
 
@@ -15,6 +16,11 @@ ALTER TABLE suggestion ADD COLUMN IF NOT EXISTS intent_confidence REAL
   CHECK (intent_confidence IS NULL OR (intent_confidence >= 0 AND intent_confidence <= 1));
 ALTER TABLE labeled_sample ADD COLUMN IF NOT EXISTS predicted_confidence REAL
   CHECK (predicted_confidence IS NULL OR (predicted_confidence >= 0 AND predicted_confidence <= 1));
+ALTER TABLE suggestion ADD COLUMN IF NOT EXISTS route_rule SMALLINT
+  CHECK (route_rule IS NULL OR route_rule BETWEEN 1 AND 8);
+ALTER TABLE labeled_sample ADD COLUMN IF NOT EXISTS route_rule SMALLINT
+  CHECK (route_rule IS NULL OR route_rule BETWEEN 1 AND 8);
+CREATE INDEX IF NOT EXISTS labeled_sample_time_idx ON labeled_sample (created_at, id);
 
 -- ---------------------------------------------------------------- 每周人工复核
 

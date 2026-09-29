@@ -565,6 +565,7 @@ def _suggestion(shop_id: str, conv: str, *, minutes: float, text: str = "推荐"
         item_id="i_555",
         intent=Intent.SHIPPING_POLICY,
         intent_confidence=0.875,
+        route_rule=6,
         text=text,
         kind=DraftKind.FAQ,
         evidence_ids=["faq:1"],
@@ -584,7 +585,8 @@ def check_suggestion_repository(make: Callable[[], SuggestionRepository]) -> Non
     b1 = repo.add(_suggestion(SHOP_B, "c1", minutes=1, text="b1"))
     assert len({a1.id, a2.id, a3.id, b1.id}) == 4 and a1.id != 77
     assert repo.get(SHOP_A, a1.id) == a1
-    assert a1.intent_confidence == 0.875  # §13.5 重算阈值用的置信度原样存取
+    assert a1.intent_confidence == 0.875  # §13.5 重算阈值用的置信度、路由规则原样存取
+    assert a1.route_rule == 6
     old = _suggestion(SHOP_B, "c9", minutes=9, text="旧")
     no_conf = repo.add(old.model_copy(update={"intent_confidence": None}))
     assert repo.get(SHOP_B, no_conf.id).intent_confidence is None
@@ -656,20 +658,38 @@ def check_feedback_repository(make: Callable[[], FeedbackRepository]) -> None:
             text="发啥快递",
             predicted_intent=Intent.OTHER,
             predicted_confidence=0.625,
+            route_rule=6,
             true_intent=Intent.SHIPPING_POLICY,
             source="feedback_reject",
             created_at=NOW,
         )
     )
     repo.add_label(
+        LabeledSample(
+            shop_id=SHOP_A,
+            text="这件起球吗",
+            predicted_intent=Intent.PRODUCT_SPEC,
+            true_intent=Intent.PRODUCT_SPEC,
+            source="feedback_edit",
+            created_at=NOW - timedelta(days=40),
+        )
+    )
+    repo.add_label(
         LabeledSample(shop_id=SHOP_B, text="在吗", true_intent=Intent.GREETING, created_at=NOW)
     )
-    assert [s.text for s in repo.list_labels(SHOP_A)] == ["发啥快递"]
-    assert repo.list_labels(SHOP_A)[0].predicted_confidence == 0.625
-    exported = {s.shop_id: s for s in repo.export_training_labels()}
-    assert set(exported) == {SHOP_A, SHOP_B}
+    assert [s.text for s in repo.list_labels(SHOP_A)] == ["这件起球吗", "发啥快递"]
+    assert repo.list_labels(SHOP_A)[1].predicted_confidence == 0.625
+    assert repo.list_labels(SHOP_A)[1].route_rule == 6
+    assert repo.list_labels(SHOP_A)[0].source == "feedback_edit"
+    assert [s.text for s in repo.export_training_labels()] == ["这件起球吗", "发啥快递", "在吗"]
+    # 按时间窗口导出（§13.5 每月重算）：since ≤ created_at < until
+    recent = repo.export_training_labels(since=NOW - timedelta(days=30))
+    exported = {s.shop_id: s for s in recent}
+    assert set(exported) == {SHOP_A, SHOP_B} and len(recent) == 2
     assert exported[SHOP_A].predicted_confidence == 0.625
     assert exported[SHOP_B].predicted_confidence is None
+    assert [s.text for s in repo.export_training_labels(until=NOW)] == ["这件起球吗"]
+    assert repo.export_training_labels(since=NOW, until=NOW) == []
     assert repo.purge_shop(SHOP_B) == 2
     assert repo.list_gaps(SHOP_B) == [] and repo.list_labels(SHOP_B) == []
     assert len(repo.list_gaps(SHOP_A)) == 2

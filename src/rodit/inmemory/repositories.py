@@ -494,9 +494,17 @@ class InMemoryFeedbackRepository:
             out = [s for s in self._labels if s.shop_id == shop_id]
             return [s.model_copy() for s in sorted(out, key=lambda s: s.created_at)]
 
-    def export_training_labels(self) -> list[LabeledSample]:
+    def export_training_labels(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> list[LabeledSample]:
         with self._lock:
-            return [s.model_copy() for s in sorted(self._labels, key=lambda s: s.created_at)]
+            out = [
+                s
+                for s in self._labels
+                if (since is None or s.created_at >= since)
+                and (until is None or s.created_at < until)
+            ]
+            return [s.model_copy() for s in sorted(out, key=lambda s: s.created_at)]
 
     def purge_shop(self, shop_id: str) -> int:
         with self._lock:

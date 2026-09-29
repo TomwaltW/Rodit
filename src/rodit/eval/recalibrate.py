@@ -1,12 +1,14 @@
 """每月用采纳反馈重新计算阈值（方案 §13.5），按 §13.3 的算法给出建议，人工确认后才生效。
 
 输入是反馈闭环的判断层标注集（LabeledSample，§5.8）：
-- feedback_adopt（原样发送）→ (预测类型, 置信度, 预测类型)：理解对了；
+- feedback_adopt（原样发送）、feedback_edit（编辑后发送）→ (预测类型, 置信度, 预测类型)：
+  类型判断对了；
 - feedback_reject（理解错误）且客服选了正确类型 → (预测类型, 置信度, 正确类型)；
 - feedback_reject 没选正确类型 → (预测类型, 置信度, "<unknown>")：算作预测类型的一次误判，
   不给任何类型增加真实样本（覆盖率的分母）；
 - manual（人工标注）带预测类型、置信度、正确类型时同样使用；
-- 没有预测类型或置信度（旧数据、手工标注）的跳过并计数；时间窗外的不用。
+- 没有预测类型或置信度（旧数据、手工标注）的跳过并计数；记了路由规则、但不是规则 6
+  （安抚、分条等不看辅助阈值的路径）的跳过并计数；时间窗外的不用。
 
 对每个问题类型，按 §13.3 扫描阈值：智能辅助 target_precision = 0.90；全自动 0.98，只对
 routing.auto_threshold 里列出的类型计算。和 rodit.eval.calibration.pick_threshold 的规则相同
@@ -15,7 +17,7 @@ routing.auto_threshold 里列出的类型计算。和 rodit.eval.calibration.pic
 1. 选择偏差（关键）：只有展示过的推荐才会有客服反馈，而路由只在置信度 ≥ 当前辅助阈值时出推荐
    （§6.6 规则 6）。当前阈值以下只有安抚（规则 3）、分条（规则 5）这些少数路径留下的标注，
    分条推荐还只会留下"理解错误"（原样发送的不写标注，见 FeedbackService），这部分既不完整也
-   没有代表性；LabeledSample 又没记是哪条规则出的推荐，分不开。直接扫描的话，阈值往下挪时
+   没有代表性（记了路由规则的标注按规则 6 过滤掉它们，旧标注分不开）。直接扫描的话，阈值往下挪时
    选中的样本不变、准确率和覆盖率一样，并列取低值，就会"建议"一个比当前阈值低、却没有任何
    数据支撑的阈值。所以：
    - 反馈数据的辅助阈值只维持或上调（ratchet）：扫描从当前阈值开始；要下调，先用影子对比或
@@ -64,6 +66,7 @@ AUTO_PRECISION = 0.98  # §13.3 全自动
 DEFAULT_WINDOW_DAYS = 30  # §13.5 每月一次
 DEFAULT_MIN_SUPPORT = 30
 UNKNOWN_TRUE = "<unknown>"  # 理解错误但没选正确类型
+ASSIST_RULE = 6  # §6.6 规则 6：置信度 ≥ 辅助阈值 → 出推荐（重算的就是这个阈值）
 GRID: tuple[float, ...] = tuple(x / 100 for x in range(50, 100))  # 与 §13.3 一致
 EPS = 1e-9
 
@@ -154,6 +157,7 @@ class LabelStats(_Model):
     skipped_no_intent: int
     skipped_no_confidence: int
     skipped_manual_unlabeled: int
+    skipped_other_rule: int = 0  # 不是规则 6 出的推荐（记了路由规则的标注才分得出）
     shops: int  # 用上的标注来自几家店铺
 
 
@@ -194,9 +198,12 @@ def build_samples(
         if label.predicted_confidence is None:
             skipped["no_confidence"] += 1
             continue
+        if label.route_rule is not None and label.route_rule != ASSIST_RULE:
+            skipped["other_rule"] += 1  # 安抚（规则 3）、分条（规则 5）等不看辅助阈值
+            continue
         predicted = label.predicted_intent.value
-        if label.source == "feedback_adopt":
-            true = predicted  # 原样发送：理解对了
+        if label.source in ("feedback_adopt", "feedback_edit"):
+            true = predicted  # 原样或编辑后发送：类型判断对了
         elif label.true_intent is not None:
             true = label.true_intent.value
         elif label.source == "feedback_reject":
@@ -217,6 +224,7 @@ def build_samples(
         skipped_no_intent=skipped["no_intent"],
         skipped_no_confidence=skipped["no_confidence"],
         skipped_manual_unlabeled=skipped["manual_unlabeled"],
+        skipped_other_rule=skipped["other_rule"],
         shops=len(shops),
     )
     return out, stats
@@ -505,6 +513,25 @@ def proposal_yaml(
 # ================================================================ 重算
 
 
+def resolve_window(
+    now: datetime,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    *,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+) -> tuple[datetime, datetime]:
+    """标注时间窗 [since, until)：默认 now 之前 window_days 天。时间都要带时区。"""
+    if now.tzinfo is None:
+        raise ValueError("now 需要带时区")
+    until = until or now
+    since = since or until - timedelta(days=window_days)
+    if since.tzinfo is None or until.tzinfo is None:
+        raise ValueError("since / until 需要带时区")
+    if since >= until:
+        raise ValueError("since 必须早于 until")
+    return since, until
+
+
 def recalibrate(
     labels: Iterable[LabeledSample],
     routing: RoutingConfig,
@@ -516,14 +543,7 @@ def recalibrate(
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> RecalibrationReport:
     """§13.5 每月重算：默认用 now 之前 30 天的标注。只返回建议，不改任何配置。"""
-    if now.tzinfo is None:
-        raise ValueError("now 需要带时区")
-    until = until or now
-    since = since or until - timedelta(days=window_days)
-    if since.tzinfo is None or until.tzinfo is None:
-        raise ValueError("since / until 需要带时区")
-    if since >= until:
-        raise ValueError("since 必须早于 until")
+    since, until = resolve_window(now, since, until, window_days=window_days)
     samples, stats = build_samples(labels, since=since, until=until)
     plan = plan_thresholds(samples, routing, min_support=min_support, ratchet=True)
     header = [f"§13.5 阈值重算建议（标注时间窗 {_fmt(since)} ~ {_fmt(until)}，东八区）"]
@@ -615,15 +635,22 @@ def render_text(report: RecalibrationReport, *, config_source: str | None = None
     sources = s.by_source
     add(
         f"标注：导出 {s.total} 条，时间窗内 {s.in_window} 条，用上 {s.used} 条"
-        f"（采纳 {sources.get('feedback_adopt', 0)}、理解错误 {sources.get('feedback_reject', 0)}"
+        f"（采纳 {sources.get('feedback_adopt', 0)}、编辑后发送 {sources.get('feedback_edit', 0)}、"
+        f"理解错误 {sources.get('feedback_reject', 0)}"
         f"（其中没选正确类型 {s.reject_unknown_true}）、人工 {sources.get('manual', 0)}），"
         f"来自 {s.shops} 家店铺"
     )
-    skipped = s.skipped_no_intent + s.skipped_no_confidence + s.skipped_manual_unlabeled
+    skipped = (
+        s.skipped_no_intent
+        + s.skipped_no_confidence
+        + s.skipped_manual_unlabeled
+        + s.skipped_other_rule
+    )
     if skipped:
         add(
             f"跳过 {skipped} 条：没有预测类型 {s.skipped_no_intent}、没有置信度 "
-            f"{s.skipped_no_confidence}、人工标注没有正确类型 {s.skipped_manual_unlabeled}"
+            f"{s.skipped_no_confidence}、人工标注没有正确类型 {s.skipped_manual_unlabeled}、"
+            f"不是规则 6 的推荐 {s.skipped_other_rule}"
         )
     add(f"样本门槛：预测为该类型的标注 ≥ {report.plan.min_support} 条才给建议")
     add("")
@@ -660,6 +687,7 @@ __all__ = [
     "REGRESSION_REMINDER",
     "STATUS_LABELS",
     "UNKNOWN_TRUE",
+    "resolve_window",
     "LabelStats",
     "ProposalStatus",
     "RecalibrationReport",

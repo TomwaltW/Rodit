@@ -572,8 +572,11 @@ class FeedbackRepository(Protocol):
         """按 created_at 升序。"""
         ...
 
-    def export_training_labels(self) -> list[LabeledSample]:
-        """导出本平台单元内所有店铺的标注数据，只用于训练路由分类器（§6.4）。
+    def export_training_labels(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> list[LabeledSample]:
+        """导出本平台单元内所有店铺的标注数据，只用于训练路由分类器（§6.4）和每月重算阈值
+        （§13.5）；since ≤ created_at < until，按 created_at 升序。
         不对商家接口开放；数据不出单元。"""
         ...
 

@@ -21,6 +21,8 @@
   （默认 incloud_llm）。只在本地开发机上这样做：密钥放本地 .env，不进仓库；评测集全是合成数据。
 
 部分评测：--intent 只跑某个问题类型，--limit N 用 --seed 随机抽 N 条（可复现）。
+路由分类器（§6.4）：--classifier 模型文件（python -m rodit.ops train-classifier 的输出）代替路由的
+判断层，两种模式都可以；上线前和 --baseline 一起跑回归（§13.5）。
 完整结果：--json 输出 JSON 到标准输出；--json out.json 写文件（文本报告照常输出）。
 退出码：0 正常；1 回归比较有指标下降；2 配置错误（环境变量、基线文件、筛选后没有用例等）。
 """
@@ -41,10 +43,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from rodit.app.offline import EvidenceEchoLLM
 from rodit.core.config import EngineConfig, load_config
+from rodit.core.decision import DecisionProvider
 from rodit.core.enums import INTENT_LABELS, Intent, ProviderName
 from rodit.core.errors import LLMError
 from rodit.core.models import EngineResult
 from rodit.core.ports import LLMClient
+from rodit.decision import ClassifierArtifactError, ClassifierProvider, RuleProvider
 from rodit.eval.baseline import METRIC_LABELS, BaselineCheck, compare_to_baseline, load_baseline
 from rodit.eval.calibration import (
     ReliabilityBin,
@@ -318,17 +322,20 @@ def _case_record(
     )
 
 
-def _llm_info(llm: LLMClient | None, config: EngineConfig | None) -> LLMInfo:
+def _llm_info(
+    llm: LLMClient | None, config: EngineConfig | None, *, classifier: bool = False
+) -> LLMInfo:
     if llm is None:
+        provider = ProviderName.CLASSIFIER if classifier else ProviderName.RULES
         return LLMInfo(
-            mode="offline", model=EvidenceEchoLLM.model, decision_provider=ProviderName.RULES.value
+            mode="offline", model=EvidenceEchoLLM.model, decision_provider=provider.value
         )
     decision = (config or EngineConfig()).decision
     return LLMInfo(
         mode="env",
         model=describe_model(llm),
         endpoint=describe_endpoint(llm),
-        decision_provider=decision.provider.value,
+        decision_provider=ProviderName.CLASSIFIER.value if classifier else decision.provider.value,
         route_votes=decision.vote_samples,
         qa_votes=decision.qa_vote_samples,
         route_timeout_s=decision.timeout_s,
@@ -346,10 +353,12 @@ def evaluate(
     config: EngineConfig | None = None,
     pricing: Pricing | None = None,
     progress: Progress | None = None,
+    route_provider: DecisionProvider | None = None,
 ) -> EvalCliReport:
     """在演示单元上跑评测集的一部分，汇总成报告。
 
     llm 为空用离线替身；给了就用它（真实模型或测试替身），路由和质检按 config.decision 组装。
+    route_provider 给了就用它路由（--classifier：训练好的分类器，§6.4 上线前的 §13.5 回归）。
     intent / limit / seed 见 runner.select_cases；pricing 为空时只报 token。
     """
     wanted = Intent(intent) if intent is not None else None
@@ -359,9 +368,9 @@ def evaluate(
         raise ValueError(f"评测集 {split}{where} 为空")
     _check_cases(selected)
     if llm is None:
-        make_harness = partial(demo_harness, config)
+        make_harness = partial(demo_harness, config, route_provider)
     else:
-        make_harness = partial(llm_harness, llm, config)
+        make_harness = partial(llm_harness, llm, config, route_provider)
     run = run_eval(
         selected, make_harness, gate=GATE, assist_precision=target_precision, progress=progress
     )
@@ -421,7 +430,7 @@ def evaluate(
         intent=wanted.value if wanted is not None else None,
         limit=limit,
         seed=seed if limit is not None else None,
-        llm=_llm_info(llm, config),
+        llm=_llm_info(llm, config, classifier=route_provider is not None),
         cases=[_case_record(s, by_id[s.case_id], run.traces[s.case_id], pricing) for s in scores],
         latency=latency_report([t.latency_ms for t in traces]),
         usage=usage_report([t.llm_calls for t in traces], pricing) if metered else None,
@@ -724,6 +733,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--price-output", type=float, metavar="PRICE", help="输出单价：每 1000 token 的价格"
     )
+    parser.add_argument(
+        "--classifier",
+        metavar="PATH",
+        help="用训练好的路由分类器（python -m rodit.ops train-classifier 的输出）代替路由判断层",
+    )
     parser.add_argument("--baseline", metavar="PATH", help="基线（之前一次 --json 的输出）")
     parser.add_argument(
         "--tolerance",
@@ -762,6 +776,12 @@ def main(
         pricing = resolve_pricing(args.price_input, args.price_output)
         config = load_config(args.config) if args.config else None
         baseline = load_baseline(args.baseline) if args.baseline else None
+        route_provider: DecisionProvider | None = None
+        if args.classifier:
+            try:
+                route_provider = ClassifierProvider.load(args.classifier, fallback=RuleProvider())
+            except ClassifierArtifactError as e:
+                raise ValueError(f"路由分类器模型文件不能用：{e}") from None
         llm: LLMClient | None = None
         if args.llm == "env":
             llm = (client_factory or client_from_env)()
@@ -778,6 +798,7 @@ def main(
             config=config,
             pricing=pricing,
             progress=_progress_printer(err) if llm is not None else None,
+            route_provider=route_provider,
         )
         if baseline is not None:
             check = compare_to_baseline(

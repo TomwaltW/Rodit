@@ -164,3 +164,10 @@ def test_must_include_ignores_spacing():
     case = case.model_copy(update={"must_include": ["10 月 8 日"], "must_cite": []})
     result = _result(case, "亲，预计10月8日补货哦")
     assert score_case(case, result).factual == 2
+
+
+def test_pick_threshold_ties_on_rounded_coverage_go_to_the_lower_threshold():
+    """覆盖率 1/3 四舍五入成 0.3333（往下舍）：比较时按条数，并列仍然取先扫到的更低阈值。"""
+    rows = [("x", 0.55, "y"), ("x", 0.95, "x"), ("z", 0.9, "x"), ("z", 0.9, "x")]
+    pick = pick_threshold(rows, "x", 0.9)
+    assert pick is not None and pick.threshold == 0.56 and pick.coverage == 0.3333
