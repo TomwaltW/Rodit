@@ -71,6 +71,8 @@ def seeded(db: Database, truncate, token_key: str) -> None:
         conversations.add_message(
             make_message("在吗", world=world, shop_id=shop, msg_id=f"m_{shop}")
         )
+        # 撤回先于消息到达：message_recall 里的墓碑（迁移版本 3）
+        assert conversations.recall_message(shop, "conv_889", f"m_{shop}_later") is False
         suggestions.add(
             SuggestionRecord(
                 shop_id=shop,
@@ -276,7 +278,8 @@ def test_non_superuser_owner_can_migrate_and_is_still_bound_by_rls(pg_admin_dsn)
     try:
         with psycopg.connect(make_conninfo(pg_admin_dsn, dbname=dbname)) as conn:
             conn.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(owner)))
-            conn.execute(MIGRATIONS[0].sql())
+            for migration in MIGRATIONS:  # 全部版本（版本 3 新建了 message_recall）
+                conn.execute(migration.sql())
             owned = conn.execute(
                 "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
                 " AND tableowner = current_user"

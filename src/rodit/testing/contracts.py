@@ -40,6 +40,7 @@ from rodit.core.models import (
     SuggestionRecord,
 )
 from rodit.core.ports import (
+    RECALL_TOMBSTONE_TTL,
     AfterSaleReviewRepository,
     ConversationRepository,
     FeedbackRepository,
@@ -47,7 +48,7 @@ from rodit.core.ports import (
     ShopAuthRepository,
     SuggestionRepository,
 )
-from rodit.testing.fakes import make_message
+from rodit.testing.fakes import FakeClock, make_message
 from rodit.testing.fixtures import (
     BUYER,
     SHOP_A,
@@ -240,6 +241,69 @@ def check_knowledge_status_compare_and_set(make: Callable[[], KnowledgeRepositor
     )
 
 
+def check_candidate_uniqueness(make: Callable[[], KnowledgeRepository]) -> None:
+    """等商家审核的候选知识不重复（§5.8）：同一店铺、同样的问题和回答、同一商品、同一问题类型的
+    CANDIDATE 只能有一条。多个实例同时把同一条编辑回复变成候选时由存储保证（PostgreSQL 部分唯一
+    索引，内存实现在同一把锁里检查）：后到的 add_knowledge 抛 ConcurrencyConflict、不写入。"""
+    repo = make()
+
+    def candidate(**kw: object) -> KnowledgeItem:
+        base: dict[str, object] = {
+            "shop_id": SHOP_A,
+            "question": "能改地址吗",
+            "answer": "亲，发货前可以改哦~",
+            "source": KnowledgeSource.ADOPTED,
+            "status": KnowledgeStatus.CANDIDATE,
+            "item_id": "i_555",
+            "intent": Intent.MODIFY_ORDER,
+            "created_at": NOW,
+        }
+        base.update(kw)
+        return KnowledgeItem.model_validate(base)
+
+    def conflicts(item: KnowledgeItem) -> bool:
+        try:
+            repo.add_knowledge(item)
+        except ConcurrencyConflict:
+            return True
+        return False
+
+    first = repo.add_knowledge(candidate())
+    assert conflicts(candidate())  # 同样的候选已在等审核
+    assert [k.id for k in repo.list_knowledge(SHOP_A, status=KnowledgeStatus.CANDIDATE)] == [
+        first.id
+    ]
+    # 任何一项不同都是另一条候选
+    for other in (
+        candidate(answer="亲，发货前可以改的"),
+        candidate(question="地址能改吗"),
+        candidate(item_id="i_777"),
+        candidate(item_id=None),
+        candidate(intent=Intent.SHIPPING_POLICY),
+        candidate(intent=None),
+        candidate(shop_id=SHOP_B),
+    ):
+        assert not conflicts(other), other
+    assert conflicts(candidate(item_id=None))  # 没有商品、没有类型的也按"相同"去重
+    assert conflicts(candidate(intent=None))
+    # 只管等审核的：已通过 / 已下线的同样内容不挡新候选，商家自己录的同样 FAQ 也不挡
+    repo.set_knowledge_status(SHOP_A, first.id, KnowledgeStatus.APPROVED, approved_by="merchant")
+    second = repo.add_knowledge(candidate())
+    assert not conflicts(candidate(status=KnowledgeStatus.APPROVED))
+    # 改回候选时撞上等审核的同样内容：比较后更新不写入
+    try:
+        repo.set_knowledge_status(SHOP_A, first.id, KnowledgeStatus.CANDIDATE)
+    except ConcurrencyConflict:
+        pass
+    else:
+        raise AssertionError("改回候选会和等审核的同样候选重复，应抛 ConcurrencyConflict")
+    assert repo.get_knowledge(SHOP_A, first.id).status == KnowledgeStatus.APPROVED
+    repo.set_knowledge_status(SHOP_A, second.id, KnowledgeStatus.RETIRED)
+    assert repo.set_knowledge_status(SHOP_A, first.id, KnowledgeStatus.CANDIDATE).status == (
+        KnowledgeStatus.CANDIDATE
+    )
+
+
 # ---------------------------------------------------------------- 会话
 
 
@@ -326,6 +390,70 @@ def check_conversation_recall(make: Callable[[], ConversationRepository]) -> Non
     assert [m.msg_id for m in repo.recent_messages(SHOP_B, conv)] == ["m_r1"]
     assert repo.purge_shop(SHOP_A) > 0
     assert repo.recent_messages(SHOP_A, conv) == []
+
+
+def check_recall_before_message(make: Callable[[FakeClock], ConversationRepository]) -> None:
+    """撤回先于被撤回的消息到达（§8.3 平台推送乱序、§5.3 撤回的消息不再进上下文）。
+
+    本店没见过的 msg_id 被撤回时记一条墓碑（按店铺 + 会话），recall_message 仍返回 False；
+    墓碑有效期（RECALL_TOMBSTONE_TTL）内这条消息到达时丢弃：不保存、add_message / add_outgoing
+    返回 False（引擎当作重复消息，不回答），之后按撤回过的消息去重。过期的墓碑不再生效；
+    取消订购时和会话一起删除。make 用传入的时钟判断过期。
+    """
+    clock = FakeClock(NOW)
+    repo = make(clock)
+    world = build_demo_world()
+    conv = "conv_early_recall"
+
+    def buyer(msg_id: str, text: str = "在吗", **kw: object) -> object:
+        kw.setdefault("conversation_id", conv)
+        kw.setdefault("at", clock.now())
+        return make_message(text, world=world, msg_id=msg_id, **kw)  # type: ignore[arg-type]
+
+    assert repo.recall_message(SHOP_A, conv, "m_e1") is False  # 没有消息被撤回
+    assert repo.recall_message(SHOP_A, conv, "m_e1") is False  # 平台重推的撤回：幂等
+    early = buyer("m_e1", "我的手机号13812345678，这件有M码吗")
+    assert repo.add_message(early) is False  # 到达时丢弃：不保存、不回答
+    assert repo.recent_messages(SHOP_A, conv) == []
+    assert repo.get_conversation(SHOP_A, conv) is not None  # 会话照常建立
+    assert repo.add_message(early) is False  # 平台重推：仍然去重
+    clock.advance(seconds=5)
+    assert repo.add_message(buyer("m_e2", "那黑色的吧")) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, conv)] == ["m_e2"]
+
+    # 客服 / 机器人发出的消息也可能先收到撤回
+    assert repo.recall_message(SHOP_A, conv, "out_e1") is False
+    for _ in range(2):  # 第二次是平台重推
+        assert not repo.add_outgoing(
+            shop_id=SHOP_A,
+            conversation_id=conv,
+            msg_id="out_e1",
+            role=Role.AGENT,
+            text="有的亲",
+            at=clock.now(),
+        )
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, conv)] == ["m_e2"]
+
+    # 按店铺 + 会话：别的会话、别的店铺同样的 msg_id 照常保存
+    assert repo.recall_message(SHOP_A, conv, "m_e3") is False
+    assert repo.add_message(buyer("m_e3", conversation_id="conv_early_other")) is True
+    assert repo.add_message(buyer("m_e3", shop_id=SHOP_B)) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_B, conv)] == ["m_e3"]
+    # 本店已经见过的 msg_id（在别的会话里）：不记墓碑，也不影响那条消息
+    assert repo.recall_message(SHOP_A, "conv_early_third", "m_e3") is False
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, "conv_early_other")] == ["m_e3"]
+
+    # 墓碑过期后到达的消息照常保存
+    assert repo.recall_message(SHOP_A, conv, "m_e4") is False
+    clock.advance(seconds=RECALL_TOMBSTONE_TTL.total_seconds() + 1)
+    assert repo.add_message(buyer("m_e4", "什么时候发货")) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, conv)] == ["m_e2", "m_e4"]
+
+    # 取消订购：墓碑一起删掉（之后同一个 msg_id 是新消息）
+    assert repo.recall_message(SHOP_A, conv, "m_e5") is False
+    assert repo.purge_shop(SHOP_A) > 0
+    assert repo.add_message(buyer("m_e5")) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_B, conv)] == ["m_e3"]
 
 
 # ---------------------------------------------------------------- 推荐
@@ -615,6 +743,82 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
     # B 自己读得到（证明数据确实写进去了）
     assert repos.suggestions.get(SHOP_B, b_sug.id) is not None
     assert repos.reviews.get(SHOP_B, "as_9001") is not None
+
+
+# ---------------------------------------------------------------- 取消订购后的清理（§8.4）
+
+
+def check_purge_is_idempotent(make: Callable[[], RepoSet]) -> None:
+    """purge_shop 删掉这家店铺的全部数据、返回删除条数，别的店铺一行不动；再调一次返回 0
+    （AuthGuard.revoke 中途失败时可以重试）。两种实现对同样的数据返回同样的条数。"""
+    repos = make()
+    world = build_demo_world()
+    seed_knowledge(repos.knowledge, world)
+    for shop in (SHOP_A, SHOP_B):
+        for i in (1, 2):
+            repos.conversations.add_message(
+                make_message(
+                    "在吗",
+                    world=world,
+                    shop_id=shop,
+                    msg_id=f"m_p{i}",
+                    conversation_id="conv_purge",
+                    at=NOW + timedelta(seconds=i),
+                )
+            )
+        repos.conversations.recall_message(shop, "conv_purge", "m_p_later")  # 撤回墓碑
+        for minutes in (1, 2):
+            repos.suggestions.add(_suggestion(shop, "conv_purge", minutes=minutes))
+        repos.feedback.add_gap(KnowledgeGap(shop_id=shop, missing="policy:gift", created_at=NOW))
+        repos.feedback.add_label(LabeledSample(shop_id=shop, text="在吗", created_at=NOW))
+        repos.reviews.save(
+            AfterSaleReview(
+                shop_id=shop,
+                aftersale_id="as_purge",
+                platform_status=AfterSaleStatus.PENDING_REVIEW,
+                state=ReviewState.NEW,
+            ),
+            expected_version=None,
+        )
+    k = repos.knowledge
+    knowledge_rows = (
+        1
+        + len(k.get_policies(SHOP_A))
+        + len(k.list_item_cards(SHOP_A))
+        + len(k.list_knowledge(SHOP_A, status=None))
+    )
+    purgers = {
+        "knowledge": (repos.knowledge, knowledge_rows),
+        "conversations": (repos.conversations, 4),  # 2 条消息 + 会话 + 撤回墓碑
+        "suggestions": (repos.suggestions, 2),
+        "feedback": (repos.feedback, 2),
+        "reviews": (repos.reviews, 1),
+    }
+    for name, (repo, expected) in purgers.items():
+        assert repo.purge_shop(SHOP_A) == expected, name  # type: ignore[attr-defined]
+    for name, (repo, _) in purgers.items():
+        assert repo.purge_shop(SHOP_A) == 0, name  # type: ignore[attr-defined]
+    assert k.get_shop(SHOP_A) is None and k.list_knowledge(SHOP_A, status=None) == []
+    assert repos.conversations.recent_messages(SHOP_A, "conv_purge") == []
+    assert repos.suggestions.list(SHOP_A) == [] and repos.reviews.get(SHOP_A, "as_purge") is None
+    assert repos.feedback.list_gaps(SHOP_A) == [] and repos.feedback.list_labels(SHOP_A) == []
+    # 别的店铺不受影响（墓碑也还在：B 的 m_p_later 到达时照样丢弃）
+    assert k.get_shop(SHOP_B) is not None
+    assert len(repos.conversations.recent_messages(SHOP_B, "conv_purge")) == 2
+    assert (
+        repos.conversations.add_message(
+            make_message(
+                "在吗",
+                world=world,
+                shop_id=SHOP_B,
+                msg_id="m_p_later",
+                conversation_id="conv_purge",
+            )
+        )
+        is False
+    )
+    assert len(repos.suggestions.list(SHOP_B)) == 2 and repos.reviews.get(SHOP_B, "as_purge")
+    assert len(repos.feedback.list_gaps(SHOP_B)) == 1
 
 
 # ---------------------------------------------------------------- 文本清洗（NUL 等控制字符）

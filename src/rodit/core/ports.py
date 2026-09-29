@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
@@ -358,7 +358,11 @@ class KnowledgeRepository(Protocol):
     def upsert_item_card(self, card: ItemCard) -> None: ...
 
     def add_knowledge(self, item: KnowledgeItem) -> KnowledgeItem:
-        """新增 FAQ（忽略传入的 id），返回带新 id 的记录；created_at 为空时由实现补上。"""
+        """新增 FAQ（忽略传入的 id），返回带新 id 的记录；created_at 为空时由实现补上。
+
+        等审核的候选知识不重复（§5.8）：新增的是 CANDIDATE，而本店已有问题、回答、商品、问题类型
+        都相同的 CANDIDATE 时抛 ConcurrencyConflict、不写入（多个实例同时把同一条编辑回复变成候选，
+        只能建出一条；由存储保证，调用方读到的"没有"可能已经过时）。"""
         ...
 
     def get_knowledge(self, shop_id: str, knowledge_id: int) -> KnowledgeItem | None: ...
@@ -401,7 +405,8 @@ class KnowledgeRepository(Protocol):
     ) -> KnowledgeItem:
         """不存在（或不属于该店）抛 KeyError。
         expected_status 不为空时是比较后更新：当前状态不等于它就抛 ConcurrencyConflict、不写入
-        （多实例部署时防止商家审核通过和驳回同时发生，后写的覆盖先写的）。"""
+        （多实例部署时防止商家审核通过和驳回同时发生，后写的覆盖先写的）。
+        改成 CANDIDATE 时和已有的候选重复（见 add_knowledge）也抛 ConcurrencyConflict、不写入。"""
         ...
 
     def set_knowledge_embedding(
@@ -415,6 +420,11 @@ class KnowledgeRepository(Protocol):
         ...
 
 
+RECALL_TOMBSTONE_TTL = timedelta(days=3)
+"""撤回先于消息到达时墓碑的默认有效期（ConversationRepository.recall_message）：平台推送乱序、
+重推都在这个时间之内【待确认，按平台消息服务的积压 / 重推上限调整】；过期的墓碑不再生效。"""
+
+
 @runtime_checkable
 class ConversationRepository(Protocol):
     """会话与消息（§10 conversation / message）。按 (shop_id, msg_id) 去重。"""
@@ -422,7 +432,9 @@ class ConversationRepository(Protocol):
     def add_message(self, msg: StandardMessage) -> bool:
         """保存买家消息（没有会话时自动建会话）；msg_id 重复时返回 False、不重复保存。
         StoredMessage.created_at = msg.received_at；
-        商品卡片、订单卡片存进 item_id / sku_id / order_ref。"""
+        商品卡片、订单卡片存进 item_id / sku_id / order_ref。
+        这条消息先被撤回过（见 recall_message 的墓碑）：不保存它的文字和卡片、返回 False
+        （引擎当作重复消息，不回答），会话照常建立，之后按撤回过的消息去重。"""
         ...
 
     def add_outgoing(
@@ -435,7 +447,8 @@ class ConversationRepository(Protocol):
         text: str,
         at: datetime,
     ) -> bool:
-        """保存客服 / 系统发出的消息，用于多轮上下文。msg_id 重复或会话不存在返回 False。"""
+        """保存客服 / 系统发出的消息，用于多轮上下文。msg_id 重复或会话不存在返回 False。
+        这条消息先被撤回过（会话存在时）：同 add_message，不保存、返回 False。"""
         ...
 
     def get_conversation(self, shop_id: str, conversation_id: str) -> Conversation | None: ...
@@ -448,11 +461,18 @@ class ConversationRepository(Protocol):
 
     def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
         """消息被撤回（§5.3）：删掉它的文字和卡片，之后 recent_messages 不再返回它；msg_id 仍算
-        见过（平台重推这条消息时 add_message / add_outgoing 返回 False）。
-        找不到这条消息、或已经撤回过时返回 False。"""
+        见过（平台重推这条消息时 add_message / add_outgoing 返回 False）。撤回了返回 True。
+
+        找不到这条消息、或已经撤回过时返回 False。本店从没见过这个 msg_id（平台推送乱序，
+        撤回先到，§8.3）：按 (shop_id, conversation_id, msg_id) 记一条墓碑，有效期
+        （实现的构造参数，默认 RECALL_TOMBSTONE_TTL，按注入的时钟判断）内这条消息到达时丢弃
+        （见 add_message / add_outgoing）；墓碑用掉或过期即删，数量有界。多个实例同时处理
+        撤回和这条消息时，结果和先后处理一样（消息不会留下来）。"""
         ...
 
-    def purge_shop(self, shop_id: str) -> int: ...
+    def purge_shop(self, shop_id: str) -> int:
+        """删除该店铺的会话、消息和撤回墓碑（§8.4），返回删除条数；再调一次返回 0。"""
+        ...
 
 
 @runtime_checkable

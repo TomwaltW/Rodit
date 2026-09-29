@@ -20,6 +20,10 @@
 再抛出异常（补偿），客服重试能完整走一遍，派生数据和审计不会因为状态已改而永久丢失。
 重试时候选知识按内容去重（归到上次写进去的那条，审计照常补上）；标注、知识缺失在"派生数据写成、
 审计失败"时可能多出一条（至少一次）。
+
+多实例（§5.8 候选知识去重）：进程内的锁只管本实例。两个实例同时把同样的编辑回复变成候选知识时，
+由存储保证只建一条（KnowledgeRepository.add_knowledge 对重复的等审核候选抛 ConcurrencyConflict，
+PostgreSQL 是部分唯一索引），后到的一方重新读到先建的那条、归到它上面（见 _make_candidate）。
 """
 
 from __future__ import annotations
@@ -83,6 +87,7 @@ _REALTIME_PREFIXES = tuple(
     )
 )
 _NOT_HUMAN = frozenset({"system", "bot", "auto"})
+_CANDIDATE_ATTEMPTS = 3  # 新建候选知识撞上别的实例刚建的同样候选时，最多重读几次
 
 _log = logging.getLogger(__name__)
 
@@ -437,10 +442,46 @@ class FeedbackService:
         if any(e.startswith(_REALTIME_PREFIXES) for e in record.evidence_ids):
             return None, SKIP_REALTIME
         question = minimize_text(record.question_text)
+        conflict: ConcurrencyConflict | None = None
+        for _ in range(_CANDIDATE_ATTEMPTS):
+            existing = self._pending_candidate(record, question, answer)
+            if existing is not None:
+                # 同样的候选已在等审核：这次反馈归到它上面，不再新建。它可能就是这次反馈上一次
+                # 没写完（审计失败、推荐退回展示中）留下的——分不出来，所以一律当作这次反馈的
+                # 候选，由调用方照常写 candidate_id 和 knowledge.candidate 审计，
+                # 候选知识不会没有来历
+                return existing, None
+            try:
+                saved = self._knowledge.add_knowledge(
+                    KnowledgeItem(
+                        shop_id=record.shop_id,
+                        question=question,
+                        answer=answer,
+                        source=KnowledgeSource.ADOPTED,
+                        status=KnowledgeStatus.CANDIDATE,
+                        item_id=record.item_id,
+                        intent=record.intent,
+                        created_at=now,
+                    )
+                )
+            except ConcurrencyConflict as exc:
+                # 另一个实例刚建了同样的候选（上面的检查读到的"没有"已经过时，进程内的锁管不到
+                # 别的实例）：存储挡下了第二条，重新读一次，归到先建的那条上
+                conflict = exc
+                continue
+            return saved, None
+        # 一直冲突又读不到那条（它在这期间又被审核掉了）：按写失败处理，推荐退回展示中，客服重试
+        assert conflict is not None
+        raise conflict
+
+    def _pending_candidate(
+        self, record: SuggestionRecord, question: str, answer: str
+    ) -> KnowledgeItem | None:
+        """等审核的同样候选（问题、回答、商品、问题类型都相同）。"""
         pending = self._knowledge.list_knowledge(
             record.shop_id, status=KnowledgeStatus.CANDIDATE, item_id=record.item_id
         )
-        existing = next(
+        return next(
             (
                 k
                 for k in pending
@@ -451,24 +492,6 @@ class FeedbackService:
             ),
             None,
         )
-        if existing is not None:
-            # 同样的候选已在等审核：这次反馈归到它上面，不再新建。它可能就是这次反馈上一次没写完
-            # （审计失败、推荐退回展示中）留下的——分不出来，所以一律当作这次反馈的候选，
-            # 由调用方照常写 candidate_id 和 knowledge.candidate 审计，候选知识不会没有来历
-            return existing, None
-        saved = self._knowledge.add_knowledge(
-            KnowledgeItem(
-                shop_id=record.shop_id,
-                question=question,
-                answer=answer,
-                source=KnowledgeSource.ADOPTED,
-                status=KnowledgeStatus.CANDIDATE,
-                item_id=record.item_id,
-                intent=record.intent,
-                created_at=now,
-            )
-        )
-        return saved, None
 
     def _record(
         self,

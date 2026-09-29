@@ -78,3 +78,27 @@ def test_hashing_embedder_is_deterministic_and_normalized():
     assert abs(cosine(a, b) - 1.0) < 1e-9  # 标点不影响
     assert cosine(a, emb.embed_one("发啥快递")) > cosine(a, c)
     assert emb.embed_one("") == [0.0] * 128
+
+
+# ---------------------------------------------------------------- 撤回先于消息、候选去重、清理
+
+
+def test_recall_before_message_contract():
+    contracts.check_recall_before_message(lambda clock: InMemoryConversationRepository(clock=clock))
+
+
+def test_candidate_uniqueness_contract():
+    contracts.check_candidate_uniqueness(lambda: InMemoryKnowledgeRepository(FakeClock()))
+
+
+def test_purge_is_idempotent_contract():
+    contracts.check_purge_is_idempotent(
+        lambda: contracts.RepoSet(
+            knowledge=InMemoryKnowledgeRepository(FakeClock()),
+            conversations=InMemoryConversationRepository(),
+            suggestions=InMemorySuggestionRepository(),
+            feedback=InMemoryFeedbackRepository(),
+            reviews=InMemoryAfterSaleReviewRepository(),
+            auth=InMemoryShopAuthRepository(),
+        )
+    )

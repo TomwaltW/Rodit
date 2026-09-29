@@ -20,7 +20,7 @@ import json
 import os
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -55,6 +55,7 @@ from rodit.core.models import (
     SuggestionRecord,
     strip_control_chars,
 )
+from rodit.core.ports import RECALL_TOMBSTONE_TTL
 from rodit.inmemory.embedding import cosine
 from rodit.storage.db import Conn, Database, StorageUnavailable
 
@@ -128,9 +129,9 @@ class PgKnowledgeRepository:
         self._clock = clock or SystemClock()
 
     @contextmanager
-    def _session(self, shop_id: str, *, unbounded: bool = False) -> Iterator[Conn]:
+    def _session(self, shop_id: str) -> Iterator[Conn]:
         try:
-            with self._db.session(shop_id, unbounded=unbounded) as conn:
+            with self._db.session(shop_id) as conn:
                 yield conn
         except (StorageUnavailable, psycopg.OperationalError) as e:
             raise KnowledgeUnavailable("知识库暂时不可用") from e
@@ -223,13 +224,15 @@ class PgKnowledgeRepository:
 
     # ---- FAQ
     def add_knowledge(self, item: KnowledgeItem) -> KnowledgeItem:
+        # 同样的候选已在等审核（部分唯一索引 knowledge_item_pending_candidate_uniq，迁移版本 3）：
+        # ON CONFLICT 等并发写入的事务提交后再判断，不写入也不中断事务，转成 ConcurrencyConflict
         created_at = item.created_at or self._clock.now()
         with self._session(item.shop_id) as conn:
             r = conn.execute(
                 "INSERT INTO knowledge_item (shop_id, question, answer, source, status, item_id,"
                 " intent, approved_by, created_at, embedding)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
-                f" RETURNING {_K_COLS}",
+                f" ON CONFLICT DO NOTHING RETURNING {_K_COLS}",
                 (
                     item.shop_id,
                     item.question,
@@ -243,7 +246,8 @@ class PgKnowledgeRepository:
                     list(item.embedding) if item.embedding is not None else None,
                 ),
             ).fetchone()
-        assert r is not None
+        if r is None:
+            raise ConcurrencyConflict("同样的候选知识已在等商家审核")
         return _knowledge(r)
 
     def get_knowledge(self, shop_id: str, knowledge_id: int) -> KnowledgeItem | None:
@@ -314,22 +318,26 @@ class PgKnowledgeRepository:
         if expected_status is not None:
             cond += " AND status = %s"
             params.append(expected_status)
-        with self._session(shop_id) as conn:
-            r = conn.execute(
-                "UPDATE knowledge_item SET status = %s, approved_by = COALESCE(%s, approved_by)"
-                f" WHERE {cond} RETURNING {_K_COLS}",
-                [status, approved_by, *params],
-            ).fetchone()
-            if r is None and expected_status is not None:
-                cur = conn.execute(
-                    "SELECT status FROM knowledge_item WHERE shop_id = %s AND id = %s",
-                    (shop_id, knowledge_id),
+        try:
+            with self._session(shop_id) as conn:
+                r = conn.execute(
+                    "UPDATE knowledge_item SET status = %s, approved_by = COALESCE(%s, approved_by)"
+                    f" WHERE {cond} RETURNING {_K_COLS}",
+                    [status, approved_by, *params],
                 ).fetchone()
-                if cur is not None:
-                    raise ConcurrencyConflict(
-                        f"知识 {knowledge_id} 的状态已是 {cur['status']}，"
-                        f"不是 {KnowledgeStatus(expected_status).value}"
-                    )
+                if r is None and expected_status is not None:
+                    cur = conn.execute(
+                        "SELECT status FROM knowledge_item WHERE shop_id = %s AND id = %s",
+                        (shop_id, knowledge_id),
+                    ).fetchone()
+                    if cur is not None:
+                        raise ConcurrencyConflict(
+                            f"知识 {knowledge_id} 的状态已是 {cur['status']}，"
+                            f"不是 {KnowledgeStatus(expected_status).value}"
+                        )
+        except psycopg.errors.UniqueViolation as e:
+            # 改回候选时和等审核的同样候选重复（部分唯一索引）：不写入
+            raise ConcurrencyConflict(f"知识 {knowledge_id} 和等审核的候选知识重复") from e
         if r is None:
             raise KeyError(knowledge_id)
         return _knowledge(r)
@@ -346,13 +354,15 @@ class PgKnowledgeRepository:
                 raise KeyError(knowledge_id)
 
     def purge_shop(self, shop_id: str) -> int:
-        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
-        with self._session(shop_id, unbounded=True) as conn:
-            n = 0
-            for table in ("shop_policy", "item_card", "knowledge_item"):
-                n += conn.execute(f"DELETE FROM {table} WHERE shop_id = %s", (shop_id,)).rowcount
-            n += conn.execute("DELETE FROM shop WHERE id = %s", (shop_id,)).rowcount
-            return n
+        # §8.4 分批删、每批一个短事务（Database.purge_rows）；店铺本身最后删
+        try:
+            n = sum(
+                self._db.purge_rows(shop_id, table)
+                for table in ("shop_policy", "item_card", "knowledge_item")
+            )
+            return n + self._db.purge_rows(shop_id, "shop", column="id")
+        except (StorageUnavailable, psycopg.OperationalError) as e:
+            raise KnowledgeUnavailable("知识库暂时不可用") from e
 
 
 # ================================================================ 会话（§5.3、§8.3）
@@ -364,21 +374,78 @@ def _message(r: Row) -> StoredMessage:
     return StoredMessage(**{**r, "created_at": _cst(r["created_at"])})
 
 
+_TOMBSTONE_CLEANUP_ROWS = 100
+"""写撤回墓碑时顺带删掉的本店过期墓碑上限（每次一小批，数量随有效期有界）。"""
+
+
 class PgConversationRepository:
-    """实现 core.ports.ConversationRepository（conversation / message）。
+    """实现 core.ports.ConversationRepository（conversation / message / message_recall）。
 
     消息按 (shop_id, msg_id) 去重（唯一约束 + ON CONFLICT DO NOTHING，并发重复推送也只存一条）。
     先写消息、再补会话：message 指向 conversation 的外键延迟到提交时检查，
     所以重复消息不会凭空建出会话。
     撤回的消息留一行"墓碑"继续占住 msg_id（去重），文字和卡片清空：text IS NULL 表示已撤回
     （正常写入的消息 text 都不是 NULL），recent_messages 不返回它。
+
+    撤回先于消息到达（§8.3 平台推送乱序）：本店没见过的 msg_id 被撤回时在 message_recall 记一条
+    墓碑（按店铺 + 会话，有效期 recall_ttl，按注入的时钟判断）。消息到达时删掉墓碑：还在有效期内
+    就把这条消息存成已撤回的行（文字和卡片为 NULL，占住 msg_id 去重）、返回 False。记墓碑时顺带
+    删掉本店过期的墓碑（每次最多 _TOMBSTONE_CLEANUP_ROWS 条），墓碑数量随有效期有界。
+
+    撤回和消息写入按 (shop_id, msg_id) 取事务级 advisory lock 串行：多个实例同时处理撤回和这条消息
+    时，后拿到锁的一方在 READ COMMITTED 下每条语句取新快照，一定看得到先提交的一方写下的消息或墓碑，
+    不会出现"撤回没找到消息、消息也没看到墓碑"两边都落空、消息留下来的情况。
     """
 
-    def __init__(self, db: Database) -> None:
+    def __init__(
+        self,
+        db: Database,
+        *,
+        clock: Clock | None = None,
+        recall_ttl: timedelta = RECALL_TOMBSTONE_TTL,
+    ) -> None:
+        if recall_ttl <= timedelta(0):
+            raise ValueError("recall_ttl 必须为正")
         self._db = db
+        self._clock = clock or SystemClock()
+        self._recall_ttl = recall_ttl
+
+    @staticmethod
+    def _lock_msg_id(conn: Conn, shop_id: str, msg_id: str) -> None:
+        """同一店铺同一 msg_id 的撤回和写入串行（事务结束自动释放）。"""
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"rodit.message:{shop_id}:{msg_id}",),
+        )
+
+    @staticmethod
+    def _take_tombstone(
+        conn: Conn,
+        shop_id: str,
+        conversation_id: str,
+        msg_id: str,
+        now: datetime,
+        *,
+        conversation_must_exist: bool = False,
+    ) -> bool:
+        """删掉这条消息的撤回墓碑（用掉或已过期都删）；墓碑还在有效期内返回 True。"""
+        cond = "shop_id = %s AND conversation_id = %s AND msg_id = %s"
+        params: list[object] = [shop_id, conversation_id, msg_id]
+        if conversation_must_exist:
+            cond += " AND EXISTS (SELECT 1 FROM conversation WHERE shop_id = %s AND id = %s)"
+            params += [shop_id, conversation_id]
+        row = conn.execute(
+            f"DELETE FROM message_recall WHERE {cond} RETURNING expires_at", params
+        ).fetchone()
+        return row is not None and row["expires_at"] > now
 
     def add_message(self, msg: StandardMessage) -> bool:
+        now = self._clock.now()
         with self._db.session(msg.shop_id) as conn:
+            self._lock_msg_id(conn, msg.shop_id, msg.msg_id)
+            # 先被撤回过（§8.3 撤回先到）：存成已撤回的行，只占住 msg_id，不留文字和卡片
+            recalled = self._take_tombstone(conn, msg.shop_id, msg.conversation_id, msg.msg_id, now)
+            kept = not recalled
             inserted = conn.execute(
                 f"INSERT INTO message ({_M_COLS})"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
@@ -388,10 +455,10 @@ class PgConversationRepository:
                     msg.shop_id,
                     msg.conversation_id,
                     msg.role,
-                    msg.text,
-                    msg.item_card.item_id if msg.item_card else None,
-                    msg.item_card.sku_id if msg.item_card else None,
-                    msg.order_card.order_id if msg.order_card else None,
+                    msg.text if kept else None,
+                    msg.item_card.item_id if msg.item_card and kept else None,
+                    msg.item_card.sku_id if msg.item_card and kept else None,
+                    msg.order_card.order_id if msg.order_card and kept else None,
                     msg.received_at,
                 ),
             ).fetchone()
@@ -402,7 +469,7 @@ class PgConversationRepository:
                 " VALUES (%s, %s, %s, %s) ON CONFLICT (shop_id, id) DO NOTHING",
                 (msg.shop_id, msg.conversation_id, msg.buyer_ref, msg.received_at),
             )
-            return True
+            return kept
 
     def add_outgoing(
         self,
@@ -414,7 +481,13 @@ class PgConversationRepository:
         text: str,
         at: datetime,
     ) -> bool:
+        now = self._clock.now()
         with self._db.session(shop_id) as conn:
+            self._lock_msg_id(conn, shop_id, msg_id)
+            # 会话不存在时不写、墓碑也留着（和内存实现一致）
+            recalled = self._take_tombstone(
+                conn, shop_id, conversation_id, msg_id, now, conversation_must_exist=True
+            )
             inserted = conn.execute(
                 "INSERT INTO message (msg_id, shop_id, conversation_id, role, text, created_at)"
                 " SELECT %s, %s, %s, %s, %s, %s"
@@ -426,13 +499,13 @@ class PgConversationRepository:
                     shop_id,
                     conversation_id,
                     role,
-                    strip_control_chars(text),
+                    None if recalled else strip_control_chars(text),
                     at,
                     shop_id,
                     conversation_id,
                 ),
             ).fetchone()
-            return inserted is not None
+            return inserted is not None and not recalled
 
     def get_conversation(self, shop_id: str, conversation_id: str) -> Conversation | None:
         with self._db.session(shop_id) as conn:
@@ -468,21 +541,53 @@ class PgConversationRepository:
         return [_message(r) for r in rows]
 
     def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
+        now = self._clock.now()
         with self._db.session(shop_id) as conn:
+            self._lock_msg_id(conn, shop_id, msg_id)
             updated = conn.execute(
                 "UPDATE message SET text = NULL, item_id = NULL, sku_id = NULL, order_ref = NULL"
                 " WHERE shop_id = %s AND conversation_id = %s AND msg_id = %s"
                 " AND text IS NOT NULL RETURNING id",
                 (shop_id, conversation_id, msg_id),
             ).fetchone()
-            return updated is not None
+            if updated is not None:
+                return True
+            # 本店没见过这个 msg_id：撤回先到了（§8.3），记墓碑。同一条的墓碑已过期时重新计时
+            recorded = conn.execute(
+                "INSERT INTO message_recall"
+                " (shop_id, conversation_id, msg_id, recalled_at, expires_at)"
+                " SELECT %s, %s, %s, %s, %s"
+                " WHERE NOT EXISTS (SELECT 1 FROM message WHERE shop_id = %s AND msg_id = %s)"
+                " ON CONFLICT (shop_id, conversation_id, msg_id) DO UPDATE"
+                " SET recalled_at = EXCLUDED.recalled_at, expires_at = EXCLUDED.expires_at"
+                " WHERE message_recall.expires_at <= EXCLUDED.recalled_at"
+                " RETURNING 1",
+                (
+                    shop_id,
+                    conversation_id,
+                    msg_id,
+                    now,
+                    now + self._recall_ttl,
+                    shop_id,
+                    msg_id,
+                ),
+            ).fetchone()
+            if recorded is not None:
+                conn.execute(
+                    "DELETE FROM message_recall WHERE ctid = ANY(ARRAY("
+                    " SELECT ctid FROM message_recall"
+                    " WHERE shop_id = %s AND expires_at <= %s LIMIT %s))",
+                    (shop_id, now, _TOMBSTONE_CLEANUP_ROWS),
+                )
+            return False
 
     def purge_shop(self, shop_id: str) -> int:
-        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
-        with self._db.session(shop_id, unbounded=True) as conn:
-            n = conn.execute("DELETE FROM message WHERE shop_id = %s", (shop_id,)).rowcount
-            n += conn.execute("DELETE FROM conversation WHERE shop_id = %s", (shop_id,)).rowcount
-            return n
+        # §8.4 分批删、每批一个短事务（Database.purge_rows）。先删消息再删会话：
+        # 会话的外键级联会把剩下的消息放进同一个事务里一起删
+        return sum(
+            self._db.purge_rows(shop_id, table)
+            for table in ("message", "conversation", "message_recall")
+        )
 
 
 # ================================================================ 推荐（§5.6、§10 suggestion）
@@ -602,9 +707,8 @@ class PgSuggestionRepository:
         return [_suggestion(r) for r in rows]
 
     def purge_shop(self, shop_id: str) -> int:
-        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
-        with self._db.session(shop_id, unbounded=True) as conn:
-            return conn.execute("DELETE FROM suggestion WHERE shop_id = %s", (shop_id,)).rowcount
+        # §8.4 分批删、每批一个短事务（Database.purge_rows）
+        return self._db.purge_rows(shop_id, "suggestion")
 
 
 # ================================================================ 反馈（§5.8）
@@ -684,11 +788,10 @@ class PgFeedbackRepository:
         return [_label(r) for r in rows]
 
     def purge_shop(self, shop_id: str) -> int:
-        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
-        with self._db.session(shop_id, unbounded=True) as conn:
-            n = conn.execute("DELETE FROM knowledge_gap WHERE shop_id = %s", (shop_id,)).rowcount
-            n += conn.execute("DELETE FROM labeled_sample WHERE shop_id = %s", (shop_id,)).rowcount
-            return n
+        # §8.4 分批删、每批一个短事务（Database.purge_rows）
+        return self._db.purge_rows(shop_id, "knowledge_gap") + self._db.purge_rows(
+            shop_id, "labeled_sample"
+        )
 
 
 # ================================================================ 售后审核（§7.3.2）
@@ -820,11 +923,8 @@ class PgAfterSaleReviewRepository:
         return [_review(r) for r in rows]
 
     def purge_shop(self, shop_id: str) -> int:
-        # §8.4 清理不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）
-        with self._db.session(shop_id, unbounded=True) as conn:
-            return conn.execute(
-                "DELETE FROM aftersale_review WHERE shop_id = %s", (shop_id,)
-            ).rowcount
+        # §8.4 分批删、每批一个短事务（Database.purge_rows）
+        return self._db.purge_rows(shop_id, "aftersale_review")
 
 
 # ================================================================ 授权（§8.4）
@@ -1023,9 +1123,9 @@ class PgAuditLog:
     def purge_shop(self, shop_id: str) -> int:
         """删除该店铺的审计和判断记录（§8.4 按约定删除数据时调用；是否保留由委托协议决定）。
 
-        不受请求级语句 / 等锁超时约束（Database.session 的 unbounded）：审计记录量最大。
+        审计记录量最大：分批删、每批一个短事务，不受请求级语句 / 等锁超时约束
+        （Database.purge_rows）。
         """
-        with self._db.session(shop_id, unbounded=True) as conn:
-            n = conn.execute("DELETE FROM audit_log WHERE shop_id = %s", (shop_id,)).rowcount
-            n += conn.execute("DELETE FROM decision_log WHERE shop_id = %s", (shop_id,)).rowcount
-            return n
+        return self._db.purge_rows(shop_id, "audit_log") + self._db.purge_rows(
+            shop_id, "decision_log"
+        )

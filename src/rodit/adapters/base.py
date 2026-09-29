@@ -191,6 +191,13 @@ class _LRU:
             self._data.popitem(last=False)
         return True
 
+    def discard(self, key: str) -> bool:
+        """删掉 key；原来有返回 True。"""
+        if key not in self._data:
+            return False
+        del self._data[key]
+        return True
+
     def __len__(self) -> int:
         return len(self._data)
 
@@ -266,6 +273,9 @@ class BaseMockAdapter:
         self._max_conversations = max_conversations
         self._lock = threading.Lock()
         self._seen: dict[str, _LRU] = {}
+        # 撤回先于消息到达（§8.3 乱序）：本地上下文里还没有的被撤回消息（会话 + msg_id），
+        # 那条消息到了也不进本地上下文。每个店铺最多 dedup_capacity 条
+        self._recalled: dict[str, _LRU] = {}
         self._conversations: dict[str, OrderedDict[str, _Conversation]] = {}
         self._outbox: list[OutgoingMessage] = []
         self._transfers: list[TransferRecord] = []
@@ -442,6 +452,7 @@ class BaseMockAdapter:
         with self._lock:
             n = len(self._conversations.pop(shop_id, {}))
             self._seen.pop(shop_id, None)
+            self._recalled.pop(shop_id, None)
             before = len(self._outbox) + len(self._transfers)
             self._outbox = [m for m in self._outbox if m.shop_id != shop_id]
             self._transfers = [t for t in self._transfers if t.shop_id != shop_id]
@@ -463,6 +474,11 @@ class BaseMockAdapter:
         else:
             convs.move_to_end(conversation_id)
         return conv
+
+    def _take_recalled(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
+        """这条消息先收到过撤回（本地记下的），用掉这条记录。调用方持有锁。"""
+        recalled = self._recalled.get(shop_id)
+        return recalled is not None and recalled.discard(f"{conversation_id}\x1f{msg_id}")
 
     def _first_time(self, shop_id: str, msg_id: str) -> bool:
         seen = self._seen.get(shop_id)
@@ -521,6 +537,9 @@ class BaseMockAdapter:
                 return None
             if not self._first_time(event.shop_id, event.msg_id):
                 return None
+            if self._take_recalled(event.shop_id, event.conversation_id, event.msg_id):
+                # 先被撤回过：不进本地上下文；照常交给应用层，会话仓储按撤回墓碑丢弃它
+                return msg
             conv = self._touch_conversation(event.shop_id, event.conversation_id)
             conv.messages.append(
                 StoredMessage(
@@ -562,23 +581,35 @@ class BaseMockAdapter:
             except ValidationError:
                 return None
             conv = self._conversation(event.shop_id, event.conversation_id)
-            # 没有买家消息的会话本地不记客服消息；重推的同一条不重复追加
-            if conv is not None and all(m.msg_id != event.msg_id for m in conv.messages):
+            recalled = self._take_recalled(event.shop_id, event.conversation_id, event.msg_id)
+            # 没有买家消息的会话本地不记客服消息；重推的同一条不重复追加；先被撤回过的不记
+            if (
+                conv is not None
+                and not recalled
+                and all(m.msg_id != event.msg_id for m in conv.messages)
+            ):
                 conv.messages.append(stored)
         return stored.model_copy()
 
     def _accept_recall(self, event: RawEvent) -> MessageRecall | None:
         """撤回不按 msg_id 挡掉重推：应用层写会话失败时抛错让平台重推，这里要照样交出去。
         撤回本身是幂等的（本地上下文再删一次没有变化；ConversationRepository.recall_message
-        对已经撤回的消息返回 False）。"""
+        对已经撤回的消息返回 False）。本地上下文里还没有被撤回的那条（撤回先到，§8.3 乱序）：
+        记下它，那条消息到了不进本地上下文（get_context 不返回它）；是否丢弃由会话仓储的撤回墓碑
+        决定，这里照常把消息交给应用层。"""
         recalled = opt_str(event.recalled_msg_id)
         if recalled is None:
             return None
         with self._lock:
             conv = self._conversation(event.shop_id, event.conversation_id)
-            if conv is not None:
-                kept = [m for m in conv.messages if m.msg_id != recalled]
+            kept = [m for m in conv.messages if m.msg_id != recalled] if conv is not None else []
+            if conv is not None and len(kept) != len(conv.messages):
                 conv.messages = deque(kept, maxlen=self._context_limit)
+            else:  # 本地还没有这条（撤回先到，§8.3）：记下，那条消息到了不进本地上下文
+                marks = self._recalled.get(event.shop_id)
+                if marks is None:
+                    marks = self._recalled[event.shop_id] = _LRU(self._dedup_capacity)
+                marks.add(f"{event.conversation_id}\x1f{recalled}")
         return MessageRecall(
             shop_id=event.shop_id,
             conversation_id=event.conversation_id,
