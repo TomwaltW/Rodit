@@ -50,13 +50,14 @@ from rodit.decision.rules import RuleProvider
 from rodit.eval.calibration import Sample, reliability
 from rodit.eval.dataset import cases
 from rodit.eval.recalibrate import (
+    CLASSIFIER_REGRESSION_REMINDER,
     DEFAULT_MIN_SUPPORT,
-    REGRESSION_REMINDER,
     ThresholdPlan,
     plan_thresholds,
     proposal_yaml,
     render_plan,
 )
+from rodit.feedback.service import CONFIRMING_RULES
 
 RECOMMENDED_SAMPLES = 2000  # §6.4 积累 2,000–5,000 条带标签数据
 DEFAULT_MIN_SAMPLES = 200  # 低于这个数拒绝训练（除非 force）
@@ -161,6 +162,13 @@ def dedupe(
         counts["labels_total"] += 1
         if label.true_intent is None:
             counts["unlabeled"] += 1
+            continue
+        if (
+            label.source in ("feedback_adopt", "feedback_edit")
+            and label.route_rule is not None
+            and label.route_rule not in CONFIRMING_RULES
+        ):
+            counts["unlabeled"] += 1  # 澄清、安抚发出去不说明类型对了（修正前写下的旧标注）
             continue
         counts["usable"] += 1
         key = feature_key(label.text)
@@ -479,11 +487,8 @@ def render_text(report: TrainReport) -> str:
         "上线：模型文件放在平台单元内（不拷出平台云），部署配置 decision.provider 改成 classifier、"
         "合并上面的阈值片段，环境变量 RODIT_CLASSIFIER_PATH 指向模型文件；质检仍用大模型（§6.4）"
     )
-    add(REGRESSION_REMINDER)
-    add(
-        "注意：python -m rodit.eval 还不能加载模型文件跑整条链路（路由只有关键词规则或大模型），"
-        "上面留出集和评测集的对比只覆盖问题类型识别"
-    )
+    add(CLASSIFIER_REGRESSION_REMINDER)
+    add("上面留出集和评测集的对比只覆盖问题类型识别；整条链路的效果看上面那条回归")
     return "\n".join(lines)
 
 

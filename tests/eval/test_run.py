@@ -184,3 +184,12 @@ def test_classifier_option_rejects_a_broken_model_file(tmp_path):
     err = io.StringIO()
     assert main(["--classifier", str(target)], out=io.StringIO(), err=err) == 2
     assert "路由分类器模型文件不能用" in err.getvalue()
+
+
+def test_classifier_config_without_model_file_is_refused(tmp_path):
+    """provider 是 classifier 却没给 --classifier：不跑（否则测的是关键词规则）。"""
+    config = tmp_path / "rodit.yaml"
+    config.write_text("decision:\n  provider: classifier\n", encoding="utf-8")
+    err = io.StringIO()
+    assert main(["--config", str(config)], out=io.StringIO(), err=err) == 2
+    assert "--classifier" in err.getvalue()

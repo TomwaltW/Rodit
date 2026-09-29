@@ -287,6 +287,20 @@ def test_reject_missing_knowledge_creates_gap(env):
     assert PHONE not in _audit_dump(env)
 
 
+@pytest.mark.parametrize(
+    ("rule", "labeled"), [(7, False), (3, False), (4, True), (1, True), (6, True)]
+)
+def test_only_answer_rules_confirm_the_intent(env, rule, labeled):
+    """澄清（规则 7）、安抚（规则 3）发出去不说明类型对了，不记正样本；按预测类型作答的记。"""
+    rec = env.add(route_rule=rule)
+    out = env.service.record_sent(SHOP_A, rec.id, agent_id=AGENT)
+    assert (out.label is not None) is labeled
+    edited = env.add(route_rule=rule, msg_id="m_e")
+    out = env.service.record_edited(SHOP_A, edited.id, agent_id=AGENT, edited_text="亲，改过的话术")
+    assert (out.label is not None) is labeled
+    assert len(env.feedback.list_labels(SHOP_A)) == (2 if labeled else 0)
+
+
 def test_reject_wrong_intent_creates_label(env):
     rec = env.add(question_text="这个会起球吗", intent=Intent.SIZE_ADVICE)
     out = env.service.record_rejected(

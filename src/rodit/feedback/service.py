@@ -92,6 +92,10 @@ _CANDIDATE_ATTEMPTS = 3  # 新建候选知识撞上别的实例刚建的同样�
 _log = logging.getLogger(__name__)
 
 
+CONFIRMING_RULES = frozenset({1, 4, 6})
+"""发出去就说明问题类型判断对了的路由规则（§6.6）：按预测类型作答的推荐。"""
+
+
 class FeedbackOutcome(BaseModel):
     """一次客服操作的结果：更新后的推荐记录 + 派生数据（没有时为 None）。"""
 
@@ -194,8 +198,10 @@ class FeedbackService:
                 )
             )
             with self._undo_on_failure(record, updated):
-                label = self._confirmed_label(record, "feedback_edit", now)
                 candidate, skipped = self._make_candidate(record, answer, now)
+                # 标注在候选知识写成之后再记：候选写失败退回展示中、客服重试或改点"不合适"时，
+                # 不会留下一条已经撤销的正样本（重复计数或和"理解错误"矛盾）
+                label = self._confirmed_label(record, "feedback_edit", now)
                 self._record(
                     AuditAction.FEEDBACK_EDITED,
                     actor,
@@ -430,8 +436,12 @@ class FeedbackService:
         now: datetime,
     ) -> LabeledSample | None:
         """客服发出去了（原样或编辑后）：问题类型判断对了 → 正样本（§5.8、§6.4）。
-        多问题消息分条的推荐不记（整条消息的文字对不上单个类型）。"""
+        多问题消息分条的推荐不记（整条消息的文字对不上单个类型）；只有按预测类型作答的推荐
+        （§6.6 规则 1 站外标准话术、规则 4 高风险、规则 6 出推荐）才算确认了类型——澄清（规则 7）、
+        安抚（规则 3）发出去不说明类型判断对了。没记规则的旧推荐照旧记。"""
         if not record.question_text or self._is_split_message(record):
+            return None
+        if record.route_rule is not None and record.route_rule not in CONFIRMING_RULES:
             return None
         label = LabeledSample(
             shop_id=record.shop_id,

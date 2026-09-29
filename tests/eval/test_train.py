@@ -19,7 +19,10 @@ from rodit.core.models import LabeledSample
 from rodit.decision import ClassifierProvider, RuleProvider
 from rodit.decision.classifier import dump_artifact, feature_key
 from rodit.eval.dataset import cases
-from rodit.eval.recalibrate import REGRESSION_REMINDER, apply_patch
+from rodit.eval.recalibrate import (
+    CLASSIFIER_REGRESSION_REMINDER,
+    apply_patch,
+)
 from rodit.eval.train import (
     RECOMMENDED_SAMPLES,
     InsufficientTrainingData,
@@ -104,6 +107,20 @@ def test_dedupe_merges_same_features_and_takes_majority():
     assert counts["conflicting_texts"] == 2 and counts["dropped_ties"] == 1
     assert counts["excluded_eval_overlap"] == 1
     assert counts["unique_texts"] == 3
+
+
+def test_dedupe_drops_adoptions_of_clarify_and_soothe_cards():
+    """澄清（规则 7）、安抚（规则 3）的推荐发出去不说明类型对了：修正前写下的正样本不进训练。"""
+    base = _label("还有货吗", Intent.OTHER)  # feedback_adopt
+    labels = [
+        base.model_copy(update={"route_rule": 7}),
+        base.model_copy(update={"route_rule": 3, "source": "feedback_edit"}),
+        base.model_copy(update={"text": "发货了吗", "route_rule": 6}),
+        base.model_copy(update={"text": "能便宜吗", "route_rule": 7, "source": "feedback_reject"}),
+    ]
+    items, counts = dedupe(labels)
+    assert sorted(i.key for i in items) == ["发货了吗", "能便宜吗"]
+    assert counts["unlabeled"] == 2
 
 
 def test_dedupe_is_order_independent(labels):
@@ -217,7 +234,7 @@ def test_render_text(result):
     assert "只生成模型文件" in text and "关键词规则" in text and "留出集" in text
     assert result.report.artifact_sha256 in text
     assert "RODIT_CLASSIFIER_PATH" in text
-    assert REGRESSION_REMINDER in text
+    assert CLASSIFIER_REGRESSION_REMINDER in text and "--classifier" in text
 
 
 # ================================================================ 可复现

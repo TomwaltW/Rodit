@@ -775,6 +775,13 @@ def main(
     try:
         pricing = resolve_pricing(args.price_input, args.price_output)
         config = load_config(args.config) if args.config else None
+        if (
+            config is not None
+            and config.decision.provider == ProviderName.CLASSIFIER
+            and not args.classifier
+        ):
+            # 不然路由悄悄换成关键词规则 / 大模型，回归测的不是要上线的分类器（§13.5）
+            raise ValueError("配置的 decision.provider 是 classifier：用 --classifier 指定模型文件")
         baseline = load_baseline(args.baseline) if args.baseline else None
         route_provider: DecisionProvider | None = None
         if args.classifier:

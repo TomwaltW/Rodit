@@ -27,11 +27,14 @@ from rodit.knowledge.sync import (
 )
 from rodit.testing.fakes import FakeClock, FakeImageTextExtractor, InMemoryItemCatalog
 from rodit.testing.fixtures import (
+    DEFAULT_NOW,
     DEMO_OCR_TEXTS,
     SHOP_A,
     SHOP_B,
     DemoWorld,
+    build_demo_world,
     demo_platform_items,
+    seed_knowledge,
 )
 
 OPERATOR = "owner_a"
@@ -43,6 +46,7 @@ class CountingRepo:
     def __init__(self, inner: InMemoryKnowledgeRepository) -> None:
         self._inner = inner
         self.card_writes: list[str] = []
+        self.bookkeeping: list[str] = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -52,7 +56,10 @@ class CountingRepo:
         self._inner.upsert_item_card(card)
 
     def update_item_card(self, shop_id: str, item_id: str, changes):
-        self.card_writes.append(item_id)
+        if set(changes) == {"platform_detail_text"}:
+            self.bookkeeping.append(item_id)  # 只补记平台原文（升级前同步的卡片）
+        else:
+            self.card_writes.append(item_id)
         return self._inner.update_item_card(shop_id, item_id, changes)
 
 
@@ -118,6 +125,8 @@ def test_first_sync_creates_updates_and_keeps_merchant_fields(kit: Kit):
     # 没变的商品不写，updated_at 不变
     assert kit.inner.get_item_card(SHOP_A, "i_777").updated_at == before["i_777"].updated_at
     assert sorted(kit.repo.card_writes) == ["i_555", "i_999"]
+    # 没变的卡片只补记平台原文（不动内容、不动 updated_at），再同步就不写了
+    assert sorted(kit.repo.bookkeeping) == ["i_777", "i_888"]
 
     new = kit.inner.get_item_card(SHOP_A, "i_999")
     assert new.platform == Platform.TAOBAO and new.title == "宽松针织开衫"
@@ -130,11 +139,12 @@ def test_resync_is_a_no_op(kit: Kit):
     kit.run()
     cards = {c.item_id: c for c in kit.inner.list_item_cards(SHOP_A)}
     kit.repo.card_writes.clear()
+    kit.repo.bookkeeping.clear()
     kit.clock.advance(hours=1)
     report = kit.run()
     assert report.created == [] and report.updated == []
     assert report.unchanged == ["i_555", "i_777", "i_888", "i_999"]
-    assert kit.repo.card_writes == []
+    assert kit.repo.card_writes == [] and kit.repo.bookkeeping == []
     assert {c.item_id: c for c in kit.inner.list_item_cards(SHOP_A)} == cards
     dress = kit.inner.get_item_card(SHOP_A, "i_555")
     assert dress.detail_text.count(DEMO_OCR_TEXTS["img_555_detail_1"]) == 1  # 没有越同步越长
@@ -348,3 +358,66 @@ def test_updated_at_uses_the_injected_clock(kit: Kit):
     kit.clock.set(kit.world.now + timedelta(days=1))
     kit.run()
     assert kit.inner.get_item_card(SHOP_A, "i_999").updated_at == kit.world.now + timedelta(days=1)
+
+
+# ================================================================ 识别失败：平台原文没变才保留
+
+
+def _one_item(detail: str | None, images: list[str]) -> PlatformItem:
+    return PlatformItem(
+        shop_id=SHOP_A,
+        platform=Platform.TAOBAO,
+        item_id="i_coat",
+        title="羊毛大衣",
+        detail_text=detail,
+        detail_images=images,
+        updated_at=DEFAULT_NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "new_detail",
+    [
+        "含羊毛 30%。",  # 删掉了后半句：新文字是旧合并结果的前缀
+        None,  # 平台清空了详情文字
+        "含羊毛 30%。\n支持七天无理由退换",  # 多行：删掉了中间一句后仍像是前缀
+    ],
+)
+def test_partial_ocr_failure_never_keeps_text_the_platform_withdrew(new_detail):
+    clock = FakeClock()
+    repo = InMemoryKnowledgeRepository(clock)
+    seed_knowledge(repo, build_demo_world())
+    old_detail = "含羊毛 30%。\n支持七天无理由退换\n可机洗"
+    catalog = InMemoryItemCatalog([_one_item(old_detail, ["img1"])], Platform.TAOBAO)
+    sync = ItemSync(
+        repo,
+        catalog,
+        FakeImageTextExtractor({"img1": "图一：水洗标"}),
+        InMemoryAuditSink(),
+        clock,
+        platform=Platform.TAOBAO,
+    )
+    sync.sync_shop(SHOP_A, operator="owner_a")
+    catalog.items = [_one_item(new_detail, ["img2"])]  # 新图识别失败
+    clock.advance(hours=1)
+    report = sync.sync_shop(SHOP_A, operator="owner_a")
+    card = repo.get_item_card(SHOP_A, "i_coat")
+    assert report.updated == ["i_coat"]
+    assert "可机洗" not in (card.detail_text or "")
+    assert card.detail_text == ((new_detail or "").strip() or None)
+
+
+def test_partial_ocr_failure_keeps_last_merge_when_platform_text_is_unchanged():
+    clock = FakeClock()
+    repo = InMemoryKnowledgeRepository(clock)
+    seed_knowledge(repo, build_demo_world())
+    ocr = FakeImageTextExtractor({"img1": "图一：水洗标"})
+    catalog = InMemoryItemCatalog([_one_item("含羊毛 30%。", ["img1"])], Platform.TAOBAO)
+    sync = ItemSync(repo, catalog, ocr, InMemoryAuditSink(), clock, platform=Platform.TAOBAO)
+    sync.sync_shop(SHOP_A, operator="owner_a")
+    first = repo.get_item_card(SHOP_A, "i_coat")
+    assert first.detail_text == "含羊毛 30%。\n图一：水洗标"
+    del ocr.texts["img1"]  # 这次识别失败
+    report = sync.sync_shop(SHOP_A, operator="owner_a")
+    assert "i_coat" in report.unchanged
+    assert repo.get_item_card(SHOP_A, "i_coat") == first

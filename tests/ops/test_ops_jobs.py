@@ -34,7 +34,11 @@ from rodit.decision import (
     write_artifact,
 )
 from rodit.eval.dataset import cases
-from rodit.eval.recalibrate import REGRESSION_REMINDER, apply_patch
+from rodit.eval.recalibrate import (
+    CLASSIFIER_REGRESSION_REMINDER,
+    REGRESSION_REMINDER,
+    apply_patch,
+)
 from rodit.ops import serve
 from rodit.ops.serve import build_server, main
 from rodit.ops.settings import ServerSettings
@@ -267,7 +271,7 @@ def test_train_classifier_writes_loadable_artifact(jobs_env, tmp_path):
     assert loaded.meta is not None and loaded.meta.trained_at == NOW
     assert f"已写入模型文件：{target}" in text and loaded.artifact_sha256 in text
     assert "关键词规则" in text and "留出集" in text
-    assert REGRESSION_REMINDER in text
+    assert CLASSIFIER_REGRESSION_REMINDER in text and "--classifier" in text
 
 
 def test_train_classifier_refuses_existing_file_without_overwrite(jobs_env, tmp_path):

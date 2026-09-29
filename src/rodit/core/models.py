@@ -248,6 +248,9 @@ class ItemCard(_Model):
     usage: list[CleanText] = Field(default_factory=list)  # 使用 / 安装说明
     forbidden_claims: list[CleanText] = Field(default_factory=list)  # 不能说的卖点，质检用
     detail_text: CleanText | None = None  # 详情页文字 + 详情图 OCR 文字
+    # 上次商品同步时平台给的详情文字（不含 OCR；平台没有文字时为空串，从没同步过为 None）。
+    # 只给商品同步判断"平台文字变没变"用（有详情图识别失败时决定能不能保留上次的合并结果），回答不用
+    platform_detail_text: CleanText | None = None
     updated_at: AwareDatetime
 
     def find_sku(self, sku_id: str) -> Sku | None:

@@ -30,15 +30,15 @@ routing.auto_threshold 里列出的类型计算。和 rodit.eval.calibration.pic
    至少 min_support 条，否则按"达不到目标"处理（几条样本的 100% 不算数）。
 3. 路由不看辅助阈值的类型不给建议：高风险类型走规则 4（推荐 + 风险提示）、投诉提醒人工、
    站外交易请求走规则 1（routing.off_platform）。
-4. 覆盖率按条数精确比较：pick_threshold 用四舍五入到 4 位的覆盖率比较并列，四舍五入往下时
-   并列会判给更高的阈值（见回执），这里不复用它的扫描，只复用它的结果类型。
+4. 覆盖率按条数精确比较（和 pick_threshold 一样，并列取更低的阈值），这里另外实现扫描，
+   因为要加上面的下限和样本数规则，只复用它的结果类型。
 
 输出（RecalibrationReport）：每个类型的当前阈值、建议阈值、样本数、准确率、覆盖率、状态，
 中文摘要（render_text），以及只含要修改的类型的配置片段（proposal_yaml，合并进当前配置后按
 RoutingConfig 校验过）。这里不写任何配置文件：建议由人确认，上线前按 §13.5 先跑回归。
 
-另外要知道的数据局限（见回执）：编辑后发送、因知识缺失 / 表达不好等原因弃用的推荐不写标注，
-客服没操作就过期的推荐也没有标注；全自动发出去的回复没有客服反馈，全自动阈值主要靠智能辅助
+另外要知道的数据局限：因知识缺失 / 表达不好等原因弃用的推荐不写标注，客服没操作就过期的推荐
+也没有标注；全自动发出去的回复没有客服反馈，全自动阈值主要靠智能辅助
 模式下的采纳数据。
 """
 
@@ -73,6 +73,10 @@ EPS = 1e-9
 REGRESSION_REMINDER = (
     "上线前按 §13.5 先跑回归：python -m rodit.eval --config <新配置> --baseline <基线.json>，"
     "指标不下降才上线"
+)
+CLASSIFIER_REGRESSION_REMINDER = (
+    "上线前按 §13.5 先带模型文件跑整条链路的回归：python -m rodit.eval --config <新配置> "
+    "--classifier <模型文件> --baseline <基线.json>，指标不下降才上线"
 )
 
 Kind = Literal["assist", "auto"]
@@ -671,7 +675,7 @@ def render_text(report: RecalibrationReport, *, config_source: str | None = None
     )
     add("- 建议值不低于该类型实际出现过的最低置信度；全自动阈值不低于辅助阈值")
     add(
-        "- 编辑后发送、因其他原因弃用、没人操作就过期的推荐没有标注；"
+        "- 因其他原因弃用、没人操作就过期的推荐没有标注；"
         "全自动发出去的回复也没有客服反馈，全自动阈值主要靠智能辅助模式下的采纳数据"
     )
     add(REGRESSION_REMINDER)
@@ -684,6 +688,7 @@ __all__ = [
     "DEFAULT_MIN_SUPPORT",
     "DEFAULT_WINDOW_DAYS",
     "GRID",
+    "CLASSIFIER_REGRESSION_REMINDER",
     "REGRESSION_REMINDER",
     "STATUS_LABELS",
     "UNKNOWN_TRUE",

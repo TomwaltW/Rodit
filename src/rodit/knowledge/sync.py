@@ -211,6 +211,13 @@ class ItemSync:
                 self._repo.upsert_item_card(card)
                 report.created.append(item.item_id)
             elif _same(existing, card):
+                if existing.platform_detail_text != card.platform_detail_text:
+                    # 只是补记平台原文（升级前同步的卡片）：不算更新，不动 updated_at
+                    self._repo.update_item_card(
+                        shop_id,
+                        item.item_id,
+                        {"platform_detail_text": card.platform_detail_text},
+                    )
                 report.unchanged.append(item.item_id)
             else:
                 # 只写平台维护的字段（仓储里原子地读改写）：商家同时在别的实例上改尺码建议等
@@ -252,10 +259,18 @@ class ItemSync:
         partial: bool,
     ) -> ItemCard:
         detail = merge_detail_text(item.detail_text, texts)
-        if partial and existing is not None and existing.detail_text:
-            base = (item.detail_text or "").strip()
-            if existing.detail_text.startswith(base):
-                detail = existing.detail_text  # 平台文字没变：保留上次合并的结果（见模块文档）
+        base = (item.detail_text or "").strip()
+        if (
+            partial
+            and existing is not None
+            and existing.detail_text
+            and existing.platform_detail_text is not None
+            and existing.platform_detail_text == base
+        ):
+            # 平台文字和上次同步时完全一样：保留上次的合并结果（见模块文档）。按记下的平台原文比，
+            # 不按前缀猜：平台删掉一句（如"支持七天无理由退换"）时新文字可能是旧合并结果的前缀，
+            # 保留旧的就会继续引用商家已经撤回的说法；从没同步过的卡片不知道原文，也不保留
+            detail = existing.detail_text
         return ItemCard(
             shop_id=shop_id,
             platform=self._platform,
@@ -270,6 +285,7 @@ class ItemSync:
             usage=list(existing.usage) if existing else [],
             forbidden_claims=list(existing.forbidden_claims) if existing else [],
             detail_text=detail,
+            platform_detail_text=base,
             updated_at=self._clock.now(),
         )
 
@@ -292,13 +308,14 @@ PLATFORM_ITEM_FIELDS: tuple[str, ...] = (
     "skus",
     "size_chart",
     "detail_text",
+    "platform_detail_text",
 )
 """商品卡片上由平台商品接口维护的字段，同步只改这些（商家填的见 admin.MERCHANT_ITEM_FIELDS）。"""
 
 
 def _same(a: ItemCard, b: ItemCard) -> bool:
-    """除 updated_at 之外完全相同。"""
-    exclude = {"updated_at"}
+    """除 updated_at 和记账用的 platform_detail_text 之外完全相同。"""
+    exclude = {"updated_at", "platform_detail_text"}
     return a.model_dump(mode="json", exclude=exclude) == b.model_dump(mode="json", exclude=exclude)
 
 
