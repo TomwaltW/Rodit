@@ -1,0 +1,27 @@
+# 构建上下文只需要 pyproject.toml、uv.lock、src/、config/rodit.yaml（见 Dockerfile）。
+# 密钥文件（.env、令牌文件）一律不进构建上下文。
+.git
+.gitignore
+.claude
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+dist
+build
+*.egg-info
+.env
+.env.*
+**/.env
+**/.env.*
+**/*tokens*.json
+deploy
+tests
+docs
+scripts
+*.md
+Dockerfile
+.dockerignore
