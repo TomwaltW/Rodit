@@ -762,14 +762,16 @@ class KnowledgeAdmin:
             changed = [f for f in changed if getattr(card, f) != normalized[f]]
             if not changed:
                 return card, []
-            updated = ItemCard.model_validate(
-                {
-                    **card.model_dump(),
-                    **{f: normalized[f] for f in changed},
-                    "updated_at": self._clock.now(),
-                }
+            # 只写改了的字段（仓储里原子地读改写）：别的实例上同时跑的商品同步改的是平台字段，
+            # 两边的修改都留下
+            saved = self._repo.update_item_card(
+                shop_id,
+                item_id,
+                {**{f: normalized[f] for f in changed}, "updated_at": self._clock.now()},
             )
-            self._repo.upsert_item_card(updated)
+            if saved is None:
+                raise KeyError(f"店铺 {shop_id} 没有商品 {item_id}")
+            updated = saved
         self._record(
             shop_id,
             actor,
@@ -819,11 +821,19 @@ class KnowledgeAdmin:
                     changed.append(key)
             if not changed and not removed:
                 return self._snapshot(shop)
-            updated = Shop.model_validate(
+            preview = Shop.model_validate(
                 {**shop.model_dump(mode="json"), "config_overrides": overrides}
             )
-            effective_shop_config(self._config, updated)  # 合并平台 / 类目默认后也必须合法
-            self._repo.upsert_shop(updated)
+            effective_shop_config(self._config, preview)  # 合并平台 / 类目默认后也必须合法
+            # 只写改了的键（仓储里原子地读改写）：复核人员同时切换影子模式、填问卷改别的键，
+            # 两边的修改都留下
+            saved = self._repo.update_shop_config(
+                shop_id,
+                {**{k: overrides[k] for k in changed}, **dict.fromkeys(removed)},
+            )
+            if saved is None:
+                raise ShopInactive(shop_id)
+            updated = saved
         self._record(
             shop_id,
             actor,

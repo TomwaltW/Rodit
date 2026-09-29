@@ -213,7 +213,15 @@ class ItemSync:
             elif _same(existing, card):
                 report.unchanged.append(item.item_id)
             else:
-                self._repo.upsert_item_card(card)
+                # 只写平台维护的字段（仓储里原子地读改写）：商家同时在别的实例上改尺码建议等
+                # 自己填的字段，两边的修改都留下
+                saved = self._repo.update_item_card(
+                    shop_id,
+                    item.item_id,
+                    {f: getattr(card, f) for f in (*PLATFORM_ITEM_FIELDS, "updated_at")},
+                )
+                if saved is None:  # 同步过程中卡片被删了（取消订购清理）：不重建
+                    return
                 report.updated.append(item.item_id)
         if not item.on_sale:
             report.off_sale.append(item.item_id)
@@ -275,6 +283,17 @@ class ItemSync:
                 created_at=self._clock.now(),
             )
         )
+
+
+PLATFORM_ITEM_FIELDS: tuple[str, ...] = (
+    "title",
+    "category",
+    "attributes",
+    "skus",
+    "size_chart",
+    "detail_text",
+)
+"""商品卡片上由平台商品接口维护的字段，同步只改这些（商家填的见 admin.MERCHANT_ITEM_FIELDS）。"""
 
 
 def _same(a: ItemCard, b: ItemCard) -> bool:

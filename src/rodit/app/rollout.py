@@ -338,8 +338,12 @@ class RolloutService:
                     if not force:
                         raise RolloutGateNotPassed(gate)
                     forced = True
-            overrides = {**shop.config_overrides, "shadow_mode": target == RolloutStage.SHADOW}
-            repo.upsert_shop(shop.model_copy(update={"config_overrides": overrides}))
+            # 只写 shadow_mode 一个键（仓储里原子地读改写）：商家同时改别的配置也不会互相覆盖
+            if (
+                repo.update_shop_config(shop_id, {"shadow_mode": target == RolloutStage.SHADOW})
+                is None
+            ):
+                raise ShopInactive(shop_id)
             self._audit(
                 shop_id,
                 operator,

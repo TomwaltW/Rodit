@@ -563,8 +563,7 @@ class AssistService:
     def apply_questionnaire(self, shop_id: str, answers: Mapping[int, str]) -> dict[str, Any]:
         """店铺政策问卷（附录 C）：写入政策，合并店铺配置覆盖项。"""
         repo = self.unit.repos.knowledge
-        # 店铺配置用 model_copy 更新（不走模型边界的清洗）：回答先去掉 NUL 等控制字符，
-        # 否则 PostgreSQL 的 JSONB 写不进去（内存实现照存，两种实现不一致）
+        # 回答先去掉 NUL 等控制字符（PostgreSQL 的 TEXT / JSONB 写不进去）
         cleaned = {
             k: strip_control_chars(v) if isinstance(v, str) else v for k, v in answers.items()
         }
@@ -575,10 +574,9 @@ class AssistService:
             entries, patch = apply_questionnaire(shop_id, cleaned, self.unit.clock.now())
             for entry in entries:
                 repo.upsert_policy(entry)
-            if patch:
-                repo.upsert_shop(
-                    shop.model_copy(update={"config_overrides": {**shop.config_overrides, **patch}})
-                )
+            # 只写问卷改到的配置键（仓储里原子地读改写，并发的配置修改不会互相覆盖）
+            if patch and repo.update_shop_config(shop_id, patch) is None:
+                raise KeyError(shop_id)
             return {"policies": [e.key for e in entries], "config": sorted(patch)}
 
     # ================================================================ 报表（§12.4）

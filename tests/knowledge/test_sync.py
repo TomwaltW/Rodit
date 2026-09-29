@@ -51,6 +51,10 @@ class CountingRepo:
         self.card_writes.append(card.item_id)
         self._inner.upsert_item_card(card)
 
+    def update_item_card(self, shop_id: str, item_id: str, changes):
+        self.card_writes.append(item_id)
+        return self._inner.update_item_card(shop_id, item_id, changes)
+
 
 class Kit:
     def __init__(self, repo: InMemoryKnowledgeRepository, world: DemoWorld) -> None:

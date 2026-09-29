@@ -555,7 +555,7 @@ def test_revoke_waits_for_in_flight_stage_switch_and_the_shop_stays_deleted(
         service,
         lambda: service.rollout.set_stage(SHOP_A, "shadow", operator=REVIEWER),
         repo,
-        "upsert_shop",
+        "update_shop_config",
     )
     assert not errors and seen == [False]
     assert repo.get_shop(SHOP_A) is None  # 在途的配置写入没有把删掉的店铺写回来
