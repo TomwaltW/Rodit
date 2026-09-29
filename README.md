@@ -22,6 +22,35 @@ uv run python -m rodit.app.demo  # 用合成数据跑方案 §11 的核心流程
 环境里跑通"懂→找→写→判"全链路。设置 `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` / `RODIT_LLM_API_KEY`
 后改用 OpenAI 兼容接口的境内已备案模型（只在本地开发机上这样做，见下方"数据合规"）。
 
+### 用真实大模型评测
+
+`python -m rodit.eval` 默认用离线替身跑合成评测集（方案 §13，不联网，是回归基线）。加 `--llm env` 改用真实的
+OpenAI 兼容模型走完整链路：路由、质检按 `EngineConfig.decision` 组装（默认 `incloud_llm`：路由 3 次投票、
+质检 1 次），生成走大模型，和演示单元接大模型时同一套接线。评测集全是合成数据，只在本地开发机上跑。
+
+```bash
+# 密钥只放本地 .env（已 gitignore）或云端环境的密钥设置；不要写进仓库、命令行历史或云端环境变量
+set -a; source .env; set +a      # 提供 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_LLM_API_KEY（可选 RODIT_LLM_TIMEOUT_S）
+
+uv run python -m rodit.eval --llm env --limit 10 --seed 1          # 先随机抽 10 条试跑（省钱）
+uv run python -m rodit.eval --llm env --intent size_advice         # 只跑一个问题类型
+uv run python -m rodit.eval --llm env --json ~/rodit-evals/llm.json \
+    --price-input 0.002 --price-output 0.008                       # 全量 + 完整结果 + 成本估算
+uv run python -m rodit.eval --llm env --baseline ~/rodit-evals/llm.json --tolerance 0.02  # §13.5 回归
+```
+
+- 报告在离线评测的各节（§13.2 评分与上线门槛、§13.3 阈值校准）之外，还有 §12.1 耗时（各环节和端到端的
+  P50 / P95，对照目标）、§14 用量（按路由 / 生成 / 质检分的 token、失败次数，给了单价时的成本，
+  按 §14 示例口径折算的每店月用量）、降级统计；失败清单里有模型草稿和质检原因（已脱敏）。
+- 单价是每 1000 token 的价格，也可以用环境变量 `RODIT_LLM_PRICE_INPUT_PER_1K` / `RODIT_LLM_PRICE_OUTPUT_PER_1K`；
+  不给只报 token。`--config config/rodit.yaml` 可以换引擎配置（投票次数、超时、阈值）做对比。
+- `--json out.json` 写完整结果（逐条的类型、评分、耗时、用量；放仓库外，不提交），`--json` 不带路径时输出到
+  标准输出。
+  `--baseline` 只比较两次都有的用例：类型准确率、事实正确、合规满分率（全部和其中的测试集）任一项比基线低超过
+  容差（默认 0，§13.5 指标不下降）时退出码为 1；配置错误（缺环境变量、连通性检查失败等）退出码为 2。
+- 跑之前先发一个几个 token 的连通性检查请求，地址、模型、密钥不对时直接报错。报告和日志里没有密钥，
+  接口地址只显示主机名。`--seed` 只决定 `--limit` 抽哪几条，不发给模型（路由投票要靠采样的随机性，§6.4）。
+
 ## 生产组装需要的环境变量
 
 `rodit.app.production.build_production_unit` 只从部署环境（平台云内）读这些变量；仓库、云端开发环境里都不放值：
