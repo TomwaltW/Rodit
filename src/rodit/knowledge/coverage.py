@@ -184,5 +184,5 @@ def describe_gap(marker: str) -> str:
             label = f"属性 · {field.removeprefix('attr:')}"
         else:
             label = _ITEM_FIELD_LABELS.get(field, field)
-        return f"商品 {item_id} · {label}"
+        return f"当前商品 · {label}" if item_id == "?" else f"商品 {item_id} · {label}"
     return marker

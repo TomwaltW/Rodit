@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from rodit.core import evidence as ev
 from rodit.core.enums import Intent, Platform, PolicyKey
 from rodit.core.errors import KnowledgeUnavailable
 from rodit.core.models import ItemCard, PolicyEntry, Shop, Sku
@@ -174,3 +175,8 @@ def test_unknown_shop_and_repository_failure(repo, flaky):
 )
 def test_describe_gap(marker, text):
     assert describe_gap(marker) == text
+
+
+def test_describe_gap_for_field_of_unknown_current_item():
+    """缺当前商品时的字段标记（item:?:size_advice）不显示成"商品 ? · …"。"""
+    assert describe_gap(ev.missing_item_field(None, "size_advice")) == "当前商品 · 尺码建议"
