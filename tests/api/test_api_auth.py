@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from api_support import (
     CALLERS,
     EVENTS_PATH,
+    SHOP_A_CALLERS,
     SHOP_B_CALLERS,
     SHOP_ROUTES,
     TOKENS,
@@ -24,6 +27,26 @@ from rodit.core.enums import SuggestionStatus
 from rodit.testing.fixtures import AGENT, MANAGER, SHOP_A, SHOP_B
 
 ROUTE_IDS = [r.name for r in SHOP_ROUTES]
+
+
+def test_every_shop_route_is_listed(api: Api):
+    """应用里每个店铺范围的路由都在 SHOP_ROUTES 里（下面的串店、角色、401 测试才覆盖得到）。
+
+    路由表从 OpenAPI 文档读（不依赖 FastAPI 内部的路由包装），路径模板转成正则去匹配清单里的 URL。
+    """
+    listed = {(r.method, r.url(SHOP_A)) for r in SHOP_ROUTES}
+    paths = api.client.app.openapi()["paths"]
+    missing = []
+    for template, operations in paths.items():
+        if not template.startswith("/v1/shops/{shop_id}"):
+            continue
+        pattern = re.compile("^" + re.sub(r"\{[^/]+\}", "[^/]+", template) + "$")
+        for method in operations:
+            m = method.upper()
+            if not any(lm == m and pattern.match(url) for lm, url in listed):
+                missing.append(f"{m} {template}")
+    assert len(paths) > 10
+    assert missing == [], f"这些路由没有列进 tests/api 的路由清单：{missing}"
 
 
 # ================================================================ 身份与令牌
@@ -189,7 +212,7 @@ def test_integration_principal_can_push_its_own_shop(api: Api):
 @pytest.mark.parametrize("route", SHOP_ROUTES, ids=ROUTE_IDS)
 def test_roles_outside_the_route_are_rejected(api: Api, route: Route):
     before = shop_snapshot(api, SHOP_A)
-    for caller in ("agent_a", "manager_a", "merchant_a", "integration_a"):
+    for caller in SHOP_A_CALLERS:
         if CALLERS[caller].role in route.roles:
             continue
         r = api.call(route.method, route.url(SHOP_A), caller, json=route.body)
