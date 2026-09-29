@@ -1,8 +1,22 @@
-"""知识中心（方案 §5.2）：检索（结构化优先 + 语义检索补充）、平台规则、冷启动问卷与缺失检查。
+"""知识中心（方案 §5.2）：检索（结构化优先 + 语义检索补充）、平台规则、冷启动问卷与缺失检查；
+商家控制台的知识编辑与店铺配置（admin）、平台商品同步与详情图 OCR（sync，§5.2.3）。
 
-负责：T2。只依赖 rodit.core。
+负责：T2（控制台部分：K）。只依赖 rodit.core。
 """
 
+from rodit.knowledge.admin import (
+    LOCKED_CONFIG_FIELDS,
+    MERCHANT_CONFIG_FIELDS,
+    MERCHANT_ITEM_FIELDS,
+    AnswerChecker,
+    FaqChange,
+    FaqChanges,
+    FaqCheck,
+    FaqWarning,
+    KnowledgeAdmin,
+    PolicyRow,
+    ShopConfigSnapshot,
+)
 from rodit.knowledge.category import (
     CATEGORY_TIPS,
     CategoryTip,
@@ -49,6 +63,7 @@ from rodit.knowledge.search import (
     FaqSearcher,
     normalize_question,
 )
+from rodit.knowledge.sync import ItemSync, ItemSyncUnavailable, SyncReport, merge_detail_text
 
 __all__ = [
     "APPAREL_CHECKLIST",
@@ -57,17 +72,31 @@ __all__ = [
     "DEFAULT_FAQ_MIN_SCORE",
     "EXACT_MATCH_SCORE",
     "GENERIC_CHECKLIST",
+    "LOCKED_CONFIG_FIELDS",
+    "MERCHANT_CONFIG_FIELDS",
+    "MERCHANT_ITEM_FIELDS",
     "PLATFORM_RULES",
     "QUESTIONNAIRE",
     "QUESTIONNAIRE_BY_ID",
     "SEMANTIC_SCORE_CAP",
+    "AnswerChecker",
     "CategoryTip",
     "ChecklistEntry",
+    "FaqChange",
+    "FaqChanges",
+    "FaqCheck",
     "FaqSearcher",
+    "FaqWarning",
+    "ItemSync",
+    "ItemSyncUnavailable",
+    "KnowledgeAdmin",
     "KnowledgeRetriever",
     "PlatformRuleText",
+    "PolicyRow",
     "PolicyTarget",
     "QuestionnaireItem",
+    "ShopConfigSnapshot",
+    "SyncReport",
     "apply_questionnaire",
     "category_group",
     "category_tip_evidence",
@@ -76,6 +105,7 @@ __all__ = [
     "describe_gap",
     "find_gaps",
     "find_platform_rule",
+    "merge_detail_text",
     "normalize_question",
     "parse_banned_words",
     "parse_tone",
