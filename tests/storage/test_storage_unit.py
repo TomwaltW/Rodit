@@ -55,11 +55,18 @@ def test_knowledge_outage_maps_to_knowledge_unavailable():
 
 
 def test_schema_enables_forced_rls_for_every_business_table():
-    script = MIGRATIONS[0].sql()
+    v1 = MIGRATIONS[0].sql()
+    later = "\n".join(m.sql() for m in MIGRATIONS[1:])
+    script = v1 + "\n" + later
     assert [m.version for m in MIGRATIONS] == sorted({m.version for m in MIGRATIONS})
-    loop_tables = set(re.findall(r"'(\w+)'", script.split("FOREACH t IN ARRAY ARRAY[")[1][:400]))
-    assert loop_tables | {"shop"} == set(BUSINESS_TABLES)
-    assert "ALTER TABLE shop FORCE ROW LEVEL SECURITY" in script
+    loop_tables = set(re.findall(r"'(\w+)'", v1.split("FOREACH t IN ARRAY ARRAY[")[1][:400]))
+    later_tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+) \(", later))
+    assert loop_tables | {"shop"} | later_tables == set(BUSINESS_TABLES)
+    assert "ALTER TABLE shop FORCE ROW LEVEL SECURITY" in v1
+    for table in later_tables:  # 之后的版本新建的表不在版本 1 的循环里：逐张开启
+        assert f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY" in later, table
+        assert f"CREATE POLICY shop_isolation ON {table}" in later, table
+        assert f"ON {table} TO rodit_app" in later, table
     for table in BUSINESS_TABLES:
         assert f"CREATE TABLE IF NOT EXISTS {table} (" in script
     # 业务表的店铺列都是 NOT NULL（audit_log 例外：无店铺的系统事件）

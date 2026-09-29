@@ -11,6 +11,8 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    或历史里），结果等同按顺序到达；重新处理时不出 auto_reply（最新那条可能已经自动回复过，
    全自动下由此转人工）；
 3. 刷新推荐：同一会话之前 SHOWN 的推荐记录改成 EXPIRED（§5.3 新消息到达时刷新推荐）；
+   撤回（on_recall，应用层在撤回事件里调用）：被撤回的那条消息触发的 SHOWN 推荐改成 EXPIRED，
+   返回会话里仍在展示的推荐卡片给侧边栏刷新（§5.3 撤回的消息不再进上下文）；
 4. 会话理解（engine.understanding.ConversationBuilder）→ ConversationContext；
 5. 路由 → RouteDecision，按 core.pipeline.ACTION_PLANS[route.action] 执行：
    - 检索（KnowledgeUnavailable → 不推荐，§12.2）；
@@ -39,6 +41,9 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    整个系统只在这里加）。不满足时退回智能辅助（照常给推荐），并且 transfer_to_human=True——
    §5.7 全自动模式下质检不通过、依据不足、投诉等都要转人工，§12.2 全自动出故障由客服接管。
    影子模式（§13.4）：mode=SHADOW，推荐只用于事后对比，app 层不得展示；不出 auto_reply、不转人工。
+   影子记录每轮一套：乱序时重算最新一轮（run.late），这一轮（按最新买家消息的 msg_id）已经有
+   SHADOW 记录就不再写第二套（事后对比不重复计数），结果照常返回（卡片没有 suggestion_id），
+   SUGGEST 审计带 shadow_duplicate=True。
    店铺或配置读不出来（知识库故障等，不是已知停用）而消息是 AUTO 时，生效模式无从判断：
    按全自动的兜底处理，transfer_to_human=True（§12.2 全自动模式下任何故障 → 客服接管）。
 
@@ -141,6 +146,7 @@ from rodit.engine.cards import (
     HARD_RULE_LABELS,
     blocking_rules,
     build_card,
+    card_from_record,
     dedupe,
     dropped_draft_alert,
 )
@@ -490,6 +496,38 @@ class AssistEngine:
             self._warn("expire", exc)
             run.degrade(DEGRADED_STORAGE)
 
+    def on_recall(
+        self, shop_id: str, conversation_id: str, msg_id: str
+    ) -> list[SuggestionCard] | None:
+        """撤回（§5.3）：被撤回的消息触发的、还在展示中的推荐改成 EXPIRED——撤回的消息不再进
+        上下文，照着它写的推荐也不能再发。
+
+        有推荐被过期时返回会话里仍在展示中的推荐卡片（侧边栏按它刷新；通常为空，即清空），
+        没有改动返回 None（不用刷新）。客服刚好发送 / 反馈了的那条以客服的操作为准；
+        影子记录（SHADOW）没展示过，不动。存储失败向外抛：应用层让平台重推撤回，过期是幂等的。
+        """
+        expired = False
+        shown = self._suggestions.list(
+            shop_id, conversation_id=conversation_id, status=SuggestionStatus.SHOWN
+        )
+        for record in shown:
+            if record.msg_id != msg_id:
+                continue
+            try:
+                self._suggestions.update(
+                    record.model_copy(update={"status": SuggestionStatus.EXPIRED}),
+                    expected_status=SuggestionStatus.SHOWN,
+                )
+            except ConcurrencyConflict:
+                continue
+            expired = True
+        if not expired:
+            return None
+        remaining = self._suggestions.list(
+            shop_id, conversation_id=conversation_id, status=SuggestionStatus.SHOWN
+        )
+        return [card_from_record(r) for r in remaining]
+
     # ------------------------------------------------------------ 执行计划
 
     def _no_generate_reason(self, run: _Run, route: RouteDecision) -> str:
@@ -721,6 +759,21 @@ class AssistEngine:
         if not cards:
             return cards
         status = SuggestionStatus.SHADOW if ctx.mode == Mode.SHADOW else SuggestionStatus.SHOWN
+        if status == SuggestionStatus.SHADOW and run.late and self._shadow_turn_recorded(run):
+            # 影子模式每轮一套记录（§13.4 事后对比不重复计数）：这一轮第一次处理时已经记过
+            self._audit(
+                run,
+                AuditAction.SUGGEST,
+                {
+                    "suggestion_ids": [None] * len(cards),
+                    "count": len(cards),
+                    "status": str(status),
+                    "intents": [str(c.intent) for c, _ in cards],
+                    "kinds": [str(c.kind) for c, _ in cards],
+                    "shadow_duplicate": True,
+                },
+            )
+            return cards
         question = mask_pii(ctx.current.text)
         item_id = ctx.item.item_id if ctx.item is not None else None
         now = self._clock.now()
@@ -762,6 +815,18 @@ class AssistEngine:
             },
         )
         return out
+
+    def _shadow_turn_recorded(self, run: _Run) -> bool:
+        """这一轮（最新买家消息）已经有影子记录。读不到时按没有处理（照常写，写不进去会降级）。"""
+        msg = run.msg
+        try:
+            records = self._suggestions.list(
+                msg.shop_id, conversation_id=msg.conversation_id, status=SuggestionStatus.SHADOW
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._warn("shadow_check", exc)
+            return False
+        return any(r.msg_id == msg.msg_id for r in records)
 
     # ------------------------------------------------------------ 全自动（§5.6、§12.2、§12.3）
 

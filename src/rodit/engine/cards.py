@@ -4,6 +4,9 @@
 - 依据来源按草稿引用的 evidence_ids 从证据包里取标签（"商品属性 · 面料""店铺政策 · 发货时效"）；
 - 置信度：FAQ / 模板，或大模型回答的 grounded ≥ 0.9，并且问题类型置信度 ≥ 0.85 → 高，其余中；
 - 风险提示 = 路由的风险提示 + 证据包的提醒（物流停滞等）+ 降级说明（去重保序）。
+
+推荐记录 → 卡片（card_from_record）只在撤回后刷新侧边栏时用（§5.3）：记录里没有问题类型置信度、
+依据标签和风险提示，置信度按"中"、依据来源只列 ID，风险提示换成"请核实"。
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from rodit.core.models import (
     QAResult,
     RouteDecision,
     SuggestionCard,
+    SuggestionRecord,
 )
 from rodit.core.questions import Q_GROUNDED
 
@@ -101,6 +105,24 @@ def build_card(
         confidence=card_confidence(draft.kind, qa, intent_confidence),
         risk_hints=dedupe([*route.risk_hints, *bundle.alerts, *(n for n in notes if n)]),
         qa_scores=dict(qa.scores),
+    )
+
+
+RECALL_REFRESH_HINT = "买家撤回了一条消息，推荐已刷新，请核实后再发送"
+
+
+def card_from_record(record: SuggestionRecord) -> SuggestionCard:
+    """仍在展示中的推荐记录 → 侧边栏卡片（撤回后刷新，§5.3）。记录里没存的信息不替它补：
+    置信度按"中"（没法复核的卡片不声称高）、依据来源只列 ID、风险提示提醒客服核实。"""
+    return SuggestionCard(
+        suggestion_id=record.id,
+        text=record.text,
+        intent=record.intent,
+        kind=record.kind,
+        evidence=[EvidenceRefView(id=e, label=e) for e in dedupe(record.evidence_ids)],
+        confidence=Confidence.MEDIUM,
+        risk_hints=[RECALL_REFRESH_HINT],
+        qa_scores=dict(record.qa_scores or {}),
     )
 
 

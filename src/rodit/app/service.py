@@ -11,7 +11,8 @@
        transfer_to_human：请适配器转人工（§5.7）；转人工失败记错误日志（需要人工跟进）。
     客服 / 机器人回声 → 写进会话（§5.3 最近几轮对话；和反馈、自动回复写回的同一次发送不重复存，
     见 _store_outgoing）；
-    撤回 → 从会话里去掉那条消息（不再进上下文，原文不留）；写不进去时抛给平台重推。
+    撤回 → 从会话里去掉那条消息（不再进上下文，原文不留），按它给的推荐过期、侧边栏刷新成剩下的
+    （§5.3）；撤回先于那条消息到达时由会话仓储记墓碑，消息到了丢弃（§8.3）；写不进去时抛给平台重推。
 客服操作（§5.8）：发送 / 编辑后发送 / 不合适 → 反馈闭环；发出去的文字写回会话，作为下一轮上下文
 （反馈已经记下后写回失败只记日志，不报失败——报了客服重试也会被拒）。
 发出的文字写回会话（回声、反馈写回、全自动写回）和撤回都持有这个会话的锁，查重和写入之间不会插进
@@ -57,6 +58,7 @@ from rodit.core.models import (
     KnowledgeItem,
     StandardMessage,
     StoredMessage,
+    SuggestionCard,
     strip_control_chars,
 )
 from rodit.core.pii import mask_pii
@@ -248,7 +250,7 @@ class AssistService:
             if isinstance(parsed, StoredMessage):
                 self._record_echo(parsed)
             elif isinstance(parsed, MessageRecall):
-                self._record_recall(parsed)
+                self._record_recall(adapter, parsed)
             return None
 
     def _record_echo(self, echo: StoredMessage) -> None:
@@ -269,16 +271,24 @@ class AssistService:
                 at=echo.created_at,
             )
 
-    def _record_recall(self, recall: MessageRecall) -> None:
-        """撤回：那条消息不再进上下文，原文不留（§5.3、§12.3 最小化）。
+    def _record_recall(self, adapter: PlatformAdapter, recall: MessageRecall) -> None:
+        """撤回：那条消息不再进上下文，原文不留（§5.3、§12.3 最小化）；按它给的推荐不能再发——
+        引擎把这些推荐过期（on_recall），侧边栏刷新成会话里剩下的推荐（通常是清空）。
+        撤回先于那条消息到达（§8.3 乱序）：会话仓储记墓碑，消息到了丢弃（不保存、不回答）。
 
         写不进去时异常向外抛（平台收到失败会重推；适配器不按 msg_id 挡掉重推的撤回，
-        recall_message 本身是幂等的）。持有会话锁：回声正在接替写回的记录时，等它换完再撤回。
+        recall_message 和推荐过期都是幂等的，重推时补上没做完的那一步）。侧边栏刷新失败只记日志
+        （和展示推荐一样）。持有会话锁：回声正在接替写回的记录、引擎正在处理这个会话时，等它做完。
         """
         with self._locks.hold((recall.shop_id, recall.conversation_id)):
             self.unit.repos.conversations.recall_message(
                 recall.shop_id, recall.conversation_id, recall.recalled_msg_id
             )
+            remaining = self.unit.engine.on_recall(
+                recall.shop_id, recall.conversation_id, recall.recalled_msg_id
+            )
+            if remaining is not None:
+                self._show(adapter, recall.shop_id, recall.conversation_id, remaining)
 
     def ask_standalone(
         self,
@@ -324,7 +334,7 @@ class AssistService:
             if result is None:
                 return None
             if result.mode != Mode.SHADOW:
-                self._show(adapter, msg, result)
+                self._show(adapter, msg.shop_id, msg.conversation_id, result.suggestions)
             reason = result.no_suggestion_reason or "转人工"
             if result.auto_reply is not None and result.mode == Mode.AUTO:
                 if not self._send_auto_reply(adapter, msg, result):
@@ -335,17 +345,23 @@ class AssistService:
                 self._transfer(adapter, msg, reason)
             return result
 
-    def _show(self, adapter: PlatformAdapter, msg: StandardMessage, result: EngineResult) -> None:
-        """把推荐推到侧边栏 / 工作台。失败不抛给平台：消息已经存下，重推会被去重；
-        全自动照常发送（发送失败再转人工，§12.2），智能辅助下客服本来就在接待。"""
+    def _show(
+        self,
+        adapter: PlatformAdapter,
+        shop_id: str,
+        conversation_id: str,
+        cards: list[SuggestionCard],
+    ) -> None:
+        """把推荐推到侧边栏 / 工作台（空列表表示清空）。失败不抛给平台：消息已经存下，重推会被
+        去重；全自动照常发送（发送失败再转人工，§12.2），智能辅助下客服本来就在接待。"""
         try:
-            adapter.show_suggestions(msg.shop_id, msg.conversation_id, result.suggestions)
+            adapter.show_suggestions(shop_id, conversation_id, cards)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "推荐展示失败（%s）：店铺 %s 会话 %s",
                 type(exc).__name__,
-                msg.shop_id,
-                msg.conversation_id,
+                shop_id,
+                conversation_id,
             )
 
     def _transfer(self, adapter: PlatformAdapter, msg: StandardMessage, reason: str) -> None:
