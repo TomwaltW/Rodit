@@ -287,7 +287,7 @@ def issue_metrics_token(name: str, *, expires_at: datetime | None = None) -> Iss
 def append_entries(path: str | Path, entries: Iterable[PrincipalEntry | MetricsEntry]) -> TokenFile:
     """把新条目加进令牌文件（没有就新建）；原子替换，权限 0600。返回写入后的内容。"""
     target = Path(path)
-    data = TokenFile.load(target) if target.exists() else TokenFile()
+    data = _load(target) if target.exists() else TokenFile()  # 格式不对 → TokenFileError
     principals = list(data.principals)
     metrics = list(data.metrics)
     for entry in entries:

@@ -29,7 +29,7 @@ from rodit.app.unit import in_memory_repos
 from rodit.core.enums import Platform
 from rodit.ops import serve
 from rodit.ops.bindings import BindingError, PlatformBindings, is_mock
-from rodit.ops.instrument import MeteredToolGateway, ObservedAuditLog
+from rodit.ops.instrument import ObservedAuditLog
 from rodit.ops.serve import StartupError, build_server, healthcheck, main
 from rodit.ops.settings import DEFAULT_TOKENS_FILE, ServerSettings, SettingsError
 from rodit.ops.tokens import TokenFileAuthenticator, TokenFileError
@@ -122,8 +122,8 @@ def test_production_mode_c_only(ops_env, token_file, monkeypatch):
     unit = server.unit
     assert unit.adapters.keys() == [(Platform.TAOBAO, "C")]
     assert isinstance(unit.adapters.get(Platform.TAOBAO, "C"), StandaloneAssistAdapter)
-    assert isinstance(unit.tools, MeteredToolGateway)
-    assert isinstance(unit.tools.inner, NullToolGateway)
+    # 模式 C 的空网关不调平台接口，不计量（平台调用量指标里不出现没发生的调用）
+    assert isinstance(unit.tools, NullToolGateway)
     assert unit.action_port is None
     # 生产组装：PostgreSQL 仓储，审计套上指标采集，大模型计量也经过它
     assert isinstance(unit.repos.audit, ObservedAuditLog)
@@ -469,6 +469,30 @@ def test_main_startup_failure_exit_code_and_log(ops_env, token_file, capsys):
     assert SYNTHETIC_TOKEN_KEY not in err and SYNTHETIC_LLM_KEY not in err
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RODIT_DB_STATEMENT_TIMEOUT_MS", "abc"),
+        ("RODIT_DB_LOCK_TIMEOUT_MS", "-5"),
+        ("RODIT_LLM_TIMEOUT_S", "abc"),
+        ("RODIT_CONFIG", "/nonexistent/rodit.yaml"),
+    ],
+)
+def test_main_bad_config_values_are_startup_failures(
+    ops_env, token_file, monkeypatch, capsys, name, value
+):
+    """配置值不对：和其他拒绝启动一样只记原因（JSON 日志一行），退出码 2，不甩原始回溯。"""
+    monkeypatch.setenv("RODIT_MODE_C_ONLY", "1")
+    monkeypatch.setenv(name, value)
+    ran: list[Any] = []
+    assert main(["serve"], run=lambda *a, **k: ran.append(a)) == serve.EXIT_STARTUP
+    assert not ran
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    record = json.loads(err.strip().splitlines()[-1])
+    assert record["level"] == "ERROR" and "启动失败" in record["msg"]
+
+
 def test_main_migrate_on_start(ops_env, token_file, monkeypatch):
     monkeypatch.setenv("RODIT_MODE_C_ONLY", "1")
     monkeypatch.setenv("RODIT_MIGRATE_ON_START", "1")
@@ -522,6 +546,17 @@ def test_issue_token_command(tmp_path, capsys):
     assert main(["issue-token", "--shop-id", SHOP_A], out=io.StringIO()) == serve.EXIT_STARTUP
 
 
+def test_issue_token_append_to_malformed_file_prints_no_token(tmp_path, capsys):
+    """令牌文件格式不对：写不进去，就不显示令牌（显示了也用不了），退出码 2，文件不动。"""
+    path = tmp_path / "tokens.json"
+    path.write_text("{not json", encoding="utf-8")
+    out = io.StringIO()
+    args = ["issue-token", "--shop-id", SHOP_A, "--user-id", "kf_09", "--role", "agent"]
+    assert main([*args, "--append", str(path)], out=out) == serve.EXIT_STARTUP
+    assert "Bearer" not in out.getvalue() and "Bearer" not in capsys.readouterr().out
+    assert path.read_text(encoding="utf-8") == "{not json"
+
+
 def test_issue_token_with_expiry(tmp_path):
     out = io.StringIO()
     path = tmp_path / "tokens.json"
@@ -562,8 +597,46 @@ def test_healthcheck_command():
 def test_healthcheck_via_main(monkeypatch):
     import urllib.request
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout: _Resp(200))
+    handlers: list[Any] = []
+
+    class _Opener:
+        def open(self, url: str, timeout: float) -> _Resp:
+            return _Resp(200)
+
+    def build_opener(*hs: Any) -> _Opener:
+        handlers.extend(hs)
+        return _Opener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
     assert main(["healthcheck"]) == 0
+    # 本机探测不走环境代理：ProxyHandler 显式给空
+    [proxy] = [h for h in handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert proxy.proxies == {}
+
+
+def test_healthcheck_ignores_http_proxy_env(monkeypatch):
+    """HTTP_PROXY 指向连不上的代理、NO_PROXY 没列 127.0.0.1：本机 /healthz 照样探到。"""
+    import http.server
+    import threading
+
+    class Health(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200 if self.path == "/healthz" else 404)
+            self.end_headers()
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for name in ("NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")  # 丢弃端口，连不上
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+        assert healthcheck({"RODIT_PORT": str(server.server_address[1])}) == 0
+    finally:
+        server.shutdown()
 
 
 def test_local_init_refused_in_production(ops_env, token_file):

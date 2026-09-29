@@ -34,6 +34,7 @@ from typing import Any, TextIO
 import psycopg
 from fastapi import FastAPI
 
+from rodit.adapters import NullToolGateway
 from rodit.api import create_app
 from rodit.api.auth import PrincipalRole
 from rodit.app.production import build_production_unit, migrate, production_database
@@ -44,7 +45,7 @@ from rodit.core.config import EngineConfig, load_config
 from rodit.core.enums import ProviderName
 from rodit.core.errors import StorageUnavailable
 from rodit.core.pii import BuyerRefHasher
-from rodit.core.ports import AuditLog
+from rodit.core.ports import AuditLog, ToolGateway
 from rodit.llm import MeteredLLMClient
 from rodit.ops.bindings import (
     BindingContext,
@@ -195,7 +196,12 @@ def compose_unit(
     ctx = BindingContext(platform=settings.platform, config=config, clock=clock, hasher=hasher)
     bindings = resolve_bindings(settings, ctx, factory=bindings_factory)
     metrics = RoditMetrics(platform=settings.platform, mode=settings.deploy_mode)
-    tools = MeteredToolGateway(bindings.tools, metrics)
+    # 模式 C 的空网关不调任何平台接口：不计量，免得平台调用量指标里出现根本没发生的调用（§12.4）
+    tools: ToolGateway = (
+        bindings.tools
+        if isinstance(bindings.tools, NullToolGateway)
+        else MeteredToolGateway(bindings.tools, metrics)
+    )
 
     def observe(audit: AuditLog) -> AuditLog:
         return ObservedAuditLog(audit, metrics)
@@ -223,7 +229,7 @@ def _offline_unit(
     clock: Clock,
     hasher: BuyerRefHasher,
     bindings: PlatformBindings,
-    tools: MeteredToolGateway,
+    tools: ToolGateway,
     observe: Callable[[AuditLog], AuditLog],
     repos: Repos | None,
 ) -> Unit:
@@ -382,11 +388,13 @@ def issue_token_command(args: argparse.Namespace, out: TextIO) -> int:
             print("issue-token 需要 --shop-id、--user-id、--role（或 --metrics）", file=sys.stderr)
             return EXIT_STARTUP
         issued = issue_principal_token(args.shop_id, args.user_id, args.role, expires_at=expires)
-    print("令牌原文只显示这一次，请直接交给使用方；令牌文件里只存它的哈希：", file=out)
-    _print_token(out, issued)
     entry_json = issued.entry.model_dump_json(exclude_none=True)
     if args.append:
+        # 先写进文件再显示令牌：写不进去（文件格式不对、没有权限）时不显示一个用不了的令牌
         append_entries(args.append, [issued.entry])
+    print("令牌原文只显示这一次，请直接交给使用方；令牌文件里只存它的哈希：", file=out)
+    _print_token(out, issued)
+    if args.append:
         print(f"已写入令牌文件：{args.append}", file=out)
     else:
         section = "metrics" if args.metrics else "principals"
@@ -469,7 +477,8 @@ def healthcheck(
     port = env.get("RODIT_PORT", "").strip() or "8000"
     if not port.isdigit():
         return EXIT_FAILURE
-    open_url = opener or urllib.request.urlopen
+    # 本机探测不走环境里的 HTTP 代理（HTTP_PROXY 没把 127.0.0.1 列进 NO_PROXY 时会发给代理）
+    open_url = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
     try:
         with open_url(f"http://127.0.0.1:{port}/healthz", timeout=2) as resp:
             return 0 if getattr(resp, "status", None) == 200 else EXIT_FAILURE
@@ -522,9 +531,9 @@ def main(
     if command == "healthcheck":
         return healthcheck()
     _early_logging(os.environ)
-    if command == "issue-token":
-        return issue_token_command(args, out)
     try:
+        if command == "issue-token":
+            return issue_token_command(args, out)
         if command == "migrate":
             migrate_database()
             return 0
@@ -544,6 +553,9 @@ def main(
     except (StorageUnavailable, psycopg.Error) as exc:  # 只记类型：说明里可能有主机名、账号
         logger.error("数据库不可用：%s", type(exc).__name__)
         return EXIT_FAILURE
+    except (ValueError, OSError) as exc:  # 配置值不对（超时不是正整数、配置文件不存在……）
+        logger.error("启动失败：%s", exc)
+        return EXIT_STARTUP
     if run is None:
         import uvicorn
 

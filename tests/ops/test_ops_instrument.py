@@ -420,3 +420,36 @@ def test_http_metrics_use_route_templates_and_error_codes(metrics):
     assert sample(s, "rodit_http_request_duration_seconds_count", route=route, method="GET") == 3
     text = metrics.render()
     assert "s_1001" not in text and "13812345678" not in text and "北京" not in text
+
+
+def test_http_metrics_method_label_is_bounded(metrics):
+    """客户端随便编的方法名（h11 都接受）不能各占一条序列、把序列上限挤满。"""
+    client = _http_app(metrics)
+    for i in range(50):
+        client.request(f"X{i:05d}", "/nothing-here")
+    client.get("/v1/shops/s_1001/things/x")
+    s = _samples(metrics)
+    route = "/v1/shops/{shop_id}/things/{thing_id}"
+    assert (
+        sample(s, "rodit_http_requests_total", route="unmatched", method="other", status="404")
+        == 50
+    )
+    assert sample(s, "rodit_http_requests_total", route=route, method="GET", status="200") == 1
+    assert "X00001" not in metrics.render()
+
+
+def test_http_metrics_label_docs_routes_by_template(metrics):
+    """FastAPI 自带的 /docs、/openapi.json 是匹配上的路由，不记成 unmatched。"""
+    client = _http_app(metrics)
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/docs").status_code == 200
+    s = _samples(metrics)
+    assert (
+        sample(s, "rodit_http_requests_total", route="/openapi.json", method="GET", status="200")
+        == 1
+    )
+    assert sample(s, "rodit_http_requests_total", route="/docs", method="GET", status="200") == 1
+    assert (
+        sample(s, "rodit_http_requests_total", route="unmatched", method="GET", status="200")
+        is None
+    )

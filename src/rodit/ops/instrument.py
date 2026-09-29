@@ -29,6 +29,8 @@ from datetime import datetime, timedelta
 from importlib import metadata
 from typing import Any
 
+from starlette.routing import Match
+
 from rodit.adapters import AuthGuard
 from rodit.core.audit import AuditAction
 from rodit.core.clock import Clock, SystemClock
@@ -596,10 +598,10 @@ class HttpMetricsMiddleware:
                 logger.warning("指标采集失败：%s", type(exc).__name__)
 
     def _observe(self, scope: Mapping[str, Any], state: Mapping[str, Any], seconds: float) -> None:
-        route = scope.get("route")
-        path = getattr(route, "path", None)
-        route_label = path if isinstance(path, str) and path else UNMATCHED_ROUTE
-        method = str(scope.get("method", "")).upper()
+        route_label = _route_label(scope, state["status"])
+        # 方法名来自客户端（h11 接受任意记号）：只认标准方法，其余归 other，标签值有界
+        raw_method = str(scope.get("method", "")).upper()
+        method = raw_method if raw_method in _HTTP_METHODS else "other"
         code = None
         if state.get("unhandled"):
             code = "internal_error"  # 和接口层对未预期异常的错误码一致
@@ -607,6 +609,28 @@ class HttpMetricsMiddleware:
             code = _error_code(state["body"]) if state["json"] else None
             code = code or f"http_{state['status']}"
         self.metrics.observe_http(route_label, method, state["status"], seconds, code)
+
+
+_HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+
+
+def _route_label(scope: Mapping[str, Any], status: int) -> str:
+    """路由模板作标签。FastAPI 只给 APIRoute 设 scope["route"]；它自己加的 /docs、/openapi.json
+    这类 Starlette 路由匹配上了也没有，成功的请求按应用的路由表再匹配一次拿模板。
+    没匹配上的（扫描器乱试的路径）一律记 unmatched。"""
+    path = getattr(scope.get("route"), "path", None)
+    if isinstance(path, str) and path:
+        return path
+    if status < 400:
+        for candidate in getattr(scope.get("app"), "routes", ()):
+            try:
+                match, _ = candidate.matches(scope)
+            except Exception:  # noqa: BLE001 — 匹配失败就当没匹配上
+                continue
+            template = getattr(candidate, "path", None)
+            if match == Match.FULL and isinstance(template, str) and template:
+                return template
+    return UNMATCHED_ROUTE
 
 
 def _error_code(body: bytes) -> str | None:
