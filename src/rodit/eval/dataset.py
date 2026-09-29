@@ -1,52 +1,28 @@
-"""合成评测集（方案 §13.1）。
+"""合成评测集（方案 §13.1）：首发类目服饰（女装，D7 默认），约 300 条。
 
-每条标注：正确的问题类型、参考答案要点、必须引用的依据、不能出现的内容。全部基于合成演示世界
-（rodit.testing.fixtures），不含真实商家、买家数据。按 id 的哈希留出 20% 作为测试集，不参与调参。
+每条标注：正确的问题类型（及可接受的备选）、参考答案要点、必须引用的依据、不能出现的内容、
+允许的路由结果（标注约定见 rodit.eval.cases_base）。全部基于合成演示世界（rodit.testing.fixtures），
+不含真实商家、买家数据；期望按方案和演示世界的事实写，不按离线流水线的实际输出调。
 
-标注约定：
-- must_cite：每个元素是"任选其一"的依据 ID 组，推荐回答的依据里至少要有组内一个；
-- must_include：回答里必须出现的要点（子串）；
-- must_not_include：回答里不能出现的内容（错误事实、违规话术）；
-- expected_actions：允许的路由结果（空表示按问题类型正常回答，即 answer / high_risk_answer）；
-- no_suggestion_ok：不给推荐也算对（如投诉、要求人工）。
+- 初版 81 条（本文件 CASES_V1）：按 id 的哈希分组（cases_base.hash_split），分组保持不变；
+- 扩充的用例（cases_presale / cases_aftersale / cases_other）覆盖全部 20 个问题类型和 §11 的
+  核心流程，另有口语、错别字 / 谐音、一条消息多个问题、情绪、站外请求、带商品 / 订单卡片、
+  依赖历史的追问、文字里的个人信息（合成）、依据不足时不该给推荐等情况。
+
+测试集（§13.1 留出 20%，不参与调参）按问题类型分层：每个类型的测试集条数取该类型总条数的 20%
+（四舍五入，至少 1 条），先算上初版已在测试集里的，差的从该类型的扩充用例里按 id 的 sha256 从小到大
+补足；结果冻结在用例上（holdout=True），以后新增用例不会改变已有用例的分组。
 """
 
 from __future__ import annotations
 
-import hashlib
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
-
 from rodit.core.enums import Intent, Role, RouteAction
-
-
-class EvalCase(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    text: str
-    expected_intent: Intent
-    acceptable_intents: list[Intent] = Field(default_factory=list)
-    shop: str = "SHOP_A"  # fixtures 里的常量名
-    buyer: str = "BUYER"  # fixtures 里的常量名
-    item_id: str | None = None
-    sku_id: str | None = None
-    order_id: str | None = None
-    history: list[tuple[Role, str]] = Field(default_factory=list)
-    expected_actions: list[RouteAction] = Field(default_factory=list)
-    must_cite: list[list[str]] = Field(default_factory=list)
-    must_include: list[str] = Field(default_factory=list)
-    must_not_include: list[str] = Field(default_factory=list)
-    no_suggestion_ok: bool = False
-    tags: list[str] = Field(default_factory=list)
-
-    @property
-    def split(self) -> Literal["dev", "test"]:
-        """按 id 的哈希稳定分组：20% 测试集（§13.1 留出，不参与调参）。"""
-        h = int(hashlib.sha256(self.id.encode()).hexdigest(), 16)
-        return "test" if h % 5 == 0 else "dev"
-
+from rodit.eval.cases_aftersale import AFTERSALE_CASES
+from rodit.eval.cases_base import EvalCase, hash_split
+from rodit.eval.cases_other import OTHER_CASES
+from rodit.eval.cases_presale import PRESALE_CASES
 
 I, A = Intent, RouteAction  # noqa: E741
 
@@ -55,7 +31,7 @@ def _c(id: str, text: str, intent: Intent, **kw) -> EvalCase:  # noqa: A002
     return EvalCase(id=id, text=text, expected_intent=intent, **kw)
 
 
-CASES: list[EvalCase] = [
+CASES_V1: list[EvalCase] = [
     # ---------------------------------------------------------------- 售前：商品参数
     _c(
         "spec-01",
@@ -698,7 +674,13 @@ CASES: list[EvalCase] = [
 ]
 
 
+CASES: list[EvalCase] = [*CASES_V1, *PRESALE_CASES, *AFTERSALE_CASES, *OTHER_CASES]
+
+
 def cases(split: Literal["dev", "test", "all"] = "all") -> list[EvalCase]:
     if split == "all":
         return list(CASES)
     return [c for c in CASES if c.split == split]
+
+
+__all__ = ["CASES", "CASES_V1", "EvalCase", "cases", "hash_split"]

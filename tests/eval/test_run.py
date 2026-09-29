@@ -1,15 +1,17 @@
 """python -m rodit.eval：在合成评测集上跑本地演示单元（§13），不崩、报告齐全、指标不低于基线。
 
 下限比实测基线略低（留一两条用例的余量），用来发现回归（§13.5 指标不下降才上线），不是上线门槛。
-实测基线（离线大模型 + 关键词规则路由 + 启发式质检）：
+实测基线（离线大模型 + 关键词规则路由 + 启发式质检；评测集扩充到 324 条后）：
 
-| 评测集 | 条数 | 类型准确率 | 路由 | 出推荐 | 事实正确 | 切题 | 合规 | 表达 | ECE |
-|---|---|---|---|---|---|---|---|---|---|
-| dev  | 66 | 84.8% | 89.4% | 83.3% | 71.2% | 83.3% | 100% | 87.9% | 0.019 |
-| test | 15 | 93.3% | 100%  | 80.0% | 80.0% | 80.0% | 100% | 86.7% | 0.150 |
-| all  | 81 | 86.4% | 91.4% | 82.7% | 72.8% | 82.7% | 100% | 87.7% | 0.043 |
+| 评测集 | 条数 | 类型准确率 | 路由 | 出推荐 | 事实正确 | 切题 | 合规 | 表达 | 失败 | ECE |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dev  | 258 | 78.7% | 83.7% | 79.5% | 58.5% | 76.7% | 100% | 85.7% | 118 | 0.056 |
+| test | 66  | 81.8% | 84.8% | 83.3% | 65.2% | 78.8% | 100% | 90.9% | 30  | 0.037 |
+| all  | 324 | 79.3% | 84.0% | 80.2% | 59.9% | 77.2% | 100% | 86.7% | 148 | 0.050 |
 
-测试集门槛（事实正确、合规满分率 ≥ 95%）未通过：离线替身只会复述依据里最像的一句。
+测试集门槛（事实正确、合规满分率 ≥ 95%）未通过：离线替身只会复述依据里最像的一句，
+扩充的用例里多问题、依赖历史的追问、依据不足和售后细分场景更多，离线替身答不全。
+（初版 81 条上的结果不变：dev 66 条、test 15 条的失败清单和扩充前一样。）
 """
 
 from __future__ import annotations
@@ -27,34 +29,34 @@ from rodit.eval.dataset import cases
 
 FLOORS: dict[str, dict[str, float]] = {
     "dev": {
-        "intent_accuracy": 0.82,
-        "action_accuracy": 0.86,
-        "suggestion_rate": 0.80,
-        "factual": 0.68,
-        "on_topic": 0.80,
+        "intent_accuracy": 0.77,
+        "action_accuracy": 0.82,
+        "suggestion_rate": 0.78,
+        "factual": 0.57,
+        "on_topic": 0.75,
         "compliance": 1.0,
-        "expression": 0.85,
+        "expression": 0.84,
     },
     "test": {
-        "intent_accuracy": 0.86,
-        "action_accuracy": 0.93,
-        "suggestion_rate": 0.73,
-        "factual": 0.73,
-        "on_topic": 0.73,
+        "intent_accuracy": 0.79,
+        "action_accuracy": 0.81,
+        "suggestion_rate": 0.80,
+        "factual": 0.62,
+        "on_topic": 0.75,
         "compliance": 1.0,
-        "expression": 0.80,
+        "expression": 0.87,
     },
     "all": {
-        "intent_accuracy": 0.84,
-        "action_accuracy": 0.89,
-        "suggestion_rate": 0.80,
-        "factual": 0.70,
-        "on_topic": 0.80,
+        "intent_accuracy": 0.78,
+        "action_accuracy": 0.83,
+        "suggestion_rate": 0.79,
+        "factual": 0.59,
+        "on_topic": 0.76,
         "compliance": 1.0,
         "expression": 0.85,
     },
 }
-MAX_FAILURES = {"dev": 22, "test": 5, "all": 27}
+MAX_FAILURES = {"dev": 121, "test": 32, "all": 152}
 MAX_ECE = 0.10  # 全部用例上的期望校准误差
 
 
