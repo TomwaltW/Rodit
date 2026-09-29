@@ -546,6 +546,19 @@ def test_issue_token_command(tmp_path, capsys):
     assert main(["issue-token", "--shop-id", SHOP_A], out=io.StringIO()) == serve.EXIT_STARTUP
 
 
+def test_issue_token_for_a_reviewer(tmp_path):
+    """复核人员（§13.5）按店铺签发令牌；user_id 必须是具体的人。"""
+    path = tmp_path / "tokens.json"
+    out = io.StringIO()
+    args = ["issue-token", "--shop-id", SHOP_A, "--user-id", "qa_01", "--role", "reviewer"]
+    assert main([*args, "--append", str(path)], out=out) == 0
+    token = re.search(r"Bearer (rdt_\S+)", out.getvalue()).group(1)
+    principal = TokenFileAuthenticator(path).authenticate(token)
+    assert (principal.role, principal.shop_id) == ("reviewer", SHOP_A)
+    bad = ["issue-token", "--shop-id", SHOP_A, "--user-id", "system", "--role", "reviewer"]
+    assert main(bad, out=io.StringIO()) == serve.EXIT_STARTUP
+
+
 def test_issue_token_append_to_malformed_file_prints_no_token(tmp_path, capsys):
     """令牌文件格式不对：写不进去，就不显示令牌（显示了也用不了），退出码 2，文件不动。"""
     path = tmp_path / "tokens.json"

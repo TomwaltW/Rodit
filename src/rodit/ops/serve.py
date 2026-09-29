@@ -57,7 +57,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol, TextIO
+from typing import Any, Protocol, TextIO, get_args
 
 import psycopg
 import yaml
@@ -730,7 +730,7 @@ def _parser() -> argparse.ArgumentParser:
     issue = sub.add_parser("issue-token", help="签发访问令牌")
     issue.add_argument("--shop-id")
     issue.add_argument("--user-id")
-    issue.add_argument("--role", choices=["agent", "manager", "merchant", "integration"])
+    issue.add_argument("--role", choices=sorted(get_args(PrincipalRole)))
     issue.add_argument("--metrics", action="store_true", help="签发 /metrics 的抓取令牌")
     issue.add_argument("--name", help="抓取令牌的名字（--metrics 时）")
     issue.add_argument("--expires-days", type=float, default=0, help="有效天数（0 = 不过期）")

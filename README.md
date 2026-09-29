@@ -96,10 +96,17 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 |---|---|
 | `serve` | 启动服务（镜像默认命令） |
 | `migrate` | 迁移数据库（属主账号 `RODIT_MIGRATE_DSN`，没设就用 `RODIT_DATABASE_DSN`），并授权 `rodit_app` 读迁移版本（`/readyz` 用）；幂等，每次发布前跑一次 |
-| `issue-token --shop-id … --user-id … --role agent\|manager\|merchant\|integration [--expires-days N] [--append 文件]` | 签发访问令牌：原文只打印这一次，令牌文件只存 SHA-256 |
+| `issue-token --shop-id … --user-id … --role agent\|manager\|merchant\|integration\|reviewer [--expires-days N] [--append 文件]` | 签发访问令牌：原文只打印这一次，令牌文件只存 SHA-256 |
 | `issue-token --metrics --name prometheus [--append 文件]` | 签发 `/metrics` 的抓取令牌 |
 | `local-init` | 只用于本地试用（`RODIT_ENV=local`） |
 | `healthcheck` | 镜像 HEALTHCHECK 用：请求本机 `/healthz` |
+| `recalibrate [--since …] [--until …] [--min-support N] [--out 文件] [--config YAML]` | §13.5 每月按采纳反馈重算阈值：只输出建议（中文摘要 + 只含改动的 YAML 片段），不改任何配置 |
+| `train-classifier --out 文件 [--min-samples N] [--force] [--overwrite] [--config YAML]` | §6.4 用反馈标注训练路由分类器：报告留出集和评测集上对比关键词规则的效果，原子写入模型文件（JSON） |
+
+`recalibrate` 和 `train-classifier` 是离线任务，标注从 `RODIT_TRAINER_DSN` 读（这个登录账号要能
+`SET ROLE rodit_trainer`，只能跨店读 `labeled_sample`，读不到别的表）；退出码 0 完成、1 数据库不可用、
+2 参数或配置不对。两者的结果上线前都要先跑回归（§13.5）：
+`python -m rodit.eval --config <新配置> [--classifier <模型文件>] --baseline <基线.json>`，指标不下降才上线。
 
 ### 环境变量
 
@@ -131,6 +138,8 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `RODIT_MIGRATE_ON_START` | `false` | `serve` 前先迁移（服务进程需要属主权限，不推荐） |
 | `RODIT_AUTH_EXPIRY_WARN_DAYS` / `RODIT_AUTH_EXPIRY_CHECK_S` | 7 / 300 | 授权即将过期告警的窗口、检查间隔 |
 | `RODIT_READINESS_CACHE_S` | 2 | `/readyz` 结果缓存 |
+| `RODIT_CLASSIFIER_PATH` | | `decision.provider: classifier` 时必填：`train-classifier` 输出的模型文件；缺失或校验不过拒绝启动 |
+| `RODIT_TRAINER_DSN` | | 只给离线任务（`recalibrate`、`train-classifier`）：能 `SET ROLE rodit_trainer` 的登录账号，不给服务进程 |
 
 ### 生产模式下拒绝启动（退出码 2，日志只写原因和变量名）
 
@@ -144,9 +153,12 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 - **平台绑定工厂**：`RODIT_PLATFORM_BINDINGS=包.模块:函数`，签名 `(rodit.ops.BindingContext) -> rodit.ops.PlatformBindings`。
   `tools` 实现 `ToolGateway`（只读，§7.1；限流 / 故障抛 `ToolUnavailable`，返回的数据已最小化）；
   `adapters` 实现 `PlatformAdapter`（模式 A / B；用 `ctx.hasher` 把平台买家 ID 变成 `buyer_ref`；`peek_shop_id` 不改状态）；
-  `action_port` 二期才有（写售后，必须人确认）；`shop_ids` 返回订购列表（授权过期告警用）。
+  `action_port` 二期才有（写售后，必须人确认）；`shop_ids` 返回订购列表（授权过期告警用）；
+  `catalog` 实现 `ItemCatalog`（平台商品接口，只读）、`ocr` 实现 `ImageTextExtractor`（详情图 OCR，图片不出云），
+  用于商家控制台的商品同步（§5.2.3），不给时同步接口返回 503。
 - **令牌文件**：由平台的登录体系（工作台子账号等）签发令牌，写进挂载的密钥文件（格式见 `rodit.ops.tokens`）。
-- **数据库账号**：属主账号给 `migrate` 任务；服务账号 `GRANT rodit_app TO <账号>`。
+- **数据库账号**：属主账号给 `migrate` 任务；服务账号 `GRANT rodit_app TO <账号>`；
+  离线训练 / 重算任务单独一个账号 `GRANT rodit_trainer TO <账号>`（`RODIT_TRAINER_DSN`）。
 - 大模型：平台云内可调用的境内已备案模型（D5），OpenAI 兼容接口。
 
 ### 探针与指标（§12.4）
@@ -162,6 +174,23 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
   `rodit_http_errors_total{route,code}`（`code="tenant_isolation"` 即串店拦截）等。
   标签里只有店铺 ID 和代码，不含买家文本、`buyer_ref`、会话 ID；取消订购后该店铺的指标一起删掉。
 - 日志：一行一个 JSON，手机号、地址等个人信息打码，令牌、连接串密码、密钥原文替换成 `***`。
+
+## 商家控制台与上线节奏（方案 §9.1、§5.2、§13.4、§13.5）
+
+店铺范围的接口都在 `/v1/shops/{shop_id}/…`，鉴权和串店检查同其他接口；操作人一律取自令牌身份。
+
+| 功能 | 接口 | 角色 |
+|---|---|---|
+| FAQ：列表、录入、修改（旧条目下线、新条目上线，旧推荐的依据 ID 不变）、带修改地审核候选 | `console/faqs`、`console/faqs/{id}/edit`、`console/candidates/{id}/approve-edited` | 看：店长、商家；改：商家 |
+| 店铺政策：逐项查看和修改（改动即时生效，§5.2.1） | `console/policies`、`console/policies/{key}` | 同上 |
+| 商品卡片：商家填的字段（尺码建议、洗护、使用说明、不能说的卖点）；平台商品同步 + 详情图 OCR | `console/items`、`console/items/{item_id}`、`console/items/sync` | 同上 |
+| 店铺配置（§9.3）：语气、称呼、长度、禁用词、关闭的问题类型、推荐条数、售后金额上限、店长 | `console/config` | 同上；影子模式、全自动开关不在这里 |
+| 上线状态：当前阶段、影子对比、各阶段门槛、没法自动检查的条件 | `rollout/status`、`rollout/shadow` | 店长、商家、复核人员 |
+| 切换影子 / 智能辅助（§13.4）：切到智能辅助要过门槛，没过要强制并写明原因 | `rollout/stage` | 切回影子：商家、复核人员；切到智能辅助：复核人员 |
+| 每周人工复核（§13.5）：按问题类型分层抽 50 条、按 §13.2 四个维度打分、报表（事实正确和合规满分率 ≥ 95%） | `quality/sample`、`quality/reviews`、`quality/reviews/{id}`、`quality/report` | 复核人员；报表店长、商家也能看 |
+
+复核人员（`reviewer` 角色）是我们的质检人员，按店铺签发令牌；看推荐原文每次都记访问审计（§9.2）。
+写操作都和取消订购互斥；店铺配置和商品卡片的修改在仓储里原子地只改涉及的字段，并发修改不会互相覆盖。
 
 ## 一条买家消息怎么走（方案 §4.2）
 
@@ -180,16 +209,16 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 |---|---|---|
 | `rodit.core` | 契约：数据模型、Jev 格式判断层接口、端口协议、配置、证据规则、个人信息最小化 | §5–§10 |
 | `rodit.decision` / `rodit.routing` | 判断层（规则、境内大模型投票、分类器、受限的 Jev）与路由 | §6 |
-| `rodit.knowledge` | 知识中心：结构化优先检索、FAQ 语义检索、冲突处理、平台规则、问卷、缺失检查 | §5.2 |
+| `rodit.knowledge` | 知识中心：结构化优先检索、FAQ 语义检索、冲突处理、平台规则、问卷、缺失检查；知识编辑、商品同步 | §5.2 |
 | `rodit.tools` / `rodit.aftersale` | 平台只读工具（缓存降级）、物流问答与异常、售后问答与审核助手 | §7 |
 | `rodit.generation` / `rodit.qa` | 答案生成与质检 | §5.4、§5.5 |
-| `rodit.adapters` / `rodit.feedback` | 三平台接入（模拟）、模式 C、授权；反馈闭环与报表 | §8、§5.8、§12.4 |
+| `rodit.adapters` / `rodit.feedback` | 三平台接入（模拟）、模式 C、授权；反馈闭环与报表；影子对比、上线门槛、每周复核 | §8、§5.8、§12.4、§13.4、§13.5 |
 | `rodit.engine` | 编排：会话理解、执行计划、推荐卡片、降级与兜底 | §5.3、§5.6、§5.7、§12.2 |
 | `rodit.storage` / `rodit.llm` | PostgreSQL（行级安全）存储；OpenAI 兼容大模型客户端与用量计量 | §9.2、§10、§12.4 |
 | `rodit.app` | 平台单元组装、应用服务、本地演示、生产组装 | §9.1 |
-| `rodit.api` | HTTP 接口（按店铺鉴权、串店拦截）；模式 C 独立话术助手网页 `/assist` | §8.1、§8.4、§9.2 |
+| `rodit.api` | HTTP 接口（按店铺鉴权、串店拦截）；商家控制台、上线节奏与复核接口；模式 C 独立话术助手网页 `/assist` | §8.1、§8.4、§9.1、§9.2、§13.4 |
 | `rodit.ops` | 部署入口（`python -m rodit.ops`）、健康 / 就绪检查、Prometheus 指标、个人信息过滤的 JSON 日志 | §9.1、§12 |
-| `rodit.eval` | 合成评测集（324 条）、§13.2 评分、§13.3 阈值校准；离线替身或真实大模型、耗时与成本、回归比较 | §13、§12.1、§14 |
+| `rodit.eval` | 合成评测集（324 条）、§13.2 评分、§13.3 阈值校准；离线替身或真实大模型、耗时与成本、回归比较；每月阈值重算、路由分类器训练 | §13、§12.1、§14、§6.4 |
 
 ## 数据合规（摘自 CLAUDE.md）
 
