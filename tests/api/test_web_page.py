@@ -232,10 +232,11 @@ def test_script_keeps_token_in_session_storage_and_headers_only(api: Api):
     assert "localStorage" not in js and "document.cookie" not in js
     assert "sessionStorage" in js
     assert "console." not in js  # 不打日志
-    assert "Authorization" in js and "Bearer ${state.token}" in js
-    # 令牌不拼进地址：只在 Authorization 头里出现
-    uses = [line for line in js.splitlines() if "state.token" in line and "`" in line]
-    assert uses == ["    if (state.token) headers.Authorization = `Bearer ${state.token}`;"]
+    assert "Authorization" in js and "Bearer ${token}" in js
+    # 令牌不拼进地址：只在 Authorization 头里出现（api() 发请求时取一次 state.token）
+    uses = [line for line in js.splitlines() if "token" in line and "`" in line and "${" in line]
+    assert uses == ["    if (token) headers.Authorization = `Bearer ${token}`;"]
+    assert "const token = state.token;" in js
     assert "credentials: 'omit'" in js
 
 
@@ -317,3 +318,12 @@ def test_every_form_control_has_a_label(api: Api):
     # 错误提示读屏会念出来；状态更新用 aria-live
     assert any(a.get("role") == "alert" for _, a in page.tags)
     assert any(a.get("aria-live") == "polite" for _, a in page.tags)
+
+
+def test_script_drops_responses_that_arrive_after_a_different_sign_in(api: Api):
+    """退出后换人登录：上一位的请求晚回来不写进下一位的界面，上一位的 401 也不把下一位登出。"""
+    js = api.get(JS).text
+    assert "state.me && state.token === token" in js  # 401 只登出发请求的那一位
+    for fn in ("loadItems", "ask", "loadConsole"):
+        body = js.split(f"async function {fn}(", 1)[1].split("\n  }\n", 1)[0]
+        assert "const me = state.me" in body and "state.me !== me" in body, fn

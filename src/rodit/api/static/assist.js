@@ -174,7 +174,8 @@
 
   async function api(method, path, body) {
     const headers = { Accept: 'application/json' };
-    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+    const token = state.token; // 发请求时的身份：响应回来时可能已经换人登录
+    if (token) headers.Authorization = `Bearer ${token}`;
     const init = {
       method,
       headers,
@@ -203,7 +204,7 @@
     if (!resp.ok) {
       const code = data && typeof data.error === 'string' ? data.error : `http_${resp.status}`;
       const failure = new ApiFailure(resp.status, code, describeFailure(resp.status, data && data.message));
-      if (resp.status === 401 && state.me) {
+      if (resp.status === 401 && state.me && state.token === token) {
         signOut();
         showError(`${failure.message}。请重新登录。`);
       }
@@ -344,11 +345,14 @@
 
   async function loadItems() {
     const hint = $('item-hint');
+    const me = state.me; // 每次登录换一个对象：响应回来时已经退出或换人登录就丢掉
     try {
       const items = await api('GET', shopPath('items'));
+      if (state.me !== me) return;
       state.items = Array.isArray(items) ? items : [];
       hint.textContent = '买家问的是某件商品（面料、尺码……）时选上，回答更准。';
     } catch (err) {
+      if (state.me !== me) return;
       state.items = [];
       hint.textContent = `商品列表没有加载出来：${err.message}`;
     }
@@ -409,9 +413,11 @@
     if (itemId) body.item_id = itemId;
 
     const turn = addTurn(question, itemId);
+    const me = state.me;
     setBusy(true);
     try {
       const result = await api('POST', shopPath('standalone/ask'), body);
+      if (state.me !== me) return; // 期间退出或换人登录：不把上一位的结果写进新会话
       field.value = '';
       if (result === null) {
         turn.body.replaceChildren(h('p', { className: 'note' }, '这条问题没有处理（重复提交或不是买家问题）。'));
@@ -423,6 +429,7 @@
         renderResult(turn, result);
       }
     } catch (err) {
+      if (state.me !== me) return;
       turn.article.classList.add('failed');
       turn.body.replaceChildren(
         h('p', { className: 'error-inline', role: 'alert' }, `没有提交成功：${err.message}`),
@@ -816,13 +823,14 @@
 
   async function loadConsole() {
     if (!state.me || !CONSOLE_ROLES.includes(state.me.role)) return;
+    const me = state.me;
     $('adoption').replaceChildren(h('p', { className: 'muted' }, '加载中…'));
     $('gaps').replaceChildren(h('p', { className: 'muted' }, '加载中…'));
     const [adoption, gaps] = await Promise.allSettled([
       api('GET', shopPath(`reports/adoption${sinceParam()}`)),
       api('GET', shopPath('knowledge/gaps')),
     ]);
-    if (!state.me) return; // 期间登录失效
+    if (state.me !== me) return; // 期间登录失效或换人登录：不把上一位店铺的报表显示给下一位
     if (adoption.status === 'fulfilled') renderAdoption(adoption.value);
     else $('adoption').replaceChildren(h('p', { className: 'error-inline' }, adoption.reason.message));
     if (gaps.status === 'fulfilled') renderGaps(gaps.value);
@@ -935,12 +943,15 @@
     }
     const button = $('questionnaire-button');
     button.disabled = true;
+    const me = state.me;
     try {
       const result = await api('POST', shopPath('questionnaire'), { answers });
+      if (state.me !== me) return;
       status.textContent = `已保存：写入政策 ${result.policies.length} 项，更新店铺配置 ${result.config.length} 项。`;
       status.className = 'status ok';
       loadConsole();
     } catch (err) {
+      if (state.me !== me) return;
       status.textContent = `没有保存成功：${err.message}`;
       status.className = 'status error';
     } finally {
