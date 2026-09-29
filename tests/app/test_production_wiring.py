@@ -145,3 +145,12 @@ def test_audit_wrapper_wraps_every_audit_writer(prod_env):
     assert unit.gate._audit is audit  # type: ignore[attr-defined]  质检留痕
     assert audit in unit.repos.purgers()
     assert isinstance(_build().repos.audit, PgAuditLog)
+
+
+def test_postgres_repos_share_the_unit_clock(prod_env):
+    """会话仓储用单元的时钟（撤回先到的标记按它过期），和知识仓储一致。"""
+    from rodit.testing.fakes import FakeClock
+
+    clock = FakeClock()
+    repos = production.postgres_repos(Database("dbname=rodit_never_connected"), clock=clock)
+    assert repos.conversations._clock is clock  # type: ignore[attr-defined]

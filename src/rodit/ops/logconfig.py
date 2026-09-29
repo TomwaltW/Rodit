@@ -166,10 +166,13 @@ def configure_logging(
         raise ValueError(f"日志格式只能是 json 或 text：{fmt!r}")
     root.addHandler(handler)
     root.setLevel(level if isinstance(level, int) else level.upper())
+    # uvicorn 按自己的 log_level / access_log 设过级别、关过冒泡的话都还原：由根日志器统一过滤和输出
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logger = logging.getLogger(name)
         logger.handlers.clear()
         logger.propagate = True
+        logger.setLevel(logging.NOTSET)
+        logger.disabled = False
     return handler
 
 

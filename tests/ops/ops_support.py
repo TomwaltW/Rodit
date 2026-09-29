@@ -17,6 +17,7 @@ from starlette.exceptions import StarletteDeprecationWarning
 
 from rodit.adapters import StandaloneAssistAdapter, TaobaoMockAdapter
 from rodit.ops.bindings import BindingContext, PlatformBindings, demo_bindings
+from rodit.storage.db import MIGRATIONS
 from rodit.testing.fakes import InMemoryToolGateway
 from rodit.testing.fixtures import build_demo_world
 
@@ -84,10 +85,10 @@ class _Result:
 
 @dataclass
 class FakeReadinessDb:
-    """实现 health.SessionDatabase：versions 是 schema_migrations 里的版本；
+    """实现 health.SessionDatabase：versions 是 schema_migrations 里的版本（默认全部迁移）；
     enter_error / query_error 模拟连不上 / 查询出错。"""
 
-    versions: Sequence[int] = (1, 2)
+    versions: Sequence[int] = field(default_factory=lambda: tuple(m.version for m in MIGRATIONS))
     enter_error: BaseException | None = None
     query_error: BaseException | None = None
     sessions: int = 0

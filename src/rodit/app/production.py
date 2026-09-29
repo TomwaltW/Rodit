@@ -74,7 +74,7 @@ def postgres_repos(db: Database, *, clock: Clock, token_env: str = "RODIT_TOKEN_
     """一个单元的 PostgreSQL 仓储。令牌加密密钥从环境变量读（§8.4 令牌加密存储）。"""
     return Repos(
         knowledge=PgKnowledgeRepository(db, clock=clock),
-        conversations=PgConversationRepository(db),
+        conversations=PgConversationRepository(db, clock=clock),
         suggestions=PgSuggestionRepository(db),
         feedback=PgFeedbackRepository(db),
         reviews=PgAfterSaleReviewRepository(db),

@@ -34,10 +34,11 @@ from rodit.ops.serve import StartupError, build_server, healthcheck, main
 from rodit.ops.settings import DEFAULT_TOKENS_FILE, ServerSettings, SettingsError
 from rodit.ops.tokens import TokenFileAuthenticator, TokenFileError
 from rodit.storage import PgAuditLog
+from rodit.storage.db import MIGRATIONS
 from rodit.testing.fakes import FakeClock
 from rodit.testing.fixtures import SHOP_A, SHOP_B, build_demo_world
 
-ALL_VERSIONS = (1, 2)
+ALL_VERSIONS = tuple(m.version for m in MIGRATIONS)
 
 
 def _settings(**env: str) -> ServerSettings:

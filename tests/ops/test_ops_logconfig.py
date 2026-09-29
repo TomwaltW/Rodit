@@ -136,3 +136,15 @@ def test_bad_format_arguments_do_not_crash(stream):
     logging.getLogger("rodit.test").info("缺参数 %s %s", "只有一个")
     (line,) = _lines(stream)
     assert "缺参数" in line["msg"]
+
+
+def test_uvicorn_levels_set_earlier_are_reset(stream):
+    """uvicorn 以 log_level="warning"、access_log=False 启动过（同一进程里）：
+    重新配置后访问日志照样经过过滤输出，不会被遗留的级别吞掉。"""
+    access = logging.getLogger("uvicorn.access")
+    access.setLevel(logging.WARNING)
+    access.propagate = False
+    configure_logging("INFO", "json", stream=stream)
+    access.info('%s - "GET %s HTTP/1.1" 200', "10.0.0.1:5000", "/healthz")
+    (line,) = _lines(stream)
+    assert line["logger"] == "uvicorn.access" and "/healthz" in line["msg"]
