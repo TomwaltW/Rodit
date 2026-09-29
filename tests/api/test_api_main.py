@@ -6,7 +6,14 @@ import io
 
 from api_support import TestClient
 
-from rodit.api.__main__ import DEMO_HOST, DEMO_PORT, DEMO_PRINCIPALS, build_demo_app, main
+from rodit.api.__main__ import (
+    DEMO_HOST,
+    DEMO_PORT,
+    DEMO_PRINCIPALS,
+    build_demo_app,
+    demo_page_url,
+    main,
+)
 from rodit.testing.fixtures import SHOP_A, SHOP_B
 
 
@@ -57,3 +64,15 @@ def test_main_prints_demo_banner_and_binds_localhost():
         f"/v1/shops/{SHOP_A}/reports/qa", headers={"Authorization": f"Bearer {token}"}
     )
     assert r.status_code == 403 and r.json()["error"] == "forbidden_role"
+
+
+def test_main_prints_the_web_page_url_and_the_page_is_served():
+    """模式 C 网页工具（§8.1）：启动信息里有页面地址，页面在演示应用里能打开。"""
+    calls = []
+    out = io.StringIO()
+    main(out, run=lambda app, **kwargs: calls.append(app))
+    assert demo_page_url() == "http://127.0.0.1:8000/assist"
+    assert f"网页工具（模式 C）：{demo_page_url()}" in out.getvalue()
+    [app] = calls
+    r = TestClient(app).get("/assist")
+    assert r.status_code == 200 and "text/html" in r.headers["content-type"]

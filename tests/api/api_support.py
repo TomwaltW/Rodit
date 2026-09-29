@@ -104,6 +104,7 @@ _MERCHANT = frozenset({"merchant"})
 
 SHOP_ROUTES: tuple[Route, ...] = (
     Route("POST", "/v1/shops/{shop}/standalone/ask", {"session_id": "w", "question": "能开发票吗"}),
+    Route("GET", "/v1/shops/{shop}/items"),
     Route("POST", "/v1/shops/{shop}/suggestions/1/sent"),
     Route("POST", "/v1/shops/{shop}/suggestions/1/edited", {"edited_text": "亲，可以开的哦"}),
     Route("POST", "/v1/shops/{shop}/suggestions/1/rejected", {"reason": "other"}),

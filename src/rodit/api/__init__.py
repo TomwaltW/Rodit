@@ -4,7 +4,8 @@
 - auth：调用方身份 Principal、Authenticator 协议、开发用 StaticTokenAuthenticator（§9.2 租户隔离）；
 - errors：统一的错误 JSON 和异常映射（§12.2、§12.3）；
 - schemas：请求 / 响应模型（只放客服、商家需要看的内容，§5.3）；
-- python -m rodit.api：本地演示（合成数据，仅本机 127.0.0.1:8000）。
+- web：模式 C 独立话术助手网页（GET / 和 /assist，自带的静态页面，§8.1、§5.6、§5.8、§12.4）；
+- python -m rodit.api：本地演示（合成数据，仅本机 127.0.0.1:8000，网页工具在 /assist）。
 
 负责：集成阶段（TΩ）。可以依赖所有子包，但只调用 rodit.app.AssistService
 （外加 Unit 字段的只读查询）。

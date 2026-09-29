@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Rodit 话术助手（模式 C）</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assist/assist.css">
+<script id="rodit-config" type="application/json">__RODIT_PAGE_CONFIG__</script>
+<script src="assist/assist.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#question">跳到买家问题</a>
+<header class="topbar">
+  <h1>Rodit 话术助手 <span class="subtitle">模式 C · <span id="platform-name">独立话术助手</span></span></h1>
+  <div id="whoami" class="whoami" hidden>
+    <span id="identity"></span>
+    <button type="button" id="sign-out" class="secondary">退出</button>
+  </div>
+</header>
+
+<main id="main">
+  <details id="notice" class="notice" open>
+    <summary><strong>使用前须知：只能在本店已与我们签署《个人信息委托处理协议》后使用</strong>（方案 §8.1，建议法务确认）</summary>
+    <ul>
+      <li>只粘贴买家的问题本身，不要粘贴昵称、手机号、收件地址、订单号。粘贴的文字进入系统时先做个人信息最小化（手机号、地址等打码），之后才会调用大模型（§5.3）。</li>
+      <li>本工具不做任何自动抓取；推荐由你确认后自己复制回平台发给买家。模式 C 没有平台数据，查不到订单、物流、售后进度。</li>
+    </ul>
+  </details>
+
+  <noscript><p class="error">这个页面需要启用 JavaScript。</p></noscript>
+  <div id="error" class="error" role="alert" tabindex="-1" hidden></div>
+  <p id="live" class="visually-hidden" aria-live="polite"></p>
+
+  <section id="login" class="panel" aria-labelledby="login-title">
+    <h2 id="login-title">登录</h2>
+    <form id="login-form" novalidate>
+      <div class="field">
+        <label for="token">访问令牌</label>
+        <input id="token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="token-hint">
+        <p id="token-hint" class="hint">令牌只保存在本标签页（sessionStorage），关闭标签页即失效，不会出现在网址里。</p>
+      </div>
+      <button type="submit" id="login-button">登录</button>
+    </form>
+  </section>
+
+  <section id="assist" class="panel" aria-labelledby="assist-title" hidden>
+    <div class="section-head">
+      <h2 id="assist-title">买家问题</h2>
+      <div class="session">
+        <span id="session-label"></span>
+        <button type="button" id="new-session" class="secondary">新会话（换一位买家）</button>
+      </div>
+    </div>
+    <form id="ask-form" novalidate>
+      <div class="field">
+        <label for="item">商品（选填）</label>
+        <div id="item-filter-wrap" class="item-filter" hidden>
+          <label for="item-filter" class="visually-hidden">筛选商品</label>
+          <input id="item-filter" type="search" placeholder="按名称或编号筛选商品" autocomplete="off">
+        </div>
+        <select id="item" aria-describedby="item-hint">
+          <option value="">不指定商品</option>
+        </select>
+        <p id="item-hint" class="hint">买家问的是某件商品（面料、尺码……）时选上，回答更准。</p>
+      </div>
+      <div class="field">
+        <label for="question">买家的问题</label>
+        <textarea id="question" rows="3" aria-describedby="question-hint"></textarea>
+        <p id="question-hint" class="hint">Ctrl + Enter 提交。同一会话里的追问会带上前面的对话；换一位买家时点「新会话」。</p>
+      </div>
+      <button type="submit" id="ask-button">获取推荐回答</button>
+    </form>
+    <div id="turns" class="turns"></div>
+  </section>
+
+  <section id="console" class="panel" aria-labelledby="console-title" hidden>
+    <div class="section-head">
+      <h2 id="console-title">店铺数据</h2>
+      <form id="report-form" class="inline-form" novalidate>
+        <label for="range">统计范围</label>
+        <select id="range">
+          <option value="7">近 7 天</option>
+          <option value="30">近 30 天</option>
+          <option value="">全部</option>
+        </select>
+        <button type="submit" class="secondary">刷新</button>
+      </form>
+    </div>
+    <h3>推荐采纳率</h3>
+    <div id="adoption" class="adoption"></div>
+    <h3>要补的知识</h3>
+    <div id="gaps"></div>
+    <details id="questionnaire" class="questionnaire" hidden>
+      <summary>店铺政策问卷（附录 C）</summary>
+      <form id="questionnaire-form" novalidate>
+        <p class="hint">只提交填写了的题目；提交后覆盖这些题目原来的回答。「要补的知识」里写了该补第几题。</p>
+        <div id="questionnaire-fields"></div>
+        <button type="submit" id="questionnaire-button">提交问卷</button>
+        <p id="questionnaire-status" class="status" role="status"></p>
+      </form>
+    </details>
+  </section>
+</main>
+</body>
+</html>
