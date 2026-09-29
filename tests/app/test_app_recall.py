@@ -145,6 +145,29 @@ def test_recall_expiry_failure_is_redelivered(monkeypatch: Any):
     assert adapter.sidebar(SHOP_A, CONV) == []
 
 
+def test_recall_clears_sidebar_even_if_a_later_read_would_fail(monkeypatch: Any):
+    """过期提交之后再读推荐列表失败的话，重推时已经没有可过期的记录、侧边栏就刷新不了；
+    剩下的卡片从过期之前读到的列表里算，只读一次。"""
+    service, adapter = _service()
+    result = service.handle_event("B", taobao_event("什么时候发货", msg_id="g1"))
+    assert result is not None and result.suggestions
+    repo = service.unit.repos.suggestions
+    real_list = repo.list
+    calls = {"n": 0}
+
+    def flaky(*args: Any, **kw: Any) -> Any:
+        if kw.get("status") == SuggestionStatus.SHOWN:
+            calls["n"] += 1
+            if calls["n"] == 2:  # 过期之后的第二次读
+                raise StorageUnavailable("数据库连接失败")
+        return real_list(*args, **kw)
+
+    monkeypatch.setattr(repo, "list", flaky)
+    assert service.handle_event("B", _recall("g1_recall", "g1")) is None
+    assert {r.status for r in _records(service)} == {SuggestionStatus.EXPIRED}
+    assert adapter.sidebar(SHOP_A, CONV) == []
+
+
 def test_shadow_shop_late_message_does_not_double_count_shadow_comparison():
     service, adapter = _service()
     repo = service.unit.repos.knowledge

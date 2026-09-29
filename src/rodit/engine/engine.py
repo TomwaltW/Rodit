@@ -510,6 +510,9 @@ class AssistEngine:
         shown = self._suggestions.list(
             shop_id, conversation_id=conversation_id, status=SuggestionStatus.SHOWN
         )
+        # 剩下的卡片从过期之前读到的列表里算，不再读第二次：过期已经提交后第二次读失败的话，
+        # 平台重推撤回时已经没有可过期的记录，侧边栏就再也刷新不了
+        remaining = [r for r in shown if r.msg_id != msg_id]
         for record in shown:
             if record.msg_id != msg_id:
                 continue
@@ -523,9 +526,6 @@ class AssistEngine:
             expired = True
         if not expired:
             return None
-        remaining = self._suggestions.list(
-            shop_id, conversation_id=conversation_id, status=SuggestionStatus.SHOWN
-        )
         return [card_from_record(r) for r in remaining]
 
     # ------------------------------------------------------------ 执行计划
