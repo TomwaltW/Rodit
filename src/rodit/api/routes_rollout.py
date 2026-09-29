@@ -1,10 +1,171 @@
 """上线节奏与持续评估接口（方案 §13.4 影子对比与阶段门槛、§13.5 每周人工复核）。
 
-鉴权一律用 rodit.api.deps 的 *Dep（§9.2 串店检查）；业务逻辑在 rodit.app.rollout。
+鉴权一律用 rodit.api.deps 的 *Dep 或 shop_guard（§9.2 串店检查）；业务逻辑在 rodit.app.rollout。
+
+| 接口 | 角色 |
+|---|---|
+| GET rollout/status、rollout/shadow、quality/report（只有计数、分数、推荐 ID） | 店长、商家、复核 |
+| POST rollout/stage → shadow（停止展示，安全方向） | 商家、复核 |
+| POST rollout/stage → assist（要过 §13.4 门槛或强制） | 复核 |
+| POST quality/sample、quality/reviews/{id} | 复核 |
+| GET quality/reviews（含推荐文字，每次都留访问记录） | 复核 |
+
+（"复核"指我们的复核人员，reviewer 角色。）
+
+复核人、操作人一律取自调用方身份，不取请求体。影子 → 智能辅助的门槛没过、又没有强制切换时返回
+409 gate_not_passed，响应里带门槛结果（哪些条件没过、哪些没法检查），店铺配置不变。
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Path, Query
+from fastapi.responses import JSONResponse
+
+from rodit.api.auth import CONSOLE_ROLES, MERCHANT_ROLES, REVIEWER_ROLES, Principal
+from rodit.api.deps import MSG_FORBIDDEN_ROLE, ReviewerDep, ServiceDep, Since, shop_guard
+from rodit.api.errors import ApiError
+from rodit.api.schemas_rollout import (
+    QualityReviewView,
+    SampleRequest,
+    ScoreRequest,
+    ShadowView,
+    StageRequest,
+)
+from rodit.app.rollout import ReviewList, RolloutGateNotPassed, StageChange
+from rodit.core.enums import QualityReviewStatus
+from rodit.core.models import QUALITY_PERIOD_PATTERN
+from rodit.feedback.review import QualityReport, SampleResult
+from rodit.feedback.rollout import RolloutStage, RolloutStatus
+
+ERROR_GATE_NOT_PASSED = "gate_not_passed"
+
+RolloutReadDep = Annotated[Principal, Depends(shop_guard(CONSOLE_ROLES | REVIEWER_ROLES))]
+"""看上线状态、影子对比、复核报表（没有文字）：店长、商家、复核人员。"""
+StageDep = Annotated[Principal, Depends(shop_guard(MERCHANT_ROLES | REVIEWER_ROLES))]
+"""切换阶段：商家（只能切回影子）、复核人员。"""
+
+Period = Annotated[
+    str | None,
+    Query(pattern=QUALITY_PERIOD_PATTERN, description="ISO 周，如 2026-W40；默认上一个完整周"),
+]
+ReviewId = Annotated[int, Path(ge=1)]
+
+_GATE_409 = {
+    409: {"description": "影子 → 智能辅助的门槛没过（gate_not_passed，带门槛结果）或不允许的切换"}
+}
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------- 上线节奏（§13.4）
+
+
+@router.get("/v1/shops/{shop_id}/rollout/status", response_model=RolloutStatus, tags=["上线节奏"])
+def rollout_status(principal: RolloutReadDep, service: ServiceDep) -> RolloutStatus:
+    """当前阶段、建议、影子对比汇总、各阶段门槛（影子 → 智能辅助、智能辅助 → 下一阶段、
+    开放全自动的各类型），以及需要人工确认的条件。只读，没有文字。"""
+    return service.rollout.status(principal.shop_id)
+
+
+@router.get("/v1/shops/{shop_id}/rollout/shadow", response_model=ShadowView, tags=["上线节奏"])
+def rollout_shadow(
+    principal: RolloutReadDep, service: ServiceDep, since: Since = None
+) -> ShadowView:
+    """影子模式的推荐和客服实际回复的对比（§13.4）：逐组的推荐 ID 和字符重合度。
+    since 默认最近两个完整周的开始。只读，没有文字。"""
+    return ShadowView.from_comparison(service.rollout.shadow(principal.shop_id, since=since))
+
+
+@router.post(
+    "/v1/shops/{shop_id}/rollout/stage",
+    response_model=StageChange,
+    responses=_GATE_409,
+    tags=["上线节奏"],
+)
+def rollout_stage(
+    body: StageRequest, principal: StageDep, service: ServiceDep
+) -> StageChange | JSONResponse:
+    """切换影子模式 / 智能辅助（§13.4）。切到影子（不再展示推荐）商家和复核人员都可以；
+    切到智能辅助只有复核人员可以，要过门槛，没过时 force=true 并写明原因才切。"""
+    target = RolloutStage(body.stage)
+    if target != RolloutStage.SHADOW and principal.role not in REVIEWER_ROLES:
+        raise ApiError(403, "forbidden_role", MSG_FORBIDDEN_ROLE)
+    try:
+        return service.rollout.set_stage(
+            principal.shop_id,
+            target,
+            operator=principal.user_id,
+            force=body.force,
+            note=body.note,
+            role=principal.role,
+        )
+    except RolloutGateNotPassed as exc:
+        return JSONResponse(
+            {
+                "error": ERROR_GATE_NOT_PASSED,
+                "message": str(exc),
+                "gate": exc.gate.model_dump(mode="json"),
+            },
+            status_code=409,
+        )
+
+
+# ---------------------------------------------------------------- 每周人工复核（§13.5）
+
+
+@router.post("/v1/shops/{shop_id}/quality/sample", response_model=SampleResult, tags=["每周复核"])
+def quality_sample(
+    body: SampleRequest, principal: ReviewerDep, service: ServiceDep
+) -> SampleResult:
+    """抽一个周期的复核样本（默认上一个完整周、50 条，按问题类型分层）。重复调用只补不换。"""
+    return service.rollout.sample(
+        principal.shop_id, reviewer=principal.user_id, period=body.period, size=body.size
+    )
+
+
+@router.get("/v1/shops/{shop_id}/quality/reviews", response_model=ReviewList, tags=["每周复核"])
+def quality_reviews(
+    principal: ReviewerDep,
+    service: ServiceDep,
+    period: Period = None,
+    status: Annotated[QualityReviewStatus | None, Query()] = None,
+) -> ReviewList:
+    """复核列表：样本 + 推荐文字、买家问题、编辑后发出的文字、依据 ID（都已做个人信息最小化）。
+    只给复核人员；每次返回都记访问记录（quality.viewed，§9.2）。"""
+    return service.rollout.list_reviews(
+        principal.shop_id, viewer=principal.user_id, period=period, status=status
+    )
+
+
+@router.post(
+    "/v1/shops/{shop_id}/quality/reviews/{review_id}",
+    response_model=QualityReviewView,
+    tags=["每周复核"],
+)
+def quality_score(
+    review_id: ReviewId, body: ScoreRequest, principal: ReviewerDep, service: ServiceDep
+) -> QualityReviewView:
+    """记下复核结果（§13.2 事实正确、切题、合规、表达各 0–2 分，或跳过）。可以改判。"""
+    review = service.rollout.score(
+        principal.shop_id,
+        review_id,
+        status=body.status,
+        reviewer=principal.user_id,
+        scores=body.scores,
+        note=body.note,
+    )
+    return QualityReviewView.from_review(review)
+
+
+@router.get("/v1/shops/{shop_id}/quality/report", response_model=QualityReport, tags=["每周复核"])
+def quality_report(
+    principal: RolloutReadDep, service: ServiceDep, period: Period = None
+) -> QualityReport:
+    """一个周期的复核报表：抽样 / 已打分 / 跳过 / 待复核条数，各维度满分率和平均分，
+    §13.2 上线门槛（事实正确、合规满分率 ≥ 95%），按问题类型拆分。没有文字。"""
+    return service.rollout.report(principal.shop_id, period=period)
+
+
+__all__ = ["ERROR_GATE_NOT_PASSED", "router"]
