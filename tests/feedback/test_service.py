@@ -73,6 +73,7 @@ class Env:
             "question_text": QUESTION,
             "item_id": "i_555",
             "intent": Intent.SIZE_ADVICE,
+            "intent_confidence": 0.72,
             "text": "亲，建议您选 M 码哦~",
             "kind": DraftKind.LLM,
             "evidence_ids": [ev.item_size_advice("i_555"), ev.item_size_chart("i_555")],
@@ -115,6 +116,7 @@ def test_record_sent(env):
         Intent.SIZE_ADVICE,
         "feedback_adopt",
     )
+    assert label.predicted_confidence == 0.72  # §13.5 重算阈值的三元组要有置信度
     assert label.created_at == env.clock.now()
     [event] = [e for e in env.audit.events if e.action == AuditAction.FEEDBACK_SENT]
     assert event.actor == "kf_07" and event.shop_id == SHOP_A
@@ -292,6 +294,7 @@ def test_reject_wrong_intent_creates_label(env):
         Intent.PRODUCT_SPEC,
         "feedback_reject",
     )
+    assert label.predicted_confidence == 0.72
     detail = env.events(AuditAction.FEEDBACK_REJECTED)[0]
     assert detail["reason"] == "wrong_intent" and detail["true_intent"] == "product_spec"
     # 只知道"不是这个类型"也记录

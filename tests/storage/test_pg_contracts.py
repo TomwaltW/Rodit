@@ -13,6 +13,7 @@ from rodit.storage import (
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
 )
@@ -50,6 +51,12 @@ def test_feedback_repository_contract(db, truncate):
     contracts.check_feedback_repository(fresh(truncate, lambda: PgFeedbackRepository(db)))
 
 
+def test_quality_review_repository_contract(db, truncate):
+    contracts.check_quality_review_repository(
+        fresh(truncate, lambda: PgQualityReviewRepository(db))
+    )
+
+
 def test_aftersale_review_repository_contract(db, truncate):
     contracts.check_aftersale_review_repository(
         fresh(truncate, lambda: PgAfterSaleReviewRepository(db))
@@ -73,6 +80,7 @@ def test_cross_shop_isolation(db, truncate, token_key):
                 feedback=PgFeedbackRepository(db),
                 reviews=PgAfterSaleReviewRepository(db),
                 auth=PgShopAuthRepository(db, encryption_key=token_key),
+                quality_reviews=PgQualityReviewRepository(db),
             ),
         )
     )
@@ -103,6 +111,7 @@ def test_purge_is_idempotent_contract(pg_dsn, truncate, token_key):
                 feedback=PgFeedbackRepository(small),
                 reviews=PgAfterSaleReviewRepository(small),
                 auth=PgShopAuthRepository(small, encryption_key=token_key),
+                quality_reviews=PgQualityReviewRepository(small),
             ),
         )
     )

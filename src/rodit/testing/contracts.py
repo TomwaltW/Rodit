@@ -23,6 +23,7 @@ from rodit.core.enums import (
     Intent,
     KnowledgeSource,
     KnowledgeStatus,
+    QualityReviewStatus,
     ReviewAdvice,
     ReviewState,
     Role,
@@ -36,6 +37,8 @@ from rodit.core.models import (
     KnowledgeItem,
     LabeledSample,
     PolicyEntry,
+    QualityReview,
+    QualityScores,
     ShopAuth,
     SuggestionRecord,
 )
@@ -45,6 +48,7 @@ from rodit.core.ports import (
     ConversationRepository,
     FeedbackRepository,
     KnowledgeRepository,
+    QualityReviewRepository,
     ShopAuthRepository,
     SuggestionRepository,
 )
@@ -467,6 +471,7 @@ def _suggestion(shop_id: str, conv: str, *, minutes: float, text: str = "推荐"
         question_text="发什么快递",
         item_id="i_555",
         intent=Intent.SHIPPING_POLICY,
+        intent_confidence=0.875,
         text=text,
         kind=DraftKind.FAQ,
         evidence_ids=["faq:1"],
@@ -486,6 +491,12 @@ def check_suggestion_repository(make: Callable[[], SuggestionRepository]) -> Non
     b1 = repo.add(_suggestion(SHOP_B, "c1", minutes=1, text="b1"))
     assert len({a1.id, a2.id, a3.id, b1.id}) == 4 and a1.id != 77
     assert repo.get(SHOP_A, a1.id) == a1
+    assert a1.intent_confidence == 0.875  # §13.5 重算阈值用的置信度原样存取
+    old = _suggestion(SHOP_B, "c9", minutes=9, text="旧")
+    no_conf = repo.add(old.model_copy(update={"intent_confidence": None}))
+    assert repo.get(SHOP_B, no_conf.id).intent_confidence is None
+    repo.purge_shop(SHOP_B)
+    b1 = repo.add(_suggestion(SHOP_B, "c1", minutes=1, text="b1"))
     assert repo.get(SHOP_B, a1.id) is None
     assert [r.text for r in repo.list(SHOP_A)] == ["a1", "a3", "a2"]  # created_at 升序
     assert [r.text for r in repo.list(SHOP_A, conversation_id="c1")] == ["a1", "a2"]
@@ -551,6 +562,7 @@ def check_feedback_repository(make: Callable[[], FeedbackRepository]) -> None:
             shop_id=SHOP_A,
             text="发啥快递",
             predicted_intent=Intent.OTHER,
+            predicted_confidence=0.625,
             true_intent=Intent.SHIPPING_POLICY,
             source="feedback_reject",
             created_at=NOW,
@@ -560,10 +572,107 @@ def check_feedback_repository(make: Callable[[], FeedbackRepository]) -> None:
         LabeledSample(shop_id=SHOP_B, text="在吗", true_intent=Intent.GREETING, created_at=NOW)
     )
     assert [s.text for s in repo.list_labels(SHOP_A)] == ["发啥快递"]
-    assert {s.shop_id for s in repo.export_training_labels()} == {SHOP_A, SHOP_B}
+    assert repo.list_labels(SHOP_A)[0].predicted_confidence == 0.625
+    exported = {s.shop_id: s for s in repo.export_training_labels()}
+    assert set(exported) == {SHOP_A, SHOP_B}
+    assert exported[SHOP_A].predicted_confidence == 0.625
+    assert exported[SHOP_B].predicted_confidence is None
     assert repo.purge_shop(SHOP_B) == 2
     assert repo.list_gaps(SHOP_B) == [] and repo.list_labels(SHOP_B) == []
     assert len(repo.list_gaps(SHOP_A)) == 2
+
+
+# ---------------------------------------------------------------- 每周人工复核（§13.5）
+
+
+def _quality(shop_id: str, suggestion_id: int, *, period: str = "2026-W40") -> QualityReview:
+    return QualityReview(
+        shop_id=shop_id,
+        period=period,
+        suggestion_id=suggestion_id,
+        intent=Intent.SHIPPING_POLICY,
+        sampled_at=NOW,
+    )
+
+
+def check_quality_review_repository(make: Callable[[], QualityReviewRepository]) -> None:
+    repo = make()
+    a1, a2, b1 = repo.add_many([_quality(SHOP_A, 11), _quality(SHOP_A, 12), _quality(SHOP_B, 11)])
+    assert len({a1.id, a2.id, b1.id}) == 3 and a1.status == QualityReviewStatus.PENDING
+    assert repo.get(SHOP_A, a1.id) == a1 and repo.get(SHOP_B, a1.id) is None
+    # 幂等：同一店铺、周期、推荐不重复写，返回已有的那条；新周期是新样本
+    again, other_week = repo.add_many(
+        [_quality(SHOP_A, 11), _quality(SHOP_A, 11, period="2026-W41")]
+    )
+    assert again == a1 and other_week.id not in {a1.id, a2.id, b1.id}
+    assert [r.id for r in repo.list(SHOP_A, period="2026-W40")] == [a1.id, a2.id]
+    assert len(repo.list(SHOP_A)) == 3
+    for bad in (_quality(SHOP_A, 13).model_copy(update={"id": 5}),):
+        try:
+            repo.add_many([bad])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("带 id 的样本不能当新样本写入")
+    scores = QualityScores(factual=2, relevance=2, compliance=2, expression=1)
+    done = repo.record(
+        SHOP_A,
+        a1.id,
+        status=QualityReviewStatus.SCORED,
+        scores=scores,
+        reviewer="qa_01",
+        note="语气可以更自然",
+        reviewed_at=NOW + timedelta(hours=1),
+    )
+    assert done.status == QualityReviewStatus.SCORED and done.scores == scores
+    assert repo.get(SHOP_A, a1.id) == done
+    assert repo.get(SHOP_A, a1.id).reviewed_at == NOW + timedelta(hours=1)
+    # 已复核的再抽中也不会被重置成 pending
+    assert repo.add_many([_quality(SHOP_A, 11)])[0].status == QualityReviewStatus.SCORED
+    # 改判：后一次覆盖
+    skipped = repo.record(
+        SHOP_A,
+        a1.id,
+        status=QualityReviewStatus.SKIPPED,
+        scores=None,
+        reviewer="qa_02",
+        note=None,
+        reviewed_at=NOW + timedelta(hours=2),
+    )
+    assert skipped.status == QualityReviewStatus.SKIPPED and skipped.scores is None
+    assert skipped.reviewer == "qa_02"
+    assert [r.id for r in repo.list(SHOP_A, status=QualityReviewStatus.PENDING)] == [
+        a2.id,
+        other_week.id,
+    ]
+    for kwargs in (
+        {"status": QualityReviewStatus.SCORED, "scores": None},  # scored 必须有分数
+        {"status": QualityReviewStatus.PENDING, "scores": None},  # 不能改回 pending
+    ):
+        try:
+            repo.record(SHOP_A, a2.id, reviewer="qa_01", note=None, reviewed_at=NOW, **kwargs)  # type: ignore[arg-type]
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非法的复核结果应抛 ValueError：{kwargs}")
+    assert repo.get(SHOP_A, a2.id).status == QualityReviewStatus.PENDING
+    try:  # 别的店铺的样本：当作不存在
+        repo.record(
+            SHOP_A,
+            b1.id,
+            status=QualityReviewStatus.SKIPPED,
+            scores=None,
+            reviewer="qa_01",
+            note=None,
+            reviewed_at=NOW,
+        )
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("用别的店铺身份复核应抛 KeyError")
+    assert repo.get(SHOP_B, b1.id).status == QualityReviewStatus.PENDING
+    assert repo.purge_shop(SHOP_B) == 1 and repo.list(SHOP_B) == []
+    assert repo.purge_shop(SHOP_B) == 0 and len(repo.list(SHOP_A)) == 3
 
 
 # ---------------------------------------------------------------- 售后审核
@@ -690,6 +799,7 @@ class RepoSet:
     feedback: FeedbackRepository
     reviews: AfterSaleReviewRepository
     auth: ShopAuthRepository
+    quality_reviews: QualityReviewRepository
 
 
 def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
@@ -724,6 +834,7 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
             expires_at=NOW + timedelta(days=1),
         )
     )
+    (b_quality,) = repos.quality_reviews.add_many([_quality(SHOP_B, b_sug.id or 1)])
 
     k = repos.knowledge
     assert k.get_knowledge(SHOP_A, b_faq) is None
@@ -740,9 +851,12 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
     assert repos.reviews.get(SHOP_A, "as_9001") is None
     assert repos.reviews.list_by_state(SHOP_A) == []
     assert repos.auth.get(SHOP_A) is None
+    assert repos.quality_reviews.get(SHOP_A, b_quality.id) is None
+    assert repos.quality_reviews.list(SHOP_A) == []
     # B 自己读得到（证明数据确实写进去了）
     assert repos.suggestions.get(SHOP_B, b_sug.id) is not None
     assert repos.reviews.get(SHOP_B, "as_9001") is not None
+    assert repos.quality_reviews.get(SHOP_B, b_quality.id) is not None
 
 
 # ---------------------------------------------------------------- 取消订购后的清理（§8.4）
@@ -780,6 +894,7 @@ def check_purge_is_idempotent(make: Callable[[], RepoSet]) -> None:
             ),
             expected_version=None,
         )
+        repos.quality_reviews.add_many([_quality(shop, 1), _quality(shop, 2)])
     k = repos.knowledge
     knowledge_rows = (
         1
@@ -793,6 +908,7 @@ def check_purge_is_idempotent(make: Callable[[], RepoSet]) -> None:
         "suggestions": (repos.suggestions, 2),
         "feedback": (repos.feedback, 2),
         "reviews": (repos.reviews, 1),
+        "quality_reviews": (repos.quality_reviews, 2),
     }
     for name, (repo, expected) in purgers.items():
         assert repo.purge_shop(SHOP_A) == expected, name  # type: ignore[attr-defined]
@@ -819,6 +935,8 @@ def check_purge_is_idempotent(make: Callable[[], RepoSet]) -> None:
     )
     assert len(repos.suggestions.list(SHOP_B)) == 2 and repos.reviews.get(SHOP_B, "as_purge")
     assert len(repos.feedback.list_gaps(SHOP_B)) == 1
+    assert repos.quality_reviews.list(SHOP_A) == []
+    assert len(repos.quality_reviews.list(SHOP_B)) == 2
 
 
 # ---------------------------------------------------------------- 文本清洗（NUL 等控制字符）
@@ -926,3 +1044,17 @@ def check_text_sanitation(make: Callable[[], RepoSet]) -> None:
     assert got_review is not None and got_review == saved
     assert got_review.reason == "买家说没收到"
     assert got_review.action_result == {"note": "已处理", "steps": ["ab"]}
+
+    (quality,) = repos.quality_reviews.add_many([_quality(SHOP_A, rec.id or 1)])
+    scored = repos.quality_reviews.record(
+        SHOP_A,
+        quality.id or 0,
+        status=QualityReviewStatus.SKIPPED,
+        scores=None,
+        reviewer="qa_01",
+        note=DIRTY_TEXT,
+        reviewed_at=NOW,
+    )
+    assert scored.note == CLEAN_TEXT
+    got_quality = repos.quality_reviews.get(SHOP_A, quality.id or 0)
+    assert got_quality is not None and got_quality.note == CLEAN_TEXT

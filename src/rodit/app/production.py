@@ -23,7 +23,14 @@ from rodit.core.clock import Clock, SystemClock
 from rodit.core.config import EngineConfig
 from rodit.core.enums import Platform
 from rodit.core.pii import BuyerRefHasher
-from rodit.core.ports import AfterSaleActionPort, AuditLog, PlatformAdapter, ToolGateway
+from rodit.core.ports import (
+    AfterSaleActionPort,
+    AuditLog,
+    ImageTextExtractor,
+    ItemCatalog,
+    PlatformAdapter,
+    ToolGateway,
+)
 from rodit.llm import MeteredLLMClient, OpenAICompatibleClient
 from rodit.storage import (
     Database,
@@ -32,6 +39,7 @@ from rodit.storage import (
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
 )
@@ -80,6 +88,7 @@ def postgres_repos(db: Database, *, clock: Clock, token_env: str = "RODIT_TOKEN_
         reviews=PgAfterSaleReviewRepository(db),
         auth=PgShopAuthRepository.from_env(db, env_name=token_env),
         audit=PgAuditLog(db),
+        quality_reviews=PgQualityReviewRepository(db),
     )
 
 
@@ -98,6 +107,8 @@ def build_production_unit(
     action_port: AfterSaleActionPort | None = None,
     clock: Clock | None = None,
     audit_wrapper: Callable[[AuditLog], AuditLog] | None = None,
+    catalog: ItemCatalog | None = None,
+    ocr: ImageTextExtractor | None = None,
 ) -> Unit:
     """生产单元：tools / adapters / action_port 由平台云里的实现注入（见模块说明）。
 
@@ -130,4 +141,6 @@ def build_production_unit(
         tools=tools,
         adapters=adapters,
         action_port=action_port,
+        catalog=catalog,
+        ocr=ocr,
     )

@@ -215,6 +215,8 @@ def compose_unit(
             action_port=bindings.action_port,
             clock=clock,
             audit_wrapper=observe,
+            catalog=bindings.catalog,
+            ocr=bindings.ocr,
         )
         probe = llm_probe(config.llm, environ=env, env_prefix=LLM_ENV_PREFIX)
     else:
@@ -256,6 +258,8 @@ def _offline_unit(
         action_port=bindings.action_port,
         route_provider=RuleProvider(),
         qa_provider=HeuristicQAJudge(),
+        catalog=bindings.catalog,
+        ocr=bindings.ocr,
     )
 
 

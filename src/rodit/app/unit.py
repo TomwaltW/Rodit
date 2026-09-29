@@ -32,9 +32,12 @@ from rodit.core.ports import (
     ConversationRepository,
     Embedder,
     FeedbackRepository,
+    ImageTextExtractor,
+    ItemCatalog,
     KnowledgeRepository,
     LLMClient,
     PlatformAdapter,
+    QualityReviewRepository,
     ShopAuthRepository,
     SuggestionRepository,
     ToolGateway,
@@ -50,6 +53,7 @@ from rodit.inmemory import (
     InMemoryConversationRepository,
     InMemoryFeedbackRepository,
     InMemoryKnowledgeRepository,
+    InMemoryQualityReviewRepository,
     InMemoryShopAuthRepository,
     InMemorySuggestionRepository,
 )
@@ -74,6 +78,7 @@ class Repos:
     reviews: AfterSaleReviewRepository
     auth: ShopAuthRepository
     audit: AuditLog
+    quality_reviews: QualityReviewRepository
 
     def purgers(self) -> list[object]:
         """§8.4 取消订购后要按约定删除数据的仓储（都有 purge_shop）。令牌由 AuthGuard 删除。"""
@@ -83,6 +88,7 @@ class Repos:
             self.suggestions,
             self.feedback,
             self.reviews,
+            self.quality_reviews,
             self.audit,
         ]
 
@@ -96,6 +102,7 @@ def in_memory_repos(clock: Clock) -> Repos:
         reviews=InMemoryAfterSaleReviewRepository(),
         auth=InMemoryShopAuthRepository(),
         audit=InMemoryAuditSink(),
+        quality_reviews=InMemoryQualityReviewRepository(),
     )
 
 
@@ -124,6 +131,9 @@ class Unit:
     adapters: AdapterRegistry
     auth: AuthGuard
     action_port: AfterSaleActionPort | None = None
+    # 平台商品接口和详情图 OCR（§5.2.3 商品自动同步）；没注入时商品同步不可用，其他照常
+    catalog: ItemCatalog | None = None
+    ocr: ImageTextExtractor | None = None
     extra_purgers: list[object] = field(default_factory=list)
 
     def shop_config(self, shop_id: str) -> ShopConfig:
@@ -149,6 +159,8 @@ def build_unit(
     cache: Cache | None = None,
     route_provider: DecisionProvider | None = None,
     qa_provider: DecisionProvider | None = None,
+    catalog: ItemCatalog | None = None,
+    ocr: ImageTextExtractor | None = None,
 ) -> Unit:
     """把各模块接成一个平台单元。
 
@@ -156,7 +168,10 @@ def build_unit(
       （rodit.decision.build_decision_provider）；
       路由的兜底永远是关键词规则（§12.2 判断层不可用 → 关键词路由）。
     - action_port 为空表示没有申请写售后权限（MVP，§8.4 最小权限）：审核助手只给建议。
+    - catalog / ocr：平台商品接口和详情图 OCR（§5.2.3），为空时商品同步不可用。
     """
+    if catalog is not None and catalog.platform != platform:
+        raise ValueError(f"商品接口属于 {catalog.platform}，单元是 {platform}（§9.1 数据不跨云）")
     if tools.platform != platform:
         raise ValueError(f"平台工具属于 {tools.platform}，单元是 {platform}（§9.1 数据不跨云）")
     cache = cache or InMemoryCache(clock)
@@ -261,4 +276,6 @@ def build_unit(
         adapters=registry,
         auth=AuthGuard(repos.auth, clock),
         action_port=action_port,
+        catalog=catalog,
+        ocr=ocr,
     )

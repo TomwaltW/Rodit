@@ -35,6 +35,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from rodit.adapters import StandaloneAssistAdapter
+from rodit.app.console import ConsoleService
+from rodit.app.rollout import RolloutService
 from rodit.app.unit import Unit
 from rodit.core.enums import (
     AfterSaleAction,
@@ -215,6 +217,15 @@ class AssistService:
         self.unit = unit
         self._locks = _KeyedLocks()
         self._gate = _ShopGate()
+        self.console = ConsoleService(unit, self.processing)  # 商家控制台（§9.1、§5.2）
+        self.rollout = RolloutService(unit, self.processing)  # 上线节奏与每周复核（§13.4、§13.5）
+
+    @contextmanager
+    def processing(self, shop_id: str) -> Iterator[None]:
+        """按店铺的读方闸门：客服 / 商家 / 复核操作都在里面做，取消订购等它们做完再删数据（§8.4）。
+        不可重入：持有时不能再调取消订购。"""
+        with self._gate.processing(shop_id):
+            yield
 
     # ================================================================ 买家消息
 

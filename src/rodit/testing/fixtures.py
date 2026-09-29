@@ -41,6 +41,7 @@ from rodit.core.models import (
     LogisticsTrace,
     OrderInfo,
     OrderLine,
+    PlatformItem,
     PolicyEntry,
     PriceInfo,
     Shop,
@@ -994,3 +995,66 @@ def seed_knowledge(repo, world: DemoWorld) -> dict[tuple[str, str], int]:
         assert saved.id is not None
         ids[(saved.shop_id, saved.question)] = saved.id
     return ids
+
+
+# ================================================================ 平台商品接口（§5.2.3）
+
+DEMO_OCR_TEXTS: dict[str, str] = {
+    "img_555_detail_1": "细节图：领口包边、腰部松紧、隐形拉链",
+    "img_999_detail_1": "针织开衫 洗涤：冷水手洗 平铺晾干",
+}
+"""详情图引用 → OCR 文字（合成）。img_broken 不在里面：OCR 失败的图。"""
+
+
+def demo_platform_items(world: DemoWorld) -> list[PlatformItem]:
+    """平台商品接口返回的商品（合成）：从演示世界的商品卡片里取平台维护的字段，再加几处变化，
+    让商品同步有东西可做（§5.2.3）：
+    - i_555：标题平台上改了、多了一张详情图（OCR 文字并入详情）；商家填的尺码建议等不在这里；
+    - i_777：没变；
+    - i_888：已下架（on_sale=False）；
+    - i_999：平台上新上架、本地还没有卡片的针织开衫（一张能识别、一张识别失败的详情图）；
+    其他店铺的商品原样返回（按 shop_id 过滤由接口负责）。
+    """
+    out: list[PlatformItem] = []
+    for card in world.items:
+        item = PlatformItem(
+            shop_id=card.shop_id,
+            platform=card.platform,
+            item_id=card.item_id,
+            title=card.title,
+            category=card.category,
+            attributes=dict(card.attributes),
+            skus=[s.model_copy(deep=True) for s in card.skus],
+            size_chart=[dict(row) for row in card.size_chart],
+            detail_text=card.detail_text,
+            updated_at=card.updated_at,
+        )
+        if card.shop_id == SHOP_A and card.item_id == "i_555":
+            item = item.model_copy(
+                update={
+                    "title": "法式碎花连衣裙（新款）",
+                    "detail_images": ["img_555_detail_1"],
+                    "updated_at": world.now - timedelta(hours=1),
+                }
+            )
+        elif card.shop_id == SHOP_A and card.item_id == "i_888":
+            item = item.model_copy(update={"on_sale": False})
+        out.append(item)
+    out.append(
+        PlatformItem(
+            shop_id=SHOP_A,
+            platform=Platform.TAOBAO,
+            item_id="i_999",
+            title="宽松针织开衫",
+            category="女装/针织衫",
+            attributes={"面料": "腈纶 70%、羊毛 30%", "厚薄": "常规"},
+            skus=[
+                Sku(sku_id="k_91", 颜色="燕麦", 尺码="均码"),
+                Sku(sku_id="k_92", 颜色="黑色", 尺码="均码"),
+            ],
+            detail_text="慵懒宽松版型，春秋百搭。",
+            detail_images=["img_999_detail_1", "img_broken"],
+            updated_at=world.now - timedelta(hours=2),
+        )
+    )
+    return sorted(out, key=lambda i: (i.shop_id, i.item_id))

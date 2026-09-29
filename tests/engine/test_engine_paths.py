@@ -577,6 +577,16 @@ def test_split_multi_one_card_per_part(kit: Kit) -> None:
     assert [c.confidence for c in result.suggestions] == [Confidence.MEDIUM, Confidence.HIGH]
     records = kit.suggestions.list(SHOP_A)
     assert [r.intent for r in records] == [Intent.SHIPPING_POLICY, Intent.PRICE_PROMO]
+    # 推荐记录带上该条的路由置信度（§13.5 每月重算阈值用）
+    assert [r.intent_confidence for r in records] == [0.55, 0.9]
+
+
+def test_suggestion_record_carries_route_confidence(kit: Kit) -> None:
+    kit.router.decide = make_route(Intent.SHIPPING_POLICY, confidence=0.83)
+    kit.generator.script = [[llm("亲，48 小时内发货"), llm("亲，付款后 48 小时内发出")]]
+    result = kit.engine().handle(kit.msg("什么时候发货"))
+    assert result is not None and len(result.suggestions) == 2
+    assert [r.intent_confidence for r in kit.suggestions.list(SHOP_A)] == [0.83, 0.83]
 
 
 def test_split_multi_partial_failure_is_flagged(kit: Kit) -> None:

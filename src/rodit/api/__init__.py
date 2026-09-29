@@ -1,6 +1,9 @@
 """HTTP 接口（模式 C 独立话术助手、平台事件、反馈、知识审核、报表、售后审核、取消订购）。
 
 - app.create_app(service, authenticator=...)：应用工厂，一个平台单元一份（§9.1），没有全局状态；
+- deps：共用的依赖和鉴权（令牌 → 身份 → 串店 → 角色 → 店铺状态，§9.2）；
+- routes_console：商家控制台（知识编辑、店铺配置、商品同步，§9.1、§5.2）；
+- routes_rollout：上线节奏与每周人工复核（§13.4、§13.5）；
 - auth：调用方身份 Principal、Authenticator 协议、开发用 StaticTokenAuthenticator（§9.2 租户隔离）；
 - errors：统一的错误 JSON 和异常映射（§12.2、§12.3）；
 - schemas：请求 / 响应模型（只放客服、商家需要看的内容，§5.3）；
@@ -17,6 +20,8 @@ from rodit.api.auth import (
     HUMAN_ROLES,
     INTEGRATION_ROLES,
     MERCHANT_ROLES,
+    PERSON_ROLES,
+    REVIEWER_ROLES,
     Authenticator,
     Principal,
     PrincipalRole,
@@ -30,6 +35,8 @@ __all__ = [
     "HUMAN_ROLES",
     "INTEGRATION_ROLES",
     "MERCHANT_ROLES",
+    "PERSON_ROLES",
+    "REVIEWER_ROLES",
     "ApiError",
     "Authenticator",
     "Principal",

@@ -32,7 +32,13 @@ from rodit.core.clock import Clock
 from rodit.core.config import EngineConfig
 from rodit.core.enums import Platform
 from rodit.core.pii import BuyerRefHasher
-from rodit.core.ports import AfterSaleActionPort, PlatformAdapter, ToolGateway
+from rodit.core.ports import (
+    AfterSaleActionPort,
+    ImageTextExtractor,
+    ItemCatalog,
+    PlatformAdapter,
+    ToolGateway,
+)
 
 MOCK_MODULE_PREFIXES: tuple[str, ...] = ("rodit.testing", "rodit.tools.mock_platform")
 
@@ -59,11 +65,14 @@ class PlatformBindings:
     - adapters：接入适配器（模式 A / B，需要时也可以带上模式 C 的 StandaloneAssistAdapter）；
     - action_port：售后写接口（二期才申请写权限，§8.4；MVP 为 None，审核只给建议）；
     - shop_ids：本单元服务的店铺（订购列表），授权即将过期告警用（§12.4）；不给时只看令牌文件。
+    - catalog / ocr：平台商品接口和详情图 OCR（§5.2.3 商品自动同步），不给时商品同步不可用。
     """
 
     tools: ToolGateway
     adapters: Sequence[PlatformAdapter]
     action_port: AfterSaleActionPort | None = None
+    catalog: ItemCatalog | None = None
+    ocr: ImageTextExtractor | None = None
     shop_ids: Callable[[], Iterable[str]] | None = None
     mode_c_only: bool = field(default=False)
 

@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -435,8 +436,10 @@ class AssistEngine:
             self._run_unit(run, ctx, unit, plan)
         self._record_gaps(run, ctx, units)
 
-        cards = self._cards(run, units)
-        cards = self._persist(run, ctx, cards)
+        scored = self._cards(run, units)
+        cards = self._persist(
+            run, ctx, [(c, d) for c, d, _ in scored], confidences=[x for _, _, x in scored]
+        )
         auto_reply = self._auto_reply(run, ctx, route, plan, units, cards)
         return self._finish(
             run,
@@ -732,8 +735,9 @@ class AssistEngine:
 
     # ------------------------------------------------------------ 卡片与记录（§5.6、§10）
 
-    def _cards(self, run: _Run, units: list[_Unit]) -> list[tuple[SuggestionCard, Draft]]:
-        out: list[tuple[SuggestionCard, Draft]] = []
+    def _cards(self, run: _Run, units: list[_Unit]) -> list[tuple[SuggestionCard, Draft, float]]:
+        """每张卡片带上它那一条的路由置信度（写进 SuggestionRecord.intent_confidence）。"""
+        out: list[tuple[SuggestionCard, Draft, float]] = []
         for unit in units:
             for draft, qa in unit.passed[: unit.limit]:
                 notes = [
@@ -750,11 +754,16 @@ class AssistEngine:
                     intent_confidence=unit.intent_confidence,
                     degraded=notes,
                 )
-                out.append((card, draft))
+                out.append((card, draft, unit.intent_confidence))
         return out
 
     def _persist(
-        self, run: _Run, ctx: ConversationContext, cards: list[tuple[SuggestionCard, Draft]]
+        self,
+        run: _Run,
+        ctx: ConversationContext,
+        cards: list[tuple[SuggestionCard, Draft]],
+        *,
+        confidences: Sequence[float],
     ) -> list[tuple[SuggestionCard, Draft]]:
         if not cards:
             return cards
@@ -779,7 +788,7 @@ class AssistEngine:
         now = self._clock.now()
         latency = run.elapsed_ms()
         out: list[tuple[SuggestionCard, Draft]] = []
-        for card, draft in cards:
+        for (card, draft), confidence in zip(cards, confidences, strict=True):
             record = SuggestionRecord(
                 shop_id=ctx.shop_id,
                 conversation_id=ctx.conversation_id,
@@ -787,6 +796,7 @@ class AssistEngine:
                 question_text=question,
                 item_id=item_id,
                 intent=card.intent,
+                intent_confidence=min(1.0, max(0.0, confidence)),
                 text=card.text,
                 kind=card.kind,
                 evidence_ids=dedupe(draft.evidence_ids),
@@ -870,7 +880,7 @@ class AssistEngine:
             intent_confidence=route.intent_confidence,
             degraded=[],
         )
-        persisted = self._persist(run, ctx, [(card, draft)])
+        persisted = self._persist(run, ctx, [(card, draft)], confidences=[route.intent_confidence])
         stored = persisted[0][0] if persisted else card
         return stored, stored.model_copy(update={"text": text})
 

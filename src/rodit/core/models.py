@@ -22,6 +22,7 @@ from pydantic import (
     Field,
     SecretStr,
     field_validator,
+    model_validator,
 )
 
 from rodit.core.decision import DecisionResponse
@@ -42,6 +43,7 @@ from rodit.core.enums import (
     Mode,
     OrderStatus,
     Platform,
+    QualityReviewStatus,
     RejectReason,
     ReviewAdvice,
     ReviewState,
@@ -239,6 +241,29 @@ class ItemCard(_Model):
         return next((s for s in self.skus if s.sku_id == sku_id), None)
 
 
+class PlatformItem(_Model):
+    """平台商品接口返回的商品（§5.2.3 商品自动同步）：只有平台维护的字段。
+
+    同步时覆盖 ItemCard 的标题、类目、属性、SKU、尺码表、详情文字；商家填写的字段
+    （size_advice、care、usage、forbidden_claims）不在这里，同步不会动。
+    detail_images 是详情图在平台上的引用（图片 ID 或平台 CDN 地址），交给 ImageTextExtractor
+    在平台云内做 OCR，文字并入 detail_text。价格、库存不在这里（回答时实时查）。
+    """
+
+    shop_id: str
+    platform: Platform
+    item_id: str
+    title: CleanText
+    category: str | None = None
+    attributes: dict[str, CleanText] = Field(default_factory=dict)
+    skus: list[Sku] = Field(default_factory=list)
+    size_chart: list[dict[str, str | int | float]] = Field(default_factory=list)
+    detail_text: CleanText | None = None
+    detail_images: list[str] = Field(default_factory=list)
+    on_sale: bool = True  # 已下架的商品同步时不删卡片，只报告出来
+    updated_at: AwareDatetime
+
+
 class KnowledgeItem(_Model):
     """FAQ 与优质回答（§10 knowledge_item）。"""
 
@@ -277,9 +302,58 @@ class LabeledSample(_Model):
     shop_id: str
     text: CleanText  # 已做个人信息最小化
     predicted_intent: Intent | None = None
+    # 路由给 predicted_intent 的置信度（SuggestionRecord.intent_confidence），§13.5 每月按采纳反馈
+    # 重算阈值用（§13.3 的 (预测类型, 置信度, 真实类型) 三元组）；手工标注、旧数据为 None
+    predicted_confidence: float | None = Field(default=None, ge=0, le=1)
     true_intent: Intent | None = None
     source: Literal["feedback_reject", "feedback_adopt", "manual"] = "manual"
     created_at: AwareDatetime
+
+
+class QualityScores(_Model):
+    """§13.2 回答质量评分：每个维度 0 / 1 / 2 分。"""
+
+    factual: int = Field(ge=0, le=2)  # 事实正确
+    relevance: int = Field(ge=0, le=2)  # 切题
+    compliance: int = Field(ge=0, le=2)  # 合规
+    expression: int = Field(ge=0, le=2)  # 表达
+
+
+QUALITY_PERIOD_PATTERN = r"^\d{4}-W(0[1-9]|[1-4]\d|5[0-3])$"
+"""复核周期：ISO 周，如 "2026-W40"（datetime.isocalendar() 的年和周）。"""
+
+
+class QualityReview(_Model):
+    """每周人工复核的一条样本（§13.5 每周从推荐中抽 50 条人工复核，按 §13.2 打分）。
+
+    只存推荐 ID 和打分，不复制推荐文字和买家问题：复核时从 SuggestionRecord 读（已做个人信息
+    最小化），取消订购时随店铺数据一起删除。同一店铺、同一周期、同一推荐只有一条。
+    scored 必须有 scores、reviewer、reviewed_at；pending 不能有 scores；skipped 要有 reviewer。
+    """
+
+    id: int | None = None
+    shop_id: str
+    period: str = Field(pattern=QUALITY_PERIOD_PATTERN)
+    suggestion_id: int = Field(ge=1)
+    intent: Intent
+    status: QualityReviewStatus = QualityReviewStatus.PENDING
+    scores: QualityScores | None = None
+    reviewer: str | None = None
+    note: CleanText | None = None  # 复核人备注（已做个人信息最小化）
+    sampled_at: AwareDatetime
+    reviewed_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> QualityReview:
+        if self.status == QualityReviewStatus.SCORED:
+            if self.scores is None or not self.reviewer or self.reviewed_at is None:
+                raise ValueError("已复核（scored）的样本必须有 scores、reviewer、reviewed_at")
+        elif self.status == QualityReviewStatus.PENDING:
+            if self.scores is not None or self.reviewer or self.reviewed_at is not None:
+                raise ValueError("待复核（pending）的样本不能有 scores、reviewer、reviewed_at")
+        elif not self.reviewer or self.reviewed_at is None:
+            raise ValueError("跳过（skipped）的样本必须有 reviewer、reviewed_at")
+        return self
 
 
 # ---------------------------------------------------------------- 平台工具数据（§7，只读）
@@ -701,6 +775,8 @@ class SuggestionRecord(_Model):
     question_text: CleanText | None = None  # 买家问题（已做个人信息最小化），反馈闭环生成候选知识用
     item_id: str | None = None  # 当前商品：采纳后生成的候选 FAQ 按商品限定范围
     intent: Intent
+    # 路由给 intent 的置信度（多问题分条时是这一条的概率，§6.6 规则 5）；§13.5 重算阈值用
+    intent_confidence: float | None = Field(default=None, ge=0, le=1)
     text: CleanText
     kind: DraftKind = DraftKind.LLM
     evidence_ids: list[str] = Field(default_factory=list)

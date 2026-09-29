@@ -14,7 +14,13 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 
 from rodit.core.clock import Clock, SystemClock
-from rodit.core.enums import KnowledgeStatus, ReviewState, Role, SuggestionStatus
+from rodit.core.enums import (
+    KnowledgeStatus,
+    QualityReviewStatus,
+    ReviewState,
+    Role,
+    SuggestionStatus,
+)
 from rodit.core.errors import ConcurrencyConflict
 from rodit.core.models import (
     AfterSaleReview,
@@ -24,6 +30,8 @@ from rodit.core.models import (
     KnowledgeItem,
     LabeledSample,
     PolicyEntry,
+    QualityReview,
+    QualityScores,
     Shop,
     ShopAuth,
     StandardMessage,
@@ -472,6 +480,93 @@ class InMemoryFeedbackRepository:
             self._gaps = [g for g in self._gaps if g.shop_id != shop_id]
             self._labels = [s for s in self._labels if s.shop_id != shop_id]
             return before - len(self._gaps) - len(self._labels)
+
+
+class InMemoryQualityReviewRepository:
+    """实现 core.ports.QualityReviewRepository（§13.5 每周人工复核样本）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reviews: dict[int, QualityReview] = {}
+        self._keys: dict[tuple[str, str, int], int] = {}  # (店铺, 周期, 推荐) → id
+        self._ids = itertools.count(1)
+
+    def add_many(self, reviews: Sequence[QualityReview]) -> list[QualityReview]:
+        for r in reviews:
+            if r.id is not None or r.status != QualityReviewStatus.PENDING:
+                raise ValueError("新抽中的复核样本必须是 pending、且没有 id")
+        out: list[QualityReview] = []
+        with self._lock:
+            for r in reviews:
+                key = (r.shop_id, r.period, r.suggestion_id)
+                existing = self._keys.get(key)
+                if existing is None:
+                    existing = self._keys[key] = next(self._ids)
+                    self._reviews[existing] = r.model_copy(deep=True, update={"id": existing})
+                out.append(self._reviews[existing].model_copy(deep=True))
+        return out
+
+    def get(self, shop_id: str, review_id: int) -> QualityReview | None:
+        with self._lock:
+            r = self._reviews.get(review_id)
+            if r is None or r.shop_id != shop_id:
+                return None
+            return r.model_copy(deep=True)
+
+    def list(
+        self,
+        shop_id: str,
+        *,
+        period: str | None = None,
+        status: QualityReviewStatus | None = None,
+    ) -> list[QualityReview]:
+        with self._lock:
+            out = [
+                r
+                for _, r in sorted(self._reviews.items())
+                if r.shop_id == shop_id
+                and (period is None or r.period == period)
+                and (status is None or r.status == status)
+            ]
+            return [r.model_copy(deep=True) for r in out]
+
+    def record(
+        self,
+        shop_id: str,
+        review_id: int,
+        *,
+        status: QualityReviewStatus,
+        scores: QualityScores | None,
+        reviewer: str,
+        note: str | None,
+        reviewed_at: datetime,
+    ) -> QualityReview:
+        if QualityReviewStatus(status) == QualityReviewStatus.PENDING:
+            raise ValueError("复核结果不能是 pending")
+        with self._lock:
+            cur = self._reviews.get(review_id)
+            if cur is None or cur.shop_id != shop_id:
+                raise KeyError(review_id)
+            updated = QualityReview.model_validate(
+                {
+                    **cur.model_dump(),
+                    "status": status,
+                    "scores": scores.model_dump() if scores is not None else None,
+                    "reviewer": reviewer,
+                    "note": note,
+                    "reviewed_at": reviewed_at,
+                }
+            )
+            self._reviews[review_id] = updated
+            return updated.model_copy(deep=True)
+
+    def purge_shop(self, shop_id: str) -> int:
+        with self._lock:
+            ids = [i for i, r in self._reviews.items() if r.shop_id == shop_id]
+            for i in ids:
+                del self._reviews[i]
+            self._keys = {k: v for k, v in self._keys.items() if k[0] != shop_id}
+            return len(ids)
 
 
 class InMemoryAfterSaleReviewRepository:

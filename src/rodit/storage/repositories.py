@@ -32,7 +32,14 @@ from psycopg.types.json import Jsonb
 from pydantic import SecretStr, TypeAdapter
 
 from rodit.core.clock import CST, Clock, SystemClock
-from rodit.core.enums import DecisionStage, KnowledgeStatus, ReviewState, Role, SuggestionStatus
+from rodit.core.enums import (
+    DecisionStage,
+    KnowledgeStatus,
+    QualityReviewStatus,
+    ReviewState,
+    Role,
+    SuggestionStatus,
+)
 from rodit.core.errors import (
     ConcurrencyConflict,
     KnowledgeUnavailable,
@@ -48,6 +55,8 @@ from rodit.core.models import (
     KnowledgeItem,
     LabeledSample,
     PolicyEntry,
+    QualityReview,
+    QualityScores,
     Shop,
     ShopAuth,
     StandardMessage,
@@ -599,6 +608,7 @@ _S_FIELDS = (
     "question_text",
     "item_id",
     "intent",
+    "intent_confidence",
     "text",
     "kind",
     "evidence_ids",
@@ -714,7 +724,9 @@ class PgSuggestionRepository:
 # ================================================================ 反馈（§5.8）
 
 _GAP_COLS = "shop_id, intent, missing, question_text, source, created_at"
-_LABEL_COLS = "shop_id, text, predicted_intent, true_intent, source, created_at"
+_LABEL_COLS = (
+    "shop_id, text, predicted_intent, predicted_confidence, true_intent, source, created_at"
+)
 
 
 def _gap(r: Row) -> KnowledgeGap:
@@ -760,11 +772,12 @@ class PgFeedbackRepository:
     def add_label(self, sample: LabeledSample) -> None:
         with self._db.session(sample.shop_id) as conn:
             conn.execute(
-                f"INSERT INTO labeled_sample ({_LABEL_COLS}) VALUES (%s, %s, %s, %s, %s, %s)",
+                f"INSERT INTO labeled_sample ({_LABEL_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (
                     sample.shop_id,
                     sample.text,
                     sample.predicted_intent,
+                    sample.predicted_confidence,
                     sample.true_intent,
                     sample.source,
                     sample.created_at,
@@ -792,6 +805,156 @@ class PgFeedbackRepository:
         return self._db.purge_rows(shop_id, "knowledge_gap") + self._db.purge_rows(
             shop_id, "labeled_sample"
         )
+
+
+# ================================================================ 每周人工复核（§13.5）
+
+_Q_FIELDS = (
+    "shop_id",
+    "period",
+    "suggestion_id",
+    "intent",
+    "status",
+    "scores",
+    "reviewer",
+    "note",
+    "sampled_at",
+    "reviewed_at",
+)
+_Q_COLS = "id, " + ", ".join(_Q_FIELDS)
+
+
+def _quality_review(r: Row) -> QualityReview:
+    return QualityReview.model_validate(
+        {**r, "sampled_at": _cst(r["sampled_at"]), "reviewed_at": _cst(r["reviewed_at"])}
+    )
+
+
+class PgQualityReviewRepository:
+    """实现 core.ports.QualityReviewRepository（quality_review）。"""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    def add_many(self, reviews: Sequence[QualityReview]) -> list[QualityReview]:
+        for r in reviews:
+            if r.id is not None or r.status != QualityReviewStatus.PENDING:
+                raise ValueError("新抽中的复核样本必须是 pending、且没有 id")
+        by_shop: dict[str, list[int]] = {}
+        for i, r in enumerate(reviews):
+            by_shop.setdefault(r.shop_id, []).append(i)
+        out: list[QualityReview | None] = [None] * len(reviews)
+        placeholders = ", ".join(["%s"] * len(_Q_FIELDS))
+        for shop_id, indexes in by_shop.items():
+            with self._db.session(shop_id) as conn:
+                for i in indexes:
+                    r = reviews[i]
+                    # ON CONFLICT DO NOTHING 不返回已有的行：冲突时再按唯一键读出来
+                    row = conn.execute(
+                        f"INSERT INTO quality_review ({', '.join(_Q_FIELDS)})"
+                        f" VALUES ({placeholders})"
+                        " ON CONFLICT (shop_id, period, suggestion_id) DO NOTHING"
+                        f" RETURNING {_Q_COLS}",
+                        (
+                            r.shop_id,
+                            r.period,
+                            r.suggestion_id,
+                            r.intent,
+                            r.status,
+                            None,
+                            None,
+                            r.note,
+                            r.sampled_at,
+                            None,
+                        ),
+                    ).fetchone()
+                    if row is None:
+                        row = conn.execute(
+                            f"SELECT {_Q_COLS} FROM quality_review"
+                            " WHERE shop_id = %s AND period = %s AND suggestion_id = %s",
+                            (r.shop_id, r.period, r.suggestion_id),
+                        ).fetchone()
+                    assert row is not None
+                    out[i] = _quality_review(row)
+        return [r for r in out if r is not None]
+
+    def get(self, shop_id: str, review_id: int) -> QualityReview | None:
+        with self._db.session(shop_id) as conn:
+            r = conn.execute(
+                f"SELECT {_Q_COLS} FROM quality_review WHERE shop_id = %s AND id = %s",
+                (shop_id, review_id),
+            ).fetchone()
+        return _quality_review(r) if r else None
+
+    def list(
+        self,
+        shop_id: str,
+        *,
+        period: str | None = None,
+        status: QualityReviewStatus | None = None,
+    ) -> list[QualityReview]:
+        conds, params = ["shop_id = %s"], [shop_id]
+        for column, value in (("period", period), ("status", status)):
+            if value is not None:
+                conds.append(f"{column} = %s")
+                params.append(value)
+        with self._db.session(shop_id) as conn:
+            rows = conn.execute(
+                f"SELECT {_Q_COLS} FROM quality_review WHERE {' AND '.join(conds)} ORDER BY id",
+                params,
+            ).fetchall()
+        return [_quality_review(r) for r in rows]
+
+    def record(
+        self,
+        shop_id: str,
+        review_id: int,
+        *,
+        status: QualityReviewStatus,
+        scores: QualityScores | None,
+        reviewer: str,
+        note: str | None,
+        reviewed_at: datetime,
+    ) -> QualityReview:
+        if QualityReviewStatus(status) == QualityReviewStatus.PENDING:
+            raise ValueError("复核结果不能是 pending")
+        with self._db.session(shop_id) as conn:
+            cur = conn.execute(
+                f"SELECT {_Q_COLS} FROM quality_review WHERE shop_id = %s AND id = %s FOR UPDATE",
+                (shop_id, review_id),
+            ).fetchone()
+            if cur is None:
+                raise KeyError(review_id)
+            # 先按模型校验（scored 要有 scores 等），再写库；note 在模型里做控制字符清洗
+            updated = QualityReview.model_validate(
+                {
+                    **_quality_review(cur).model_dump(),
+                    "status": status,
+                    "scores": scores.model_dump() if scores is not None else None,
+                    "reviewer": reviewer,
+                    "note": note,
+                    "reviewed_at": reviewed_at,
+                }
+            )
+            row = conn.execute(
+                "UPDATE quality_review SET status = %s, scores = %s, reviewer = %s, note = %s,"
+                f" reviewed_at = %s WHERE shop_id = %s AND id = %s RETURNING {_Q_COLS}",
+                (
+                    updated.status,
+                    _jsonb(updated.scores.model_dump() if updated.scores else None),
+                    updated.reviewer,
+                    updated.note,
+                    updated.reviewed_at,
+                    shop_id,
+                    review_id,
+                ),
+            ).fetchone()
+        assert row is not None
+        return _quality_review(row)
+
+    def purge_shop(self, shop_id: str) -> int:
+        # §8.4 分批删、每批一个短事务（Database.purge_rows）
+        return self._db.purge_rows(shop_id, "quality_review")
 
 
 # ================================================================ 售后审核（§7.3.2）

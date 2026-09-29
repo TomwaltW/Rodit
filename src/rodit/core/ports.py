@@ -31,6 +31,7 @@ from rodit.core.enums import (
     Intent,
     KnowledgeStatus,
     Platform,
+    QualityReviewStatus,
     ReviewState,
     Role,
     SuggestionStatus,
@@ -55,9 +56,12 @@ from rodit.core.models import (
     LogisticsTrace,
     OrderInfo,
     PlatformContext,
+    PlatformItem,
     PolicyEntry,
     PriceInfo,
     QAResult,
+    QualityReview,
+    QualityScores,
     RefundProgress,
     ReturnEligibility,
     RouteDecision,
@@ -225,6 +229,35 @@ class AfterSaleActionPort(Protocol):
 
 
 # ---------------------------------------------------------------- 平台接入层（§8.2）
+
+
+@runtime_checkable
+class ItemCatalog(Protocol):
+    """平台商品接口（只读，§5.2.3 商品自动同步）：拉商品标题、属性、SKU、详情文字和详情图引用。
+
+    开放平台接口要在平台云内调用：生产实现由平台云注入，沙箱和测试用
+    rodit.testing.fakes.InMemoryItemCatalog。接口故障抛 core.errors.ToolUnavailable。
+    只返回 shop_id 这家店铺的商品（§9.2）。
+    """
+
+    platform: Platform
+
+    def list_items(self, shop_id: str) -> list[PlatformItem]:
+        """该店铺的全部商品（含已下架，on_sale=False），按 item_id 升序。"""
+        ...
+
+    def get_item(self, shop_id: str, item_id: str) -> PlatformItem | None: ...
+
+
+@runtime_checkable
+class ImageTextExtractor(Protocol):
+    """详情图 OCR（§5.2.1 "详情图 OCR 文字"）。在平台云内运行，图片不出云。
+
+    image_ref 是 PlatformItem.detail_images 里的引用。失败抛 core.errors.ToolUnavailable
+    （同步照常进行，只是这张图的文字缺失）。
+    """
+
+    def extract_text(self, shop_id: str, image_ref: str) -> str: ...
 
 
 class MessageRecall(BaseModel):
@@ -526,6 +559,47 @@ class FeedbackRepository(Protocol):
     def export_training_labels(self) -> list[LabeledSample]:
         """导出本平台单元内所有店铺的标注数据，只用于训练路由分类器（§6.4）。
         不对商家接口开放；数据不出单元。"""
+        ...
+
+    def purge_shop(self, shop_id: str) -> int: ...
+
+
+@runtime_checkable
+class QualityReviewRepository(Protocol):
+    """每周人工复核样本（§13.5）。同一店铺、同一周期（ISO 周）、同一推荐只有一条。"""
+
+    def add_many(self, reviews: Sequence[QualityReview]) -> list[QualityReview]:
+        """写入抽中的样本（status 必须是 pending，id 为 None）。幂等：同一店铺、周期、推荐已有的，
+        不重复写、原样返回已有的那条（不管它现在是什么状态）。返回和输入一一对应、都带 id。
+        reviews 可以跨店铺（每条按自己的 shop_id 写入）。"""
+        ...
+
+    def get(self, shop_id: str, review_id: int) -> QualityReview | None: ...
+
+    def list(
+        self,
+        shop_id: str,
+        *,
+        period: str | None = None,
+        status: QualityReviewStatus | None = None,
+    ) -> list[QualityReview]:
+        """按 id 升序。"""
+        ...
+
+    def record(
+        self,
+        shop_id: str,
+        review_id: int,
+        *,
+        status: QualityReviewStatus,
+        scores: QualityScores | None,
+        reviewer: str,
+        note: str | None,
+        reviewed_at: datetime,
+    ) -> QualityReview:
+        """记下复核结果（scored 带 scores；skipped 不带）。可以改判：后一次覆盖前一次
+        （历史在审计里）。status 不能是 pending、结果不合法抛 ValueError；样本不存在
+        （含别的店铺的样本）抛 KeyError。返回更新后的样本。"""
         ...
 
     def purge_shop(self, shop_id: str) -> int: ...

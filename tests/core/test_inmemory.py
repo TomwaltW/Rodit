@@ -9,6 +9,7 @@ from rodit.inmemory import (
     InMemoryConversationRepository,
     InMemoryFeedbackRepository,
     InMemoryKnowledgeRepository,
+    InMemoryQualityReviewRepository,
     InMemoryShopAuthRepository,
     InMemorySuggestionRepository,
     cosine,
@@ -33,6 +34,10 @@ def test_feedback_repository_contract():
     contracts.check_feedback_repository(InMemoryFeedbackRepository)
 
 
+def test_quality_review_repository_contract():
+    contracts.check_quality_review_repository(InMemoryQualityReviewRepository)
+
+
 def test_aftersale_review_repository_contract():
     contracts.check_aftersale_review_repository(InMemoryAfterSaleReviewRepository)
 
@@ -50,6 +55,7 @@ def test_cross_shop_isolation():
             feedback=InMemoryFeedbackRepository(),
             reviews=InMemoryAfterSaleReviewRepository(),
             auth=InMemoryShopAuthRepository(),
+            quality_reviews=InMemoryQualityReviewRepository(),
         )
     )
 
@@ -100,5 +106,6 @@ def test_purge_is_idempotent_contract():
             feedback=InMemoryFeedbackRepository(),
             reviews=InMemoryAfterSaleReviewRepository(),
             auth=InMemoryShopAuthRepository(),
+            quality_reviews=InMemoryQualityReviewRepository(),
         )
     )

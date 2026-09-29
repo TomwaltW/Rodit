@@ -20,6 +20,7 @@ from rodit.inmemory import (
     InMemoryConversationRepository,
     InMemoryFeedbackRepository,
     InMemoryKnowledgeRepository,
+    InMemoryQualityReviewRepository,
     InMemoryShopAuthRepository,
     InMemorySuggestionRepository,
 )
@@ -39,6 +40,7 @@ def test_inmemory_text_sanitation_contract():
             feedback=InMemoryFeedbackRepository(),
             reviews=InMemoryAfterSaleReviewRepository(),
             auth=InMemoryShopAuthRepository(),
+            quality_reviews=InMemoryQualityReviewRepository(),
         )
     )
 

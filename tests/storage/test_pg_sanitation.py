@@ -11,6 +11,7 @@ from rodit.storage import (
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
 )
@@ -31,6 +32,7 @@ def test_pg_text_sanitation_contract(db, truncate, token_key):
             feedback=PgFeedbackRepository(db),
             reviews=PgAfterSaleReviewRepository(db),
             auth=PgShopAuthRepository(db, encryption_key=token_key),
+            quality_reviews=PgQualityReviewRepository(db),
         )
 
     contracts.check_text_sanitation(make)

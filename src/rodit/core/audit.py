@@ -30,6 +30,18 @@ class AuditAction(StrEnum):
     KNOWLEDGE_CANDIDATE = "knowledge.candidate"
     KNOWLEDGE_APPROVED = "knowledge.approved"
     KNOWLEDGE_RETIRED = "knowledge.retired"
+    # 商家控制台（§5.2 知识中心、§9.1 知识编辑 / 配置、§9.3 店铺配置）
+    KNOWLEDGE_CREATED = "knowledge.created"  # 商家录入 FAQ
+    KNOWLEDGE_EDITED = "knowledge.edited"  # 商家改 FAQ（旧条目下线、新条目上线）
+    POLICY_UPDATED = "knowledge.policy_updated"
+    ITEM_CARD_UPDATED = "knowledge.item_card_updated"  # 商家改商品卡片上自己填的字段
+    ITEM_SYNC = "knowledge.item_sync"  # 平台商品同步（§5.2.3）：新增 / 更新 / 已下架的条数
+    CONFIG_UPDATED = "shop.config_updated"
+    # 上线节奏与持续评估（§13.4、§13.5）
+    ROLLOUT_STAGE = "shop.rollout_stage"  # 影子 ↔ 智能辅助切换：谁、门槛结果、是否强制
+    QUALITY_SAMPLED = "quality.sampled"  # 每周抽样
+    QUALITY_SCORED = "quality.scored"  # 复核打分 / 跳过
+    QUALITY_VIEWED = "quality.viewed"  # 复核人查看推荐和买家问题（§9.2 查看原始对话要留访问记录）
     # 店铺授权（§8.4 取消订购 / 授权过期，§12.4 授权过期告警）
     AUTH_EXPIRED = "auth.expired"
     AUTH_REVOKED = "auth.revoked"

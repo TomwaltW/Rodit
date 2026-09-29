@@ -91,6 +91,11 @@ LOADERS: dict[str, str] = {
         " SELECT %(s)s, 'c1', 'r' || g, now(), now() + interval '1 day'"
         " FROM generate_series(1, %(n)s) g"
     ),
+    "quality_review": (
+        "INSERT INTO quality_review (shop_id, period, suggestion_id, intent, status, sampled_at)"
+        " SELECT %(s)s, '2026-W40', g, 'greeting', 'pending', now()"
+        " FROM generate_series(1, %(n)s) g"
+    ),
 }
 SINGLE_ROW = frozenset({"shop", "shop_auth"})
 

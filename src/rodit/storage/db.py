@@ -61,9 +61,10 @@ BUSINESS_TABLES: tuple[str, ...] = (
     "knowledge_gap",
     "labeled_sample",
     "message_recall",
+    "quality_review",
 )
 """所有带店铺归属的表，全部启用并强制行级安全（shop 表的店铺列是 id，其余是 shop_id）。
-message_recall 由迁移版本 3 新建，其余由版本 1（schema.sql）建。"""
+message_recall 由迁移版本 3 新建，quality_review 由版本 4 新建，其余由版本 1（schema.sql）建。"""
 
 _MIGRATION_LOCK = 0x526F646974  # advisory lock 的键（"Rodit"），只用于串行化迁移
 
@@ -86,6 +87,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "schema.sql"),
     Migration(2, "migration_0002_aftersale_status_version.sql"),
     Migration(3, "migration_0003_recall_tombstone_candidate_unique.sql"),
+    Migration(4, "migration_0004_quality_review_confidence.sql"),
 )
 """按版本升序；已发布的脚本不再修改，结构变化加新版本（tests/storage/test_migrations.py
 按内容哈希锁定已发布的脚本）。"""
