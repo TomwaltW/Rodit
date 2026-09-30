@@ -167,7 +167,7 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 
 ### 探针与指标（§12.4）
 
-- `/healthz`：存活，不查依赖；
+- `/healthz`：存活，不查依赖（和 `/metrics` 一样是异步处理函数，不和业务请求抢工作线程：数据库不通、业务请求把线程占满时也能答）；
 - `/readyz`：就绪 = 数据库能用应用角色连上 + 迁移到最新（库里有更新版本的迁移也算就绪）+ 大模型已配置（有密钥，不真调用）；
   503 时 `checks` 里有原因代码（`unreachable` / `timeout` / `not_migrated` / `behind` / `no_privilege` / `missing_api_key`…），没有任何连接串或店铺数据；
 - `/metrics`（Prometheus 文本格式，要抓取令牌）：抓取时不查库（数据库网络不通时一次检查要十几秒，会超过抓取超时），
