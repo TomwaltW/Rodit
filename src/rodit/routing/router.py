@@ -2,7 +2,10 @@
 
 一次路由：
 1. 用 core.states.build_router_state 构造 state（唯一入口，已脱敏），
-   问题取 core.questions.ROUTER_QUESTIONS；
+   问题取 core.questions.ROUTER_QUESTIONS；主判断层是投票制的 InCloudLLMProvider 时换成
+   ROUTER_VOTE_QUESTIONS（多一道追问 second_intent，同一个请求里答，§6.4 一票一个请求）：
+   一票只能选一个 intent，认不出第二个问题；规则、分类器、Jev 的 intent 概率本来就分摊到
+   各个类型上，照旧只问四个必答问题（兜底的关键词规则也一样）；
 2. 调主判断层；判断层不可用（DecisionError / LLMError）时退回 fallback（关键词规则），
    degraded=True；
    fallback 也失败 → NO_SUGGESTION（规则 8、provider="none"），不向外抛；
@@ -39,6 +42,7 @@ from rodit.core.questions import (
     ROUTER_MODEL,
     ROUTER_QUESTIONS,
     ROUTER_QUESTIONS_VER,
+    with_followups,
 )
 from rodit.core.states import build_router_state
 from rodit.decision.llm import InCloudLLMProvider
@@ -55,6 +59,12 @@ def vote_samples_of(provider: DecisionProvider) -> int | None:
     if isinstance(provider, InCloudLLMProvider) and provider.samples > 1:
         return provider.samples
     return None
+
+
+def asks_followups(provider: DecisionProvider) -> bool:
+    """这个判断层要不要追问 second_intent：投票制的大模型判断层要（只采样一次也一样，
+    一票只选一个 intent）；给连续概率的实现（分类器、关键词规则、Jev）不要。"""
+    return isinstance(provider, InCloudLLMProvider)
 
 
 class DecisionRouter:
@@ -84,12 +94,20 @@ class DecisionRouter:
         self.history_rounds = history_rounds
 
     def build_request(self, ctx: ConversationContext) -> DecisionRequest:
-        """§6.5 路由请求。"""
+        """§6.5 路由请求（四个必答问题）。"""
         return DecisionRequest(
             model=ROUTER_MODEL,
             state=build_router_state(ctx, history_rounds=self.history_rounds),
             questions=ROUTER_QUESTIONS,
         )
+
+    @staticmethod
+    def request_for(provider: DecisionProvider, request: DecisionRequest) -> DecisionRequest:
+        """给这个判断层的请求：投票制的大模型判断层加上追问（同一个 state；路由问题即
+        ROUTER_VOTE_QUESTIONS），其他照旧。"""
+        if not asks_followups(provider):
+            return request
+        return request.model_copy(update={"questions": with_followups(request.questions)})
 
     @staticmethod
     def _ask(provider: DecisionProvider, request: DecisionRequest) -> DecisionResponse:
@@ -106,17 +124,19 @@ class DecisionRouter:
         keyword_need_human: float | None = None
         with shop_scope(ctx.shop_id):  # 大模型成本按店铺归属（§12.4）
             try:
-                response = self._ask(self.provider, request)
+                response = self._ask(self.provider, self.request_for(self.provider, request))
                 used = self.provider.name
             except (DecisionError, LLMError):
                 degraded = True
                 try:
-                    response = self._ask(self.fallback, request)
+                    response = self._ask(self.fallback, self.request_for(self.fallback, request))
                     used = self.fallback.name
                 except (DecisionError, LLMError):
                     response = None
             if response is not None and not degraded and ctx.mode == Mode.AUTO:
-                keyword_need_human = self._fallback_need_human(request)
+                keyword_need_human = self._fallback_need_human(
+                    self.request_for(self.fallback, request)
+                )
         if response is None:
             decision = RouteDecision(
                 action=RouteAction.NO_SUGGESTION,

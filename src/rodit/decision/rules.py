@@ -2,6 +2,8 @@
 
 判断层不可用时路由退回它（§12.2）。只回答 §6.5 的四个路由问题
 （intent / need_human / emotion / multi_intent），别的问题一律 DecisionError。
+追问 second_intent（core.questions.followup_questions）只问投票制的大模型判断层：
+这里 intent 的概率本来就分摊到消息里认出的各个类型上，规则 5 直接用它分条，路由器不问规则追问。
 
 - intent：关键词命中 → 按权重归一成概率（命中类型共分 RULE_TOP_MASS，其余给 other）；
   规则没有校准过的概率，最高置信度 0.9，低于任何全自动阈值（§6.6），规则永远不会触发全自动发送。

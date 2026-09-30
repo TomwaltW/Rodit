@@ -8,6 +8,12 @@
   （§12.1 路由 ≤ 1 秒），用 contextvars.copy_context().run 提交，
   保证 core.context.current_shop_id 在线程里可见（§12.4 成本归属）。
   解析与计票见 decision.voting。
+- 多问题（§6.6 规则 5）：请求里带了追问 second_intent（core.questions.ROUTER_VOTE_QUESTIONS，
+  由路由器在同一个请求里一并问，不多跑一轮）时，追问的票按采样和主要问题配对
+  （voting.second_intent_votes）；追问没答、答不出来都按"无"计，不影响其他问题，也不算有效票不足。
+- 选项概率（LLMResponse.logprobs）：接口读的是输出里第一个有内容的 token，只能记到一个单选题上：
+  输出的第一个问题是单选题时记给它，否则只有一个单选题时记给那一个（选项名对得上才用），
+  都不满足就不请求。路由请求里 intent 排第一，追问和它同一套选项、排在最后，只看票。
 - 失败：单次调用抛 LLMError 的那一票作废；所有采样都失败，或某个问题的有效票数少于 min_votes，
   抛 DecisionError（调用方据此降级，§12.2）。返回前一律 validate_response。
 """
@@ -32,14 +38,17 @@ from rodit.core.decision import (
 )
 from rodit.core.errors import DecisionError, LLMError
 from rodit.core.ports import LLMClient, LLMMessage, LLMRequest, LLMResponse
+from rodit.core.questions import Q_INTENT, Q_SECOND_INTENT
 from rodit.decision.voting import (
     NoulVote,
     Vote,
     aggregate_choice,
     aggregate_noul,
     aggregate_score,
+    aggregate_second_intent,
     choice_distribution,
     parse_sample,
+    second_intent_votes,
 )
 
 JudgePurpose = Literal["route", "qa"]
@@ -84,6 +93,22 @@ def _output_template(questions: dict[str, Question]) -> str:
         else:
             parts.append(f'"{key}": {{"answer": "<是/否>", "p": <0 到 1>}}')
     return "{" + ", ".join(parts) + "}"
+
+
+def logprob_target(questions: dict[str, Question]) -> str | None:
+    """选项概率记给哪个单选题（见模块说明）；没有能记的返回 None（不请求 logprobs）。"""
+    first = next(iter(questions.items()), None)
+    if first is not None and isinstance(first[1], ChoiceQuestion):
+        return first[0]
+    choices = [k for k, q in questions.items() if isinstance(q, ChoiceQuestion)]
+    return choices[0] if len(choices) == 1 else None
+
+
+def _paired_second_intent(questions: dict[str, Question]) -> bool:
+    """请求里的 second_intent 是跟着 intent 的追问（按票配对计票）。"""
+    return isinstance(questions.get(Q_SECOND_INTENT), ChoiceQuestion) and isinstance(
+        questions.get(Q_INTENT), ChoiceQuestion
+    )
 
 
 def build_judge_messages(request: DecisionRequest) -> list[LLMMessage]:
@@ -138,14 +163,13 @@ class InCloudLLMProvider:
     # ---------------------------------------------------------------- 调用
 
     def _llm_request(self, request: DecisionRequest) -> LLMRequest:
-        choice_questions = [q for q in request.questions.values() if isinstance(q, ChoiceQuestion)]
         return LLMRequest(
             purpose=self.purpose,
             messages=build_judge_messages(request),
             temperature=self.temperature,
             max_tokens=self.max_tokens or max(128, 64 + 48 * len(request.questions)),
             json_mode=True,
-            want_logprobs=len(choice_questions) == 1,
+            want_logprobs=logprob_target(request.questions) is not None,
             timeout_s=self.timeout_s,
             shop_id=current_shop_id(),
         )
@@ -176,13 +200,17 @@ class InCloudLLMProvider:
             errors = [r for r in results if isinstance(r, LLMError)]
             raise DecisionError(f"大模型判断全部失败（{len(errors)} 次）") from errors[-1]
         parsed = [parse_sample(request.questions, r.text) for r in responses]
-        single_choice = sum(isinstance(q, ChoiceQuestion) for q in request.questions.values()) == 1
+        target = logprob_target(request.questions)
+        paired = _paired_second_intent(request.questions)
         answers: dict[str, Answer] = {}
         for key, question in request.questions.items():
             votes: list[Vote] = [p[key] for p in parsed if key in p]
-            if isinstance(question, ChoiceQuestion):
+            if paired and key == Q_SECOND_INTENT and isinstance(question, ChoiceQuestion):
+                # 追问：按采样和主要问题配对，答不出来算"无"（不做有效票数检查）
+                answers[key] = aggregate_second_intent(key, question, second_intent_votes(parsed))
+            elif isinstance(question, ChoiceQuestion):
                 dists = []
-                if single_choice:
+                if key == target:
                     dists = [
                         d
                         for r in responses
