@@ -24,6 +24,9 @@
 路由分类器（§6.4）：--classifier 模型文件（python -m rodit.ops train-classifier 的输出）代替路由的
 判断层，两种模式都可以；上线前和 --baseline 一起跑回归（§13.5）。
 完整结果：--json 输出 JSON 到标准输出；--json out.json 写文件（文本报告照常输出）。
+报告带配置指纹（rodit.eval.fingerprint：配置的 config_fingerprint、路由 / 质检问题定义版本、
+代码版本、--classifier 模型文件的 SHA-256）；python -m rodit.ops record-eval --report out.json
+把完整评测的结论记成 eval.verdict，上线状态只认指纹和线上配置一致的结论（§13.4、§13.5）。
 退出码：0 正常；1 回归比较有指标下降；2 配置错误（环境变量、基线文件、筛选后没有用例等）。
 """
 
@@ -58,6 +61,7 @@ from rodit.eval.calibration import (
     reliability,
 )
 from rodit.eval.dataset import EvalCase, cases
+from rodit.eval.fingerprint import EvalFingerprint, current_fingerprint, file_sha256
 from rodit.eval.harness import DEMO_PLATFORM, DemoHarness, demo_harness, llm_harness
 from rodit.eval.llm_env import (
     PRICE_INPUT_ENV,
@@ -230,6 +234,7 @@ class EvalCliReport(_Model):
     usage: UsageReport | None = None
     degraded_counts: dict[str, int] = Field(default_factory=dict)
     baseline: BaselineCheck | None = None
+    fingerprint: EvalFingerprint | None = None  # 评测用的配置、问题定义、代码版本（§13.5）
 
 
 def _rate(values: Sequence[bool]) -> float:
@@ -435,6 +440,7 @@ def evaluate(
         latency=latency_report([t.latency_ms for t in traces]),
         usage=usage_report([t.llm_calls for t in traces], pricing) if metered else None,
         degraded_counts=dict(Counter(d for t in traces for d in t.degraded).most_common()),
+        fingerprint=current_fingerprint(config or EngineConfig(), git=True),
     )
 
 
@@ -680,7 +686,22 @@ def render_text(report: EvalCliReport) -> str:
     if report.baseline is not None:
         add("")
         _render_baseline(report.baseline, add)
+    if report.fingerprint is not None:
+        add("")
+        _render_fingerprint(report.fingerprint, add)
     return "\n".join(lines)
+
+
+def _render_fingerprint(fp: EvalFingerprint, add: Add) -> None:
+    code = fp.git_sha[:12] if fp.git_sha else "未知"
+    if fp.git_dirty:
+        code += "（有未提交的改动）"
+    classifier = f"，分类器 {fp.classifier_sha256[:12]}" if fp.classifier_sha256 else ""
+    add(
+        f"== 配置指纹 {fp.config_fingerprint[:12]}（路由问题 {fp.router_questions_ver}，"
+        f"质检问题 {fp.qa_questions_ver}，代码 {code}{classifier}）"
+    )
+    add("记录这次的结论（完整评测才行）：python -m rodit.ops record-eval --report <--json 的文件>")
 
 
 # ================================================================ 命令行
@@ -815,6 +836,11 @@ def main(
                 source=args.baseline,
             )
             report = report.model_copy(update={"baseline": check})
+        if args.classifier and report.fingerprint is not None:
+            fp = report.fingerprint.model_copy(
+                update={"classifier_sha256": file_sha256(args.classifier)}
+            )
+            report = report.model_copy(update={"fingerprint": fp})
     except (ValueError, RuntimeError, OSError, yaml.YAMLError) as e:
         print(f"评测没有运行：{e}", file=err)
         return 2
