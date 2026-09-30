@@ -18,7 +18,8 @@
 发出的文字写回会话（回声、反馈写回、全自动写回）和撤回都持有这个会话的锁，查重和写入之间不会插进
 另一份记录。锁的顺序固定：先店铺处理闸，再会话锁。
 取消订购（§8.4）与处理互斥：按店铺的读写闸，处理消息、客服 / 商家操作是读方，取消订购是写方——
-等在途的处理做完、期间不开始新的，删完数据再放行（之后的事件授权检查不过）。
+等在途的处理做完、期间不开始新的，再等引擎留在后台的任务（超过截止时间被丢下的分条、质检）做完，
+删完数据再放行（之后的事件授权检查不过）。
 商家操作：审核候选知识、看缺失知识、填政策问卷（附录 C）、看报表（§12.4）。
 售后审核（§7.3.2）：拉单、刷新、协商、客服确认后执行（写操作一律要人确认）。每一步先查店铺授权
 （§8.4 授权过期时停止处理）：授权无效时抛 AuthExpired，一次平台接口都不调；客服确认执行写操作时
@@ -33,7 +34,7 @@ from __future__ import annotations
 import logging
 import threading
 import unicodedata
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -84,6 +85,9 @@ from rodit.knowledge import apply_questionnaire, describe_gap, find_gaps
 logger = logging.getLogger(__name__)
 
 REASON_SEND_FAILED = "全自动回复发送失败，转人工（§12.2）"
+BACKGROUND_DRAIN_S = 30.0
+"""取消订购删数据之前，最多等引擎为这家店留在后台的任务多久（秒，见 AssistService.revoke_shop）。
+单次平台、大模型调用都有自己的超时，正常到不了这个上限。"""
 # 同一次发送可能有两份记录：写回的（反馈 agent:{推荐 id}、全自动没有平台消息 ID 时 bot:{推荐 id}）
 # 和平台推回来的回声（平台消息 ID）。两份相隔不超过这个时间、文字相同、中间没有买家消息才算同一次
 _OUTGOING_DEDUPE_WINDOW = timedelta(minutes=2)
@@ -236,6 +240,7 @@ class AssistService:
         self.unit = unit
         self._locks = _KeyedLocks()
         self._gate = _ShopGate()
+        self.background_drain_s = BACKGROUND_DRAIN_S
         self.console = ConsoleService(unit, self.processing)  # 商家控制台（§9.1、§5.2）
         self.rollout = RolloutService(unit, self.processing)  # 上线节奏与每周复核（§13.4、§13.5）
         # 店铺生命周期：开通、状态、订购事件、续期、过期清理（§8.4）
@@ -697,11 +702,22 @@ class AssistService:
 
     # ================================================================ 店铺生命周期（§8.4）
 
-    def revoke_shop(self, shop_id: str) -> dict[str, int]:
+    def revoke_shop(
+        self,
+        shop_id: str,
+        *,
+        guard: Callable[[], bool] | None = None,
+        on_purged: Callable[[dict[str, int]], None] | None = None,
+    ) -> dict[str, int] | None:
         """取消订购 / 授权过期：删令牌、停止处理，并按约定删除该店铺在本单元的全部数据。
+        返回各项删除条数。
 
-        先等这家店在途的处理做完（期间新来的排队），再删令牌和数据，最后放行：在途处理写下的
-        记录一并删掉，排队的事件授权检查不过（§8.4）。
+        先等这家店在途的处理做完（期间新来的排队），再等引擎为这家店留在后台的任务做完
+        （到截止时间被丢下、还在跑的分条和质检：它们迟到的工具缓存、大模型用量写入要一并删掉，
+        最多等 background_drain_s 秒），再删令牌和数据，最后放行：在途处理写下的记录一并删掉，
+        排队的事件授权检查不过（§8.4）。
+        guard：在写方闸门里、删之前判断（订购事件是不是晚到的旧事件、是否还过期）；返回 False 时
+        什么都不删，返回 None。on_purged(各项删除条数)：删完之后、放开闸门之前调（写清理记录）。
         """
         purgers: list[object] = [*self.unit.repos.purgers(), self.unit.cache]
         for platform, access in self.unit.adapters.keys():
@@ -710,7 +726,27 @@ class AssistService:
                 purgers.append(adapter)
         purgers.extend(self.unit.extra_purgers)
         with self._gate.revoking(shop_id):
-            return self.unit.auth.revoke(shop_id, purgers)
+            if guard is not None and not guard():
+                return None
+            self._drain_background(shop_id)
+            counts = self.unit.auth.revoke(shop_id, purgers)
+            if on_purged is not None:
+                on_purged(counts)
+            return counts
+
+    def _drain_background(self, shop_id: str) -> None:
+        """等引擎为这家店留在后台的任务做完（调用方持有写方闸门：期间不会有新的）。
+        单次平台 / 大模型调用都有自己的超时，这里再兜一个上限；超时照常删除并记警告。"""
+        wait = getattr(self.unit.engine, "wait_background", None)
+        if wait is None:
+            return
+        if not wait(shop_id, timeout=self.background_drain_s):
+            logger.warning(
+                "取消订购：店铺 %s 还有后台任务超过 %.0f 秒没做完，照常删除"
+                "（之后迟到的写入不在这次清理里）",
+                shop_id,
+                self.background_drain_s,
+            )
 
 
 __all__ = ["AFTERSALE_WRITE_SCOPES", "AssistService", "aftersale_scopes"]

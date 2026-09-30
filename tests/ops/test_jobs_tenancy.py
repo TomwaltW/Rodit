@@ -346,6 +346,7 @@ def test_cancel_pushed_through_the_binding_context_revokes_in_process(local_env)
     tenancy.onboard(grant)
     assert unit.auth.is_authorized(SHOP_A)
 
+    clock.advance(minutes=5)  # 取消晚于开通
     event = unit.parse_subscription(subscription_push("cancelled", SHOP_A, at=clock.now()))
     ctx.on_subscription(event)
     assert unit.repos.auth.get(SHOP_A) is None
@@ -482,7 +483,7 @@ def test_cli_onboard_refresh_and_purge_on_postgres(pg_cli, monkeypatch):
     [record] = audit.list_system_events(action=AuditAction.SHOP_PURGED)
     assert record.shop_id is None and record.actor == "system"
     assert record.detail["shop_id"] == NEW and record.detail["reason"] == "expired"
-    assert set(record.detail) == {"shop_id", "reason", "counts"}
+    assert set(record.detail) == {"shop_id", "reason", "counts", "event_at"}
     assert record.detail["counts"]["auth"] == 1
 
 

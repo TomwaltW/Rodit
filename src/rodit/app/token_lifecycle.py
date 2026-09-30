@@ -3,14 +3,20 @@
 续期任务（python -m rodit.ops refresh-tokens，定时在平台单元内跑）：
 
     ShopAuthRepository.expiring_shop_ids(现在 + TenancyConfig.refresh_ahead_hours)
-    （只有店铺 ID 和到期时间，不跨店读令牌）→ 逐店，在 processing(shop_id) 里（和取消订购互斥）：
-    重读授权 → 有续期令牌、还没被标记需要重新授权 → TokenRefreshPort.refresh：
-      成功：保存新令牌（平台没换续期令牌时沿用旧的），refreshed_at = 现在，审计 auth.refreshed；
+    （只有店铺 ID 和到期时间，不跨店读令牌）→ 逐店，在 processing(shop_id) 里（和同一进程里的
+    取消订购互斥）：重读授权 → 有续期令牌、还没被标记需要重新授权 → TokenRefreshPort.refresh：
+      成功：保存新令牌（平台没换续期令牌时沿用旧的），refreshed_at = 现在，needs_reauth 清掉，
+        审计 auth.refreshed；
       AuthExpired（续期令牌无效、过期、被商家撤销）：标记 needs_reauth（之后 AuthGuard.require
         不通过，问答链路 403 shop_not_authorized），审计 auth.refresh_failed；
       ToolUnavailable（限流、故障、超时）：什么都不改，下次再试；
       其他异常（平台云代码的问题）：只记异常类型，下次再试，任务退出码非 0。
-    续期期间授权被换掉了（重新订购、取消订购）：不覆盖，按新的授权来。
+    续期期间授权被换掉了（重新订购、续订）或删掉了（取消订购）：不覆盖、不标记，按新的授权来
+    （结果 SKIPPED）。续期任务是单独的进程，进程内的闸门挡不住服务进程里的订购推送，所以保存新令牌、
+    标记需要重新授权都按读到的版本比较并交换（ShopAuthRepository.replace、
+    mark_needs_reauth(expected_version=…)），不先读再写。
+    续期期间平台拒绝了旧令牌（TokenProvider.report_rejected 标记了 needs_reauth）不算换了授权：
+    被拒的是旧令牌，续期成功照样写回新令牌、清掉标记。
 
 令牌（access_token、refresh_token）只在内存里以 SecretStr 传递：不进日志、审计、异常消息和命令行
 参数；日志只有店铺 ID、异常类型和失败原因（ToolUnavailable.reason）。
@@ -54,7 +60,7 @@ class RefreshOutcome(StrEnum):
     NO_REFRESH_TOKEN = "no_refresh_token"  # 没有续期令牌：只能等商家重新授权
     REFRESH_EXPIRED = "refresh_expired"  # 续期令牌自己也过期了：只能等商家重新授权
     ALREADY_REAUTH = "already_needs_reauth"  # 之前已标记需要重新授权：不再调平台
-    SKIPPED = "skipped"  # 授权已删除、已经续过、或者续期期间被换掉了
+    SKIPPED = "skipped"  # 授权已删除、已经续过、或者续期期间被换掉 / 删掉了
 
 
 @dataclass
@@ -109,11 +115,7 @@ def _refresh_one(
     try:
         auth = repo.get(shop_id)
     except TokenDecryptionError:
-        # 令牌读不出来（换过密钥、旧版加密）：续不了，按需要重新授权处理（AuthGuard 本来就拒绝）
-        repo.mark_needs_reauth(shop_id)
-        _record(unit, shop_id, AuditAction.AUTH_REFRESH_FAILED, now, {"reason": "token_unreadable"})
-        logger.warning("令牌续期：店铺 %s 的令牌读不出来，已标记需要重新授权", shop_id)
-        return RefreshOutcome.NEEDS_REAUTH
+        return _mark_unreadable(unit, shop_id, now)
     if auth is None or auth.expires_at > before:
         return RefreshOutcome.SKIPPED  # 已经取消订购，或者列出之后有人续过 / 重新授权了
     if auth.needs_reauth:
@@ -126,7 +128,10 @@ def _refresh_one(
     try:
         fresh = refresher.refresh(shop_id, auth.refresh_token)
     except AuthExpired:
-        repo.mark_needs_reauth(shop_id)
+        # 只标记被拒的这一份：续期期间商家重新授权了，新授权不受旧续期令牌被拒的影响
+        if not repo.mark_needs_reauth(shop_id, expected_version=auth.version):
+            logger.info("令牌续期被拒，但店铺 %s 的授权在续期期间变了，不标记", shop_id)
+            return RefreshOutcome.SKIPPED
         _record(
             unit,
             shop_id,
@@ -142,29 +147,27 @@ def _refresh_one(
     except Exception as exc:  # noqa: BLE001 — 平台云代码的问题：只记类型（说明里可能有令牌）
         logger.error("令牌续期出错（%s）：店铺 %s 下次再试", type(exc).__name__, shop_id)
         return RefreshOutcome.ERROR
-    current = repo.get(shop_id)
-    if current is None or not _same_grant(current, auth):
-        # 续期期间重新订购 / 取消订购了：按新的授权来，不拿续期结果覆盖
-        logger.info("令牌续期：店铺 %s 的授权在续期期间变了，不覆盖", shop_id)
-        return RefreshOutcome.SKIPPED
     rotated = fresh.refresh_token is not None
     if rotated:  # 平台换了续期令牌：连同它的有效期一起换
         refresh_token, refresh_expires_at = fresh.refresh_token, fresh.refresh_expires_at
     else:  # 没换：沿用旧的（平台单独给了新的有效期时用新的）
         refresh_token = auth.refresh_token
         refresh_expires_at = fresh.refresh_expires_at or auth.refresh_expires_at
-    repo.save(
-        ShopAuth(
-            shop_id=shop_id,
-            access_token=fresh.access_token,
-            scopes=list(auth.scopes),
-            expires_at=fresh.expires_at,
-            refresh_token=refresh_token,
-            refresh_expires_at=refresh_expires_at,
-            refreshed_at=now,
-            needs_reauth=False,
-        )
+    renewed = ShopAuth(
+        shop_id=shop_id,
+        access_token=fresh.access_token,
+        scopes=list(auth.scopes),
+        expires_at=fresh.expires_at,
+        refresh_token=refresh_token,
+        refresh_expires_at=refresh_expires_at,
+        refreshed_at=now,
+        needs_reauth=False,  # 被拒的是旧令牌：续期成功就清掉
+        granted_at=auth.granted_at,  # 还是同一次开通的授权
     )
+    if auth.version is None or not repo.replace(renewed, expected_version=auth.version):
+        # 续期期间重新订购 / 续订 / 取消订购了：按新的授权来，不拿续期结果覆盖（也不把删掉的写回来）
+        logger.info("令牌续期：店铺 %s 的授权在续期期间变了，不覆盖", shop_id)
+        return RefreshOutcome.SKIPPED
     _record(
         unit,
         shop_id,
@@ -179,14 +182,25 @@ def _refresh_one(
     return RefreshOutcome.REFRESHED
 
 
-def _same_grant(a: ShopAuth, b: ShopAuth) -> bool:
-    """两次读到的是不是同一份授权（令牌、有效期、标记都没变）。只在内存里比较，不输出。"""
-    return (
-        a.access_token == b.access_token
-        and a.refresh_token == b.refresh_token
-        and a.expires_at == b.expires_at
-        and a.needs_reauth == b.needs_reauth
-    )
+def _mark_unreadable(unit: Unit, shop_id: str, now: datetime) -> RefreshOutcome:
+    """令牌读不出来（换过密钥、旧版加密）：续不了，按需要重新授权处理（AuthGuard 本来就拒绝）。
+
+    先记下现在这一份的版本（不解密），再确认它还是读不出来，按这个版本标记：本进程写入的授权
+    都读得出来，所以期间换上的新授权（重新授权）不会被标记；已经删掉的什么都不做。"""
+    repo = unit.repos.auth
+    stamp = repo.stamp(shop_id)
+    if stamp is None:
+        return RefreshOutcome.SKIPPED  # 已经取消订购
+    try:
+        repo.get(shop_id)
+    except TokenDecryptionError:
+        if not repo.mark_needs_reauth(shop_id, expected_version=stamp.version):
+            return RefreshOutcome.SKIPPED
+        _record(unit, shop_id, AuditAction.AUTH_REFRESH_FAILED, now, {"reason": "token_unreadable"})
+        logger.warning("令牌续期：店铺 %s 的令牌读不出来，已标记需要重新授权", shop_id)
+        return RefreshOutcome.NEEDS_REAUTH
+    logger.info("令牌续期：店铺 %s 的授权刚换过（读得出来了），下次再续", shop_id)
+    return RefreshOutcome.SKIPPED
 
 
 def _record(

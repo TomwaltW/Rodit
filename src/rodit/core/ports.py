@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
@@ -258,13 +258,15 @@ class TokenProvider(Protocol):
     - access_token：授权有效（没过期、权限够、没被标记需要重新授权）时返回令牌，否则抛
       core.errors.AuthExpired，调用方停止调用平台接口；
     - report_rejected：平台拒绝了这个令牌（如返回令牌失效）：标记需要重新授权，之后
-      access_token 抛 AuthExpired，授权告警里能看到。
+      access_token 抛 AuthExpired，授权告警里能看到。token 传被拒的那个令牌（access_token 给出的
+      SecretStr）：只在它还是这家店现在的令牌时标记——续期、重新授权换了新令牌之后，拿着旧令牌的
+      在途调用被拒不影响新授权。不传时标记现在的授权（分不出被拒的是不是旧令牌，旧的调用方式）。
     默认实现是 rodit.adapters.auth.AuthGuardTokenProvider（基于 AuthGuard）。
     """
 
     def access_token(self, shop_id: str, scopes: Iterable[str] = MVP_SCOPES) -> SecretStr: ...
 
-    def report_rejected(self, shop_id: str) -> None: ...
+    def report_rejected(self, shop_id: str, token: SecretStr | None = None) -> None: ...
 
 
 # ---------------------------------------------------------------- 平台接入层（§8.2）
@@ -721,14 +723,38 @@ class AfterSaleReviewRepository(Protocol):
     def purge_shop(self, shop_id: str) -> int: ...
 
 
+class GrantStamp(NamedTuple):
+    """一家店现在这份授权的版本和开通事件时间（ShopAuth.version、granted_at）：不含令牌，
+    读的时候不解密（ShopAuthRepository.stamp）。"""
+
+    version: int
+    granted_at: datetime | None
+
+
 @runtime_checkable
 class ShopAuthRepository(Protocol):
-    """店铺授权令牌（§8.4）。令牌（access_token、refresh_token）加密存储，只在平台云内。"""
+    """店铺授权令牌（§8.4）。令牌（access_token、refresh_token）加密存储，只在平台云内。
+
+    每次写入（save / replace）分配新的版本（ShopAuth.version，全单元不重复），标记需要重新授权
+    不换版本。续期任务（另一个进程）和平台推送（服务进程）会同时改同一家店的授权，续期结果、
+    被拒的标记都按读到的版本比较并交换：期间授权被换掉（重新授权、续订）或删掉（取消订购）时
+    什么都不改。"""
 
     def get(self, shop_id: str) -> ShopAuth | None: ...
 
     def save(self, auth: ShopAuth) -> None:
-        """整条写入（新建或覆盖），包括续期令牌、有效期和 needs_reauth。"""
+        """整条写入（新建或覆盖），包括续期令牌、有效期、needs_reauth 和 granted_at；
+        分配新的版本（忽略 auth.version）。"""
+        ...
+
+    def replace(self, auth: ShopAuth, *, expected_version: int) -> bool:
+        """只改现有的这一份授权：存的版本还是 expected_version 时整条覆盖（同 save，分配新的版本），
+        返回 True；授权已被换掉（版本不同）或已删除返回 False，什么都不写——不新建，取消订购删掉的
+        授权不会被写回来。续期任务保存新令牌用。"""
+        ...
+
+    def stamp(self, shop_id: str) -> GrantStamp | None:
+        """这家店授权的版本和开通事件时间；没有授权返回 None。不解密（令牌读不出来的也能读）。"""
         ...
 
     def delete(self, shop_id: str) -> bool:
@@ -746,9 +772,13 @@ class ShopAuthRepository(Protocol):
         rodit_auth_expiring 读（行级安全不允许跨店读 shop_auth）。"""
         ...
 
-    def mark_needs_reauth(self, shop_id: str) -> bool:
+    def mark_needs_reauth(self, shop_id: str, *, expected_version: int | None = None) -> bool:
         """标记这家店需要重新授权（续期被拒、平台拒绝了当前令牌）：之后 AuthGuard.require
-        不通过。有这家店的授权返回 True（已经标记过也是 True），没有返回 False。不解密。"""
+        不通过。标记了返回 True（已经标记过也是 True），没有这家店的授权返回 False。不解密，
+        不换版本（续期成功照样能按原来的版本写回新令牌、清掉标记）。
+
+        expected_version：被拒的是哪一份授权（读到的 ShopAuth.version）。给了时只在存的还是这一份
+        时标记（比较并交换）；已被换掉（续期、重新授权）或已删除返回 False，什么都不改。"""
         ...
 
 

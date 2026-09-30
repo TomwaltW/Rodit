@@ -996,8 +996,14 @@ def _auth(shop_id: str, *, days: float, token: str = "tok-synthetic", **kw: obje
     )
 
 
+def _unversioned(auth: ShopAuth | None) -> ShopAuth | None:
+    """去掉存储分配的版本，和写入的内容比较。"""
+    return None if auth is None else auth.model_copy(update={"version": None})
+
+
 def check_shop_auth_refresh_fields(make: Callable[[], ShopAuthRepository]) -> None:
-    """续期令牌、续期时间、needs_reauth 原样读回（PostgreSQL 实现加密落库）；再保存整条覆盖。"""
+    """续期令牌、续期时间、needs_reauth、开通事件时间原样读回（PostgreSQL 实现加密落库）；
+    再保存整条覆盖。"""
     repo = make()
     full = _auth(
         SHOP_A,
@@ -1007,10 +1013,12 @@ def check_shop_auth_refresh_fields(make: Callable[[], ShopAuthRepository]) -> No
         refresh_expires_at=NOW + timedelta(days=30),
         refreshed_at=NOW - timedelta(hours=1),
         needs_reauth=True,
+        granted_at=NOW - timedelta(days=2),
     )
     repo.save(full)
     got = repo.get(SHOP_A)
-    assert got == full
+    assert got is not None and got.version is not None
+    assert _unversioned(got) == full
     assert got.refresh_token is not None
     assert got.refresh_token.get_secret_value() == "tok-refresh-synthetic"
     assert "tok-refresh" not in repr(got) and "tok-access" not in repr(got)
@@ -1018,8 +1026,9 @@ def check_shop_auth_refresh_fields(make: Callable[[], ShopAuthRepository]) -> No
     plain = _auth(SHOP_A, days=2, token="tok-access-2")
     repo.save(plain)
     got = repo.get(SHOP_A)
-    assert got == plain
+    assert _unversioned(got) == plain
     assert got.refresh_token is None and got.refreshed_at is None and got.needs_reauth is False
+    assert got.granted_at is None
     assert repo.get(SHOP_B) is None
 
 
@@ -1041,6 +1050,74 @@ def check_mark_needs_reauth(make: Callable[[], ShopAuthRepository]) -> None:
     assert repo.get(SHOP_A).needs_reauth is False
     assert repo.delete(SHOP_A) is True
     assert repo.mark_needs_reauth(SHOP_A) is False
+
+
+def check_mark_needs_reauth_compare_and_set(make: Callable[[], ShopAuthRepository]) -> None:
+    """mark_needs_reauth(expected_version=…)：只标记被拒的那一份授权。续期 / 重新授权换过之后
+    （版本变了）、删掉之后都不改，返回 False；标记本身不换版本。"""
+    repo = make()
+    repo.save(_auth(SHOP_A, days=1, token="tok-old"))
+    old = repo.get(SHOP_A)
+    assert old is not None and old.version is not None
+    repo.save(_auth(SHOP_A, days=30, token="tok-new"))  # 期间换了新授权
+    assert repo.mark_needs_reauth(SHOP_A, expected_version=old.version) is False
+    current = repo.get(SHOP_A)
+    assert current.needs_reauth is False and current.access_token.get_secret_value() == "tok-new"
+    # 被拒的就是现在这一份：标记，版本不变
+    assert repo.mark_needs_reauth(SHOP_A, expected_version=current.version) is True
+    marked = repo.get(SHOP_A)
+    assert marked.needs_reauth is True and marked.version == current.version
+    assert repo.stamp(SHOP_A).version == current.version
+    assert repo.delete(SHOP_A) is True
+    assert repo.mark_needs_reauth(SHOP_A, expected_version=current.version) is False
+
+
+def check_shop_auth_versions(make: Callable[[], ShopAuthRepository]) -> None:
+    """版本：每次 save / replace 换新的（删掉再建也不重复）；replace 只在版本没变时整条覆盖，
+    授权被换掉或删掉时返回 False、什么都不写（不新建）；stamp 只读版本和开通事件时间。"""
+    repo = make()
+    assert repo.stamp(SHOP_A) is None
+    granted = NOW - timedelta(days=3)
+    repo.save(_auth(SHOP_A, days=1, token="tok-v1", granted_at=granted))
+    first = repo.get(SHOP_A)
+    assert first is not None and first.version is not None and first.granted_at == granted
+    stamp = repo.stamp(SHOP_A)
+    assert stamp is not None and stamp.version == first.version and stamp.granted_at == granted
+    assert "tok-" not in repr(stamp)
+    repo.save(_auth(SHOP_B, days=1, token="tok-b"))
+    assert repo.stamp(SHOP_B).version not in (None, first.version)
+    assert repo.stamp(SHOP_B).granted_at is None
+
+    # 版本没变：整条覆盖（续期写回新令牌、清掉标记），换新版本
+    repo.mark_needs_reauth(SHOP_A)
+    renewed = _auth(
+        SHOP_A,
+        days=30,
+        token="tok-v2",
+        refresh_token=SecretStr("tok-refresh-v2"),
+        refreshed_at=NOW,
+        granted_at=granted,
+    )
+    assert repo.replace(renewed, expected_version=first.version) is True
+    second = repo.get(SHOP_A)
+    assert second.access_token.get_secret_value() == "tok-v2" and second.needs_reauth is False
+    assert second.refresh_token.get_secret_value() == "tok-refresh-v2"
+    assert second.refreshed_at == NOW and second.granted_at == granted
+    assert second.version not in (None, first.version)
+    # 拿旧版本再写：已经换过了，什么都不改
+    stale = _auth(SHOP_A, days=60, token="tok-stale")
+    assert repo.replace(stale, expected_version=first.version) is False
+    assert repo.get(SHOP_A).access_token.get_secret_value() == "tok-v2"
+    # 删掉之后：不新建（取消订购删掉的授权不会被续期结果写回来）
+    assert repo.delete(SHOP_A) is True
+    assert repo.replace(stale, expected_version=second.version) is False
+    assert repo.get(SHOP_A) is None and repo.stamp(SHOP_A) is None
+    # 删掉再建：版本不和以前的重复
+    repo.save(_auth(SHOP_A, days=1, token="tok-v3"))
+    third = repo.get(SHOP_A)
+    assert third.version not in (first.version, second.version)
+    assert repo.replace(stale, expected_version=second.version) is False
+    assert repo.get(SHOP_B).access_token.get_secret_value() == "tok-b"  # 别的店铺不受影响
 
 
 def check_expiring_shop_ids(make: Callable[[], ShopAuthRepository]) -> None:
@@ -1209,6 +1286,7 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
     assert repos.conversations.list_outgoing(SHOP_A, **window) == []
     assert repos.conversations.list_outgoing(SHOP_A, roles=tuple(Role), **window) == []
     assert repos.auth.mark_needs_reauth(SHOP_A) is False  # 改不到 B 的授权
+    assert repos.auth.stamp(SHOP_A) is None  # 读不到 B 的版本和开通事件时间
     # 跨店列出快到期的店铺：只有 ID 和到期时间，没有令牌
     assert repos.auth.expiring_shop_ids(NOW + timedelta(days=3650)) == [
         (SHOP_B, NOW + timedelta(days=1))

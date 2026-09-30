@@ -180,6 +180,85 @@ def test_ten_second_generator_is_cut_at_the_budget_without_late_writes():
         assert _snapshot(r["service"]) == r["snapshot"], text  # 没有迟到的写入
 
 
+# ================================================================ 取消订购等后台任务做完（§8.4）
+
+
+def test_cancel_waits_for_a_late_platform_call_so_its_cache_write_is_purged():
+    """平台物流接口比预算慢：handle() 到点返回，查询留在后台；取消订购等它做完再删，
+    它迟到的缓存写入（买家的物流数据）一并删掉，不会在清理之后回到缓存里。"""
+    service = service_with(SlowLLM(generate_s=0, qa_s=0))
+    unit = service.unit
+    original = unit.tools.get_logistics
+    returned = threading.Event()
+
+    def slow(shop_id: str, order_id: str):  # type: ignore[no-untyped-def]
+        time.sleep(6.0)  # 平台接口慢（没有预算约束）
+        try:
+            return original(shop_id, order_id)
+        finally:
+            returned.set()
+
+    unit.tools.get_logistics = slow  # type: ignore[method-assign]
+    result = say(service, "我的快递到哪了", order_id="o_1002")
+    assert DEGRADED_BUDGET in result.degraded and not returned.is_set()
+
+    counts = service.revoke_shop(SHOP_A)
+    assert returned.is_set()  # 等后台的平台调用做完才删
+    assert counts is not None and counts["auth"] == 1
+    time.sleep(0.3)
+    assert unit.cache.get(SHOP_A, "logistics|o_1002") is None
+    assert unit.engine.wait_background(SHOP_A, timeout=0)
+
+
+def test_cancel_waits_for_a_late_qa_judge_so_its_usage_record_is_purged():
+    """判断层质检在截止之前开始、之后才返回：handle() 到点返回，调用留在后台；取消订购等它做完
+    再删，它迟到的大模型用量记录（llm.usage，按店铺归属）一并删掉。"""
+    from rodit.llm import MeteredLLMClient
+
+    slow = SlowLLM(generate_s=2.0, qa_s=4.0)
+    holder: dict[str, Any] = {}
+
+    class Metered:
+        model = slow.model
+
+        def complete(self, request: LLMRequest) -> LLMResponse:
+            return holder["llm"].complete(request)
+
+    unit = build_demo_unit(llm=Metered(), route_provider=RuleProvider())
+    holder["llm"] = MeteredLLMClient(slow, unit.repos.audit, unit.clock)
+    service = AssistService(unit)
+    result = say(service, SINGLE, item_id="i_555")
+    assert DEGRADED_BUDGET in result.degraded
+    assert slow.finished < slow.started  # 判断层还在后台跑
+
+    service.revoke_shop(SHOP_A)
+    assert slow.finished == slow.started  # 等它们做完才删
+    time.sleep(0.3)
+    assert [e.action for e in unit.repos.audit.events if e.shop_id == SHOP_A] == []
+
+
+def test_cancel_stops_waiting_for_background_work_after_the_limit():
+    """后台任务迟迟不结束：最多等 background_drain_s，照常删除（不能让取消订购一直卡住）。"""
+    service = service_with(SlowLLM(generate_s=0, qa_s=0))
+    unit = service.unit
+    original = unit.tools.get_logistics
+    release = threading.Event()
+
+    def stuck(shop_id: str, order_id: str):  # type: ignore[no-untyped-def]
+        release.wait(20)
+        return original(shop_id, order_id)
+
+    unit.tools.get_logistics = stuck  # type: ignore[method-assign]
+    say(service, "我的快递到哪了", order_id="o_1002")
+    service.background_drain_s = 0.5
+    started = time.monotonic()
+    counts = service.revoke_shop(SHOP_A)
+    assert 0.4 < time.monotonic() - started < 3.0
+    assert counts is not None and unit.repos.auth.get(SHOP_A) is None
+    release.set()
+    assert unit.engine.wait_background(SHOP_A, timeout=10)
+
+
 # ================================================================ 串店检查（§9.2、§12.4）
 
 

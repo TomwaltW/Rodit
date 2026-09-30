@@ -82,6 +82,18 @@ def test_mark_needs_reauth_contract(db, truncate, token_key):
     )
 
 
+def test_mark_needs_reauth_compare_and_set_contract(db, truncate, token_key):
+    contracts.check_mark_needs_reauth_compare_and_set(
+        fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))
+    )
+
+
+def test_shop_auth_versions_contract(db, truncate, token_key):
+    contracts.check_shop_auth_versions(
+        fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))
+    )
+
+
 def test_expiring_shop_ids_contract(db, truncate, token_key):
     contracts.check_expiring_shop_ids(
         fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))

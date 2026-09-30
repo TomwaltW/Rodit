@@ -4,6 +4,11 @@
 --    access_token 的附加认证数据都不相同；挪到别的店铺、或当成 access_token 都解不开），
 --    refresh_expires_at 是续期令牌的有效期，refreshed_at 是最近一次续期成功的时间，
 --    needs_reauth 表示续期被拒 / 平台拒绝了当前令牌，要商家重新授权（授权检查不通过）。
+--    version 是每次写入授权时换新的版本（序列 shop_auth_version_seq，删掉再建也不重复；标记
+--    needs_reauth 不换）：续期任务（另一个进程）和平台推送同时改一家店时，续期结果、被拒的标记都
+--    按读到的版本比较并交换，不会改到别的授权，也不会把取消订购删掉的授权写回来。
+--    granted_at 是这份授权来自的平台开通 / 续订事件的时间：订购事件顺序的高水位，不晚于它的
+--    开通、取消订购事件是晚到或重推的旧事件（以前的授权为空，不比较）。
 -- 2. rodit_auth_expiring(before)：续期任务、过期清理要跨店列出"快到期的店铺"，而行级安全不许
 --    rodit_app 跨店读 shop_auth。这个 SECURITY DEFINER 函数只返回店铺 ID 和到期时间（不返回令牌，
 --    也不返回别的列），固定 search_path，属于第一次执行迁移的账号，只有 rodit_app 能执行，
@@ -28,12 +33,23 @@ ALTER TABLE shop_auth ADD COLUMN IF NOT EXISTS refresh_token BYTEA;
 ALTER TABLE shop_auth ADD COLUMN IF NOT EXISTS refresh_expires_at TIMESTAMPTZ;
 ALTER TABLE shop_auth ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMPTZ;
 ALTER TABLE shop_auth ADD COLUMN IF NOT EXISTS needs_reauth BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE shop_auth ADD COLUMN IF NOT EXISTS granted_at TIMESTAMPTZ;
+CREATE SEQUENCE IF NOT EXISTS shop_auth_version_seq;
+-- 已有的行各取一个序列值
+ALTER TABLE shop_auth ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL
+  DEFAULT nextval('shop_auth_version_seq');
+ALTER SEQUENCE shop_auth_version_seq OWNED BY shop_auth.version;
+GRANT USAGE ON SEQUENCE shop_auth_version_seq TO rodit_app;
 CREATE INDEX IF NOT EXISTS shop_auth_expires_idx ON shop_auth (expires_at, shop_id);
 
 COMMENT ON COLUMN shop_auth.refresh_token IS
   '续期令牌，应用内 AES-256-GCM 加密（附加认证数据：店铺 ID、NUL 字节、refresh）';
 COMMENT ON COLUMN shop_auth.needs_reauth IS
   '续期被拒或平台拒绝了当前令牌：停止处理，等商家重新授权';
+COMMENT ON COLUMN shop_auth.version IS
+  '写入版本（每次写入授权换新的，标记 needs_reauth 不换）：续期、被拒标记按它比较并交换';
+COMMENT ON COLUMN shop_auth.granted_at IS
+  '授权来自的平台开通 / 续订事件的时间：不晚于它的订购事件是晚到的旧事件';
 
 -- ---------------------------------------------------------------- 快到期的店铺（跨店，只有 ID 和时间）
 

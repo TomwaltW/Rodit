@@ -58,9 +58,13 @@ min_llm_remaining_s=latency.min_llm_remaining_s) 里处理（EngineConfig.latenc
   截止之后才判完的大模型草稿同样丢掉），已经通过质检的 FAQ / 模板卡片保留；
   剩余时间不够再调一次大模型时，同样不重写、不送判断层质检；
 - 引擎最多等到截止时间 + concurrency.JOIN_GRACE_S；还没做完的分条整条丢掉。它的线程会在后台
-  跑完，但不写任何东西：handle() 返回之后引擎和质检都没有迟到的写入（质检截止之后不写
-  decision_log）。例外是大模型用量计量（llm.MeteredLLMClient 的 llm.usage）：后台调用返回时
-  照常记下用量——调用确实发生了，成本要算到店铺上（§12.4）；
+  跑完，引擎和质检自己的记录都不在后台写：handle() 返回之后没有迟到的审计、推荐记录、
+  decision_log（质检截止之后不写）。后台线程调用的平台工具、大模型照常留下副作用：工具结果写进
+  缓存、大模型用量计量（llm.MeteredLLMClient 的 llm.usage，调用确实发生了，成本要算到店铺上，
+  §12.4）。引擎提交的任务（分条、质检）都记在引擎的 concurrency.BackgroundWork 里（按店铺，
+  handle 里的 background_scope）：取消订购删数据之前 AssistService.revoke_shop 用 wait_background
+  等它们做完，迟到的写入一并删掉（§8.4）。生成器自己并行的大模型调用（generation 的线程池）
+  还不在里面：它的单次超时不超过剩余预算（clamp_timeout），按时返回的客户端在截止时刻就结束；
 - 以上任何一种"时间不够、丢了东西"都记降级 "budget"，engine.result 另加
   budget_exceeded=True（core.audit.RESULT_BUDGET_EXCEEDED）。
 
@@ -186,7 +190,14 @@ from rodit.engine.cards import (
     dedupe,
     dropped_draft_alert,
 )
-from rodit.engine.concurrency import NESTED_GRACE_S, Outcome, run_inline, run_ordered
+from rodit.engine.concurrency import (
+    NESTED_GRACE_S,
+    BackgroundWork,
+    Outcome,
+    background_scope,
+    run_inline,
+    run_ordered,
+)
 from rodit.engine.understanding import ConversationBuilder, ShopInactive, effective_mode
 
 logger = logging.getLogger(__name__)
@@ -374,6 +385,7 @@ class AssistEngine:
     gaps 为空时不记知识缺失提醒（结果里仍有 missing_knowledge）。
     monotonic：时间预算用的单调时钟（秒，core.budget.Deadline 的 now），测试可以注入假的；
     外层已经有截止时间时（调用方设的）要用同一个时钟。
+    交给线程池的任务按店铺记在 BackgroundWork 里，wait_background 等某家店的全部做完（取消订购用）。
     """
 
     def __init__(
@@ -405,10 +417,17 @@ class AssistEngine:
         self._clock = clock
         self._gaps = gaps
         self._builder = ConversationBuilder(knowledge, conversations, tools, config, clock)
+        self._background = BackgroundWork()
 
     @property
     def builder(self) -> ConversationBuilder:
         return self._builder
+
+    def wait_background(self, shop_id: str, timeout: float | None = None) -> bool:
+        """等这家店留在后台的任务（到截止时间被丢下、还在跑的分条和质检）全部做完；
+        timeout 秒之内做完（或本来就没有）返回 True。取消订购删数据之前调
+        （AssistService.revoke_shop），调用方要保证期间不会有这家店的新消息（持有写方闸门）。"""
+        return self._background.wait_idle(shop_id, timeout)
 
     # ------------------------------------------------------------ 入口
 
@@ -420,6 +439,7 @@ class AssistEngine:
         latency = self._config.latency
         with (
             shop_scope(msg.shop_id),
+            background_scope(self._background, msg.shop_id),
             budget.deadline_scope(
                 latency.message_budget_s,
                 min_llm_remaining_s=latency.min_llm_remaining_s,
@@ -728,8 +748,9 @@ class AssistEngine:
         """各条并行跑"找 → 写 → 判"，按原顺序收回并入 run（§12.1）。
 
         到"截止时间 + 宽限"还没做完的分条换成空的替身（该条不推荐，记 budget）；工作线程
-        不写任何东西，丢掉的分条不会在 handle() 返回之后留下写入。某一条意外抛错时和顺序执行
-        一样：前面各条已经并入，这个异常交给 handle 的兜底，后面各条丢掉。
+        不写引擎自己的记录，丢掉的分条不会在 handle() 返回之后留下审计、推荐记录；它调用的平台
+        工具、大模型迟到的缓存、用量写入由 BackgroundWork 兜住（取消订购等它们做完再删）。
+        某一条意外抛错时和顺序执行一样：前面各条已经并入，这个异常交给 handle 的兜底，后面各条丢掉。
         """
         tasks = [partial(self._run_unit, ctx, unit, plan) for unit in units]
         outcomes: list[Outcome[_Unit]] = run_ordered(tasks)

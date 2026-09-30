@@ -211,6 +211,13 @@ class ShopAuth(_Model):
     - refreshed_at：最近一次续期成功的时间（开通时为空）。
     - needs_reauth：续期被平台拒绝、或平台拒绝了当前令牌（TokenProvider.report_rejected）：
       停止处理（AuthGuard.require 不通过），等商家重新授权；重新保存授权时按传入值覆盖。
+    - granted_at：这份授权来自的平台开通 / 续订事件的时间（SubscriptionEvent.at），是这家店订购事件
+      顺序的高水位：不晚于它的开通、取消订购事件是晚到或重推的旧事件，不再处理（app.tenancy）。
+      续期不改它；直接写入的授权（旧数据、测试）为空，不参与比较。
+    - version：存储给每次写入（save / replace）分配的版本，全单元不重复（删掉再建也不会重复），
+      标记 needs_reauth 不换版本。读出来才有，保存时忽略传入的值。续期、标记需要重新授权按它
+      比较并交换（ShopAuthRepository.replace、mark_needs_reauth(expected_version=…)）：
+      期间授权被换掉、被删除时什么都不改，跨进程也成立。
     """
 
     shop_id: str
@@ -221,6 +228,8 @@ class ShopAuth(_Model):
     refresh_expires_at: AwareDatetime | None = None
     refreshed_at: AwareDatetime | None = None
     needs_reauth: bool = False
+    granted_at: AwareDatetime | None = None
+    version: int | None = None
 
 
 SubscriptionKind = Literal["subscribed", "renewed", "cancelled", "auth_revoked"]

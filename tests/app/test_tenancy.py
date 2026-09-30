@@ -7,6 +7,8 @@ AssistService.tenancy 跑在演示单元（内存仓储、合成数据）上：�
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import timedelta
 
 import pytest
@@ -20,6 +22,7 @@ from rodit.app.tenancy import (
     STATUS_TRANSITIONS,
     PurgeIncomplete,
 )
+from rodit.app.token_lifecycle import RefreshOutcome
 from rodit.core.audit import AuditAction
 from rodit.core.config import EngineConfig, TenancyConfig
 from rodit.core.enums import Platform, ShopStatus
@@ -27,7 +30,7 @@ from rodit.core.errors import ActionNotAllowed, AuthExpired, ShopInactive, Token
 from rodit.core.models import ShopAuth, SubscriptionEvent
 from rodit.core.scopes import MVP_SCOPES, PHASE2_SCOPES, SCOPE_REFUND_WRITE
 from rodit.engine.engine import REASON_SHOP_INACTIVE
-from rodit.testing.fakes import parse_subscription, subscription_push
+from rodit.testing.fakes import FakeTokenRefresher, parse_subscription, subscription_push
 from rodit.testing.fixtures import SHOP_A, SHOP_B
 
 NEW = "s_new"
@@ -263,7 +266,8 @@ def test_set_status_rejects_unknown_shop_bad_transition_and_blank_actor(service:
 def test_cancelled_subscription_revokes_and_leaves_a_system_record(service: AssistService):
     unit = service.unit
     assert unit.repos.knowledge.get_shop(SHOP_A) is not None
-    outcome = service.tenancy.handle_subscription(_event(service, "cancelled", SHOP_A))
+    cancel = _event(service, "cancelled", SHOP_A)
+    outcome = service.tenancy.handle_subscription(cancel)
     assert outcome.action == "revoked" and outcome.counts["auth"] == 1
     assert sum(outcome.counts.values()) > 1
     # 令牌、店铺、店铺审计都删了；别的店不受影响
@@ -276,8 +280,13 @@ def test_cancelled_subscription_revokes_and_leaves_a_system_record(service: Assi
 
     [record] = unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
     assert record.shop_id is None and record.actor == PLATFORM_ACTOR
-    assert set(record.detail) == {"shop_id", "reason", "counts"}
-    assert record.detail == {"shop_id": SHOP_A, "reason": "cancelled", "counts": outcome.counts}
+    assert set(record.detail) == {"shop_id", "reason", "counts", "event_at"}
+    assert record.detail == {
+        "shop_id": SHOP_A,
+        "reason": "cancelled",
+        "counts": outcome.counts,
+        "event_at": cancel.at.isoformat(),  # 触发清理的平台事件时间
+    }
 
 
 def test_auth_revoked_is_handled_like_cancel(service: AssistService):
@@ -290,6 +299,7 @@ def test_auth_revoked_is_handled_like_cancel(service: AssistService):
 def test_subscribed_and_renewed_events_onboard(service: AssistService):
     outcome = service.tenancy.handle_subscription(_event(service))
     assert outcome.action == "granted" and outcome.shop.status == ShopStatus.TRIAL
+    service.unit.clock.advance(days=1)  # 续订晚于开通
     renewed = service.tenancy.handle_subscription(_event(service, "renewed"))
     assert renewed.action == "granted"
     grants = service.unit.repos.audit.list_events(NEW, action=AuditAction.AUTH_GRANTED)
@@ -301,6 +311,7 @@ def test_same_shop_can_onboard_again_after_revoke(service: AssistService):
     service.tenancy.onboard(_event(service))
     _add_faq(service)
     assert _ask(service, FAQ_Q, msg_id="m1").suggestions
+    unit.clock.advance(minutes=30)  # 取消晚于开通
     service.tenancy.handle_subscription(_event(service, "cancelled"))
     assert unit.repos.knowledge.get_shop(NEW) is None
 
@@ -329,6 +340,231 @@ def test_stale_grant_arriving_after_the_purge_is_ignored(service: AssistService)
     # 直接调 onboard（运维开通）不受影响
     service.tenancy.onboard(_event(service, "subscribed", SHOP_A, at=sent_at))
     assert unit.repos.auth.get(SHOP_A) is not None
+
+
+# ---------------------------------------------------------------- 订购事件的顺序（平台重推、晚到）
+
+
+def _handle(service: AssistService, event: SubscriptionEvent):
+    return service.tenancy.handle_subscription(event)
+
+
+def _purge_records(service: AssistService) -> list:
+    return service.unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+
+
+def test_replayed_cancel_after_resubscribe_is_ignored(service: AssistService):
+    """商家误取消（T1）后重新订购（T2）；平台重推 T1 的取消：不删重新订购的店铺
+    （令牌、知识、推荐记录），也不再写清理记录。"""
+    unit = service.unit
+    assert _handle(service, _event(service)).action == "granted"  # T0
+    unit.clock.advance(hours=1)
+    cancel = _event(service, "cancelled")  # T1
+    assert _handle(service, cancel).action == "revoked"
+    unit.clock.advance(hours=1)
+    again = _event(service, access_token="tok-after-resubscribe")  # T2
+    assert _handle(service, again).action == "granted"
+    _add_faq(service)
+    assert _ask(service, FAQ_Q, msg_id="m1").suggestions
+    unit.clock.advance(hours=1)
+
+    replay = _handle(service, cancel)
+    assert replay.action == "ignored" and replay.counts == {}
+    auth = unit.repos.auth.get(NEW)
+    assert auth is not None and auth.access_token.get_secret_value() == "tok-after-resubscribe"
+    assert unit.auth.is_authorized(NEW)
+    shown_before = len(unit.repos.suggestions.list(NEW))
+    assert shown_before > 0  # 重新订购之后的推荐记录还在
+    assert _ask(service, FAQ_Q, msg_id="m2").suggestions[0].text == FAQ_A  # 知识还在
+    assert len(_purge_records(service)) == 1
+    # 重推 T2 的开通（已经处理过）：也是旧事件
+    assert _handle(service, again).action == "ignored"
+
+
+def test_cancel_older_than_the_current_grant_is_ignored(service: AssistService):
+    """取消订购（T1）的推送晚于之后的重新授权（T2）才到：按平台事件时间是旧事件，不清理。"""
+    unit = service.unit
+    _handle(service, _event(service))
+    unit.clock.advance(hours=1)
+    late_cancel = _event(service, "cancelled")  # 发出之后没送到，平台稍后重推
+    unit.clock.advance(hours=1)
+    renewed = _event(service, "renewed", access_token="tok-renewed-later")
+    assert _handle(service, renewed).action == "granted"
+    _add_faq(service)
+
+    assert _handle(service, late_cancel).action == "ignored"
+    assert unit.auth.is_authorized(NEW)
+    assert unit.repos.auth.get(NEW).access_token.get_secret_value() == "tok-renewed-later"
+    assert _ask(service, FAQ_Q, msg_id="m1").suggestions
+    assert _purge_records(service) == []
+
+
+def test_cancel_retried_after_a_failed_purge_does_not_wipe_a_resubscribed_shop(
+    service: AssistService,
+):
+    """取消订购第一次清理失败（平台会重推）；商家随后重新订购；平台重推那条旧的取消：不清理。"""
+    unit = service.unit
+    _handle(service, _event(service))
+    unit.clock.advance(hours=1)
+    cancel = _event(service, "cancelled")
+
+    class FailsOnce:
+        failed = False
+
+        def purge_shop(self, shop_id: str) -> int:
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("磁盘满了（模拟）")
+            return 0
+
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(RuntimeError):
+        _handle(service, cancel)
+    assert _purge_records(service) == []  # 没删完：要重试
+    unit.clock.advance(hours=2)
+    assert _handle(service, _event(service, access_token="tok-resubscribed")).action == "granted"
+    _add_faq(service)
+
+    assert _handle(service, cancel).action == "ignored"
+    assert unit.auth.is_authorized(NEW)
+    assert _ask(service, FAQ_Q, msg_id="m1").suggestions
+
+
+def test_older_grant_arriving_after_a_newer_one_keeps_the_newer_token(service: AssistService):
+    unit = service.unit
+    old = _event(service, access_token="tok-old", refresh_token="tok-refresh-old")  # T0
+    unit.clock.advance(hours=1)
+    newer_expiry = unit.clock.now() + timedelta(days=60)
+    new = _event(
+        service,
+        "renewed",
+        access_token="tok-new",
+        refresh_token="tok-refresh-new",
+        expires_at=newer_expiry,
+    )
+    assert _handle(service, new).action == "granted"
+
+    assert _handle(service, old).action == "ignored"  # T0 的开通推送晚到
+    auth = unit.repos.auth.get(NEW)
+    assert auth.access_token.get_secret_value() == "tok-new"
+    assert auth.refresh_token.get_secret_value() == "tok-refresh-new"
+    assert auth.expires_at == newer_expiry and auth.granted_at == new.at
+
+
+def test_replayed_grant_after_a_refresh_keeps_the_rotated_tokens(service: AssistService):
+    """续期换了令牌（平台同时换了续期令牌、旧的作废）之后，平台重推当初那条开通：不拿旧令牌覆盖。"""
+    unit = service.unit
+    unit.token_refresher = FakeTokenRefresher(Platform.TAOBAO, clock=unit.clock)
+    grant = _event(service, refresh_token=REFRESH, expires_at=unit.clock.now() + timedelta(hours=2))
+    assert _handle(service, grant).action == "granted"
+    assert service.tenancy.refresh_tokens().of(RefreshOutcome.REFRESHED) == [NEW]
+    rotated = unit.repos.auth.get(NEW)
+    assert rotated.access_token.get_secret_value() != TOKEN
+
+    assert _handle(service, grant).action == "ignored"
+    assert unit.repos.auth.get(NEW) == rotated  # 令牌、续期令牌、版本都没变
+
+
+def test_resubscribe_sent_after_the_cancel_is_granted_even_when_the_purge_ran_long(
+    service: AssistService,
+):
+    """大店铺清理要十分钟；商家取消 2 分钟后重新订购，推送在清理完之后才到：按事件时间比，
+    重新订购晚于取消，照常开通（不拿清理做完的时间比）。"""
+    unit = service.unit
+    cancel_at = unit.clock.now()
+
+    class BigShop:
+        def purge_shop(self, shop_id: str) -> int:
+            unit.clock.advance(minutes=10)
+            return 0
+
+    unit.extra_purgers.append(BigShop())
+    assert _handle(service, _event(service, "cancelled", SHOP_A, at=cancel_at)).action == "revoked"
+    resub = _event(
+        service,
+        "subscribed",
+        SHOP_A,
+        at=cancel_at + timedelta(minutes=2),
+        access_token="tok-resubscribed-a",
+    )
+    assert _handle(service, resub).action == "granted"
+    assert unit.repos.auth.get(SHOP_A).access_token.get_secret_value() == "tok-resubscribed-a"
+
+
+def test_resubscribe_newer_than_a_late_processed_cancel_is_granted(service: AssistService):
+    """取消（T0）晚了 30 秒才处理，重新订购（T0 + 10 秒）在那之后才到：照常开通。"""
+    unit = service.unit
+    cancel_at = unit.clock.now()
+    unit.clock.advance(seconds=10)
+    resub_at = unit.clock.now()
+    unit.clock.advance(seconds=20)
+    assert _handle(service, _event(service, "cancelled", SHOP_A, at=cancel_at)).action == "revoked"
+    resub = _event(service, "subscribed", SHOP_A, at=resub_at, access_token="tok-resub-late")
+    assert _handle(service, resub).action == "granted"
+    assert unit.auth.is_authorized(SHOP_A)
+
+
+def test_stale_grant_arriving_while_the_cancel_is_purging_is_ignored(service: AssistService):
+    """取消订购正在清理（大店铺）时，取消之前发出的开通推送到了：在写方闸门里比较，
+    清理记录写在放开闸门之前，所以它看得到清理记录，不会在清理之后把旧令牌写回来。"""
+    unit = service.unit
+    sent_at = unit.clock.now()
+    unit.clock.advance(minutes=5)
+    started, release = threading.Event(), threading.Event()
+
+    class Slow:
+        def purge_shop(self, shop_id: str) -> int:
+            started.set()
+            release.wait(5)
+            return 0
+
+    unit.extra_purgers.append(Slow())
+    out: dict[str, object] = {}
+    cancel = _event(service, "cancelled", SHOP_A)
+    stale = _event(service, "subscribed", SHOP_A, at=sent_at, access_token="tok-stale")
+    first = threading.Thread(target=lambda: out.setdefault("cancel", _handle(service, cancel)))
+    first.start()
+    assert started.wait(5)
+    second = threading.Thread(target=lambda: out.setdefault("stale", _handle(service, stale)))
+    second.start()
+    time.sleep(0.1)
+    assert "stale" not in out  # 等在写方闸门外
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert out["cancel"].action == "revoked" and out["stale"].action == "ignored"
+    assert unit.repos.auth.get(SHOP_A) is None and unit.repos.knowledge.get_shop(SHOP_A) is None
+
+
+def test_stale_cancel_arriving_while_a_newer_grant_is_written_is_ignored(service: AssistService):
+    """重新订购正在写（持有写方闸门）时，更早的取消推送到了：在清理的闸门里判断，不删新授权。"""
+    unit = service.unit
+    cancel = _event(service, "cancelled")  # T0
+    unit.clock.advance(minutes=5)
+    grant = _event(service, access_token="tok-regrant")  # T0 + 5 分钟
+    entered, release = threading.Event(), threading.Event()
+    knowledge = unit.repos.knowledge
+    real_upsert = knowledge.upsert_shop
+
+    def slow_upsert(shop):
+        entered.set()
+        release.wait(5)
+        return real_upsert(shop)
+
+    knowledge.upsert_shop = slow_upsert  # type: ignore[method-assign]
+    out: dict[str, object] = {}
+    first = threading.Thread(target=lambda: out.setdefault("grant", _handle(service, grant)))
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=lambda: out.setdefault("cancel", _handle(service, cancel)))
+    second.start()
+    time.sleep(0.1)
+    release.set()
+    first.join(5)
+    second.join(5)
+    knowledge.upsert_shop = real_upsert  # type: ignore[method-assign]
+    assert out["grant"].action == "granted" and out["cancel"].action == "ignored"
+    assert unit.auth.is_authorized(NEW) and knowledge.get_shop(NEW) is not None
 
 
 def test_revoke_requires_reason_and_propagates_purge_failures(service: AssistService):
@@ -380,6 +616,8 @@ def test_purge_expired_only_removes_shops_past_the_grace_period(service: AssistS
         "shop_id": SHOP_A,
         "reason": PURGE_REASON_EXPIRED,
         "counts": purged[SHOP_A],
+        # 不是平台事件触发的：删掉的授权没有开通事件时间（直接写入的），按开始清理的时间
+        "event_at": unit.clock.now().isoformat(),
     }
     assert record.actor == "system"
     # 再跑一次：没有要删的
@@ -453,8 +691,11 @@ def test_expired_shop_with_unreadable_token_is_still_purged(service: AssistServi
 def test_audit_never_contains_tokens(service: AssistService):
     service.tenancy.onboard(_event(service, refresh_token=REFRESH))
     service.tenancy.set_status(NEW, ShopStatus.ACTIVE, actor="ops")
-    service.tenancy.handle_subscription(_event(service, "renewed", refresh_token=REFRESH))
-    service.tenancy.handle_subscription(_event(service, "cancelled"))
+    service.unit.clock.advance(days=1)
+    renewed = _event(service, "renewed", refresh_token=REFRESH)
+    assert service.tenancy.handle_subscription(renewed).action == "granted"
+    service.unit.clock.advance(days=1)
+    assert service.tenancy.handle_subscription(_event(service, "cancelled")).action == "revoked"
     _no_token_text(service)
     auth = ShopAuth(
         shop_id=NEW,

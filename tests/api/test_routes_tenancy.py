@@ -98,7 +98,8 @@ def test_renewed_push_replaces_the_token(api: Api):
 def test_cancelled_push_revokes_and_platform_events_stop(api: Api):
     first = api.post(EVENTS_PATH, "push_a", json=taobao_event("能开发票吗", msg_id="h1"))
     assert first.status_code == 200, first.text
-    r = api.post(PATH, "push_a", json=_push(api, "cancelled", SHOP_A))
+    cancel = _push(api, "cancelled", SHOP_A)
+    r = api.post(PATH, "push_a", json=cancel)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["action"] == "revoked" and body["kind"] == "cancelled" and body["status"] is None
@@ -106,13 +107,19 @@ def test_cancelled_push_revokes_and_platform_events_stop(api: Api):
     assert api.unit.repos.auth.get(SHOP_A) is None
     assert api.unit.repos.knowledge.get_shop(SHOP_A) is None
     [record] = _purged(api)
-    assert record.detail == {"shop_id": SHOP_A, "reason": "cancelled", "counts": body["counts"]}
+    assert record.detail == {
+        "shop_id": SHOP_A,
+        "reason": "cancelled",
+        "counts": body["counts"],
+        "event_at": cancel["at"],
+    }
     # 之后这家店的平台事件一律 403
     after = api.post(EVENTS_PATH, "push_a", json=taobao_event("在吗", msg_id="h2"))
     assert after.status_code == 403
-    # 重推同一条取消：幂等（没有可删的了）
-    again = api.post(PATH, "push_a", json=_push(api, "cancelled", SHOP_A))
-    assert again.status_code == 200 and again.json()["total"] == 0
+    # 重推同一条取消：已经处理过的旧事件，什么都不做（200，平台不再重推）
+    again = api.post(PATH, "push_a", json=cancel)
+    assert again.status_code == 200 and again.json()["action"] == "ignored"
+    assert again.json()["total"] is None and len(_purged(api)) == 1
 
 
 def test_cross_shop_push_is_403_and_changes_nothing(api: Api):

@@ -55,6 +55,14 @@ def test_mark_needs_reauth_contract():
     contracts.check_mark_needs_reauth(InMemoryShopAuthRepository)
 
 
+def test_mark_needs_reauth_compare_and_set_contract():
+    contracts.check_mark_needs_reauth_compare_and_set(InMemoryShopAuthRepository)
+
+
+def test_shop_auth_versions_contract():
+    contracts.check_shop_auth_versions(InMemoryShopAuthRepository)
+
+
 def test_expiring_shop_ids_contract():
     contracts.check_expiring_shop_ids(InMemoryShopAuthRepository)
 

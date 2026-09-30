@@ -28,7 +28,7 @@ from rodit.core.audit import AuditAction
 from rodit.core.config import EngineConfig, TenancyConfig
 from rodit.core.enums import Platform
 from rodit.core.errors import AuthExpired, TokenDecryptionError, ToolUnavailable
-from rodit.core.models import RefreshedToken, ShopAuth
+from rodit.core.models import RefreshedToken, ShopAuth, SubscriptionEvent
 from rodit.core.scopes import MVP_SCOPES
 from rodit.testing.fakes import FakeTokenRefresher
 from rodit.testing.fixtures import SHOP_A, SHOP_B
@@ -77,7 +77,9 @@ def _grant(
         needs_reauth=needs_reauth,
     )
     service.unit.repos.auth.save(auth)
-    return auth
+    stored = service.unit.repos.auth.get(shop_id)  # 带上存储分配的版本
+    assert stored is not None
+    return stored
 
 
 def _audit_text(service: AssistService) -> str:
@@ -293,6 +295,151 @@ def test_grant_replaced_during_refresh_is_not_overwritten(svc):
     report = service.tenancy.refresh_tokens()
     assert report.of(RefreshOutcome.SKIPPED) == [SHOP_A]
     assert unit.repos.auth.get(SHOP_A).access_token.get_secret_value() == "tok-renewed-meanwhile"
+
+
+def test_rejected_refresh_does_not_mark_a_grant_renewed_meanwhile(svc):
+    """续期调用期间商家重新授权了（服务进程保存了新授权），旧续期令牌随之被平台拒绝：
+    只标记被拒的那一份，新授权照常可用。"""
+    service, _ = svc
+    unit = service.unit
+    _grant(service, SHOP_A, hours=1)
+    serve = AssistService(unit)  # 另一个进程（服务进程）：闸门和续期任务不是同一把
+    grant = SubscriptionEvent(
+        kind="renewed",
+        shop_id=SHOP_A,
+        platform=Platform.TAOBAO,
+        at=unit.clock.now(),
+        scopes=sorted(MVP_SCOPES),
+        access_token=SecretStr("tok-reauthorized-meanwhile"),
+        expires_at=unit.clock.now() + timedelta(days=365),
+    )
+
+    class RacingRefresher:
+        platform = Platform.TAOBAO
+
+        def refresh(self, shop_id: str, refresh_token: SecretStr) -> RefreshedToken:
+            assert serve.tenancy.handle_subscription(grant).action == "granted"
+            raise AuthExpired("重新授权之后旧的续期令牌作废了（模拟）")
+
+    unit.token_refresher = RacingRefresher()
+    report = service.tenancy.refresh_tokens()
+    assert report.of(RefreshOutcome.SKIPPED) == [SHOP_A]
+    auth = unit.repos.auth.get(SHOP_A)
+    assert auth.access_token.get_secret_value() == "tok-reauthorized-meanwhile"
+    assert auth.needs_reauth is False and unit.auth.is_authorized(SHOP_A)
+    assert unit.repos.audit.list_events(SHOP_A, action=AuditAction.AUTH_REFRESH_FAILED) == []
+
+
+def test_rejection_of_the_old_token_after_a_refresh_does_not_mark_the_new_one(svc):
+    """续期换了令牌之后，拿着旧令牌的在途调用被平台拒绝（report_rejected 带上旧令牌）：
+    新令牌不受影响，下一轮续期也照常。"""
+    service, _ = svc
+    unit = service.unit
+    _grant(service, SHOP_A, hours=2)
+    old = unit.tokens.access_token(SHOP_A)
+    assert service.tenancy.refresh_tokens().of(RefreshOutcome.REFRESHED) == [SHOP_A]
+    unit.tokens.report_rejected(SHOP_A, old)
+    assert unit.repos.auth.get(SHOP_A).needs_reauth is False
+    assert unit.auth.is_authorized(SHOP_A)
+    assert unit.tokens.access_token(SHOP_A).get_secret_value() != old.get_secret_value()
+    unit.clock.advance(days=29, hours=12)
+    assert service.tenancy.refresh_tokens().of(RefreshOutcome.REFRESHED) == [SHOP_A]
+
+
+@pytest.mark.parametrize("with_token", [True, False])
+def test_rejection_of_the_old_token_during_refresh_keeps_the_refreshed_token(svc, with_token):
+    """续期调用期间，拿着旧令牌的在途请求被平台拒绝（标记了 needs_reauth）：被拒的是旧令牌，
+    续期成功照样写回新令牌（含换过的续期令牌）并清掉标记，不丢掉续期结果。"""
+    service, _ = svc
+    unit = service.unit
+    _grant(service, SHOP_A, hours=2)
+    old = unit.tokens.access_token(SHOP_A)
+    now = unit.clock.now()
+
+    class RacingRefresher:
+        platform = Platform.TAOBAO
+
+        def refresh(self, shop_id: str, refresh_token: SecretStr) -> RefreshedToken:
+            if with_token:
+                unit.tokens.report_rejected(shop_id, old)
+            else:  # 旧的调用方式（不带令牌）
+                unit.tokens.report_rejected(shop_id)
+            assert unit.repos.auth.get(shop_id).needs_reauth is True
+            return RefreshedToken(
+                access_token=SecretStr("tok-new-access"),
+                expires_at=now + timedelta(days=30),
+                refresh_token=SecretStr("tok-new-refresh"),
+                refresh_expires_at=now + timedelta(days=90),
+            )
+
+    unit.token_refresher = RacingRefresher()
+    report = service.tenancy.refresh_tokens()
+    assert report.of(RefreshOutcome.REFRESHED) == [SHOP_A]
+    auth = unit.repos.auth.get(SHOP_A)
+    assert auth.access_token.get_secret_value() == "tok-new-access"
+    assert auth.refresh_token.get_secret_value() == "tok-new-refresh"
+    assert auth.needs_reauth is False and unit.auth.is_authorized(SHOP_A)
+    assert unit.repos.audit.list_events(SHOP_A, action=AuditAction.AUTH_REFRESHED)
+
+
+def test_refresh_does_not_recreate_a_grant_revoked_before_it_is_saved(svc):
+    """续期任务（单独的进程）拿到新令牌、正要保存时，服务进程取消订购删掉了授权和数据：
+    不把授权写回来（带版本条件的更新，不新建）。"""
+    service, _ = svc
+    unit = service.unit
+    _grant(service, SHOP_A, hours=1)
+    serve = AssistService(unit)  # 服务进程：闸门和续期任务不是同一把
+    repo = unit.repos.auth
+    real_save, real_replace = repo.save, repo.replace
+
+    def revoke_first(write):
+        def wrapped(*args, **kwargs):
+            if repo.get(SHOP_A) is not None:
+                serve.tenancy.revoke(SHOP_A, reason="cancelled", actor="platform")
+            return write(*args, **kwargs)
+
+        return wrapped
+
+    repo.save = revoke_first(real_save)  # type: ignore[method-assign]
+    repo.replace = revoke_first(real_replace)  # type: ignore[method-assign]
+    report = service.tenancy.refresh_tokens()
+    repo.save, repo.replace = real_save, real_replace  # type: ignore[method-assign]
+    assert report.of(RefreshOutcome.SKIPPED) == [SHOP_A]
+    assert repo.get(SHOP_A) is None and not unit.auth.is_authorized(SHOP_A)
+    assert unit.repos.knowledge.get_shop(SHOP_A) is None
+
+
+def test_unreadable_token_replaced_before_marking_is_not_marked(svc):
+    """令牌读不出来，要标记需要重新授权时商家刚好重新授权了：按记下的版本标记，不标记新授权。"""
+    service, refresher = svc
+    unit = service.unit
+    _grant(service, SHOP_A, hours=1)
+    real_get = unit.repos.auth.get
+    reads = {"n": 0}
+    fresh = ShopAuth(
+        shop_id=SHOP_A,
+        access_token=SecretStr("tok-reauthorized"),
+        scopes=sorted(MVP_SCOPES),
+        expires_at=unit.clock.now() + timedelta(days=365),
+    )
+
+    def get(shop_id: str):
+        if shop_id == SHOP_A and reads["n"] < 2:
+            reads["n"] += 1
+            if reads["n"] == 2:  # 确认还读不出来的同时，新授权写进来了
+                unit.repos.auth.save(fresh)
+            raise TokenDecryptionError("模拟：换过密钥")
+        return real_get(shop_id)
+
+    unit.repos.auth.get = get  # type: ignore[method-assign]
+    report = service.tenancy.refresh_tokens()
+    unit.repos.auth.get = real_get  # type: ignore[method-assign]
+    assert report.of(RefreshOutcome.SKIPPED) == [SHOP_A]
+    assert refresher.calls == []
+    auth = unit.repos.auth.get(SHOP_A)
+    assert auth.access_token.get_secret_value() == "tok-reauthorized"
+    assert auth.needs_reauth is False and unit.auth.is_authorized(SHOP_A)
+    assert unit.repos.audit.list_events(SHOP_A, action=AuditAction.AUTH_REFRESH_FAILED) == []
 
 
 def test_shop_revoked_after_listing_is_skipped(svc):

@@ -65,7 +65,7 @@ from rodit.core.models import (
     merge_overrides,
     strip_control_chars,
 )
-from rodit.core.ports import RECALL_TOMBSTONE_TTL
+from rodit.core.ports import RECALL_TOMBSTONE_TTL, GrantStamp
 from rodit.inmemory.embedding import cosine
 from rodit.storage.db import Conn, Database, StorageUnavailable
 
@@ -1192,8 +1192,11 @@ _TOKEN_KDF_INFO = b"rodit shop_auth access_token v1"
 _REFRESH_AAD_SUFFIX = "\x00refresh"
 _AUTH_COLS = (
     "shop_id, access_token, scopes, expires_at, refresh_token, refresh_expires_at,"
-    " refreshed_at, needs_reauth"
+    " refreshed_at, needs_reauth, granted_at"
 )
+_AUTH_READ_COLS = _AUTH_COLS + ", version"
+# 写入版本（迁移版本 5）：全库递增的序列，删掉再建也不重复；标记需要重新授权不换版本
+_AUTH_NEXT_VERSION = "nextval('shop_auth_version_seq')"
 
 
 def _token_cipher(encryption_key: str) -> AESGCM:
@@ -1215,7 +1218,10 @@ class PgShopAuthRepository:
       附加认证数据是"店铺 ID + NUL 字节 + refresh"：和 access_token 的密文互换、挪到任何店铺
       （包括名字是"店铺 ID:refresh"这样的店铺）的 access_token 列都解不出来。
     - expiring_shop_ids 经 SECURITY DEFINER 函数 rodit_auth_expiring 跨店读（只有店铺 ID 和到期
-      时间，不解密）；mark_needs_reauth 只改标记、不解密。
+      时间，不解密）；mark_needs_reauth 只改标记、不解密；stamp 只读版本和开通事件时间、不解密。
+    - 版本（version）来自序列 shop_auth_version_seq，每次 save / replace 换新的；replace、
+      mark_needs_reauth(expected_version=…) 是带版本条件的一条 UPDATE（比较并交换），续期任务和
+      服务进程同时改同一家店时不会改到别的授权，replace 也不会把删掉的授权插回来。
     - 密钥不对、密文损坏、旧格式（v0.x 用库内 pgcrypto 加密的令牌）都抛 TokenDecryptionError，
       需要重新授权写入；repr、异常消息里都不出现密钥和令牌（令牌进出都是 SecretStr）。
     - 换密钥：用旧密钥读出、新密钥写回（MVP 未提供批量工具）。
@@ -1274,7 +1280,7 @@ class PgShopAuthRepository:
     def get(self, shop_id: str) -> ShopAuth | None:
         with self._db.session(shop_id) as conn:
             r = conn.execute(
-                f"SELECT {_AUTH_COLS} FROM shop_auth WHERE shop_id = %s", (shop_id,)
+                f"SELECT {_AUTH_READ_COLS} FROM shop_auth WHERE shop_id = %s", (shop_id,)
             ).fetchone()
         if r is None:
             return None
@@ -1292,35 +1298,68 @@ class PgShopAuthRepository:
             refresh_expires_at=_cst(r["refresh_expires_at"]),
             refreshed_at=_cst(r["refreshed_at"]),
             needs_reauth=bool(r["needs_reauth"]),
+            granted_at=_cst(r["granted_at"]),
+            version=int(r["version"]),
         )
 
-    def save(self, auth: ShopAuth) -> None:
+    def _sealed_values(self, auth: ShopAuth) -> tuple[Any, ...]:
+        """auth 按 _AUTH_COLS 的顺序（令牌加密）。"""
         sealed = self._encrypt(auth.shop_id, auth.access_token.get_secret_value())
         sealed_refresh = (
             self._encrypt(auth.shop_id, auth.refresh_token.get_secret_value(), refresh=True)
             if auth.refresh_token is not None
             else None
         )
+        return (
+            auth.shop_id,
+            sealed,
+            list(auth.scopes),
+            auth.expires_at,
+            sealed_refresh,
+            auth.refresh_expires_at,
+            auth.refreshed_at,
+            auth.needs_reauth,
+            auth.granted_at,
+        )
+
+    def save(self, auth: ShopAuth) -> None:
+        values = self._sealed_values(auth)
         with self._db.session(auth.shop_id) as conn:
             conn.execute(
-                f"INSERT INTO shop_auth ({_AUTH_COLS})"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                f"INSERT INTO shop_auth ({_AUTH_COLS}, version)"
+                f" VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, {_AUTH_NEXT_VERSION})"
                 " ON CONFLICT (shop_id) DO UPDATE SET access_token = EXCLUDED.access_token,"
                 " scopes = EXCLUDED.scopes, expires_at = EXCLUDED.expires_at,"
                 " refresh_token = EXCLUDED.refresh_token,"
                 " refresh_expires_at = EXCLUDED.refresh_expires_at,"
-                " refreshed_at = EXCLUDED.refreshed_at, needs_reauth = EXCLUDED.needs_reauth",
-                (
-                    auth.shop_id,
-                    sealed,
-                    list(auth.scopes),
-                    auth.expires_at,
-                    sealed_refresh,
-                    auth.refresh_expires_at,
-                    auth.refreshed_at,
-                    auth.needs_reauth,
-                ),
+                " refreshed_at = EXCLUDED.refreshed_at, needs_reauth = EXCLUDED.needs_reauth,"
+                " granted_at = EXCLUDED.granted_at, version = EXCLUDED.version",
+                values,
             )
+
+    def replace(self, auth: ShopAuth, *, expected_version: int) -> bool:
+        """带版本条件的一条 UPDATE：不新建（删掉的授权不会被写回来）。"""
+        _, *fields = self._sealed_values(auth)
+        with self._db.session(auth.shop_id) as conn:
+            return (
+                conn.execute(
+                    "UPDATE shop_auth SET access_token = %s, scopes = %s, expires_at = %s,"
+                    " refresh_token = %s, refresh_expires_at = %s, refreshed_at = %s,"
+                    f" needs_reauth = %s, granted_at = %s, version = {_AUTH_NEXT_VERSION}"
+                    " WHERE shop_id = %s AND version = %s",
+                    (*fields, auth.shop_id, expected_version),
+                ).rowcount
+                > 0
+            )
+
+    def stamp(self, shop_id: str) -> GrantStamp | None:
+        with self._db.session(shop_id) as conn:
+            r = conn.execute(
+                "SELECT version, granted_at FROM shop_auth WHERE shop_id = %s", (shop_id,)
+            ).fetchone()
+        if r is None:
+            return None
+        return GrantStamp(version=int(r["version"]), granted_at=_cst(r["granted_at"]))
 
     def expiring_shop_ids(self, before: datetime) -> list[tuple[str, datetime]]:
         """跨店：不设店铺范围，经 SECURITY DEFINER 函数读（只有店铺 ID 和到期时间）。"""
@@ -1332,14 +1371,18 @@ class PgShopAuthRepository:
             ).fetchall()
         return [(r["shop_id"], _cst(r["expires_at"])) for r in rows]
 
-    def mark_needs_reauth(self, shop_id: str) -> bool:
+    def mark_needs_reauth(self, shop_id: str, *, expected_version: int | None = None) -> bool:
         with self._db.session(shop_id) as conn:
-            return (
-                conn.execute(
+            if expected_version is None:
+                cur = conn.execute(
                     "UPDATE shop_auth SET needs_reauth = true WHERE shop_id = %s", (shop_id,)
-                ).rowcount
-                > 0
-            )
+                )
+            else:  # 比较并交换：被拒的那一份已经被换掉 / 删掉时不改
+                cur = conn.execute(
+                    "UPDATE shop_auth SET needs_reauth = true WHERE shop_id = %s AND version = %s",
+                    (shop_id, expected_version),
+                )
+            return cur.rowcount > 0
 
     def delete(self, shop_id: str) -> bool:
         """只删除、不解密：旧格式或密钥不对的令牌也能删掉（取消订购，§8.4）。"""

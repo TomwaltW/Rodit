@@ -40,7 +40,7 @@ from rodit.core.models import (
     SuggestionRecord,
     merge_overrides,
 )
-from rodit.core.ports import RECALL_TOMBSTONE_TTL
+from rodit.core.ports import RECALL_TOMBSTONE_TTL, GrantStamp
 from rodit.inmemory.embedding import cosine
 
 
@@ -683,11 +683,13 @@ class InMemoryAfterSaleReviewRepository:
 
 
 class InMemoryShopAuthRepository:
-    """实现 core.ports.ShopAuthRepository（内存里不加密；PostgreSQL 实现加密落库）。"""
+    """实现 core.ports.ShopAuthRepository（内存里不加密；PostgreSQL 实现加密落库）。
+    版本是这个仓储里递增的序号（删掉再建也不重复）；比较并交换都在锁里做。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._auth: dict[str, ShopAuth] = {}
+        self._versions = itertools.count(1)
 
     def get(self, shop_id: str) -> ShopAuth | None:
         with self._lock:
@@ -696,7 +698,22 @@ class InMemoryShopAuthRepository:
 
     def save(self, auth: ShopAuth) -> None:
         with self._lock:
-            self._auth[auth.shop_id] = auth.model_copy()
+            self._auth[auth.shop_id] = auth.model_copy(update={"version": next(self._versions)})
+
+    def replace(self, auth: ShopAuth, *, expected_version: int) -> bool:
+        with self._lock:
+            current = self._auth.get(auth.shop_id)
+            if current is None or current.version != expected_version:
+                return False
+            self._auth[auth.shop_id] = auth.model_copy(update={"version": next(self._versions)})
+            return True
+
+    def stamp(self, shop_id: str) -> GrantStamp | None:
+        with self._lock:
+            a = self._auth.get(shop_id)
+            if a is None or a.version is None:
+                return None
+            return GrantStamp(version=a.version, granted_at=a.granted_at)
 
     def delete(self, shop_id: str) -> bool:
         with self._lock:
@@ -710,10 +727,12 @@ class InMemoryShopAuthRepository:
             ]
         return sorted(found, key=lambda pair: (pair[1], pair[0]))
 
-    def mark_needs_reauth(self, shop_id: str) -> bool:
+    def mark_needs_reauth(self, shop_id: str, *, expected_version: int | None = None) -> bool:
         with self._lock:
             auth = self._auth.get(shop_id)
             if auth is None:
                 return False
+            if expected_version is not None and auth.version != expected_version:
+                return False  # 被拒的那一份已经被换掉了
             self._auth[shop_id] = auth.model_copy(update={"needs_reauth": True})
             return True

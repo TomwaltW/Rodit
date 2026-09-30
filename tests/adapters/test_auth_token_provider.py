@@ -79,3 +79,43 @@ def test_report_rejected_marks_the_shop_for_reauthorization(setup):
     assert TOKEN not in str(ei.value)
     provider.report_rejected(SHOP_B)  # 没有授权的店铺：不报错
     assert repo.get(SHOP_B) is None
+
+
+def test_report_rejected_with_the_current_token_marks_the_shop(setup):
+    _, repo, guard, provider = setup
+    token = provider.access_token(SHOP_A)
+    provider.report_rejected(SHOP_A, token)
+    assert repo.get(SHOP_A).needs_reauth is True
+    assert not guard.is_authorized(SHOP_A)
+
+
+def test_report_rejected_with_a_replaced_token_leaves_the_new_grant_alone(setup):
+    """在途调用拿着旧令牌被平台拒绝时，续期 / 重新授权已经换上了新令牌：不标记新授权。"""
+    _, repo, guard, provider = setup
+    old = provider.access_token(SHOP_A)
+    auth = repo.get(SHOP_A)
+    repo.save(auth.model_copy(update={"access_token": SecretStr("tok-synthetic-provider-0002")}))
+    provider.report_rejected(SHOP_A, old)
+    assert repo.get(SHOP_A).needs_reauth is False and guard.is_authorized(SHOP_A)
+    assert provider.access_token(SHOP_A).get_secret_value() == "tok-synthetic-provider-0002"
+    provider.report_rejected(SHOP_B, old)  # 没有授权的店铺：不报错
+    assert repo.get(SHOP_B) is None
+
+
+def test_report_rejected_does_not_mark_a_grant_replaced_between_check_and_mark(setup):
+    """比对令牌之后、标记之前换了新授权（另一个进程的续期）：按读到的版本比较并交换，
+    不标记新授权。"""
+    _, repo, guard, provider = setup
+    old = provider.access_token(SHOP_A)
+    real_mark = repo.mark_needs_reauth
+
+    def mark(shop_id: str, *, expected_version: int | None = None) -> bool:
+        current = repo.get(shop_id)
+        repo.save(current.model_copy(update={"access_token": SecretStr("tok-renewed-0003")}))
+        return real_mark(shop_id, expected_version=expected_version)
+
+    repo.mark_needs_reauth = mark  # type: ignore[method-assign]
+    provider.report_rejected(SHOP_A, old)
+    repo.mark_needs_reauth = real_mark  # type: ignore[method-assign]
+    got = repo.get(SHOP_A)
+    assert got.needs_reauth is False and got.access_token.get_secret_value() == "tok-renewed-0003"

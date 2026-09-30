@@ -7,7 +7,9 @@
   （needs_reauth：续期被拒、平台拒绝了当前令牌）都抛 AuthExpired，调用方停止处理
   （§8.4 授权过期时停止处理）；
 - 平台云代码（只读工具、适配器）取令牌用 AuthGuardTokenProvider（core.ports.TokenProvider）：
-  授权无效时抛 AuthExpired，平台拒绝令牌时 report_rejected 标记需要重新授权；
+  授权无效时抛 AuthExpired，平台拒绝令牌时 report_rejected 标记需要重新授权——只标记被拒的
+  那一份授权（带上被拒的令牌时比对令牌，再按版本比较并交换）：续期、重新授权之后旧令牌被拒
+  不影响新授权；
 - 商家取消订购或授权过期：AuthGuard.revoke 删除令牌，并按约定删除该店铺的数据
   （调用各仓储的 purge_shop）；
 - 授权即将过期告警（§12.4）：AuthGuard.expiring。
@@ -18,6 +20,7 @@
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Callable, Iterable
 from datetime import timedelta
 from typing import Literal, Protocol, runtime_checkable
@@ -129,9 +132,22 @@ class AuthGuard:
                 out.append(shop_id)
         return out
 
-    def mark_needs_reauth(self, shop_id: str) -> bool:
-        """标记这家店需要重新授权（之后 require 不通过）；有授权返回 True。不读令牌。"""
-        return bool(self._repo.mark_needs_reauth(shop_id))
+    def mark_needs_reauth(self, shop_id: str, *, token: SecretStr | None = None) -> bool:
+        """标记这家店需要重新授权（之后 require 不通过）；标记了返回 True。
+
+        token：平台拒绝的那个令牌。给了时只标记它所在的那一份授权：存的已经不是这个令牌
+        （续期、重新授权换了新的）、授权已删除或令牌读不出来（require 本来就不通过）都不标记，
+        返回 False；比对和标记之间换了授权也不标记（按读到的版本比较并交换）。
+        不给时标记现在的授权（不读令牌）。令牌不进日志和异常消息。"""
+        if token is None:
+            return bool(self._repo.mark_needs_reauth(shop_id))
+        try:
+            auth = self._repo.get(shop_id)
+        except TokenDecryptionError:
+            return False
+        if auth is None or not _same_secret(auth.access_token, token):
+            return False
+        return bool(self._repo.mark_needs_reauth(shop_id, expected_version=auth.version))
 
     def revoke(
         self, shop_id: str, purge: Purger | Iterable[Purger] | None = None
@@ -159,7 +175,8 @@ class AuthGuardTokenProvider:
     """core.ports.TokenProvider 的默认实现（基于 AuthGuard）：给平台云代码取店铺的有效令牌。
 
     access_token 先过 AuthGuard.require（没有授权、过期、缺权限、需要重新授权都抛 AuthExpired），
-    返回 SecretStr；report_rejected 标记需要重新授权。令牌不进日志和异常消息。
+    返回 SecretStr；report_rejected 标记需要重新授权（带上被拒的令牌时只标记它所在的那一份授权，
+    见 AuthGuard.mark_needs_reauth）。令牌不进日志和异常消息。
     """
 
     def __init__(self, guard: AuthGuard) -> None:
@@ -171,8 +188,13 @@ class AuthGuardTokenProvider:
     def access_token(self, shop_id: str, scopes: Iterable[str] = MVP_SCOPES) -> SecretStr:
         return self._guard.require(shop_id, scopes).access_token
 
-    def report_rejected(self, shop_id: str) -> None:
-        self._guard.mark_needs_reauth(shop_id)
+    def report_rejected(self, shop_id: str, token: SecretStr | None = None) -> None:
+        self._guard.mark_needs_reauth(shop_id, token=token)
+
+
+def _same_secret(a: SecretStr, b: SecretStr) -> bool:
+    """两个令牌是否相同（定长比较，不输出令牌）。"""
+    return hmac.compare_digest(a.get_secret_value().encode(), b.get_secret_value().encode())
 
 
 def _purgers(purge: Purger | Iterable[Purger] | None) -> list[Purger]:

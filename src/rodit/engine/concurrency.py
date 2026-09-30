@@ -7,7 +7,13 @@
   （core.context.shop_scope，大模型成本按店铺归属）等 contextvar；
 - 有截止时间时最多等到"截止时间 + grace_s"：截止时刻生成器刚退回模板、只剩硬规则质检的任务
   还能收尾。到点没做完的任务不再等——线程会继续跑完（Python 线程不能强行停止），结果丢掉。
-  所以任务本身不写任何共享状态：审计、推荐记录都在调用方线程、收回结果之后写；
+  任务不写审计、推荐记录这类引擎自己的记录（都在调用方线程、收回结果之后写），但它调用的平台
+  工具、大模型会照常留下副作用：工具结果写进缓存（tools.CachingToolGateway）、大模型用量计量
+  （llm.MeteredLLMClient 的 llm.usage）；
+- 所以在 background_scope(work, shop_id) 里经 run_ordered 提交的任务都记在 BackgroundWork 里
+  （按店铺计数，做完才减）：取消订购删数据之前 wait_idle 等它们做完，它们迟到的写入一并删掉
+  （§8.4）。嵌套的并行（分条里的质检）在分条的线程里提交，分条还没做完时就已经记上，计数不会
+  中途归零。不经 run_ordered 的线程池（生成器并行生成几份草稿）不在里面；
 - 没有截止时间时等全部做完（离线任务、控制台、测试）；只有一个任务时直接在调用方线程里跑；
 - 任务里抛出的异常放进 Outcome.error，由调用方按原顺序处理（和顺序执行一样：前面的先生效）。
 """
@@ -15,9 +21,13 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
-from collections.abc import Callable, Sequence
+import threading
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from rodit.core.budget import current_deadline, submit_in_context
 
@@ -29,6 +39,64 @@ handle() 在截止时间 + 这个宽限 + 收尾（写推荐记录、审计）�
 
 NESTED_GRACE_S = 0.05
 """分条内部（多份草稿并行质检）的宽限：比 JOIN_GRACE_S 短，分条自己先收尾，引擎才等得到它。"""
+
+
+class BackgroundWork:
+    """按店铺记着交给线程池、还没做完的任务（含到截止时间被丢下、还在后台跑的）。线程安全。
+
+    track 在提交之后马上调（任务已经做完也没关系：做完的回调立即执行）；wait_idle 等这家店
+    的任务全部做完。没有进行中的任务时不占内存。"""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._pending: dict[str, int] = {}
+
+    def track(self, shop_id: str, future: cf.Future[Any]) -> None:
+        with self._cond:
+            self._pending[shop_id] = self._pending.get(shop_id, 0) + 1
+        future.add_done_callback(lambda _f: self._done(shop_id))
+
+    def _done(self, shop_id: str) -> None:
+        with self._cond:
+            left = self._pending.get(shop_id, 0) - 1
+            if left > 0:
+                self._pending[shop_id] = left
+            else:
+                self._pending.pop(shop_id, None)
+            self._cond.notify_all()
+
+    def pending(self, shop_id: str) -> int:
+        with self._cond:
+            return self._pending.get(shop_id, 0)
+
+    def wait_idle(self, shop_id: str, timeout: float | None = None) -> bool:
+        """等这家店的任务全部做完；timeout 秒之内做完（或本来就没有）返回 True。"""
+        limit = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._cond:
+            while self._pending.get(shop_id):
+                if limit is None:
+                    self._cond.wait()
+                    continue
+                left = limit - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+            return True
+
+
+_background: ContextVar[tuple[BackgroundWork, str] | None] = ContextVar(
+    "rodit_background_work", default=None
+)
+
+
+@contextmanager
+def background_scope(work: BackgroundWork, shop_id: str) -> Iterator[None]:
+    """这段代码里（含它提交到线程池的任务里）run_ordered 提交的任务都记到 work 的 shop_id 名下。"""
+    token = _background.set((work, shop_id))
+    try:
+        yield
+    finally:
+        _background.reset(token)
 
 
 @dataclass(frozen=True)
@@ -52,11 +120,18 @@ def run_ordered(
     deadline = current_deadline()
     if len(tasks) == 1 and deadline is None:
         return [run_inline(tasks[0])]
+    scope = _background.get()
     pool = cf.ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix=name)
+    futures: list[cf.Future[T]] = []
     try:
-        futures = [submit_in_context(pool, task) for task in tasks]
+        for task in tasks:
+            future = submit_in_context(pool, task)
+            if scope is not None:
+                work, shop_id = scope
+                work.track(shop_id, future)
+            futures.append(future)
     finally:
-        # 不等：到点没做完的任务留在后台跑完，线程随后退出
+        # 不等：到点没做完的任务留在后台跑完，线程随后退出（BackgroundWork 记着它们）
         pool.shutdown(wait=False)
     timeout = None if deadline is None else deadline.remaining() + grace_s
     cf.wait(futures, timeout=timeout)
@@ -80,4 +155,12 @@ def _collect(future: cf.Future[T]) -> Outcome[T]:
     return Outcome(finished=True, value=future.result())
 
 
-__all__ = ["JOIN_GRACE_S", "NESTED_GRACE_S", "Outcome", "run_inline", "run_ordered"]
+__all__ = [
+    "JOIN_GRACE_S",
+    "NESTED_GRACE_S",
+    "BackgroundWork",
+    "Outcome",
+    "background_scope",
+    "run_inline",
+    "run_ordered",
+]

@@ -162,6 +162,7 @@ def test_tenant_lifecycle_end_to_end():
     assert event(FAQ_Q, "e5").json()["suggestions"]
 
     # 6. 取消订购（平台代码在进程内推）：停止处理、删除数据、系统事件留下
+    clock.advance(hours=2)  # 取消晚于续订
     cancel = unit.parse_subscription(subscription_push("cancelled", NEW, at=clock.now()))
     on_subscription(cancel)
     assert unit.repos.auth.get(NEW) is None and unit.repos.knowledge.get_shop(NEW) is None
@@ -170,7 +171,8 @@ def test_tenant_lifecycle_end_to_end():
     assert event(FAQ_Q, "e6").status_code == 403
     [record] = unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
     assert record.detail["shop_id"] == NEW and record.detail["reason"] == "cancelled"
-    assert set(record.detail) == {"shop_id", "reason", "counts"}
+    assert set(record.detail) == {"shop_id", "reason", "counts", "event_at"}
+    assert record.detail["event_at"] == cancel.at.isoformat()
     # 别的店不受影响
     assert unit.repos.knowledge.get_shop(SHOP_A) is not None and unit.auth.is_authorized(SHOP_A)
 
@@ -389,5 +391,105 @@ def test_cancel_and_auth_checks_on_postgres(pg_service: AssistService):
     with pytest.raises(AuthExpired):
         service.review_aftersale(SHOP_A, "as_2001")
     [record] = unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
-    assert record.detail == {"shop_id": SHOP_A, "reason": "auth_revoked", "counts": outcome.counts}
+    assert record.detail == {
+        "shop_id": SHOP_A,
+        "reason": "auth_revoked",
+        "counts": outcome.counts,
+        "event_at": cancel.at.isoformat(),
+    }
     assert unit.repos.knowledge.get_shop(SHOP_B) is not None
+
+
+@pytest.mark.pg
+def test_replayed_cancel_after_resubscribe_on_postgres(pg_service: AssistService):
+    """PostgreSQL：开通事件时间随授权落库（granted_at），清理记录带 event_at；平台重推的旧取消
+    不删重新订购的店铺，重推的旧开通不盖掉新令牌。"""
+    service = pg_service
+    unit = service.unit
+    clock = unit.clock
+    handle = service.tenancy.handle_subscription
+    parse = unit.parse_subscription
+    assert handle(parse(subscription_push("subscribed", NEW, at=clock.now()))).action == "granted"
+    clock.advance(hours=1)
+    cancel = parse(subscription_push("cancelled", NEW, at=clock.now()))
+    assert handle(cancel).action == "revoked"
+    clock.advance(hours=1)
+    again = parse(subscription_push("subscribed", NEW, at=clock.now(), access_token="tok-pg-2"))
+    assert handle(again).action == "granted"
+    assert unit.repos.auth.stamp(NEW).granted_at == again.at
+    service.console.create_faq(NEW, question=FAQ_Q, answer=FAQ_A, merchant=MERCHANT)
+
+    assert handle(cancel).action == "ignored"
+    assert handle(again).action == "ignored"
+    assert unit.repos.auth.get(NEW).access_token.get_secret_value() == "tok-pg-2"
+    result = service.handle_event("B", taobao_event(FAQ_Q, msg_id="pg-r1", seller_id=NEW))
+    assert result is not None and result.suggestions[0].text == FAQ_A
+    assert len(unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)) == 1
+
+
+@pytest.mark.pg
+def test_refresh_job_racing_the_server_on_postgres(pg_service: AssistService):
+    """续期任务是单独的进程（闸门不同），和服务进程同时改同一家店的授权（PostgreSQL，带版本条件的
+    UPDATE）：续期被拒时不标记期间重新授权的新授权；拿到新令牌时授权已被取消订购删掉，不写回来。"""
+    job = pg_service
+    unit = job.unit
+    serve = AssistService(unit)  # 服务进程
+    repo = unit.repos.auth
+    now = unit.clock.now()
+    for shop_id in (SHOP_A, SHOP_B):  # 两家都快到期、有续期令牌
+        auth = repo.get(shop_id)
+        repo.save(
+            auth.model_copy(
+                update={
+                    "expires_at": now + timedelta(hours=2),
+                    "refresh_token": SecretStr(f"tok-pg-refresh-{shop_id}"),
+                    "refresh_expires_at": now + timedelta(days=60),
+                }
+            )
+        )
+    regrant = unit.parse_subscription(
+        subscription_push(
+            "renewed",
+            SHOP_A,
+            at=now,
+            access_token="tok-pg-regrant",
+            expires_at=now + timedelta(days=365),
+        )
+    )
+    real_refresher = FakeTokenRefresher(Platform.TAOBAO, clock=unit.clock)
+
+    class Racing:
+        platform = Platform.TAOBAO
+
+        def refresh(self, shop_id: str, refresh_token: SecretStr):
+            if shop_id == SHOP_A:  # 续期期间商家重新授权，旧续期令牌作废
+                assert serve.tenancy.handle_subscription(regrant).action == "granted"
+                raise AuthExpired("旧续期令牌作废（模拟）")
+            return real_refresher.refresh(shop_id, refresh_token)
+
+    real_replace, real_save = repo.replace, repo.save
+
+    def revoke_b_first(auth: ShopAuth) -> None:
+        if auth.shop_id == SHOP_B and repo.stamp(SHOP_B) is not None:  # 正要保存时服务进程取消订购
+            serve.tenancy.revoke(SHOP_B, reason="cancelled", actor="platform")
+
+    def replace(auth: ShopAuth, *, expected_version: int) -> bool:
+        revoke_b_first(auth)
+        return real_replace(auth, expected_version=expected_version)
+
+    def save(auth: ShopAuth) -> None:
+        revoke_b_first(auth)
+        real_save(auth)
+
+    unit.token_refresher = Racing()
+    repo.replace, repo.save = replace, save  # type: ignore[method-assign]
+    report = job.tenancy.refresh_tokens()
+    repo.replace, repo.save = real_replace, real_save  # type: ignore[method-assign]
+
+    assert sorted(report.of(RefreshOutcome.SKIPPED)) == sorted([SHOP_A, SHOP_B])
+    a = repo.get(SHOP_A)
+    assert a.access_token.get_secret_value() == "tok-pg-regrant" and a.needs_reauth is False
+    assert unit.auth.is_authorized(SHOP_A)
+    assert unit.repos.audit.list_events(SHOP_A, action=AuditAction.AUTH_REFRESH_FAILED) == []
+    assert repo.get(SHOP_B) is None and not unit.auth.is_authorized(SHOP_B)
+    assert unit.repos.knowledge.get_shop(SHOP_B) is None
