@@ -204,12 +204,66 @@ def merge_overrides(shop: Shop, changes: Mapping[str, Any]) -> dict[str, Any]:
 
 class ShopAuth(_Model):
     """店铺授权（§8.4）。access_token 只存放在对应平台云内，落库时加密；
-    用 SecretStr 防止出现在 repr / 日志里。"""
+    用 SecretStr 防止出现在 repr / 日志里。
+
+    - refresh_token：平台给的续期令牌（有的平台没有），和 access_token 一样加密落库；
+      refresh_expires_at 是它的有效期（过了只能让商家重新授权）。
+    - refreshed_at：最近一次续期成功的时间（开通时为空）。
+    - needs_reauth：续期被平台拒绝、或平台拒绝了当前令牌（TokenProvider.report_rejected）：
+      停止处理（AuthGuard.require 不通过），等商家重新授权；重新保存授权时按传入值覆盖。
+    """
 
     shop_id: str
     access_token: SecretStr
     scopes: list[str]
     expires_at: AwareDatetime
+    refresh_token: SecretStr | None = None
+    refresh_expires_at: AwareDatetime | None = None
+    refreshed_at: AwareDatetime | None = None
+    needs_reauth: bool = False
+
+
+SubscriptionKind = Literal["subscribed", "renewed", "cancelled", "auth_revoked"]
+"""服务市场的订购事件（§8.4）：订购、续订、取消订购、商家撤销授权。"""
+
+
+class SubscriptionEvent(_Model):
+    """平台推送的订购 / 授权事件（§8.4），由平台云代码解析成这个格式
+    （PlatformBindings.parse_subscription；测试用 rodit.testing.fakes.parse_subscription）。
+
+    - subscribed / renewed 带上新的令牌（access_token，可能还有 refresh_token）和权限；
+    - cancelled / auth_revoked 只需要 shop_id：停止处理并按约定删除数据。
+    令牌是 SecretStr，不出现在 repr / 日志里；没有买家信息。
+    """
+
+    kind: SubscriptionKind
+    shop_id: str = Field(min_length=1)
+    platform: Platform
+    at: AwareDatetime
+    scopes: list[str] = Field(default_factory=list)
+    access_token: SecretStr | None = None
+    refresh_token: SecretStr | None = None
+    expires_at: AwareDatetime | None = None
+    refresh_expires_at: AwareDatetime | None = None
+    category: str | None = None  # 主营类目（开通时写进 Shop.category）
+
+    @model_validator(mode="after")
+    def _grant_has_token(self) -> SubscriptionEvent:
+        if self.kind in ("subscribed", "renewed") and (
+            self.access_token is None or self.expires_at is None
+        ):
+            raise ValueError("订购 / 续订事件必须带 access_token 和 expires_at")
+        return self
+
+
+class RefreshedToken(_Model):
+    """TokenRefreshPort.refresh 的结果：新的令牌和有效期。平台不换续期令牌时 refresh_token 为空
+    （调用方沿用旧的）。"""
+
+    access_token: SecretStr
+    expires_at: AwareDatetime
+    refresh_token: SecretStr | None = None
+    refresh_expires_at: AwareDatetime | None = None
 
 
 # ---------------------------------------------------------------- 知识（§5.2）

@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -125,17 +127,49 @@ class AfterSaleConfig(_Model):
 
 
 class LLMConfig(_Model):
-    """境内已备案大模型（D5）的调用配置。密钥不在这里：只写环境变量名，调用时再读。"""
+    """境内已备案大模型（D5）的调用配置。密钥不在这里：只写环境变量名，调用时再读。
+
+    public_name / filing_no：对外公示的模型名称和备案号（§12.3 生成式人工智能服务登记 / 备案），
+    网页工具和 /v1/me 展示；require_disclosure 为 True 时生产部署缺这两项拒绝启动。
+    """
 
     base_url: str | None = None  # OpenAI 兼容接口地址；为空时从环境变量 RODIT_LLM_BASE_URL 读
     model: str | None = None  # 为空时从 RODIT_LLM_MODEL 读
     api_key_env: str = "RODIT_LLM_API_KEY"
     timeout_s: float = 10.0  # 单次调用的上限；各环节自己的预算见 decision / generation
+    public_name: str | None = None  # 公示的模型名称【待定：D5 选定后填】
+    filing_no: str | None = None  # 备案号【待定：D5 选定后填】
+    require_disclosure: bool = False
 
 
 class PrivacyConfig(_Model):
     # buyer_ref 哈希的盐从这个环境变量读（§8.3）；生产部署必须设置，仓库里没有真实值
     buyer_salt_env: str = "RODIT_BUYER_SALT"
+
+
+class LatencyConfig(_Model):
+    """每条消息的时间预算（§12.1 端到端 ≤ 5 秒）。引擎用 core.budget.deadline_scope 执行。"""
+
+    # 从引擎开始处理到出结果的上限：留出接入层、展示的余量（5 秒 − 0.5 秒）
+    message_budget_s: float = Field(default=4.5, gt=0, le=30)
+    # 剩余时间少于这个值就不再调大模型（一次生成 / 质检来不及），退回 FAQ / 模板
+    min_llm_remaining_s: float = Field(default=0.8, ge=0, le=30)
+
+    @model_validator(mode="after")
+    def _llm_fits_budget(self) -> LatencyConfig:
+        if self.min_llm_remaining_s >= self.message_budget_s:
+            raise ValueError("min_llm_remaining_s 必须小于 message_budget_s（否则永远不调大模型）")
+        return self
+
+
+class TenancyConfig(_Model):
+    """店铺生命周期（§8.4 开通、续期、取消订购 / 授权过期后按约定删除数据）。"""
+
+    refresh_ahead_hours: float = Field(default=24, gt=0)  # 到期前多久续期
+    # 授权过期多少天后删除该店铺的数据【待定：委托处理协议（§8.4 按约定删除），法务确认后改】
+    purge_after_expiry_days: int = Field(default=30, ge=0)
+    # 开通时允许申请的权限阶段（adapters.auth.scopes_for_phase）：1 = MVP 只读，2 = 加上写售后
+    onboarding_phase: Literal[1, 2] = 1
 
 
 class EngineConfig(_Model):
@@ -148,6 +182,8 @@ class EngineConfig(_Model):
     aftersale: AfterSaleConfig = Field(default_factory=AfterSaleConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    latency: LatencyConfig = Field(default_factory=LatencyConfig)
+    tenancy: TenancyConfig = Field(default_factory=TenancyConfig)
     # 配置分层（§9.3）：平台默认 → 类目默认 → 店铺配置，下层覆盖上层
     shop_defaults_by_platform: dict[Platform, dict[str, Any]] = Field(default_factory=dict)
     shop_defaults_by_category: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -159,6 +195,22 @@ def load_config(path: str | Path | None = None) -> EngineConfig:
         return EngineConfig()
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     return EngineConfig.model_validate(data)
+
+
+def config_fingerprint(config: EngineConfig) -> str:
+    """生效配置的指纹：规范化 JSON（键排序、紧凑、UTF-8）的 SHA-256 十六进制串。
+
+    同样的配置（不管来自默认值还是 YAML、键的顺序如何）指纹相同；任何一个取值变了指纹就变。
+    §13.5 上线前回归：评测结论记下指纹，线上配置的指纹和它一致才算"这套配置跑过回归"。
+    配置里没有密钥（只有环境变量名），指纹可以写进审计和报告。
+    """
+    canonical = json.dumps(
+        config.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

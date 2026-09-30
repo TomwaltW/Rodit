@@ -6,7 +6,13 @@
     def build(ctx: rodit.ops.BindingContext) -> rodit.ops.PlatformBindings: ...
 
 ctx 里有平台、生效配置、时钟和 buyer_ref 哈希器（适配器要用同一个哈希器把平台买家 ID 变成
-buyer_ref，§8.3）。
+buyer_ref，§8.3），还有两个"先交出、后接上"的入口（工厂被调用时平台单元还没组装好）：
+- ctx.tokens（core.ports.TokenProvider）：平台只读工具、适配器调用开放平台接口时取店铺令牌；
+  单元组装好之后接到 Unit.tokens（AuthGuardTokenProvider），之前调用抛 RuntimeError；
+- ctx.on_subscription：平台推送的订购事件（SubscriptionEvent）交给它；服务组装好之后接到
+  AssistService.tenancy.handle_subscription。
+平台云代码还可以提供：令牌续期接口（token_refresher）、订购推送解析（parse_subscription）、
+大模型的出口（llm_transport，签名同 rodit.llm.openai_compat.Transport，§12.3 经平台可报备的通道）。
 
 - 模式 C 单独部署（Phase 0，§8.1 不需要任何平台数据）：不给工厂，设 RODIT_MODE_C_ONLY=1，
   入口用 mode_c_bindings（NullToolGateway + StandaloneAssistAdapter，没有写接口）；
@@ -18,8 +24,12 @@ buyer_ref，§8.3）。
 from __future__ import annotations
 
 import importlib
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
+
+from pydantic import SecretStr
 
 from rodit.adapters import (
     BaseMockAdapter,
@@ -31,14 +41,19 @@ from rodit.adapters import (
 from rodit.core.clock import Clock
 from rodit.core.config import EngineConfig
 from rodit.core.enums import Platform
+from rodit.core.models import SubscriptionEvent
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import (
     AfterSaleActionPort,
     ImageTextExtractor,
     ItemCatalog,
     PlatformAdapter,
+    TokenProvider,
+    TokenRefreshPort,
     ToolGateway,
 )
+from rodit.core.scopes import MVP_SCOPES
+from rodit.llm.openai_compat import Transport
 
 MOCK_MODULE_PREFIXES: tuple[str, ...] = ("rodit.testing", "rodit.tools.mock_platform")
 
@@ -47,14 +62,96 @@ class BindingError(RuntimeError):
     """平台绑定缺失、不合法或在生产模式下用了模拟实现。"""
 
 
+class LazyTokenProvider:
+    """BindingContext.tokens：绑定工厂被调用时平台单元还没组装好，先交出这个代理，
+    组装好之后 bind 到 Unit.tokens。没绑定时调用抛 RuntimeError（不会静默放行）。只能绑定一次。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._target: TokenProvider | None = None
+
+    def __repr__(self) -> str:
+        return f"LazyTokenProvider(bound={self.bound})"
+
+    @property
+    def bound(self) -> bool:
+        return self._target is not None
+
+    def bind(self, provider: TokenProvider) -> None:
+        with self._lock:
+            if self._target is not None and self._target is not provider:
+                raise RuntimeError("BindingContext.tokens 已经绑定过")
+            self._target = provider
+
+    def _get(self) -> TokenProvider:
+        target = self._target
+        if target is None:
+            raise RuntimeError("平台单元还没组装好：BindingContext.tokens 还不能用")
+        return target
+
+    def access_token(self, shop_id: str, scopes: Iterable[str] = MVP_SCOPES) -> SecretStr:
+        return self._get().access_token(shop_id, scopes)
+
+    def report_rejected(self, shop_id: str) -> None:
+        self._get().report_rejected(shop_id)
+
+
+SubscriptionHandler = Callable[[SubscriptionEvent], None]
+
+
+class LazySubscriptionHandler:
+    """BindingContext.on_subscription：服务组装好之后 bind 到
+    AssistService.tenancy.handle_subscription。没绑定时调用抛 RuntimeError（平台代码应当重推，
+    而不是当作处理过了）。只能绑定一次。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._target: SubscriptionHandler | None = None
+
+    def __repr__(self) -> str:
+        return f"LazySubscriptionHandler(bound={self.bound})"
+
+    @property
+    def bound(self) -> bool:
+        return self._target is not None
+
+    def bind(self, handler: SubscriptionHandler) -> None:
+        with self._lock:
+            if self._target is not None and self._target != handler:
+                raise RuntimeError("BindingContext.on_subscription 已经绑定过")
+            self._target = handler
+
+    def __call__(self, event: SubscriptionEvent) -> None:
+        target = self._target
+        if target is None:
+            raise RuntimeError("服务还没组装好：BindingContext.on_subscription 还不能用")
+        target(event)
+
+
 @dataclass(frozen=True)
 class BindingContext:
-    """交给平台绑定工厂的上下文。"""
+    """交给平台绑定工厂的上下文。tokens / on_subscription 见模块说明（先交出、后接上）。"""
 
     platform: Platform
     config: EngineConfig
     clock: Clock
     hasher: BuyerRefHasher
+    tokens: TokenProvider = field(default_factory=LazyTokenProvider)
+    on_subscription: SubscriptionHandler = field(default_factory=LazySubscriptionHandler)
+
+
+def bind_context(
+    ctx: BindingContext,
+    *,
+    tokens: TokenProvider | None = None,
+    on_subscription: SubscriptionHandler | None = None,
+) -> None:
+    """把 ctx 里的代理接到真正的实现上（serve 组装时调用）。ctx 里不是代理（调用方自己给了
+    实现）时不动它。"""
+    if tokens is not None and isinstance(ctx.tokens, LazyTokenProvider):
+        ctx.tokens.bind(tokens)
+    if on_subscription is not None and isinstance(ctx.on_subscription, LazySubscriptionHandler):
+        ctx.on_subscription.bind(on_subscription)
 
 
 @dataclass
@@ -66,6 +163,10 @@ class PlatformBindings:
     - action_port：售后写接口（二期才申请写权限，§8.4；MVP 为 None，审核只给建议）；
     - shop_ids：本单元服务的店铺（订购列表），授权即将过期告警用（§12.4）；不给时只看令牌文件。
     - catalog / ocr：平台商品接口和详情图 OCR（§5.2.3 商品自动同步），不给时商品同步不可用。
+    - token_refresher：平台的令牌续期接口（§8.4），不给时续期任务不可用（只能等商家重新授权）。
+    - parse_subscription：平台订购推送（原始 dict）→ SubscriptionEvent；不认识的推送返回 None。
+    - llm_transport：大模型的出口（签名同 rodit.llm.openai_compat.Transport），平台要求经它报备的
+      通道调用时注入；不给时用默认的 urllib 出口。
     """
 
     tools: ToolGateway
@@ -75,6 +176,9 @@ class PlatformBindings:
     ocr: ImageTextExtractor | None = None
     shop_ids: Callable[[], Iterable[str]] | None = None
     mode_c_only: bool = field(default=False)
+    token_refresher: TokenRefreshPort | None = None
+    parse_subscription: Callable[[dict[str, Any]], SubscriptionEvent | None] | None = None
+    llm_transport: Transport | None = None
 
 
 BindingsFactory = Callable[[BindingContext], PlatformBindings]
@@ -127,15 +231,25 @@ def validate_bindings(
         raise BindingError("NullToolGateway 只能用于模式 C 单独部署（RODIT_MODE_C_ONLY=1）")
     if bindings.catalog is not None and getattr(bindings.catalog, "platform", None) != platform:
         raise BindingError(f"商品接口不属于本单元的平台 {platform.value}")
+    refresher = bindings.token_refresher
+    if refresher is not None and getattr(refresher, "platform", None) != platform:
+        raise BindingError(f"令牌续期接口不属于本单元的平台 {platform.value}")
+    for name in ("parse_subscription", "llm_transport"):
+        hook = getattr(bindings, name)
+        if hook is not None and not callable(hook):
+            raise BindingError(f"平台绑定的 {name} 必须是可调用对象")
     if not allow_mock:
         mocks = [
-            type(obj).__name__
+            _label(obj)
             for obj in (
                 bindings.tools,
                 *adapters,
                 bindings.action_port,
                 bindings.catalog,
                 bindings.ocr,
+                bindings.token_refresher,
+                bindings.parse_subscription,
+                bindings.llm_transport,
             )
             if obj is not None and is_mock(obj)
         ]
@@ -147,13 +261,24 @@ def validate_bindings(
 
 
 def is_mock(obj: object) -> bool:
-    """本仓库的模拟实现（合成数据）。模式 C 的 StandaloneAssistAdapter 不算。"""
+    """本仓库的模拟实现（合成数据）。模式 C 的 StandaloneAssistAdapter 不算。
+    函数（如 parse_subscription、llm_transport）按定义它的模块判断。"""
     if isinstance(obj, StandaloneAssistAdapter):
         return False
     if isinstance(obj, BaseMockAdapter):
         return True
-    module = type(obj).__module__ or ""
-    return any(module == p or module.startswith(p + ".") for p in MOCK_MODULE_PREFIXES)
+    modules = {type(obj).__module__ or "", getattr(obj, "__module__", None) or ""}
+    return any(
+        module == prefix or module.startswith(prefix + ".")
+        for module in modules
+        for prefix in MOCK_MODULE_PREFIXES
+    )
+
+
+def _label(obj: object) -> str:
+    """报错里用的名字：函数用限定名，对象用类名。"""
+    name = getattr(obj, "__qualname__", None)
+    return name if isinstance(name, str) and name else type(obj).__name__
 
 
 # ================================================================ 本地试用（合成数据）
@@ -163,7 +288,12 @@ def demo_bindings(ctx: BindingContext) -> PlatformBindings:
     """本地试用（RODIT_ENV=local）：合成演示世界的平台数据 + 模拟适配器（模式 B）+ 模式 C。
     售后写接口也是模拟的（FakeActionPort，只改合成数据）。生产模式会拒绝这些实现。"""
     from rodit.app.demo import SUPPORTED_ACTIONS
-    from rodit.testing.fakes import FakeActionPort, InMemoryToolGateway
+    from rodit.testing.fakes import (
+        FakeActionPort,
+        FakeSubscriptionParser,
+        FakeTokenRefresher,
+        InMemoryToolGateway,
+    )
     from rodit.testing.fixtures import build_demo_world
 
     world = build_demo_world(ctx.clock.now())
@@ -179,7 +309,12 @@ def demo_bindings(ctx: BindingContext) -> PlatformBindings:
     )
     shops = sorted(s.id for s in world.shops.values() if s.platform == ctx.platform)
     return PlatformBindings(
-        tools=tools, adapters=adapters, action_port=action_port, shop_ids=lambda: shops
+        tools=tools,
+        adapters=adapters,
+        action_port=action_port,
+        shop_ids=lambda: shops,
+        token_refresher=FakeTokenRefresher(ctx.platform, clock=ctx.clock),
+        parse_subscription=FakeSubscriptionParser(ctx.platform),
     )
 
 
@@ -188,7 +323,11 @@ __all__ = [
     "BindingContext",
     "BindingError",
     "BindingsFactory",
+    "LazySubscriptionHandler",
+    "LazyTokenProvider",
     "PlatformBindings",
+    "SubscriptionHandler",
+    "bind_context",
     "demo_bindings",
     "is_mock",
     "load_factory",

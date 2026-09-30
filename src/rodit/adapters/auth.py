@@ -3,13 +3,17 @@
 - 商家在服务市场订购后授权，令牌按店铺保存（ShopAuthRepository，只在对应平台云内、加密落库）；
 - 最小权限：MVP 只申请读订单、读物流、读售后、读商品（MVP_SCOPES）；写售后到二期再申请
   （PHASE2_SCOPES）；
-- 处理任何店铺的数据前先 AuthGuard.require：没有授权、已过期、权限不够都抛 AuthExpired，
-  调用方停止处理（§8.4 授权过期时停止处理）；
+- 处理任何店铺的数据前先 AuthGuard.require：没有授权、已过期、权限不够、被标记需要重新授权
+  （needs_reauth：续期被拒、平台拒绝了当前令牌）都抛 AuthExpired，调用方停止处理
+  （§8.4 授权过期时停止处理）；
+- 平台云代码（只读工具、适配器）取令牌用 AuthGuardTokenProvider（core.ports.TokenProvider）：
+  授权无效时抛 AuthExpired，平台拒绝令牌时 report_rejected 标记需要重新授权；
 - 商家取消订购或授权过期：AuthGuard.revoke 删除令牌，并按约定删除该店铺的数据
   （调用各仓储的 purge_shop）；
 - 授权即将过期告警（§12.4）：AuthGuard.expiring。
 
-权限名是我们内部的叫法，申请授权时由各平台的实现映射成平台的权限包名【待确认】。
+权限名是我们内部的叫法，申请授权时由各平台的实现映射成平台的权限包名【待确认】；
+定义在 core.scopes（端口的默认参数要用），这里原样导出。
 """
 
 from __future__ import annotations
@@ -18,24 +22,37 @@ from collections.abc import Callable, Iterable
 from datetime import timedelta
 from typing import Literal, Protocol, runtime_checkable
 
+from pydantic import SecretStr
+
 from rodit.core.clock import Clock
 from rodit.core.errors import AuthExpired, TokenDecryptionError
 from rodit.core.models import ShopAuth
 from rodit.core.ports import ShopAuthRepository
-
-SCOPE_ORDER_READ = "order.read"
-SCOPE_LOGISTICS_READ = "logistics.read"
-SCOPE_REFUND_READ = "refund.read"
-SCOPE_ITEM_READ = "item.read"
-SCOPE_REFUND_WRITE = "refund.write"
-
-MVP_SCOPES: frozenset[str] = frozenset(
-    {SCOPE_ORDER_READ, SCOPE_LOGISTICS_READ, SCOPE_REFUND_READ, SCOPE_ITEM_READ}
+from rodit.core.scopes import (
+    MVP_SCOPES,
+    PHASE2_SCOPES,
+    SCOPE_ITEM_READ,
+    SCOPE_LOGISTICS_READ,
+    SCOPE_ORDER_READ,
+    SCOPE_REFUND_READ,
+    SCOPE_REFUND_WRITE,
 )
-"""MVP 只申请只读权限（§8.4 最小权限）。问答链路处理消息前要求具备这些权限。"""
 
-PHASE2_SCOPES: frozenset[str] = MVP_SCOPES | {SCOPE_REFUND_WRITE}
-"""二期售后审核助手（§15 Phase 2）才申请写售后权限。"""
+__all__ = [
+    "MVP_SCOPES",
+    "PHASE2_SCOPES",
+    "SCOPE_ITEM_READ",
+    "SCOPE_LOGISTICS_READ",
+    "SCOPE_ORDER_READ",
+    "SCOPE_REFUND_READ",
+    "SCOPE_REFUND_WRITE",
+    "AuthGuard",
+    "AuthGuardTokenProvider",
+    "Purger",
+    "SupportsPurge",
+    "excess_scopes",
+    "scopes_for_phase",
+]
 
 
 def scopes_for_phase(phase: Literal[1, 2]) -> frozenset[str]:
@@ -83,6 +100,8 @@ class AuthGuard:
             raise AuthExpired(f"店铺 {shop_id} 没有授权或已取消订购，停止处理（方案 §8.4）")
         if auth.expires_at <= self._clock.now():
             raise AuthExpired(f"店铺 {shop_id} 的授权已于 {auth.expires_at.isoformat()} 过期")
+        if auth.needs_reauth:
+            raise AuthExpired(f"店铺 {shop_id} 的授权需要商家重新授权（续期被拒或令牌失效，§8.4）")
         missing = frozenset(scopes) - frozenset(auth.scopes)
         if missing:
             raise AuthExpired(f"店铺 {shop_id} 的授权缺少权限：{sorted(missing)}")
@@ -96,8 +115,8 @@ class AuthGuard:
         return True
 
     def expiring(self, shop_ids: Iterable[str], *, within: timedelta) -> list[str]:
-        """授权在 within 之内到期（含已过期、没有授权、令牌读不出来）的店铺，按传入顺序
-        （§12.4 授权过期告警）。"""
+        """授权在 within 之内到期（含已过期、没有授权、令牌读不出来、需要重新授权）的店铺，
+        按传入顺序（§12.4 授权过期告警）。"""
         deadline = self._clock.now() + within
         out: list[str] = []
         for shop_id in shop_ids:
@@ -106,9 +125,13 @@ class AuthGuard:
             except TokenDecryptionError:
                 out.append(shop_id)  # 需要重新授权
                 continue
-            if auth is None or auth.expires_at <= deadline:
+            if auth is None or auth.expires_at <= deadline or auth.needs_reauth:
                 out.append(shop_id)
         return out
+
+    def mark_needs_reauth(self, shop_id: str) -> bool:
+        """标记这家店需要重新授权（之后 require 不通过）；有授权返回 True。不读令牌。"""
+        return bool(self._repo.mark_needs_reauth(shop_id))
 
     def revoke(
         self, shop_id: str, purge: Purger | Iterable[Purger] | None = None
@@ -130,6 +153,26 @@ class AuthGuard:
             else:
                 counts[name] = purger(shop_id)
         return counts
+
+
+class AuthGuardTokenProvider:
+    """core.ports.TokenProvider 的默认实现（基于 AuthGuard）：给平台云代码取店铺的有效令牌。
+
+    access_token 先过 AuthGuard.require（没有授权、过期、缺权限、需要重新授权都抛 AuthExpired），
+    返回 SecretStr；report_rejected 标记需要重新授权。令牌不进日志和异常消息。
+    """
+
+    def __init__(self, guard: AuthGuard) -> None:
+        self._guard = guard
+
+    def __repr__(self) -> str:
+        return "AuthGuardTokenProvider()"
+
+    def access_token(self, shop_id: str, scopes: Iterable[str] = MVP_SCOPES) -> SecretStr:
+        return self._guard.require(shop_id, scopes).access_token
+
+    def report_rejected(self, shop_id: str) -> None:
+        self._guard.mark_needs_reauth(shop_id)
 
 
 def _purgers(purge: Purger | Iterable[Purger] | None) -> list[Purger]:

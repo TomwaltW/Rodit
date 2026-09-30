@@ -27,6 +27,7 @@ RELEASED_SHA256 = {
     2: "89d1e349d11d445e6f010e84c5e3686428c877bafe3dcea09800d013f3685d1b",
     3: "254848388c403503c430f4dd79bd5df1b22feb57858060aa16c2d2ea7bdadf39",
     4: "9b8387a668d5ffe74618b2dd0f165861c2581de087385b2406935e14cd93df8a",
+    5: "c2c10afc8eb72462fd05ffd10525a3c405339993b77eb0ee0e249535e0601f26",
 }
 """已发布迁移脚本的 SHA-256。新增版本时在这里补一行；已有的行不能改。"""
 
@@ -189,7 +190,8 @@ def test_v4_upgrades_a_v3_database_with_data_and_is_rerunnable(make_database, mo
             " VALUES (%s, '在吗', 'manual', %s)",
             (SHOP_A, now),
         )
-    assert Database(dsn).migrate() == [4]
+    # 升级到最新（版本 4 及之后的版本）
+    assert Database(dsn).migrate() == [m.version for m in MIGRATIONS if m.version >= 4]
     db = Database(dsn)
     [old] = PgSuggestionRepository(db).list(SHOP_A)
     assert old.intent_confidence is None and old.route_rule is None
@@ -228,3 +230,64 @@ def test_v4_upgrades_a_v3_database_with_data_and_is_rerunnable(make_database, mo
     with Database(dsn, app_role=None).session(None) as conn:
         conn.execute(v4.sql())  # 再执行一次：不报错、数据不变
     assert PgQualityReviewRepository(db).get(SHOP_A, review.id) == review
+
+
+def test_v5_upgrades_a_v4_database_with_auth_and_is_rerunnable(make_database, monkeypatch):
+    """迁移到版本 4 后已经有授权和系统事件，再迁移版本 5：旧授权没有续期令牌、
+    needs_reauth 为 false，照样读得出来、列得进快到期的店铺；系统事件变得可读；
+    版本 5 的脚本再执行一次不出错。"""
+    from pydantic import SecretStr
+
+    from rodit.core.models import ShopAuth
+    from rodit.storage import PgAuditLog, PgShopAuthRepository
+
+    key = "rodit-test-token-key-synthetic-only"
+    dsn = make_database()
+    monkeypatch.setattr(db_module, "MIGRATIONS", tuple(m for m in MIGRATIONS if m.version <= 4))
+    assert Database(dsn).migrate() == [1, 2, 3, 4]
+    monkeypatch.undo()
+    now = build_demo_world().now
+    sealer = PgShopAuthRepository(Database(dsn), encryption_key=key)
+    with Database(dsn, app_role=None).session(None) as conn:  # 版本 4 的表结构：没有新列
+        for shop, days in ((SHOP_A, 1), (SHOP_B, 10)):
+            conn.execute(
+                "INSERT INTO shop_auth (shop_id, access_token, scopes, expires_at)"
+                " VALUES (%s, %s, %s, %s)",
+                (
+                    shop,
+                    sealer._encrypt(shop, f"tok-{shop}-v4"),
+                    ["order.read"],
+                    now + timedelta(days=days),
+                ),
+            )
+        conn.execute(
+            "INSERT INTO audit_log (shop_id, actor, action, detail, created_at)"
+            " VALUES (NULL, 'system', 'llm.usage', '{}', %s)",
+            (now,),
+        )
+    assert Database(dsn).migrate() == [5]
+    assert Database(dsn).migrate() == []
+    db = Database(dsn)
+    repo = PgShopAuthRepository(db, encryption_key=key)
+    old = repo.get(SHOP_A)
+    assert old is not None and old.access_token.get_secret_value() == f"tok-{SHOP_A}-v4"
+    assert old.refresh_token is None and old.refreshed_at is None and old.needs_reauth is False
+    assert repo.expiring_shop_ids(now + timedelta(days=2)) == [(SHOP_A, now + timedelta(days=1))]
+    assert [e.action for e in PgAuditLog(db).list_system_events()] == ["llm.usage"]
+    repo.save(
+        ShopAuth(
+            shop_id=SHOP_A,
+            access_token=SecretStr("tok-a-v5"),
+            scopes=["order.read"],
+            expires_at=now + timedelta(days=3),
+            refresh_token=SecretStr("tok-a-refresh-v5"),
+        )
+    )
+    v5 = next(m for m in MIGRATIONS if m.version == 5)
+    with Database(dsn, app_role=None).session(None) as conn:
+        conn.execute(v5.sql())  # 再执行一次：不报错、数据不变
+    after = repo.get(SHOP_A)
+    assert after is not None and after.refresh_token is not None
+    assert after.refresh_token.get_secret_value() == "tok-a-refresh-v5"
+    assert repo.mark_needs_reauth(SHOP_B) is True
+    assert [s for s, _ in repo.expiring_shop_ids(now + timedelta(days=30))] == [SHOP_A, SHOP_B]

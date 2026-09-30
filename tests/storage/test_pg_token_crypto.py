@@ -114,3 +114,75 @@ def test_corrupted_ciphertext_fails_without_leaking(pg_dsn, admin_db, truncate, 
             repo.get(SHOP_A)
         text = str(ei.value) + repr(ei.value) + str(ei.value.__cause__)
         assert token_key not in text and TOKEN not in text
+
+
+# ================================================================ 续期令牌（迁移版本 5）
+
+REFRESH = "tok-synthetic-refresh-9911"
+
+
+def _with_refresh(shop_id: str = SHOP_A) -> ShopAuth:
+    return _auth(shop_id).model_copy(
+        update={
+            "refresh_token": SecretStr(REFRESH),
+            "refresh_expires_at": NOW + timedelta(days=90),
+            "refreshed_at": NOW,
+        }
+    )
+
+
+def test_refresh_token_never_reaches_the_database_in_plaintext(pg_dsn, truncate, token_key):
+    db = RecordingDatabase(pg_dsn)
+    repo = PgShopAuthRepository(db, encryption_key=token_key)
+    repo.save(_with_refresh())
+    got = repo.get(SHOP_A)
+    assert got is not None and got.refresh_token is not None
+    assert got.refresh_token.get_secret_value() == REFRESH
+    assert repo.mark_needs_reauth(SHOP_A) is True
+    assert [s for s, _ in repo.expiring_shop_ids(NOW + timedelta(days=365))] == [SHOP_A]
+    for query, params in db.sent:
+        text = query + " " + _flatten(params)
+        for secret in (token_key, TOKEN, REFRESH):
+            assert secret not in text, f"密钥或明文令牌发给了数据库：{query}"
+
+
+def test_refresh_ciphertext_is_bound_to_its_shop_and_role(pg_dsn, admin_db, truncate, token_key):
+    """续期令牌的附加认证数据是"店铺 ID:refresh"：
+    和 access_token 的密文互换、挪到别的店铺都解不开。"""
+    repo = PgShopAuthRepository(Database(pg_dsn), encryption_key=token_key)
+    repo.save(_with_refresh(SHOP_A))
+    repo.save(_with_refresh(SHOP_B))
+    with admin_db.session(None) as conn:  # A：两个密文互换
+        conn.execute(
+            "UPDATE shop_auth SET access_token = refresh_token, refresh_token = access_token"
+            " WHERE shop_id = %s",
+            (SHOP_A,),
+        )
+    with pytest.raises(TokenDecryptionError) as ei:
+        repo.get(SHOP_A)
+    text = str(ei.value) + repr(ei.value) + str(ei.value.__cause__)
+    assert token_key not in text and REFRESH not in text and TOKEN not in text
+    with admin_db.session(None) as conn:  # B：换成 A 的续期令牌密文（A 此时的 access_token 列）
+        conn.execute(
+            "UPDATE shop_auth SET refresh_token ="
+            " (SELECT access_token FROM shop_auth WHERE shop_id = %s) WHERE shop_id = %s",
+            (SHOP_A, SHOP_B),
+        )
+    with pytest.raises(TokenDecryptionError):
+        repo.get(SHOP_B)
+
+
+def test_unreadable_tokens_can_still_be_listed_and_marked(pg_dsn, admin_db, truncate, token_key):
+    """令牌读不出来（换过密钥、数据损坏）的店铺照样列进快到期的店铺、照样能标记需要重新授权：
+    这两个操作都不解密。"""
+    repo = PgShopAuthRepository(Database(pg_dsn), encryption_key=token_key)
+    repo.save(_with_refresh())
+    with admin_db.session(None) as conn:
+        conn.execute("UPDATE shop_auth SET access_token = 'garbage'::bytea")
+    with pytest.raises(TokenDecryptionError):
+        repo.get(SHOP_A)
+    assert repo.expiring_shop_ids(NOW + timedelta(days=31)) == [(SHOP_A, NOW + timedelta(days=30))]
+    assert repo.mark_needs_reauth(SHOP_A) is True
+    with admin_db.session(None) as conn:
+        flag = conn.execute("SELECT needs_reauth FROM shop_auth").fetchone()["needs_reauth"]
+    assert flag is True

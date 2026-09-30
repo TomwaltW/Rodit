@@ -37,6 +37,7 @@ from typing import Any
 from rodit.adapters import StandaloneAssistAdapter
 from rodit.app.console import ConsoleService
 from rodit.app.rollout import RolloutService
+from rodit.app.tenancy import TenancyService
 from rodit.app.unit import Unit
 from rodit.core.enums import (
     AfterSaleAction,
@@ -219,6 +220,8 @@ class AssistService:
         self._gate = _ShopGate()
         self.console = ConsoleService(unit, self.processing)  # 商家控制台（§9.1、§5.2）
         self.rollout = RolloutService(unit, self.processing)  # 上线节奏与每周复核（§13.4、§13.5）
+        # 店铺生命周期：开通、状态、订购事件、过期清理（§8.4）
+        self.tenancy = TenancyService(unit, self.processing, self.revoke_shop)
 
     @contextmanager
     def processing(self, shop_id: str) -> Iterator[None]:
@@ -345,7 +348,14 @@ class AssistService:
             if result is None:
                 return None
             if result.mode != Mode.SHADOW:
-                self._show(adapter, msg.shop_id, msg.conversation_id, result.suggestions)
+                self._show(
+                    adapter,
+                    msg.shop_id,
+                    msg.conversation_id,
+                    result.suggestions,
+                    alerts=result.alerts,
+                    notice=result.no_suggestion_reason,
+                )
             reason = result.no_suggestion_reason or "转人工"
             if result.auto_reply is not None and result.mode == Mode.AUTO:
                 if not self._send_auto_reply(adapter, msg, result):
@@ -362,11 +372,18 @@ class AssistService:
         shop_id: str,
         conversation_id: str,
         cards: list[SuggestionCard],
+        *,
+        alerts: Sequence[str] = (),
+        notice: str | None = None,
     ) -> None:
-        """把推荐推到侧边栏 / 工作台（空列表表示清空）。失败不抛给平台：消息已经存下，重推会被
-        去重；全自动照常发送（发送失败再转人工，§12.2），智能辅助下客服本来就在接待。"""
+        """把推荐推到侧边栏 / 工作台（空列表表示清空），连同标红提醒（EngineResult.alerts）和
+        没有推荐时的原因（no_suggestion_reason）。失败不抛给平台：消息已经存下，重推会被
+        去重；全自动照常发送（发送失败再转人工，§12.2），智能辅助下客服本来就在接待。
+        撤回后刷新侧边栏时不带提醒（那条消息的提醒随它的推荐一起过期）。"""
         try:
-            adapter.show_suggestions(shop_id, conversation_id, cards)
+            adapter.show_suggestions(
+                shop_id, conversation_id, cards, alerts=list(alerts), notice=notice
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "推荐展示失败（%s）：店铺 %s 会话 %s",

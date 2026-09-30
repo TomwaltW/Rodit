@@ -601,6 +601,27 @@ class PgConversationRepository:
             ).fetchall()
         return [_message(r) for r in rows]
 
+    def list_outgoing(
+        self,
+        shop_id: str,
+        *,
+        since: datetime,
+        until: datetime,
+        roles: Sequence[Role] = (Role.AGENT, Role.BOT),
+    ) -> list[StoredMessage]:
+        wanted = sorted({Role(r).value for r in roles})
+        if not wanted:
+            return []
+        with self._db.session(shop_id) as conn:
+            rows = conn.execute(
+                f"SELECT {_M_COLS} FROM message"
+                " WHERE shop_id = %s AND role = ANY(%s) AND text IS NOT NULL"
+                " AND created_at >= %s AND created_at < %s"
+                " ORDER BY created_at, id",
+                (shop_id, wanted, since, until),
+            ).fetchall()
+        return [_message(r) for r in rows]
+
     def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
         now = self._clock.now()
         with self._db.session(shop_id) as conn:
@@ -1165,6 +1186,11 @@ _TOKEN_FORMAT = b"RDT1"  # 密文格式标记（版本 1：AES-256-GCM）
 _TOKEN_NONCE_BYTES = 12
 _TOKEN_TAG_BYTES = 16
 _TOKEN_KDF_INFO = b"rodit shop_auth access_token v1"
+_REFRESH_AAD_SUFFIX = ":refresh"  # 续期令牌的附加认证数据 = 店铺 ID + ":refresh"
+_AUTH_COLS = (
+    "shop_id, access_token, scopes, expires_at, refresh_token, refresh_expires_at,"
+    " refreshed_at, needs_reauth"
+)
 
 
 def _token_cipher(encryption_key: str) -> AESGCM:
@@ -1182,7 +1208,10 @@ class PgShopAuthRepository:
       SQL 参数发给数据库——库开了慢查询日志（log_min_duration_statement）或 auto_explain 时，
       绑定参数会原样写进数据库日志。
     - 密文格式：b"RDT1" + 12 字节随机 nonce + 密文 + 16 字节认证标签；店铺 ID 作为附加认证数据，
-      把一个店铺的密文挪到别的店铺名下解不出来。
+      把一个店铺的密文挪到别的店铺名下解不出来。续期令牌（refresh_token，迁移版本 5）同样加密，
+      附加认证数据是"店铺 ID:refresh"：和 access_token 的密文互换也解不出来。
+    - expiring_shop_ids 经 SECURITY DEFINER 函数 rodit_auth_expiring 跨店读（只有店铺 ID 和到期
+      时间，不解密）；mark_needs_reauth 只改标记、不解密。
     - 密钥不对、密文损坏、旧格式（v0.x 用库内 pgcrypto 加密的令牌）都抛 TokenDecryptionError，
       需要重新授权写入；repr、异常消息里都不出现密钥和令牌（令牌进出都是 SecretStr）。
     - 换密钥：用旧密钥读出、新密钥写回（MVP 未提供批量工具）。
@@ -1206,12 +1235,18 @@ class PgShopAuthRepository:
             raise RuntimeError(f"环境变量 {env_name} 未设置：店铺令牌必须加密存储（方案 §8.4）")
         return cls(db, encryption_key=key)
 
-    def _encrypt(self, shop_id: str, token: str) -> bytes:
+    @staticmethod
+    def _aad(shop_id: str, *, refresh: bool) -> bytes:
+        return (shop_id + _REFRESH_AAD_SUFFIX if refresh else shop_id).encode("utf-8")
+
+    def _encrypt(self, shop_id: str, token: str, *, refresh: bool = False) -> bytes:
         nonce = os.urandom(_TOKEN_NONCE_BYTES)
-        sealed = self._cipher.encrypt(nonce, token.encode("utf-8"), shop_id.encode("utf-8"))
+        sealed = self._cipher.encrypt(
+            nonce, token.encode("utf-8"), self._aad(shop_id, refresh=refresh)
+        )
         return _TOKEN_FORMAT + nonce + sealed
 
-    def _decrypt(self, shop_id: str, blob: bytes) -> str:
+    def _decrypt(self, shop_id: str, blob: bytes, *, refresh: bool = False) -> str:
         head = len(_TOKEN_FORMAT)
         if not blob.startswith(_TOKEN_FORMAT) or len(blob) < (
             head + _TOKEN_NONCE_BYTES + _TOKEN_TAG_BYTES
@@ -1222,7 +1257,7 @@ class PgShopAuthRepository:
         nonce = blob[head : head + _TOKEN_NONCE_BYTES]
         try:
             plain = self._cipher.decrypt(
-                nonce, blob[head + _TOKEN_NONCE_BYTES :], shop_id.encode("utf-8")
+                nonce, blob[head + _TOKEN_NONCE_BYTES :], self._aad(shop_id, refresh=refresh)
             )
             return plain.decode("utf-8")
         except (InvalidTag, UnicodeDecodeError) as e:
@@ -1233,28 +1268,71 @@ class PgShopAuthRepository:
     def get(self, shop_id: str) -> ShopAuth | None:
         with self._db.session(shop_id) as conn:
             r = conn.execute(
-                "SELECT shop_id, access_token, scopes, expires_at FROM shop_auth"
-                " WHERE shop_id = %s",
-                (shop_id,),
+                f"SELECT {_AUTH_COLS} FROM shop_auth WHERE shop_id = %s", (shop_id,)
             ).fetchone()
         if r is None:
             return None
+        refresh = r["refresh_token"]
         return ShopAuth(
             shop_id=r["shop_id"],
             access_token=SecretStr(self._decrypt(r["shop_id"], bytes(r["access_token"]))),
             scopes=list(r["scopes"]),
             expires_at=_cst(r["expires_at"]),
+            refresh_token=(
+                SecretStr(self._decrypt(r["shop_id"], bytes(refresh), refresh=True))
+                if refresh is not None
+                else None
+            ),
+            refresh_expires_at=_cst(r["refresh_expires_at"]),
+            refreshed_at=_cst(r["refreshed_at"]),
+            needs_reauth=bool(r["needs_reauth"]),
         )
 
     def save(self, auth: ShopAuth) -> None:
         sealed = self._encrypt(auth.shop_id, auth.access_token.get_secret_value())
+        sealed_refresh = (
+            self._encrypt(auth.shop_id, auth.refresh_token.get_secret_value(), refresh=True)
+            if auth.refresh_token is not None
+            else None
+        )
         with self._db.session(auth.shop_id) as conn:
             conn.execute(
-                "INSERT INTO shop_auth (shop_id, access_token, scopes, expires_at)"
-                " VALUES (%s, %s, %s, %s)"
+                f"INSERT INTO shop_auth ({_AUTH_COLS})"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (shop_id) DO UPDATE SET access_token = EXCLUDED.access_token,"
-                " scopes = EXCLUDED.scopes, expires_at = EXCLUDED.expires_at",
-                (auth.shop_id, sealed, list(auth.scopes), auth.expires_at),
+                " scopes = EXCLUDED.scopes, expires_at = EXCLUDED.expires_at,"
+                " refresh_token = EXCLUDED.refresh_token,"
+                " refresh_expires_at = EXCLUDED.refresh_expires_at,"
+                " refreshed_at = EXCLUDED.refreshed_at, needs_reauth = EXCLUDED.needs_reauth",
+                (
+                    auth.shop_id,
+                    sealed,
+                    list(auth.scopes),
+                    auth.expires_at,
+                    sealed_refresh,
+                    auth.refresh_expires_at,
+                    auth.refreshed_at,
+                    auth.needs_reauth,
+                ),
+            )
+
+    def expiring_shop_ids(self, before: datetime) -> list[tuple[str, datetime]]:
+        """跨店：不设店铺范围，经 SECURITY DEFINER 函数读（只有店铺 ID 和到期时间）。"""
+        with self._db.session(None) as conn:
+            rows = conn.execute(
+                "SELECT shop_id, expires_at FROM rodit_auth_expiring(%s)"
+                ' ORDER BY expires_at, shop_id COLLATE "C"',
+                (before,),
+            ).fetchall()
+        return [(r["shop_id"], _cst(r["expires_at"])) for r in rows]
+
+    def mark_needs_reauth(self, shop_id: str) -> bool:
+        with self._db.session(shop_id) as conn:
+            return (
+                conn.execute(
+                    "UPDATE shop_auth SET needs_reauth = true WHERE shop_id = %s", (shop_id,)
+                ).rowcount
+                > 0
             )
 
     def delete(self, shop_id: str) -> bool:
@@ -1278,9 +1356,9 @@ _D_COLS = (
 class PgAuditLog:
     """实现 core.ports.AuditLog（audit_log / decision_log）。按店铺查询，结果按时间升序。
 
-    shop_id 为空的事件（如没有店铺归属的大模型调用）在不设店铺范围的事务里写入，
-    应用侧读不到（list_events 必须带店铺）；表是 FORCE 行级安全，连表的所有者也读不到，
-    只有超级用户或带 BYPASSRLS 的运维角色能查看。
+    shop_id 为空的系统事件（如没有店铺归属的大模型调用、shop.purged、eval.verdict）在不设店铺范围
+    的事务里写入，也只能在不设店铺范围的事务里读（list_system_events；迁移版本 5 的
+    system_event_select 策略）：设了店铺范围的事务读不到任何系统事件，list_events 只返回本店的。
     detail / answers 不放买家原文（调用方负责最小化，§5.3）。
     """
 
@@ -1322,6 +1400,25 @@ class PgAuditLog:
             conds.append("created_at >= %s")
             params.append(since)
         with self._db.session(shop_id) as conn:
+            rows = conn.execute(
+                f"SELECT {_E_COLS} FROM audit_log WHERE {' AND '.join(conds)}"
+                " ORDER BY created_at, id",
+                params,
+            ).fetchall()
+        return [AuditEvent(**{**r, "created_at": _cst(r["created_at"])}) for r in rows]
+
+    def list_system_events(
+        self, *, action: str | None = None, since: datetime | None = None
+    ) -> list[AuditEvent]:
+        conds: list[str] = ["shop_id IS NULL"]
+        params: list[Any] = []
+        if action is not None:
+            conds.append("action = %s")
+            params.append(action)
+        if since is not None:
+            conds.append("created_at >= %s")
+            params.append(since)
+        with self._db.session(None) as conn:
             rows = conn.execute(
                 f"SELECT {_E_COLS} FROM audit_log WHERE {' AND '.join(conds)}"
                 " ORDER BY created_at, id",

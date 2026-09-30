@@ -14,10 +14,11 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from pydantic import SecretStr
 
+from rodit.core.audit import AuditAction
 from rodit.core.enums import (
     AfterSaleStatus,
     DraftKind,
@@ -33,6 +34,7 @@ from rodit.core.enums import (
 from rodit.core.errors import ConcurrencyConflict
 from rodit.core.models import (
     AfterSaleReview,
+    AuditEvent,
     ItemCard,
     KnowledgeGap,
     KnowledgeItem,
@@ -47,6 +49,7 @@ from rodit.core.models import (
 from rodit.core.ports import (
     RECALL_TOMBSTONE_TTL,
     AfterSaleReviewRepository,
+    AuditLog,
     ConversationRepository,
     FeedbackRepository,
     KnowledgeRepository,
@@ -59,6 +62,7 @@ from rodit.testing.fixtures import (
     BUYER,
     SHOP_A,
     SHOP_B,
+    SHOP_C,
     build_demo_world,
     seed_knowledge,
 )
@@ -470,6 +474,71 @@ def check_conversation_repository(make: Callable[[], ConversationRepository]) ->
     assert repo.get_conversation(SHOP_B, m1.conversation_id) is None
     assert len(repo.recent_messages(SHOP_A, m1.conversation_id)) == 3
     check_conversation_recall(make)
+
+
+def check_list_outgoing(make: Callable[[], ConversationRepository]) -> None:
+    """list_outgoing（§13.4 合规扫描用）：本店在时间窗里发出的消息（默认客服和机器人），
+    跨会话、按时间升序（同一时间按写入顺序）；since 含、until 不含；
+    不含买家消息、已撤回的消息、别的店铺的。"""
+    repo = make()
+    world = build_demo_world()
+    t0 = NOW - timedelta(hours=1)
+
+    def at(minutes: float) -> datetime:
+        return t0 + timedelta(minutes=minutes)
+
+    for shop, conv in ((SHOP_A, "conv_out_1"), (SHOP_A, "conv_out_2"), (SHOP_B, "conv_out_1")):
+        repo.add_message(
+            make_message(
+                "在吗",
+                world=world,
+                shop_id=shop,
+                conversation_id=conv,
+                msg_id=f"{shop}:{conv}:buyer",
+                at=at(0),
+            )
+        )
+    outgoing = [
+        (SHOP_A, "conv_out_1", "a1_agent", Role.AGENT, "亲，在的", at(1)),
+        (SHOP_A, "conv_out_2", "a2_bot", Role.BOT, "【智能客服】亲，在的", at(2)),
+        (SHOP_A, "conv_out_1", "a1_tie_1", Role.AGENT, "同一时间第一条", at(3)),
+        (SHOP_A, "conv_out_2", "a2_tie_2", Role.AGENT, "同一时间第二条", at(3)),
+        (SHOP_A, "conv_out_1", "a1_recalled", Role.AGENT, "发错了", at(4)),
+        (SHOP_A, "conv_out_2", "a2_late", Role.AGENT, "窗口外", at(10)),
+        (SHOP_B, "conv_out_1", "b1_agent", Role.AGENT, "B 店的回复", at(1)),
+    ]
+    for shop, conv, msg_id, role, text, when in outgoing:
+        assert repo.add_outgoing(
+            shop_id=shop, conversation_id=conv, msg_id=msg_id, role=role, text=text, at=when
+        )
+    assert repo.recall_message(SHOP_A, "conv_out_1", "a1_recalled") is True
+
+    got = repo.list_outgoing(SHOP_A, since=at(1), until=at(10))
+    assert [m.msg_id for m in got] == ["a1_agent", "a2_bot", "a1_tie_1", "a2_tie_2"]
+    assert all(m.shop_id == SHOP_A and m.role in (Role.AGENT, Role.BOT) for m in got)
+    assert got[1].role == Role.BOT and got[1].text == "【智能客服】亲，在的"
+    assert [m.msg_id for m in repo.list_outgoing(SHOP_A, since=at(1), until=at(3))] == [
+        "a1_agent",
+        "a2_bot",
+    ]  # until 不含
+    agents = repo.list_outgoing(SHOP_A, since=at(0), until=at(11), roles=(Role.AGENT,))
+    assert [m.msg_id for m in agents] == ["a1_agent", "a1_tie_1", "a2_tie_2", "a2_late"]
+    buyers = repo.list_outgoing(SHOP_A, since=at(0), until=at(11), roles=(Role.BUYER,))
+    assert sorted(m.msg_id for m in buyers) == [
+        f"{SHOP_A}:conv_out_1:buyer",
+        f"{SHOP_A}:conv_out_2:buyer",
+    ]
+    assert repo.list_outgoing(SHOP_A, since=at(0), until=at(11), roles=()) == []
+    assert repo.list_outgoing(SHOP_A, since=at(5), until=at(5)) == []
+    # 别的店铺：只看得到自己的
+    assert [m.msg_id for m in repo.list_outgoing(SHOP_B, since=at(0), until=at(11))] == ["b1_agent"]
+    assert repo.list_outgoing(SHOP_C, since=at(0), until=at(11)) == []
+    # 返回的是拷贝
+    got[0].text = "改了"
+    assert repo.list_outgoing(SHOP_A, since=at(1), until=at(2))[0].text == "亲，在的"
+    assert repo.purge_shop(SHOP_A) > 0
+    assert repo.list_outgoing(SHOP_A, since=at(0), until=at(11)) == []
+    assert len(repo.list_outgoing(SHOP_B, since=at(0), until=at(11))) == 1
 
 
 def check_conversation_recall(make: Callable[[], ConversationRepository]) -> None:
@@ -917,6 +986,146 @@ def check_shop_auth_repository(make: Callable[[], ShopAuthRepository]) -> None:
     assert repo.delete(SHOP_B) is False
 
 
+def _auth(shop_id: str, *, days: float, token: str = "tok-synthetic", **kw: object) -> ShopAuth:
+    return ShopAuth(
+        shop_id=shop_id,
+        access_token=SecretStr(token),
+        scopes=["order.read", "logistics.read"],
+        expires_at=NOW + timedelta(days=days),
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def check_shop_auth_refresh_fields(make: Callable[[], ShopAuthRepository]) -> None:
+    """续期令牌、续期时间、needs_reauth 原样读回（PostgreSQL 实现加密落库）；再保存整条覆盖。"""
+    repo = make()
+    full = _auth(
+        SHOP_A,
+        days=1,
+        token="tok-access-synthetic",
+        refresh_token=SecretStr("tok-refresh-synthetic"),
+        refresh_expires_at=NOW + timedelta(days=30),
+        refreshed_at=NOW - timedelta(hours=1),
+        needs_reauth=True,
+    )
+    repo.save(full)
+    got = repo.get(SHOP_A)
+    assert got == full
+    assert got.refresh_token is not None
+    assert got.refresh_token.get_secret_value() == "tok-refresh-synthetic"
+    assert "tok-refresh" not in repr(got) and "tok-access" not in repr(got)
+    # 再保存：整条覆盖（续期成功后写回新令牌、清掉 needs_reauth；平台没给续期令牌就是空的）
+    plain = _auth(SHOP_A, days=2, token="tok-access-2")
+    repo.save(plain)
+    got = repo.get(SHOP_A)
+    assert got == plain
+    assert got.refresh_token is None and got.refreshed_at is None and got.needs_reauth is False
+    assert repo.get(SHOP_B) is None
+
+
+def check_mark_needs_reauth(make: Callable[[], ShopAuthRepository]) -> None:
+    """mark_needs_reauth：只标记这家店；没有授权返回 False；重复标记照样 True；重新保存按传入值。"""
+    repo = make()
+    assert repo.mark_needs_reauth(SHOP_A) is False
+    repo.save(_auth(SHOP_A, days=1, refresh_token=SecretStr("tok-refresh-a")))
+    repo.save(_auth(SHOP_B, days=1))
+    assert repo.mark_needs_reauth(SHOP_A) is True
+    assert repo.mark_needs_reauth(SHOP_A) is True
+    got = repo.get(SHOP_A)
+    assert got is not None and got.needs_reauth is True
+    assert got.refresh_token is not None  # 只改标记，令牌不动
+    assert got.refresh_token.get_secret_value() == "tok-refresh-a"
+    assert got.access_token.get_secret_value() == "tok-synthetic"
+    assert repo.get(SHOP_B).needs_reauth is False  # 别的店铺不受影响
+    repo.save(_auth(SHOP_A, days=5))  # 重新授权
+    assert repo.get(SHOP_A).needs_reauth is False
+    assert repo.delete(SHOP_A) is True
+    assert repo.mark_needs_reauth(SHOP_A) is False
+
+
+def check_expiring_shop_ids(make: Callable[[], ShopAuthRepository]) -> None:
+    """expiring_shop_ids：跨店列出到期时间不晚于 before 的店铺，只有 (店铺 ID, 到期时间)，
+    按到期时间升序（同一时间按店铺 ID）；含已过期、需要重新授权的；删掉授权后不再列出。"""
+    repo = make()
+    assert repo.expiring_shop_ids(NOW + timedelta(days=3650)) == []
+    repo.save(_auth(SHOP_A, days=1, token="tok-a", refresh_token=SecretStr("tok-refresh-a")))
+    repo.save(_auth(SHOP_B, days=3, token="tok-b"))
+    repo.save(_auth(SHOP_C, days=-1, token="tok-c", needs_reauth=True))  # 已过期
+    got = repo.expiring_shop_ids(NOW + timedelta(days=2))
+    assert got == [(SHOP_C, NOW - timedelta(days=1)), (SHOP_A, NOW + timedelta(days=1))]
+    for pair in got:  # 只有 ID 和到期时间，从不带令牌
+        assert isinstance(pair, tuple) and len(pair) == 2
+        assert isinstance(pair[0], str) and isinstance(pair[1], datetime)
+        assert pair[1].tzinfo is not None
+    assert "tok-" not in repr(got)
+    # 边界：到期时间正好等于 before 也算
+    assert [s for s, _ in repo.expiring_shop_ids(NOW + timedelta(days=1))] == [SHOP_C, SHOP_A]
+    everything = repo.expiring_shop_ids(NOW + timedelta(days=3650))
+    assert [s for s, _ in everything] == [SHOP_C, SHOP_A, SHOP_B]
+    assert repo.expiring_shop_ids(NOW - timedelta(days=2)) == []
+    # 同一到期时间按店铺 ID 排
+    repo.save(_auth(SHOP_B, days=1, token="tok-b"))
+    assert [s for s, _ in repo.expiring_shop_ids(NOW + timedelta(days=1))] == [
+        SHOP_C,
+        SHOP_A,
+        SHOP_B,
+    ]
+    assert repo.delete(SHOP_A) is True
+    assert [s for s, _ in repo.expiring_shop_ids(NOW + timedelta(days=3650))] == [SHOP_C, SHOP_B]
+
+
+# ---------------------------------------------------------------- 系统事件
+
+
+def check_system_events(make: Callable[[], AuditLog]) -> None:
+    """list_system_events 只返回 shop_id 为空的系统事件（按时间升序，可按动作、时间过滤）；
+    list_events(店铺) 不返回系统事件；清理店铺数据不删系统事件。"""
+    audit = make()
+    audit.record(AuditEvent(shop_id=SHOP_A, actor="system", action="engine.result", created_at=NOW))
+    audit.record(
+        AuditEvent(
+            shop_id=None,
+            actor="system",
+            action=AuditAction.EVAL_VERDICT,
+            detail={"fingerprint": "f" * 64, "passed": True},
+            created_at=NOW + timedelta(minutes=2),
+        )
+    )
+    audit.record(
+        AuditEvent(
+            shop_id=None,
+            actor="system",
+            action=AuditAction.SHOP_PURGED,
+            detail={"shop_id": SHOP_C, "reason": "cancelled", "rows": 12},
+            created_at=NOW + timedelta(minutes=1),
+        )
+    )
+    audit.record(
+        AuditEvent(
+            shop_id=SHOP_B,
+            actor="system",
+            action=AuditAction.SHOP_PURGED,
+            created_at=NOW + timedelta(minutes=1),
+        )
+    )
+    events = audit.list_system_events()
+    assert [e.action for e in events] == [AuditAction.SHOP_PURGED, AuditAction.EVAL_VERDICT]
+    assert all(e.shop_id is None for e in events)
+    assert events[0].detail == {"shop_id": SHOP_C, "reason": "cancelled", "rows": 12}
+    purged = audit.list_system_events(action=AuditAction.SHOP_PURGED)
+    assert len(purged) == 1 and purged[0].detail["shop_id"] == SHOP_C
+    later = audit.list_system_events(since=NOW + timedelta(minutes=2))
+    assert [e.action for e in later] == [AuditAction.EVAL_VERDICT]
+    assert audit.list_system_events(action="no.such.action") == []
+    # 店铺的查询不返回系统事件
+    assert [e.shop_id for e in audit.list_events(SHOP_A)] == [SHOP_A]
+    assert [e.shop_id for e in audit.list_events(SHOP_B)] == [SHOP_B]
+    # 清理店铺数据不删系统事件（取消订购的清理记录要留下来）
+    assert audit.purge_shop(SHOP_A) == 1
+    assert audit.purge_shop(SHOP_B) == 1
+    assert len(audit.list_system_events()) == 2
+
+
 # ---------------------------------------------------------------- 串店测试（§9.2）
 
 
@@ -929,6 +1138,7 @@ class RepoSet:
     reviews: AfterSaleReviewRepository
     auth: ShopAuthRepository
     quality_reviews: QualityReviewRepository
+    audit: AuditLog | None = None  # 给了就一起跑审计的串店检查
 
 
 def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
@@ -961,9 +1171,22 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
             access_token=SecretStr("tok-b"),
             scopes=["order.read"],
             expires_at=NOW + timedelta(days=1),
+            refresh_token=SecretStr("tok-b-refresh"),
         )
     )
     (b_quality,) = repos.quality_reviews.add_many([_quality(SHOP_B, b_sug.id or 1)])
+    repos.conversations.add_outgoing(
+        shop_id=SHOP_B,
+        conversation_id="conv_b",
+        msg_id="m_b_agent",
+        role=Role.AGENT,
+        text="B 店客服的回复",
+        at=NOW,
+    )
+    if repos.audit is not None:
+        repos.audit.record(
+            AuditEvent(shop_id=SHOP_B, actor="system", action="engine.result", created_at=NOW)
+        )
 
     k = repos.knowledge
     assert k.get_knowledge(SHOP_A, b_faq) is None
@@ -982,10 +1205,28 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
     assert repos.auth.get(SHOP_A) is None
     assert repos.quality_reviews.get(SHOP_A, b_quality.id) is None
     assert repos.quality_reviews.list(SHOP_A) == []
+    window = {"since": NOW - timedelta(days=1), "until": NOW + timedelta(days=1)}
+    assert repos.conversations.list_outgoing(SHOP_A, **window) == []
+    assert repos.conversations.list_outgoing(SHOP_A, roles=tuple(Role), **window) == []
+    assert repos.auth.mark_needs_reauth(SHOP_A) is False  # 改不到 B 的授权
+    # 跨店列出快到期的店铺：只有 ID 和到期时间，没有令牌
+    assert repos.auth.expiring_shop_ids(NOW + timedelta(days=3650)) == [
+        (SHOP_B, NOW + timedelta(days=1))
+    ]
+    if repos.audit is not None:
+        assert repos.audit.list_events(SHOP_A) == []
+        assert repos.audit.list_system_events() == []  # 店铺的事件不算系统事件
     # B 自己读得到（证明数据确实写进去了）
     assert repos.suggestions.get(SHOP_B, b_sug.id) is not None
     assert repos.reviews.get(SHOP_B, "as_9001") is not None
     assert repos.quality_reviews.get(SHOP_B, b_quality.id) is not None
+    assert [m.msg_id for m in repos.conversations.list_outgoing(SHOP_B, **window)] == ["m_b_agent"]
+    b_auth = repos.auth.get(SHOP_B)
+    assert b_auth is not None and b_auth.needs_reauth is False
+    assert b_auth.refresh_token is not None
+    assert b_auth.refresh_token.get_secret_value() == "tok-b-refresh"
+    if repos.audit is not None:
+        assert len(repos.audit.list_events(SHOP_B)) == 1
 
 
 # ---------------------------------------------------------------- 取消订购后的清理（§8.4）

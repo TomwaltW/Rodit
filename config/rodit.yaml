@@ -61,6 +61,22 @@ aftersale:
 llm:
   api_key_env: RODIT_LLM_API_KEY
   timeout_s: 10.0
+  # 对外公示的模型名称和备案号（§12.3）【待定：D5 选定后填】；require_disclosure: true 时
+  # 生产部署缺这两项拒绝启动
+  # public_name: ...
+  # filing_no: ...
+  require_disclosure: false
+
+# 每条消息的时间预算（§12.1 端到端 ≤ 5 秒）
+latency:
+  message_budget_s: 4.5        # 引擎处理一条消息的上限（留 0.5 秒给接入层和展示）
+  min_llm_remaining_s: 0.8     # 剩余时间少于这个值不再调大模型，退回 FAQ / 模板
+
+# 店铺生命周期（§8.4）
+tenancy:
+  refresh_ahead_hours: 24      # 授权到期前多久续期
+  purge_after_expiry_days: 30  # 授权过期多少天后删除店铺数据【待定：委托处理协议】
+  onboarding_phase: 1          # 开通时允许的权限：1 = MVP 只读；2 = 加上写售后
 
 # 配置分层（§9.3）：平台默认 → 类目默认 → 店铺配置，下层覆盖上层
 shop_defaults_by_platform:

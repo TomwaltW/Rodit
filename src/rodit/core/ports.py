@@ -7,6 +7,9 @@
 3. 问答引擎的步骤："懂、找、写、判"分开（§4.1 原则 2），可以分别评估、分别替换。
 
 所有仓储方法都带 shop_id，实现必须按 shop_id 隔离（§9.2），不得跨店返回数据。
+例外只有三个，都在文档里写明了能返回什么：FeedbackRepository.export_training_labels（训练导出）、
+ShopAuthRepository.expiring_shop_ids（只有店铺 ID 和到期时间，没有令牌）、
+AuditLog.list_system_events（只有没有店铺归属的系统事件）。
 
 留痕分工（§4.1 原则 6、§10）：
 - decision_log：stage=route 由 Router 实现写，stage=qa 由 QualityGate 实现写，各写一条聚合记录；
@@ -18,11 +21,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SecretStr
 
 from rodit.core.enums import (
     AfterSaleAction,
@@ -62,6 +65,7 @@ from rodit.core.models import (
     QAResult,
     QualityReview,
     QualityScores,
+    RefreshedToken,
     RefundProgress,
     ReturnEligibility,
     RouteDecision,
@@ -74,6 +78,7 @@ from rodit.core.models import (
     SuggestionCard,
     SuggestionRecord,
 )
+from rodit.core.scopes import MVP_SCOPES
 
 # ================================================================ 1. 外部依赖
 
@@ -228,6 +233,40 @@ class AfterSaleActionPort(Protocol):
     ) -> ActionResult: ...
 
 
+# ---------------------------------------------------------------- 店铺授权（§8.4）
+
+
+@runtime_checkable
+class TokenRefreshPort(Protocol):
+    """平台的令牌续期接口（§8.4）。开放平台接口在平台云内调用：生产实现由平台云代码注入
+    （PlatformBindings.token_refresher），测试用 rodit.testing.fakes.FakeTokenRefresher。
+
+    - 续期令牌无效、过期或被商家撤销：抛 core.errors.AuthExpired（需要商家重新授权）；
+    - 限流、故障、超时：抛 core.errors.ToolUnavailable（下次再试）。
+    令牌进出都是 SecretStr；实现不得把令牌写进日志或异常消息。
+    """
+
+    platform: Platform
+
+    def refresh(self, shop_id: str, refresh_token: SecretStr) -> RefreshedToken: ...
+
+
+@runtime_checkable
+class TokenProvider(Protocol):
+    """给平台云代码（平台只读工具、适配器）取店铺的有效令牌（§8.4）。
+
+    - access_token：授权有效（没过期、权限够、没被标记需要重新授权）时返回令牌，否则抛
+      core.errors.AuthExpired，调用方停止调用平台接口；
+    - report_rejected：平台拒绝了这个令牌（如返回令牌失效）：标记需要重新授权，之后
+      access_token 抛 AuthExpired，授权告警里能看到。
+    默认实现是 rodit.adapters.auth.AuthGuardTokenProvider（基于 AuthGuard）。
+    """
+
+    def access_token(self, shop_id: str, scopes: Iterable[str] = MVP_SCOPES) -> SecretStr: ...
+
+    def report_rejected(self, shop_id: str) -> None: ...
+
+
 # ---------------------------------------------------------------- 平台接入层（§8.2）
 
 
@@ -286,6 +325,10 @@ class PlatformAdapter(Protocol):
     - send：只有模式 A 的全自动能用（text 已由引擎加好 AI 标识前缀）；
       其他接入模式抛 ActionNotAllowed。
     - transfer_to_human：全自动模式下转人工（§5.7、GB/T 47746）；不支持的平台抛 ActionNotAllowed。
+    - show_suggestions：把一批推荐推到侧边栏 / 工作台，替换上一批（空列表表示清空）。
+      alerts 是标红提醒客服的话（EngineResult.alerts，如物流停滞、买家要求人工）；
+      notice 是没有推荐时的原因（EngineResult.no_suggestion_reason），客服知道为什么是空的。
+      两者都不含买家原文；新的一批连同提醒一起替换旧的（不传即清空旧的提醒）。
     """
 
     platform: Platform
@@ -305,7 +348,13 @@ class PlatformAdapter(Protocol):
     def get_context(self, shop_id: str, conversation_id: str) -> PlatformContext: ...
 
     def show_suggestions(
-        self, shop_id: str, conversation_id: str, cards: list[SuggestionCard]
+        self,
+        shop_id: str,
+        conversation_id: str,
+        cards: list[SuggestionCard],
+        *,
+        alerts: Sequence[str] = (),
+        notice: str | None = None,
     ) -> None: ...
 
     def send(self, shop_id: str, conversation_id: str, text: str) -> SendResult: ...
@@ -343,8 +392,17 @@ class AuditLog(AuditSink, Protocol):
         since: datetime | None = None,
     ) -> list[DecisionLogEntry]: ...
 
+    def list_system_events(
+        self, *, action: str | None = None, since: datetime | None = None
+    ) -> list[AuditEvent]:
+        """没有店铺归属的系统事件（shop_id 为空，如 shop.purged、eval.verdict），按时间升序。
+        只返回 shop_id 为空的行，不会返回任何店铺的事件（PostgreSQL 实现在不设店铺范围的事务里读，
+        行级安全只放行 shop_id 为空的行）。系统事件的 detail 只放 ID、计数、原因，不放买家数据。"""
+        ...
+
     def purge_shop(self, shop_id: str) -> int:
-        """删除该店铺的审计记录（§8.4 按约定删除数据），返回删除条数。"""
+        """删除该店铺的审计记录（§8.4 按约定删除数据），返回删除条数。
+        系统事件（shop_id 为空）不删：取消订购的清理记录（shop.purged）要在清理之后留下来。"""
         ...
 
 
@@ -524,6 +582,19 @@ class ConversationRepository(Protocol):
         撤回和这条消息时，结果和先后处理一样（消息不会留下来）。"""
         ...
 
+    def list_outgoing(
+        self,
+        shop_id: str,
+        *,
+        since: datetime,
+        until: datetime,
+        roles: Sequence[Role] = (Role.AGENT, Role.BOT),
+    ) -> list[StoredMessage]:
+        """本店在 since ≤ created_at < until 之间发出的消息（默认客服和机器人，跨会话），
+        按 created_at 升序（同一时间按写入顺序）；不含已撤回的消息。上线门槛的合规扫描用
+        （§13.4 实际发出去的文字里有没有违规用语）。只返回 shop_id 这家店的消息。"""
+        ...
+
     def purge_shop(self, shop_id: str) -> int:
         """删除该店铺的会话、消息和撤回墓碑（§8.4），返回删除条数；再调一次返回 0。"""
         ...
@@ -652,15 +723,32 @@ class AfterSaleReviewRepository(Protocol):
 
 @runtime_checkable
 class ShopAuthRepository(Protocol):
-    """店铺授权令牌（§8.4）。令牌加密存储，只在平台云内。"""
+    """店铺授权令牌（§8.4）。令牌（access_token、refresh_token）加密存储，只在平台云内。"""
 
     def get(self, shop_id: str) -> ShopAuth | None: ...
 
-    def save(self, auth: ShopAuth) -> None: ...
+    def save(self, auth: ShopAuth) -> None:
+        """整条写入（新建或覆盖），包括续期令牌、有效期和 needs_reauth。"""
+        ...
 
     def delete(self, shop_id: str) -> bool:
         """删除令牌：删掉了返回 True，本来就没有返回 False。
         不解密：令牌读不出来（旧版加密、换过密钥）时也能删（取消订购，§8.4）。"""
+        ...
+
+    def expiring_shop_ids(self, before: datetime) -> list[tuple[str, datetime]]:
+        """access_token 在 before 之前（expires_at ≤ before，含已过期的）到期的店铺：
+        [(shop_id, expires_at)]，按 expires_at 升序（同一时间按 shop_id）。续期任务、过期清理、
+        按店铺汇总的报表用（给一个很远的时间就是本单元全部有授权的店铺）。
+
+        这是唯一的跨店读取授权的路径：只返回店铺 ID 和到期时间，从不返回令牌，也不解密
+        （令牌读不出来的店铺照样列出来）。PostgreSQL 实现经 SECURITY DEFINER 函数
+        rodit_auth_expiring 读（行级安全不允许跨店读 shop_auth）。"""
+        ...
+
+    def mark_needs_reauth(self, shop_id: str) -> bool:
+        """标记这家店需要重新授权（续期被拒、平台拒绝了当前令牌）：之后 AuthGuard.require
+        不通过。有这家店的授权返回 True（已经标记过也是 True），没有返回 False。不解密。"""
         ...
 
 

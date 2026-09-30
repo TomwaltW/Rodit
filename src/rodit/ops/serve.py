@@ -6,10 +6,12 @@
     python -m rodit.ops.serve local-init  本地试用：迁移 + 写入合成演示数据 + 生成令牌文件
     python -m rodit.ops.serve recalibrate 每月用采纳反馈重算阈值（§13.5，只输出建议）
     python -m rodit.ops.serve train-classifier --out FILE  训练路由分类器（§6.4 Phase 2）
+    其余子命令由 rodit.ops.jobs 注册表里的任务模块提供（店铺生命周期、上线节奏）。
 
-serve 的组装：
+serve 的组装（顺序：平台绑定 → 平台单元 → 接上 ctx.tokens → 应用服务 → 接上 ctx.on_subscription）：
     rodit.app.production.build_production_unit（PostgreSQL、境内大模型，审计套上指标采集）
-    + 平台绑定（平台云代码注入，见 rodit.ops.bindings；或 RODIT_MODE_C_ONLY=1 只部署模式 C）
+    + 平台绑定（平台云代码注入，见 rodit.ops.bindings；或 RODIT_MODE_C_ONLY=1 只部署模式 C）；
+      工厂拿到的 ctx.tokens / ctx.on_subscription 是代理，单元和服务组装好之后才接上
     + rodit.api.create_app（鉴权用 TokenFileAuthenticator，令牌哈希来自挂载的密钥文件）
     + 运维接口 /healthz、/readyz、/metrics（rodit.ops.router）+ JSON 日志（rodit.ops.logconfig）。
 
@@ -63,6 +65,7 @@ import psycopg
 import yaml
 from fastapi import FastAPI
 
+import rodit.ops.jobs as jobs
 from rodit.adapters import NullToolGateway
 from rodit.api import create_app
 from rodit.api.auth import PrincipalRole
@@ -86,6 +89,7 @@ from rodit.ops.bindings import (
     BindingError,
     BindingsFactory,
     PlatformBindings,
+    bind_context,
     demo_bindings,
     load_factory,
     mode_c_bindings,
@@ -262,6 +266,7 @@ class _Composed:
     bindings: PlatformBindings
     metrics: RoditMetrics
     llm_probe: Callable[[], Mapping[str, CheckResult]]
+    ctx: BindingContext | None = None  # 交给绑定工厂的上下文（服务组装好后接上 on_subscription）
 
 
 def compose_unit(
@@ -275,7 +280,11 @@ def compose_unit(
     """平台单元 + 指标采集（不含 HTTP 应用）。
 
     repos 只在本地试用、没配大模型（离线替身）时生效（测试用内存仓储）；
-    其他情况一律 PostgreSQL（build_production_unit）。"""
+    其他情况一律 PostgreSQL（build_production_unit）。
+
+    顺序：先调绑定工厂（它拿到的 ctx.tokens / ctx.on_subscription 是代理），再组装平台单元，
+    然后把 ctx.tokens 接到 Unit.tokens；ctx.on_subscription 由 build_server
+    在服务组装好之后接上。"""
     env = os.environ if environ is None else environ
     config = load_config(settings.config_path or None)
     preflight(settings, config, env)
@@ -314,7 +323,8 @@ def compose_unit(
             settings, config, clock, hasher, bindings, tools, observe, repos, classifier
         )
         probe = static_probe("llm", CheckResult(True, {"offline": True}))
-    return _Composed(unit=unit, bindings=bindings, metrics=metrics, llm_probe=probe)
+    bind_context(ctx, tokens=unit.tokens)  # 单元组装好了：平台云代码可以取店铺令牌了
+    return _Composed(unit=unit, bindings=bindings, metrics=metrics, llm_probe=probe, ctx=ctx)
 
 
 def _offline_unit(
@@ -415,6 +425,8 @@ def build_server(
         )
         metrics.registry.before_render(monitor.refresh)
     service = AssistService(unit)
+    if composed.ctx is not None:  # 服务组装好了：平台推送的订购事件交给店铺生命周期处理
+        bind_context(composed.ctx, on_subscription=service.tenancy.handle_subscription)
     app = create_app(service, authenticator=authenticator)
     install_ops(app, readiness=readiness, metrics=metrics, metrics_guard=guard)
     if not settings.is_production:
@@ -766,6 +778,7 @@ def _parser() -> argparse.ArgumentParser:
         help=f"留出集上预测为该类型的样本少于这个数就不校准（默认 {DEFAULT_MIN_SUPPORT}）",
     )
     train.add_argument("--config", metavar="YAML", help=config_help)
+    jobs.register_all(sub)  # 任务模块的子命令（rodit.ops.jobs）
     return parser
 
 
@@ -819,6 +832,9 @@ def main(
     _early_logging(os.environ)
     if command in ("recalibrate", "train-classifier"):
         return _run_job(command, args, out, label_source=label_source, clock=clock)
+    code = jobs.dispatch(args, os.environ)  # 任务模块认领的命令（rodit.ops.jobs）
+    if code is not None:
+        return code
     try:
         if command == "issue-token":
             return issue_token_command(args, out)

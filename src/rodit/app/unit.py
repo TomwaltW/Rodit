@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from rodit.adapters import AdapterRegistry, AuthGuard
+from rodit.adapters import AdapterRegistry, AuthGuard, AuthGuardTokenProvider
 from rodit.aftersale import DefaultAfterSaleAdvisor, ReviewAssistant
 from rodit.core.audit import InMemoryAuditSink
 from rodit.core.clock import Clock
@@ -40,6 +40,7 @@ from rodit.core.ports import (
     QualityReviewRepository,
     ShopAuthRepository,
     SuggestionRepository,
+    TokenProvider,
     ToolGateway,
 )
 from rodit.decision import RuleProvider, build_decision_provider
@@ -135,6 +136,12 @@ class Unit:
     catalog: ItemCatalog | None = None
     ocr: ImageTextExtractor | None = None
     extra_purgers: list[object] = field(default_factory=list)
+    # 给平台云代码取店铺令牌（§8.4，core.ports.TokenProvider）；不给时用基于 auth 的默认实现
+    tokens: TokenProvider | None = None
+
+    def __post_init__(self) -> None:
+        if self.tokens is None:
+            self.tokens = AuthGuardTokenProvider(self.auth)
 
     def shop_config(self, shop_id: str) -> ShopConfig:
         """店铺的生效配置（平台默认 → 类目默认 → 店铺覆盖，§9.3）。"""

@@ -1,0 +1,134 @@
+"""每条消息的时间预算（方案 §12.1 端到端 ≤ 5 秒、§12.2 超时降级）。
+
+引擎处理一条买家消息时用 deadline_scope(LatencyConfig.message_budget_s) 包住，各步骤用
+remaining() / expired() 判断还来不来得及（如剩余时间不够就不调大模型、退回 FAQ / 模板）。
+
+- 截止时间放在 contextvar 里：同一线程里的调用都看得到；线程池里的任务要用 submit_in_context
+  提交（contextvars.copy_context().run），才能看到提交时的截止时间（和 core.context.shop_scope
+  一样的做法）。
+- 嵌套：内层的截止时间不会晚于外层（取两者中较早的），外层的预算不会被内层"续命"。
+- 用单调时钟（time.monotonic），不受系统时间调整影响；测试可以注入假的 now 函数。
+  嵌套的几层要用同一个时钟。
+- 没有截止时间时 remaining() 返回 None、expired() 返回 False：不在引擎里的调用（离线任务、
+  控制台）不受影响。
+"""
+
+from __future__ import annotations
+
+import contextvars
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import Executor, Future
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, TypeVar
+
+T = TypeVar("T")
+
+MonotonicNow = Callable[[], float]
+
+
+class Deadline:
+    """一个截止时间：从创建时起 seconds 秒（seconds 必须 ≥ 0）。"""
+
+    __slots__ = ("_now", "budget_s", "expires_at", "started_at")
+
+    def __init__(self, seconds: float, *, now: MonotonicNow = time.monotonic) -> None:
+        if seconds < 0:
+            raise ValueError("时间预算不能是负数")
+        self._now = now
+        self.budget_s = float(seconds)
+        self.started_at = now()
+        self.expires_at = self.started_at + self.budget_s
+
+    @classmethod
+    def until(cls, expires_at: float, *, now: MonotonicNow = time.monotonic) -> Deadline:
+        """截止到单调时钟的 expires_at（已经过了也可以，此时立即过期）。"""
+        deadline = cls(0.0, now=now)
+        deadline.expires_at = expires_at
+        deadline.budget_s = max(0.0, expires_at - deadline.started_at)
+        return deadline
+
+    def remaining(self) -> float:
+        """还剩多少秒（不会小于 0）。"""
+        return max(0.0, self.expires_at - self._now())
+
+    def elapsed(self) -> float:
+        return self._now() - self.started_at
+
+    def expired(self) -> bool:
+        return self._now() >= self.expires_at
+
+    def __repr__(self) -> str:
+        return f"Deadline(budget_s={self.budget_s:.3f}, remaining={self.remaining():.3f})"
+
+
+_current: ContextVar[Deadline | None] = ContextVar("rodit_deadline", default=None)
+
+
+def current_deadline() -> Deadline | None:
+    """当前生效的截止时间；没有返回 None。"""
+    return _current.get()
+
+
+@contextmanager
+def deadline_scope(
+    seconds: float | None, *, now: MonotonicNow = time.monotonic
+) -> Iterator[Deadline | None]:
+    """在这段代码里设置截止时间（seconds 秒后），返回生效的 Deadline。
+
+    外层已经有更早的截止时间时沿用外层的（内层不能延长外层的预算）。seconds 为 None 表示不设新的
+    截止时间：沿用外层的（没有外层就是没有截止时间，返回 None）。退出时恢复外层的。
+    """
+    outer = _current.get()
+    if seconds is None:
+        effective = outer
+    else:
+        inner = Deadline(seconds, now=now)
+        effective = outer if outer is not None and outer.expires_at <= inner.expires_at else inner
+    token = _current.set(effective)
+    try:
+        yield effective
+    finally:
+        _current.reset(token)
+
+
+def remaining() -> float | None:
+    """当前截止时间还剩多少秒；没有截止时间返回 None。"""
+    deadline = _current.get()
+    return None if deadline is None else deadline.remaining()
+
+
+def expired() -> bool:
+    """当前截止时间已经过了；没有截止时间返回 False。"""
+    deadline = _current.get()
+    return deadline is not None and deadline.expired()
+
+
+def clamp_timeout(timeout_s: float) -> float:
+    """单次调用的超时不超过剩余预算：min(timeout_s, remaining())；没有截止时间时原样返回。"""
+    left = remaining()
+    return timeout_s if left is None else min(timeout_s, left)
+
+
+def submit_in_context(pool: Executor, fn: Callable[..., T], *args: Any, **kwargs: Any) -> Future[T]:
+    """把任务提交到线程池，并带上当前的 contextvars（截止时间、店铺范围等）：
+
+        future = submit_in_context(pool, generate, ctx, route)
+
+    线程池的工作线程不会继承提交方的 contextvar；这里复制一份上下文、在里面运行 fn。
+    每个任务一份拷贝，任务里对 contextvar 的修改不影响提交方和其他任务。
+    """
+    context = contextvars.copy_context()
+    return pool.submit(context.run, fn, *args, **kwargs)
+
+
+__all__ = [
+    "Deadline",
+    "clamp_timeout",
+    "current_deadline",
+    "deadline_scope",
+    "expired",
+    "remaining",
+    "submit_in_context",
+]

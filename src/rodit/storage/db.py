@@ -88,6 +88,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(2, "migration_0002_aftersale_status_version.sql"),
     Migration(3, "migration_0003_recall_tombstone_candidate_unique.sql"),
     Migration(4, "migration_0004_quality_review_confidence.sql"),
+    Migration(5, "migration_0005_auth_refresh_system_events.sql"),
 )
 """按版本升序；已发布的脚本不再修改，结构变化加新版本（tests/storage/test_migrations.py
 按内容哈希锁定已发布的脚本）。"""
