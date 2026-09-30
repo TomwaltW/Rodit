@@ -41,6 +41,7 @@ from rodit.core.models import (
     LogisticsTrace,
     OrderInfo,
     OrderRef,
+    PlatformItem,
     PriceInfo,
     StandardMessage,
     StockInfo,
@@ -365,6 +366,57 @@ class InMemoryToolGateway:
                 self.world.aftersales[i] = updated
                 return updated
         raise ActionNotAllowed(f"售后单 {aftersale_id} 不存在或不属于店铺 {shop_id}")
+
+
+class InMemoryItemCatalog:
+    """平台商品接口的替身（实现 core.ports.ItemCatalog，§5.2.3）。按 shop_id 隔离。
+
+    - items：平台上的商品（如 fixtures.demo_platform_items(world)）；可以直接改列表模拟平台变化；
+    - fail_on：方法名集合，调用时抛 ToolUnavailable（模拟限流 / 故障）；
+    - calls：记录 (方法名, shop_id)。
+    """
+
+    def __init__(self, items: Iterable[PlatformItem], platform: Platform = Platform.TAOBAO) -> None:
+        self.platform = platform
+        self.items: list[PlatformItem] = [i for i in items if i.platform == platform]
+        self.fail_on: set[str] = set()
+        self.calls: list[tuple[str, str]] = []
+
+    def _enter(self, name: str, shop_id: str) -> None:
+        self.calls.append((name, shop_id))
+        if name in self.fail_on:
+            raise ToolUnavailable(f"{name} 限流（模拟）")
+
+    def list_items(self, shop_id: str) -> list[PlatformItem]:
+        self._enter("list_items", shop_id)
+        out = [i for i in self.items if i.shop_id == shop_id]
+        return [i.model_copy(deep=True) for i in sorted(out, key=lambda i: i.item_id)]
+
+    def get_item(self, shop_id: str, item_id: str) -> PlatformItem | None:
+        self._enter("get_item", shop_id)
+        return next(
+            (
+                i.model_copy(deep=True)
+                for i in self.items
+                if i.shop_id == shop_id and i.item_id == item_id
+            ),
+            None,
+        )
+
+
+class FakeImageTextExtractor:
+    """详情图 OCR 的替身（实现 core.ports.ImageTextExtractor）：按图片引用查表，
+    表里没有的图抛 ToolUnavailable（模拟识别失败）。calls 记录 (shop_id, image_ref)。"""
+
+    def __init__(self, texts: Mapping[str, str]) -> None:
+        self.texts = dict(texts)
+        self.calls: list[tuple[str, str]] = []
+
+    def extract_text(self, shop_id: str, image_ref: str) -> str:
+        self.calls.append((shop_id, image_ref))
+        if image_ref not in self.texts:
+            raise ToolUnavailable(f"图片 {image_ref} 识别失败（模拟）")
+        return self.texts[image_ref]
 
 
 def _masked(info: AfterSaleInfo) -> AfterSaleInfo:

@@ -18,9 +18,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
-from typing import Literal, Protocol, runtime_checkable
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -31,6 +31,7 @@ from rodit.core.enums import (
     Intent,
     KnowledgeStatus,
     Platform,
+    QualityReviewStatus,
     ReviewState,
     Role,
     SuggestionStatus,
@@ -55,9 +56,12 @@ from rodit.core.models import (
     LogisticsTrace,
     OrderInfo,
     PlatformContext,
+    PlatformItem,
     PolicyEntry,
     PriceInfo,
     QAResult,
+    QualityReview,
+    QualityScores,
     RefundProgress,
     ReturnEligibility,
     RouteDecision,
@@ -227,6 +231,35 @@ class AfterSaleActionPort(Protocol):
 # ---------------------------------------------------------------- 平台接入层（§8.2）
 
 
+@runtime_checkable
+class ItemCatalog(Protocol):
+    """平台商品接口（只读，§5.2.3 商品自动同步）：拉商品标题、属性、SKU、详情文字和详情图引用。
+
+    开放平台接口要在平台云内调用：生产实现由平台云注入，沙箱和测试用
+    rodit.testing.fakes.InMemoryItemCatalog。接口故障抛 core.errors.ToolUnavailable。
+    只返回 shop_id 这家店铺的商品（§9.2）。
+    """
+
+    platform: Platform
+
+    def list_items(self, shop_id: str) -> list[PlatformItem]:
+        """该店铺的全部商品（含已下架，on_sale=False），按 item_id 升序。"""
+        ...
+
+    def get_item(self, shop_id: str, item_id: str) -> PlatformItem | None: ...
+
+
+@runtime_checkable
+class ImageTextExtractor(Protocol):
+    """详情图 OCR（§5.2.1 "详情图 OCR 文字"）。在平台云内运行，图片不出云。
+
+    image_ref 是 PlatformItem.detail_images 里的引用。失败抛 core.errors.ToolUnavailable
+    （同步照常进行，只是这张图的文字缺失）。
+    """
+
+    def extract_text(self, shop_id: str, image_ref: str) -> str: ...
+
+
 class MessageRecall(BaseModel):
     """PlatformAdapter.on_event 的撤回事件：会话里的一条消息被撤回（§5.3 撤回的消息不再算作
     最近几轮对话，原文也不再保留）。"""
@@ -345,9 +378,21 @@ class KnowledgeRepository(Protocol):
 
     def upsert_shop(self, shop: Shop) -> None: ...
 
+    def update_shop_config(self, shop_id: str, changes: Mapping[str, Any]) -> Shop | None:
+        """原子地改店铺配置覆盖项（§9.3）：changes 里值为 None 的键删掉（回到类目 / 平台默认），
+        其余写入；合并后按 Shop 校验，未知的键、非法的取值抛 ValueError，什么都不写。
+        店铺不存在返回 None（不新建）。读改写在一把锁 / 一个事务里：并发改不同的键不会互相覆盖
+        （商家改配置、复核人员切换影子模式、填问卷可能同时发生）。返回更新后的店铺。"""
+        ...
+
     def get_policies(self, shop_id: str) -> dict[str, PolicyEntry]: ...
 
     def upsert_policy(self, entry: PolicyEntry) -> None: ...
+
+    def delete_policy(self, shop_id: str, key: str) -> bool:
+        """删掉一项店铺政策（商家清空已经不适用的政策，如赠品活动结束）。删了返回 True，
+        本来就没有返回 False。"""
+        ...
 
     def get_item_card(self, shop_id: str, item_id: str) -> ItemCard | None: ...
 
@@ -357,8 +402,21 @@ class KnowledgeRepository(Protocol):
 
     def upsert_item_card(self, card: ItemCard) -> None: ...
 
+    def update_item_card(
+        self, shop_id: str, item_id: str, changes: Mapping[str, Any]
+    ) -> ItemCard | None:
+        """原子地改商品卡片的部分字段（商家改自己填的字段、商品同步改平台维护的字段，§5.2.3）：
+        changes 的键必须是 ItemCard 的字段，shop_id / item_id / platform 不能改；值按字段校验
+        （None 清空可选字段）。不合法抛 ValueError，什么都不写。卡片不存在返回 None（不新建）。
+        读改写在一把锁 / 一个事务里：商家改尺码建议和同步改标题同时发生，两边的修改都留下。"""
+        ...
+
     def add_knowledge(self, item: KnowledgeItem) -> KnowledgeItem:
-        """新增 FAQ（忽略传入的 id），返回带新 id 的记录；created_at 为空时由实现补上。"""
+        """新增 FAQ（忽略传入的 id），返回带新 id 的记录；created_at 为空时由实现补上。
+
+        等审核的候选知识不重复（§5.8）：新增的是 CANDIDATE，而本店已有问题、回答、商品、问题类型
+        都相同的 CANDIDATE 时抛 ConcurrencyConflict、不写入（多个实例同时把同一条编辑回复变成候选，
+        只能建出一条；由存储保证，调用方读到的"没有"可能已经过时）。"""
         ...
 
     def get_knowledge(self, shop_id: str, knowledge_id: int) -> KnowledgeItem | None: ...
@@ -401,7 +459,8 @@ class KnowledgeRepository(Protocol):
     ) -> KnowledgeItem:
         """不存在（或不属于该店）抛 KeyError。
         expected_status 不为空时是比较后更新：当前状态不等于它就抛 ConcurrencyConflict、不写入
-        （多实例部署时防止商家审核通过和驳回同时发生，后写的覆盖先写的）。"""
+        （多实例部署时防止商家审核通过和驳回同时发生，后写的覆盖先写的）。
+        改成 CANDIDATE 时和已有的候选重复（见 add_knowledge）也抛 ConcurrencyConflict、不写入。"""
         ...
 
     def set_knowledge_embedding(
@@ -415,6 +474,11 @@ class KnowledgeRepository(Protocol):
         ...
 
 
+RECALL_TOMBSTONE_TTL = timedelta(days=3)
+"""撤回先于消息到达时墓碑的默认有效期（ConversationRepository.recall_message）：平台推送乱序、
+重推都在这个时间之内【待确认，按平台消息服务的积压 / 重推上限调整】；过期的墓碑不再生效。"""
+
+
 @runtime_checkable
 class ConversationRepository(Protocol):
     """会话与消息（§10 conversation / message）。按 (shop_id, msg_id) 去重。"""
@@ -422,7 +486,9 @@ class ConversationRepository(Protocol):
     def add_message(self, msg: StandardMessage) -> bool:
         """保存买家消息（没有会话时自动建会话）；msg_id 重复时返回 False、不重复保存。
         StoredMessage.created_at = msg.received_at；
-        商品卡片、订单卡片存进 item_id / sku_id / order_ref。"""
+        商品卡片、订单卡片存进 item_id / sku_id / order_ref。
+        这条消息先被撤回过（见 recall_message 的墓碑）：不保存它的文字和卡片、返回 False
+        （引擎当作重复消息，不回答），会话照常建立，之后按撤回过的消息去重。"""
         ...
 
     def add_outgoing(
@@ -435,7 +501,8 @@ class ConversationRepository(Protocol):
         text: str,
         at: datetime,
     ) -> bool:
-        """保存客服 / 系统发出的消息，用于多轮上下文。msg_id 重复或会话不存在返回 False。"""
+        """保存客服 / 系统发出的消息，用于多轮上下文。msg_id 重复或会话不存在返回 False。
+        这条消息先被撤回过（会话存在时）：同 add_message，不保存、返回 False。"""
         ...
 
     def get_conversation(self, shop_id: str, conversation_id: str) -> Conversation | None: ...
@@ -448,11 +515,18 @@ class ConversationRepository(Protocol):
 
     def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
         """消息被撤回（§5.3）：删掉它的文字和卡片，之后 recent_messages 不再返回它；msg_id 仍算
-        见过（平台重推这条消息时 add_message / add_outgoing 返回 False）。
-        找不到这条消息、或已经撤回过时返回 False。"""
+        见过（平台重推这条消息时 add_message / add_outgoing 返回 False）。撤回了返回 True。
+
+        找不到这条消息、或已经撤回过时返回 False。本店从没见过这个 msg_id（平台推送乱序，
+        撤回先到，§8.3）：按 (shop_id, conversation_id, msg_id) 记一条墓碑，有效期
+        （实现的构造参数，默认 RECALL_TOMBSTONE_TTL，按注入的时钟判断）内这条消息到达时丢弃
+        （见 add_message / add_outgoing）；墓碑用掉或过期即删，数量有界。多个实例同时处理
+        撤回和这条消息时，结果和先后处理一样（消息不会留下来）。"""
         ...
 
-    def purge_shop(self, shop_id: str) -> int: ...
+    def purge_shop(self, shop_id: str) -> int:
+        """删除该店铺的会话、消息和撤回墓碑（§8.4），返回删除条数；再调一次返回 0。"""
+        ...
 
 
 @runtime_checkable
@@ -503,9 +577,53 @@ class FeedbackRepository(Protocol):
         """按 created_at 升序。"""
         ...
 
-    def export_training_labels(self) -> list[LabeledSample]:
-        """导出本平台单元内所有店铺的标注数据，只用于训练路由分类器（§6.4）。
+    def export_training_labels(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> list[LabeledSample]:
+        """导出本平台单元内所有店铺的标注数据，只用于训练路由分类器（§6.4）和每月重算阈值
+        （§13.5）；since ≤ created_at < until，按 created_at 升序。
         不对商家接口开放；数据不出单元。"""
+        ...
+
+    def purge_shop(self, shop_id: str) -> int: ...
+
+
+@runtime_checkable
+class QualityReviewRepository(Protocol):
+    """每周人工复核样本（§13.5）。同一店铺、同一周期（ISO 周）、同一推荐只有一条。"""
+
+    def add_many(self, reviews: Sequence[QualityReview]) -> list[QualityReview]:
+        """写入抽中的样本（status 必须是 pending，id 为 None）。幂等：同一店铺、周期、推荐已有的，
+        不重复写、原样返回已有的那条（不管它现在是什么状态）。返回和输入一一对应、都带 id。
+        reviews 可以跨店铺（每条按自己的 shop_id 写入）。"""
+        ...
+
+    def get(self, shop_id: str, review_id: int) -> QualityReview | None: ...
+
+    def list(
+        self,
+        shop_id: str,
+        *,
+        period: str | None = None,
+        status: QualityReviewStatus | None = None,
+    ) -> list[QualityReview]:
+        """按 id 升序。"""
+        ...
+
+    def record(
+        self,
+        shop_id: str,
+        review_id: int,
+        *,
+        status: QualityReviewStatus,
+        scores: QualityScores | None,
+        reviewer: str,
+        note: str | None,
+        reviewed_at: datetime,
+    ) -> QualityReview:
+        """记下复核结果（scored 带 scores；skipped 不带）。可以改判：后一次覆盖前一次
+        （历史在审计里）。status 不能是 pending、结果不合法抛 ValueError；样本不存在
+        （含别的店铺的样本）抛 KeyError。返回更新后的样本。"""
         ...
 
     def purge_shop(self, shop_id: str) -> int: ...

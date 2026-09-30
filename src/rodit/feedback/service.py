@@ -20,6 +20,10 @@
 再抛出异常（补偿），客服重试能完整走一遍，派生数据和审计不会因为状态已改而永久丢失。
 重试时候选知识按内容去重（归到上次写进去的那条，审计照常补上）；标注、知识缺失在"派生数据写成、
 审计失败"时可能多出一条（至少一次）。
+
+多实例（§5.8 候选知识去重）：进程内的锁只管本实例。两个实例同时把同样的编辑回复变成候选知识时，
+由存储保证只建一条（KnowledgeRepository.add_knowledge 对重复的等审核候选抛 ConcurrencyConflict，
+PostgreSQL 是部分唯一索引），后到的一方重新读到先建的那条、归到它上面（见 _make_candidate）。
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -83,8 +87,13 @@ _REALTIME_PREFIXES = tuple(
     )
 )
 _NOT_HUMAN = frozenset({"system", "bot", "auto"})
+_CANDIDATE_ATTEMPTS = 3  # 新建候选知识撞上别的实例刚建的同样候选时，最多重读几次
 
 _log = logging.getLogger(__name__)
+
+
+CONFIRMING_RULES = frozenset({1, 4, 6})
+"""发出去就说明问题类型判断对了的路由规则（§6.6）：按预测类型作答的推荐。"""
 
 
 class FeedbackOutcome(BaseModel):
@@ -157,7 +166,8 @@ class FeedbackService:
     def record_edited(
         self, shop_id: str, suggestion_id: int, *, agent_id: str, edited_text: str
     ) -> FeedbackOutcome:
-        """编辑后发送 → EDITED_SENT，保存编辑后的文字（已脱敏），生成候选知识等商家审核。
+        """编辑后发送 → EDITED_SENT，保存编辑后的文字（已脱敏），生成候选知识等商家审核；
+        问题类型判断对了（客服只改了说法），记一条 feedback_edit 标注（§5.8、§6.4）。
 
         - 编辑后和推荐原文一样（去掉首尾空白）→ 按原样发送处理；
         - 候选知识：问题 = 推荐记录里的买家问题，回答 = 编辑后的文字（最小化），
@@ -189,6 +199,9 @@ class FeedbackService:
             )
             with self._undo_on_failure(record, updated):
                 candidate, skipped = self._make_candidate(record, answer, now)
+                # 标注在候选知识写成之后再记：候选写失败退回展示中、客服重试或改点"不合适"时，
+                # 不会留下一条已经撤销的正样本（重复计数或和"理解错误"矛盾）
+                label = self._confirmed_label(record, "feedback_edit", now)
                 self._record(
                     AuditAction.FEEDBACK_EDITED,
                     actor,
@@ -207,7 +220,9 @@ class FeedbackService:
                         knowledge_id=candidate.id,
                         item_id=candidate.item_id,
                     )
-            return FeedbackOutcome(record=updated, candidate=candidate, candidate_skipped=skipped)
+            return FeedbackOutcome(
+                record=updated, candidate=candidate, candidate_skipped=skipped, label=label
+            )
 
     def record_rejected(
         self,
@@ -264,6 +279,8 @@ class FeedbackService:
                         shop_id=record.shop_id,
                         text=question,
                         predicted_intent=record.intent,
+                        predicted_confidence=record.intent_confidence,
+                        route_rule=record.route_rule,
                         true_intent=true_intent,
                         source="feedback_reject",
                         created_at=now,
@@ -401,17 +418,7 @@ class FeedbackService:
             record.model_copy(update={"status": SuggestionStatus.SENT, "agent_id": actor})
         )
         with self._undo_on_failure(record, updated):
-            label: LabeledSample | None = None
-            if record.question_text and not self._is_split_message(record):
-                label = LabeledSample(
-                    shop_id=record.shop_id,
-                    text=minimize_text(record.question_text),
-                    predicted_intent=record.intent,
-                    true_intent=record.intent,
-                    source="feedback_adopt",
-                    created_at=now,
-                )
-                self._feedback.add_label(label)
+            label = self._confirmed_label(record, "feedback_adopt", now)
             self._record(
                 AuditAction.FEEDBACK_SENT,
                 actor,
@@ -421,6 +428,33 @@ class FeedbackService:
                 labeled=label is not None,
             )
         return FeedbackOutcome(record=updated, label=label)
+
+    def _confirmed_label(
+        self,
+        record: SuggestionRecord,
+        source: Literal["feedback_adopt", "feedback_edit"],
+        now: datetime,
+    ) -> LabeledSample | None:
+        """客服发出去了（原样或编辑后）：问题类型判断对了 → 正样本（§5.8、§6.4）。
+        多问题消息分条的推荐不记（整条消息的文字对不上单个类型）；只有按预测类型作答的推荐
+        （§6.6 规则 1 站外标准话术、规则 4 高风险、规则 6 出推荐）才算确认了类型——澄清（规则 7）、
+        安抚（规则 3）发出去不说明类型判断对了。没记规则的旧推荐照旧记。"""
+        if not record.question_text or self._is_split_message(record):
+            return None
+        if record.route_rule is not None and record.route_rule not in CONFIRMING_RULES:
+            return None
+        label = LabeledSample(
+            shop_id=record.shop_id,
+            text=minimize_text(record.question_text),
+            predicted_intent=record.intent,
+            predicted_confidence=record.intent_confidence,
+            route_rule=record.route_rule,
+            true_intent=record.intent,
+            source=source,
+            created_at=now,
+        )
+        self._feedback.add_label(label)
+        return label
 
     def _is_split_message(self, record: SuggestionRecord) -> bool:
         """同一条买家消息还有别的类型的推荐：多问题分条（§6.6 规则 5）。"""
@@ -437,10 +471,46 @@ class FeedbackService:
         if any(e.startswith(_REALTIME_PREFIXES) for e in record.evidence_ids):
             return None, SKIP_REALTIME
         question = minimize_text(record.question_text)
+        conflict: ConcurrencyConflict | None = None
+        for _ in range(_CANDIDATE_ATTEMPTS):
+            existing = self._pending_candidate(record, question, answer)
+            if existing is not None:
+                # 同样的候选已在等审核：这次反馈归到它上面，不再新建。它可能就是这次反馈上一次
+                # 没写完（审计失败、推荐退回展示中）留下的——分不出来，所以一律当作这次反馈的
+                # 候选，由调用方照常写 candidate_id 和 knowledge.candidate 审计，
+                # 候选知识不会没有来历
+                return existing, None
+            try:
+                saved = self._knowledge.add_knowledge(
+                    KnowledgeItem(
+                        shop_id=record.shop_id,
+                        question=question,
+                        answer=answer,
+                        source=KnowledgeSource.ADOPTED,
+                        status=KnowledgeStatus.CANDIDATE,
+                        item_id=record.item_id,
+                        intent=record.intent,
+                        created_at=now,
+                    )
+                )
+            except ConcurrencyConflict as exc:
+                # 另一个实例刚建了同样的候选（上面的检查读到的"没有"已经过时，进程内的锁管不到
+                # 别的实例）：存储挡下了第二条，重新读一次，归到先建的那条上
+                conflict = exc
+                continue
+            return saved, None
+        # 一直冲突又读不到那条（它在这期间又被审核掉了）：按写失败处理，推荐退回展示中，客服重试
+        assert conflict is not None
+        raise conflict
+
+    def _pending_candidate(
+        self, record: SuggestionRecord, question: str, answer: str
+    ) -> KnowledgeItem | None:
+        """等审核的同样候选（问题、回答、商品、问题类型都相同）。"""
         pending = self._knowledge.list_knowledge(
             record.shop_id, status=KnowledgeStatus.CANDIDATE, item_id=record.item_id
         )
-        existing = next(
+        return next(
             (
                 k
                 for k in pending
@@ -451,24 +521,6 @@ class FeedbackService:
             ),
             None,
         )
-        if existing is not None:
-            # 同样的候选已在等审核：这次反馈归到它上面，不再新建。它可能就是这次反馈上一次没写完
-            # （审计失败、推荐退回展示中）留下的——分不出来，所以一律当作这次反馈的候选，
-            # 由调用方照常写 candidate_id 和 knowledge.candidate 审计，候选知识不会没有来历
-            return existing, None
-        saved = self._knowledge.add_knowledge(
-            KnowledgeItem(
-                shop_id=record.shop_id,
-                question=question,
-                answer=answer,
-                source=KnowledgeSource.ADOPTED,
-                status=KnowledgeStatus.CANDIDATE,
-                item_id=record.item_id,
-                intent=record.intent,
-                created_at=now,
-            )
-        )
-        return saved, None
 
     def _record(
         self,

@@ -115,3 +115,42 @@ def test_production_purge_runs_without_request_timeouts(prod_env, monkeypatch):
     unit.repos.audit.list_events(SHOP_A)
     unit.repos.knowledge.get_shop(SHOP_A)
     assert sessions == [False, False]
+
+
+def test_audit_wrapper_wraps_every_audit_writer(prod_env):
+    """部署入口用 audit_wrapper 给审计套一层（采集运行指标）：引擎、路由留痕、质检留痕、
+    大模型计量都写进套好的那一层；取消订购的清理也经过它。不传时仍是 PgAuditLog 本身。"""
+    from rodit.storage import PgAuditLog
+
+    class Wrapped:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+    world = build_demo_world()
+    unit = production.build_production_unit(
+        Platform.TAOBAO,
+        config=EngineConfig(llm=LLMConfig(base_url="https://llm.example.invalid/v1", model="m")),
+        tools=InMemoryToolGateway(world, Platform.TAOBAO),
+        adapters=[],
+        audit_wrapper=Wrapped,
+    )
+    audit = unit.repos.audit
+    assert isinstance(audit, Wrapped) and isinstance(audit.inner, PgAuditLog)
+    assert unit.llm._audit is audit  # type: ignore[attr-defined]  大模型计量
+    assert unit.engine._audit_sink is audit  # type: ignore[attr-defined]
+    assert unit.router.audit is audit  # 路由留痕（decision_log）
+    assert unit.gate._audit is audit  # type: ignore[attr-defined]  质检留痕
+    assert audit in unit.repos.purgers()
+    assert isinstance(_build().repos.audit, PgAuditLog)
+
+
+def test_postgres_repos_share_the_unit_clock(prod_env):
+    """会话仓储用单元的时钟（撤回先到的标记按它过期），和知识仓储一致。"""
+    from rodit.testing.fakes import FakeClock
+
+    clock = FakeClock()
+    repos = production.postgres_repos(Database("dbname=rodit_never_connected"), clock=clock)
+    assert repos.conversations._clock is clock  # type: ignore[attr-defined]

@@ -244,6 +244,24 @@ def test_rule6_assist_threshold_is_inclusive():
     assert (d.action, d.rule, d.auto_eligible) == (A.ANSWER, 6, False)
 
 
+def test_rule6_per_intent_assist_threshold_overrides_default():
+    """§13.3 按类型校准的阈值：列出的类型用自己的，没列出的用统一值。"""
+    cfg = RoutingConfig(assist_threshold_by_intent={Intent.SIZE_ADVICE: 0.8})
+    policy = RoutingPolicy(cfg)
+    assert _route(_resp("size_advice", 0.79), policy=policy).rule != 6
+    assert _route(_resp("size_advice", 0.8), policy=policy).rule == 6
+    assert _route(_resp("stock", 0.6), policy=policy).rule == 6  # 没列出：统一值 0.6
+    assert cfg.assist_threshold_for(Intent.STOCK) == 0.6
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.1, 1.2])
+def test_routing_thresholds_must_be_in_unit_interval(bad):
+    with pytest.raises(ValueError, match="阈值必须在"):
+        RoutingConfig(assist_threshold_by_intent={Intent.STOCK: bad})
+    with pytest.raises(ValueError, match="阈值必须在"):
+        RoutingConfig(auto_threshold={Intent.GREETING: bad})
+
+
 @pytest.mark.parametrize(
     ("mode", "shop", "intent", "confidence", "degraded", "eligible"),
     [

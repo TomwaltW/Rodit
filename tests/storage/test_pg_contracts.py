@@ -8,10 +8,12 @@ from typing import TypeVar
 import pytest
 
 from rodit.storage import (
+    Database,
     PgAfterSaleReviewRepository,
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
 )
@@ -49,6 +51,12 @@ def test_feedback_repository_contract(db, truncate):
     contracts.check_feedback_repository(fresh(truncate, lambda: PgFeedbackRepository(db)))
 
 
+def test_quality_review_repository_contract(db, truncate):
+    contracts.check_quality_review_repository(
+        fresh(truncate, lambda: PgQualityReviewRepository(db))
+    )
+
+
 def test_aftersale_review_repository_contract(db, truncate):
     contracts.check_aftersale_review_repository(
         fresh(truncate, lambda: PgAfterSaleReviewRepository(db))
@@ -72,6 +80,50 @@ def test_cross_shop_isolation(db, truncate, token_key):
                 feedback=PgFeedbackRepository(db),
                 reviews=PgAfterSaleReviewRepository(db),
                 auth=PgShopAuthRepository(db, encryption_key=token_key),
+                quality_reviews=PgQualityReviewRepository(db),
             ),
         )
+    )
+
+
+def test_recall_before_message_contract(db, truncate):
+    contracts.check_recall_before_message(
+        lambda clock: fresh(truncate, lambda: PgConversationRepository(db, clock=clock))()
+    )
+
+
+def test_candidate_uniqueness_contract(db, truncate):
+    contracts.check_candidate_uniqueness(
+        fresh(truncate, lambda: PgKnowledgeRepository(db, clock=FakeClock()))
+    )
+
+
+def test_purge_is_idempotent_contract(pg_dsn, truncate, token_key):
+    """清理按 2 行一批：每张表都要分好几个事务删完，结果和内存实现一样。"""
+    small = Database(pg_dsn, purge_batch_rows=2)
+    contracts.check_purge_is_idempotent(
+        fresh(
+            truncate,
+            lambda: contracts.RepoSet(
+                knowledge=PgKnowledgeRepository(small, clock=FakeClock()),
+                conversations=PgConversationRepository(small),
+                suggestions=PgSuggestionRepository(small),
+                feedback=PgFeedbackRepository(small),
+                reviews=PgAfterSaleReviewRepository(small),
+                auth=PgShopAuthRepository(small, encryption_key=token_key),
+                quality_reviews=PgQualityReviewRepository(small),
+            ),
+        )
+    )
+
+
+def test_atomic_shop_and_card_updates_contract(db, truncate):
+    contracts.check_atomic_shop_and_card_updates(
+        fresh(truncate, lambda: PgKnowledgeRepository(db, clock=FakeClock()))
+    )
+
+
+def test_policy_delete_contract(db, truncate):
+    contracts.check_policy_delete(
+        fresh(truncate, lambda: PgKnowledgeRepository(db, clock=FakeClock()))
     )

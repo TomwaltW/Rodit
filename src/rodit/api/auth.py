@@ -8,7 +8,8 @@
   agent 客服（模式 C 提问、反馈、售后审核）；
   manager 店长（客服能做的都能做，外加 R6 店长确认，§7.3.2；看缺失知识和报表）；
   merchant 商家（审核候选知识、填问卷、取消订购；看缺失知识和报表）；
-  integration 平台对接（模式 A 平台推送 / 模式 B 插件上报，只能调平台事件接口，§8.1）。
+  integration 平台对接（模式 A 平台推送 / 模式 B 插件上报，只能调平台事件接口，§8.1）；
+  reviewer 我们的复核人员（每周人工复核、上线阶段切换，§13.4、§13.5；按店铺授权）。
 - 操作人（反馈的 agent_id、售后确认的 operator、审核知识的 merchant）和 by_manager 一律取自
   Principal，请求体里不接受这些字段（§4.1 原则 3、§7.3.2 谁确认的要可信）。
 - StaticTokenAuthenticator 只用于本地开发和测试；生产环境由平台云内的登录体系（如工作台子账号
@@ -23,7 +24,7 @@ from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-PrincipalRole = Literal["agent", "manager", "merchant", "integration"]
+PrincipalRole = Literal["agent", "manager", "merchant", "integration", "reviewer"]
 
 HUMAN_ROLES: frozenset[str] = frozenset({"agent", "manager", "merchant"})
 """人的角色：可以提问、反馈、做售后审核操作（写操作必须有人确认，§4.1 原则 3）。"""
@@ -36,6 +37,13 @@ MERCHANT_ROLES: frozenset[str] = frozenset({"merchant"})
 
 INTEGRATION_ROLES: frozenset[str] = frozenset({"integration"})
 """平台对接：只能调平台事件接口（模式 A / B，§8.1）。"""
+
+REVIEWER_ROLES: frozenset[str] = frozenset({"reviewer"})
+"""我们的复核人员（按店铺授权）：每周人工复核（§13.5）、看影子对比和上线门槛、切换影子 / 智能辅助
+（§13.4）。不能提问、反馈、做售后操作，也不能改知识和店铺配置；看推荐原文要留访问记录（§9.2）。"""
+
+PERSON_ROLES: frozenset[str] = HUMAN_ROLES | REVIEWER_ROLES
+"""具体的人（user_id 不能是 system / bot / auto，§4.1 原则 3）。"""
 
 MIN_TOKEN_CHARS = 16
 
@@ -55,8 +63,8 @@ class Principal(BaseModel):
     def _human_user(self) -> Principal:
         if not self.user_id.strip():
             raise ValueError("user_id 不能为空")
-        if self.role in HUMAN_ROLES and self.user_id.strip().lower() in _NOT_HUMAN:
-            raise ValueError("客服、店长、商家的 user_id 必须是具体的人（§4.1 原则 3）")
+        if self.role in PERSON_ROLES and self.user_id.strip().lower() in _NOT_HUMAN:
+            raise ValueError("客服、店长、商家、复核人员的 user_id 必须是具体的人（§4.1 原则 3）")
         return self
 
     @property
@@ -113,6 +121,8 @@ def bearer_token(authorization: str | None) -> str | None:
 __all__ = [
     "CONSOLE_ROLES",
     "HUMAN_ROLES",
+    "PERSON_ROLES",
+    "REVIEWER_ROLES",
     "INTEGRATION_ROLES",
     "MERCHANT_ROLES",
     "MIN_TOKEN_CHARS",

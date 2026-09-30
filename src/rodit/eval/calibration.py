@@ -52,6 +52,7 @@ def pick_threshold(
     if support == 0:
         return None
     best: ThresholdPick | None = None
+    best_count = 0  # 按条数比覆盖率：ThresholdPick.coverage 是四舍五入过的，不能拿来比
     for t in grid if grid is not None else (x / 100 for x in range(50, 100)):
         picked = [s for s in rows if s.predicted == intent and s.confidence >= t]
         if not picked:
@@ -59,7 +60,8 @@ def pick_threshold(
         correct = sum(1 for s in picked if s.true == intent)
         precision = correct / len(picked)
         coverage = len(picked) / support
-        if precision >= target_precision and (best is None or coverage > best.coverage):
+        if precision >= target_precision and (best is None or len(picked) > best_count):
+            best_count = len(picked)
             best = ThresholdPick(
                 intent=intent,
                 threshold=t,

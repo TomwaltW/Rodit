@@ -11,6 +11,8 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    或历史里），结果等同按顺序到达；重新处理时不出 auto_reply（最新那条可能已经自动回复过，
    全自动下由此转人工）；
 3. 刷新推荐：同一会话之前 SHOWN 的推荐记录改成 EXPIRED（§5.3 新消息到达时刷新推荐）；
+   撤回（on_recall，应用层在撤回事件里调用）：被撤回的那条消息触发的 SHOWN 推荐改成 EXPIRED，
+   返回会话里仍在展示的推荐卡片给侧边栏刷新（§5.3 撤回的消息不再进上下文）；
 4. 会话理解（engine.understanding.ConversationBuilder）→ ConversationContext；
 5. 路由 → RouteDecision，按 core.pipeline.ACTION_PLANS[route.action] 执行：
    - 检索（KnowledgeUnavailable → 不推荐，§12.2）；
@@ -39,6 +41,9 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    整个系统只在这里加）。不满足时退回智能辅助（照常给推荐），并且 transfer_to_human=True——
    §5.7 全自动模式下质检不通过、依据不足、投诉等都要转人工，§12.2 全自动出故障由客服接管。
    影子模式（§13.4）：mode=SHADOW，推荐只用于事后对比，app 层不得展示；不出 auto_reply、不转人工。
+   影子记录每轮一套：乱序时重算最新一轮（run.late），这一轮（按最新买家消息的 msg_id）已经有
+   SHADOW 记录就不再写第二套（事后对比不重复计数），结果照常返回（卡片没有 suggestion_id），
+   SUGGEST 审计带 shadow_duplicate=True。
    店铺或配置读不出来（知识库故障等，不是已知停用）而消息是 AUTO 时，生效模式无从判断：
    按全自动的兜底处理，transfer_to_human=True（§12.2 全自动模式下任何故障 → 客服接管）。
 
@@ -87,6 +92,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -141,6 +147,7 @@ from rodit.engine.cards import (
     HARD_RULE_LABELS,
     blocking_rules,
     build_card,
+    card_from_record,
     dedupe,
     dropped_draft_alert,
 )
@@ -429,8 +436,10 @@ class AssistEngine:
             self._run_unit(run, ctx, unit, plan)
         self._record_gaps(run, ctx, units)
 
-        cards = self._cards(run, units)
-        cards = self._persist(run, ctx, cards)
+        scored = self._cards(run, units)
+        cards = self._persist(
+            run, ctx, [(c, d) for c, d, _ in scored], confidences=[x for _, _, x in scored]
+        )
         auto_reply = self._auto_reply(run, ctx, route, plan, units, cards)
         return self._finish(
             run,
@@ -489,6 +498,62 @@ class AssistEngine:
         except Exception as exc:  # noqa: BLE001
             self._warn("expire", exc)
             run.degrade(DEGRADED_STORAGE)
+
+    def on_recall(
+        self, shop_id: str, conversation_id: str, msg_id: str
+    ) -> list[SuggestionCard] | None:
+        """撤回（§5.3）：被撤回的消息触发的、还在展示中的推荐改成 EXPIRED——撤回的消息不再进
+        上下文，照着它写的推荐也不能再发。
+
+        有推荐被过期时返回会话里仍在展示中的推荐卡片（侧边栏按它刷新；通常为空，即清空），
+        没有改动返回 None（不用刷新）。客服刚好发送 / 反馈了的那条以客服的操作为准；
+        影子记录（SHADOW）没展示过，不改状态。
+        所有状态的推荐记录都去掉抄下来的买家原文（question_text）：撤回的消息原文不留（§5.3），
+        每周复核（§13.5）也看不到。存储失败向外抛：应用层让平台重推撤回，两步都是幂等的。
+        """
+        expired = False
+        shown = self._suggestions.list(
+            shop_id, conversation_id=conversation_id, status=SuggestionStatus.SHOWN
+        )
+        # 剩下的卡片从过期之前读到的列表里算，不再读第二次：过期已经提交后第二次读失败的话，
+        # 平台重推撤回时已经没有可过期的记录，侧边栏就再也刷新不了
+        remaining = [r for r in shown if r.msg_id != msg_id]
+        for record in shown:
+            if record.msg_id != msg_id:
+                continue
+            try:
+                self._suggestions.update(
+                    record.model_copy(
+                        update={"status": SuggestionStatus.EXPIRED, "question_text": None}
+                    ),
+                    expected_status=SuggestionStatus.SHOWN,
+                )
+            except ConcurrencyConflict:
+                continue
+            expired = True
+        self._forget_recalled_text(shop_id, conversation_id, msg_id)
+        if not expired:
+            return None
+        return [card_from_record(r) for r in remaining]
+
+    def _forget_recalled_text(self, shop_id: str, conversation_id: str, msg_id: str) -> None:
+        """撤回的消息触发的推荐记录（任何状态）去掉买家原文。和客服操作并发时按新状态再试。"""
+        for record in self._suggestions.list(shop_id, conversation_id=conversation_id):
+            if record.msg_id != msg_id or record.question_text is None:
+                continue
+            current: SuggestionRecord | None = record
+            for _ in range(3):
+                if current is None or current.question_text is None:
+                    break
+                try:
+                    self._suggestions.update(
+                        current.model_copy(update={"question_text": None}),
+                        expected_status=current.status,
+                    )
+                    break
+                except ConcurrencyConflict:
+                    assert current.id is not None
+                    current = self._suggestions.get(shop_id, current.id)
 
     # ------------------------------------------------------------ 执行计划
 
@@ -694,8 +759,9 @@ class AssistEngine:
 
     # ------------------------------------------------------------ 卡片与记录（§5.6、§10）
 
-    def _cards(self, run: _Run, units: list[_Unit]) -> list[tuple[SuggestionCard, Draft]]:
-        out: list[tuple[SuggestionCard, Draft]] = []
+    def _cards(self, run: _Run, units: list[_Unit]) -> list[tuple[SuggestionCard, Draft, float]]:
+        """每张卡片带上它那一条的路由置信度（写进 SuggestionRecord.intent_confidence）。"""
+        out: list[tuple[SuggestionCard, Draft, float]] = []
         for unit in units:
             for draft, qa in unit.passed[: unit.limit]:
                 notes = [
@@ -712,21 +778,41 @@ class AssistEngine:
                     intent_confidence=unit.intent_confidence,
                     degraded=notes,
                 )
-                out.append((card, draft))
+                out.append((card, draft, unit.intent_confidence))
         return out
 
     def _persist(
-        self, run: _Run, ctx: ConversationContext, cards: list[tuple[SuggestionCard, Draft]]
+        self,
+        run: _Run,
+        ctx: ConversationContext,
+        cards: list[tuple[SuggestionCard, Draft]],
+        *,
+        confidences: Sequence[float],
     ) -> list[tuple[SuggestionCard, Draft]]:
         if not cards:
             return cards
         status = SuggestionStatus.SHADOW if ctx.mode == Mode.SHADOW else SuggestionStatus.SHOWN
+        if status == SuggestionStatus.SHADOW and run.late and self._shadow_turn_recorded(run):
+            # 影子模式每轮一套记录（§13.4 事后对比不重复计数）：这一轮第一次处理时已经记过
+            self._audit(
+                run,
+                AuditAction.SUGGEST,
+                {
+                    "suggestion_ids": [None] * len(cards),
+                    "count": len(cards),
+                    "status": str(status),
+                    "intents": [str(c.intent) for c, _ in cards],
+                    "kinds": [str(c.kind) for c, _ in cards],
+                    "shadow_duplicate": True,
+                },
+            )
+            return cards
         question = mask_pii(ctx.current.text)
         item_id = ctx.item.item_id if ctx.item is not None else None
         now = self._clock.now()
         latency = run.elapsed_ms()
         out: list[tuple[SuggestionCard, Draft]] = []
-        for card, draft in cards:
+        for (card, draft), confidence in zip(cards, confidences, strict=True):
             record = SuggestionRecord(
                 shop_id=ctx.shop_id,
                 conversation_id=ctx.conversation_id,
@@ -734,6 +820,8 @@ class AssistEngine:
                 question_text=question,
                 item_id=item_id,
                 intent=card.intent,
+                intent_confidence=min(1.0, max(0.0, confidence)),
+                route_rule=run.route.rule if run.route is not None else None,
                 text=card.text,
                 kind=card.kind,
                 evidence_ids=dedupe(draft.evidence_ids),
@@ -762,6 +850,18 @@ class AssistEngine:
             },
         )
         return out
+
+    def _shadow_turn_recorded(self, run: _Run) -> bool:
+        """这一轮（最新买家消息）已经有影子记录。读不到时按没有处理（照常写，写不进去会降级）。"""
+        msg = run.msg
+        try:
+            records = self._suggestions.list(
+                msg.shop_id, conversation_id=msg.conversation_id, status=SuggestionStatus.SHADOW
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._warn("shadow_check", exc)
+            return False
+        return any(r.msg_id == msg.msg_id for r in records)
 
     # ------------------------------------------------------------ 全自动（§5.6、§12.2、§12.3）
 
@@ -805,7 +905,7 @@ class AssistEngine:
             intent_confidence=route.intent_confidence,
             degraded=[],
         )
-        persisted = self._persist(run, ctx, [(card, draft)])
+        persisted = self._persist(run, ctx, [(card, draft)], confidences=[route.intent_confidence])
         stored = persisted[0][0] if persisted else card
         return stored, stored.model_copy(update={"text": text})
 

@@ -8,20 +8,25 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import timedelta
 
 import psycopg
 import pytest
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
 from rodit.core.enums import AfterSaleStatus, ReviewState
 from rodit.core.models import AfterSaleReview
 from rodit.storage import MIGRATIONS, Database, PgAfterSaleReviewRepository
 from rodit.storage import db as db_module
-from rodit.testing.fixtures import SHOP_A, build_demo_world
+from rodit.testing.fixtures import SHOP_A, SHOP_B, build_demo_world
 
 RELEASED_SHA256 = {
     1: "5d8ef0f0a189c13cad0aeb782ec13c89e2424f7b00dfe7e0b62575e7069496d6",
     2: "89d1e349d11d445e6f010e84c5e3686428c877bafe3dcea09800d013f3685d1b",
+    3: "254848388c403503c430f4dd79bd5df1b22feb57858060aa16c2d2ea7bdadf39",
+    4: "9b8387a668d5ffe74618b2dd0f165861c2581de087385b2406935e14cd93df8a",
 }
 """已发布迁移脚本的 SHA-256。新增版本时在这里补一行；已有的行不能改。"""
 
@@ -86,3 +91,140 @@ def test_database_on_released_v1_upgrades_to_latest(make_database, monkeypatch):
         expected_version=1,
     )
     assert repo.get(SHOP_A, "as_2002").platform_status_version == "v4"
+
+
+@pytest.mark.pg
+def test_v3_retires_duplicate_pending_candidates_as_non_superuser_owner(pg_admin_dsn):
+    """已部署的库里可能已有重复的候选知识（多实例并发写入留下的），唯一索引建不起来：
+    版本 3 每组留 id 最小的一条、其余改成已下线，再建索引。生产上迁移账号是表的所有者、
+    不是超级用户，受 FORCE 行级安全约束——去重要跨所有店铺做，做完 FORCE 必须恢复。"""
+    suffix = uuid.uuid4().hex[:10]
+    owner, dbname = f"rodit_test_owner_{suffix}", f"rodit_test_v3_{suffix}"
+    with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(owner)))
+        admin.execute(
+            sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                sql.Identifier(dbname), sql.Identifier(owner)
+            )
+        )
+    dsn = make_conninfo(pg_admin_dsn, dbname=dbname)
+    insert = (
+        "INSERT INTO knowledge_item (shop_id, question, answer, source, status, item_id, intent,"
+        " created_at) VALUES (%s, %s, '亲，发货前可以改哦', 'adopted', %s, %s, %s, now())"
+        " RETURNING id"
+    )
+    try:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(owner)))
+            for migration in MIGRATIONS[:2]:
+                conn.execute(migration.sql())
+            ids: dict[str, list[int]] = {}
+            rows = [
+                ("a_same", SHOP_A, "能改地址吗", "candidate", "i_555", "modify_order"),
+                ("a_same", SHOP_A, "能改地址吗", "candidate", "i_555", "modify_order"),
+                ("a_same", SHOP_A, "能改地址吗", "candidate", "i_555", "modify_order"),
+                ("a_nulls", SHOP_A, "能改地址吗", "candidate", None, None),
+                ("a_nulls", SHOP_A, "能改地址吗", "candidate", None, None),
+                ("a_approved", SHOP_A, "能改地址吗", "approved", "i_555", "modify_order"),
+                ("a_other_item", SHOP_A, "能改地址吗", "candidate", "i_777", "modify_order"),
+                ("b_same", SHOP_B, "能改地址吗", "candidate", "i_555", "modify_order"),
+                ("b_same", SHOP_B, "能改地址吗", "candidate", "i_555", "modify_order"),
+            ]
+            for group, shop, question, status, item, intent in rows:
+                conn.execute("SELECT set_config('rodit.shop_id', %s, false)", (shop,))
+                new_id = conn.execute(insert, (shop, question, status, item, intent)).fetchone()
+                ids.setdefault(group, []).append(new_id[0])
+            conn.execute("SELECT set_config('rodit.shop_id', '', false)")
+            conn.execute(MIGRATIONS[2].sql())  # 版本 3，所有者身份、没有店铺范围
+
+            forced = conn.execute(
+                "SELECT relforcerowsecurity FROM pg_class WHERE relname = 'knowledge_item'"
+            ).fetchone()[0]
+            assert forced is True  # FORCE 已恢复：所有者自己仍受行级安全约束
+            assert conn.execute("SELECT count(*) FROM knowledge_item").fetchone()[0] == 0
+            conn.execute("SELECT set_config('rodit.shop_id', %s, false)", (SHOP_A,))
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                conn.execute(insert, (SHOP_A, "能改地址吗", "candidate", "i_555", "modify_order"))
+        with psycopg.connect(dsn) as admin_conn:  # 超级用户：绕过行级安全核对全部店铺
+            status = dict(admin_conn.execute("SELECT id, status FROM knowledge_item").fetchall())
+    finally:
+        with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(dbname))
+            )
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(owner)))
+
+    for group in ("a_same", "a_nulls", "b_same"):
+        first, *rest = ids[group]
+        assert status[first] == "candidate", group
+        assert [status[i] for i in rest] == ["retired"] * len(rest), group
+    assert status[ids["a_approved"][0]] == "approved"
+    assert status[ids["a_other_item"][0]] == "candidate"
+
+
+def test_v4_upgrades_a_v3_database_with_data_and_is_rerunnable(make_database, monkeypatch):
+    """迁移到版本 3 后有了数据，再迁移版本 4：旧推荐、旧标注的新列为空，复核表可用；
+    版本 4 的脚本再执行一次不出错（IF NOT EXISTS / DROP POLICY IF EXISTS）。"""
+    from rodit.core.enums import DraftKind, Intent, SuggestionStatus
+    from rodit.core.models import LabeledSample, QualityReview, SuggestionRecord
+    from rodit.storage import (
+        PgFeedbackRepository,
+        PgQualityReviewRepository,
+        PgSuggestionRepository,
+    )
+
+    dsn = make_database()
+    monkeypatch.setattr(db_module, "MIGRATIONS", tuple(m for m in MIGRATIONS if m.version <= 3))
+    assert Database(dsn).migrate() == [1, 2, 3]
+    monkeypatch.undo()
+    now = build_demo_world().now
+    with Database(dsn, app_role=None).session(None) as conn:  # 版本 3 的表结构：没有新列
+        conn.execute(
+            "INSERT INTO suggestion (shop_id, conversation_id, intent, text, kind, status,"
+            " created_at) VALUES (%s, 'c1', 'greeting', '亲，在的', 'template', 'shown', %s)",
+            (SHOP_A, now),
+        )
+        conn.execute(
+            "INSERT INTO labeled_sample (shop_id, text, source, created_at)"
+            " VALUES (%s, '在吗', 'manual', %s)",
+            (SHOP_A, now),
+        )
+    assert Database(dsn).migrate() == [4]
+    db = Database(dsn)
+    [old] = PgSuggestionRepository(db).list(SHOP_A)
+    assert old.intent_confidence is None and old.route_rule is None
+    [label] = PgFeedbackRepository(db).list_labels(SHOP_A)
+    assert label.predicted_confidence is None and label.route_rule is None
+    new = PgSuggestionRepository(db).add(
+        SuggestionRecord(
+            shop_id=SHOP_A,
+            conversation_id="c1",
+            intent=Intent.GREETING,
+            intent_confidence=0.9,
+            route_rule=6,
+            text="亲，在的",
+            kind=DraftKind.TEMPLATE,
+            status=SuggestionStatus.SHOWN,
+            created_at=now,
+        )
+    )
+    assert (new.intent_confidence, new.route_rule) == (0.9, 6)
+    PgFeedbackRepository(db).add_label(
+        LabeledSample(shop_id=SHOP_A, text="在吗", route_rule=6, created_at=now)
+    )
+    [review] = PgQualityReviewRepository(db).add_many(
+        [
+            QualityReview(
+                shop_id=SHOP_A,
+                period="2026-W40",
+                suggestion_id=new.id or 1,
+                intent=Intent.GREETING,
+                sampled_at=now,
+            )
+        ]
+    )
+    assert PgQualityReviewRepository(db).list(SHOP_B) == []  # 行级安全照样生效
+    v4 = next(m for m in MIGRATIONS if m.version == 4)
+    with Database(dsn, app_role=None).session(None) as conn:
+        conn.execute(v4.sql())  # 再执行一次：不报错、数据不变
+    assert PgQualityReviewRepository(db).get(SHOP_A, review.id) == review

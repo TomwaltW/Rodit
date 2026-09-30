@@ -3,7 +3,10 @@
 
 create_app 是应用工厂：一个 AssistService（一个平台单元，§9.1）+ 一个 Authenticator，没有全局状态。
 接口层只调用 AssistService，另外只读 Unit 的字段（店铺状态、店铺授权、审核记录、平台售后单、
-适配器注册表）做鉴权前置检查和展示。
+适配器注册表、商品卡片）做鉴权前置检查和展示。
+
+模式 C 网页工具（rodit.api.web）：GET / 和 /assist 是自带的静态页面，页面本身不含数据、不需要鉴权；
+页面脚本用 /v1/me 登录（令牌 → 身份），用 /v1/shops/{shop_id}/items 选商品，其余都是下面的接口。
 
 鉴权顺序（每个店铺范围的路由都一样，§9.2 串店测试覆盖全部路由）：
     令牌 → Principal（401）→ 路径 shop_id 与 principal.shop_id 一致（403 tenant_isolation）
@@ -16,32 +19,41 @@ create_app 是应用工厂：一个 AssistService（一个平台单元，§9.1�
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, FastAPI, Path, Query, Request, Response
-from pydantic import AwareDatetime
+from fastapi import APIRouter, Body, FastAPI, Path, Response
 
-from rodit.api.auth import (
-    CONSOLE_ROLES,
-    HUMAN_ROLES,
-    INTEGRATION_ROLES,
-    MERCHANT_ROLES,
-    Authenticator,
-    Principal,
-    bearer_token,
+from rodit.api import routes_console, routes_rollout
+from rodit.api.auth import PERSON_ROLES, Authenticator, Principal
+from rodit.api.deps import (
+    MSG_FORBIDDEN_ROLE,
+    AfterSaleId,
+    AgentDep,
+    ConsoleDep,
+    EmptyBody,
+    IntegrationDep,
+    KnowledgeId,
+    MerchantDep,
+    PrincipalDep,
+    RevokeDep,
+    ServiceDep,
+    Since,
+    SuggestionId,
+    require_active_shop,
 )
-from rodit.api.errors import ApiError, install_error_handlers, tenant_violation, unauthorized
+from rodit.api.errors import ApiError, install_error_handlers, tenant_violation
 from rodit.api.schemas import (
     AfterSaleReviewView,
     ConfirmRequest,
     EditedRequest,
-    EmptyRequest,
     EngineResultView,
     FeedbackView,
     GapView,
     HealthView,
+    ItemSummaryView,
     KnowledgeView,
+    MeView,
     NegotiateRequest,
     NegotiationDoneRequest,
     QuestionnaireRequest,
@@ -50,9 +62,10 @@ from rodit.api.schemas import (
     RevokeView,
     StandaloneAskRequest,
 )
+from rodit.api.web import build_web_router
 from rodit.app.service import AssistService
-from rodit.core.enums import ReviewState, ShopStatus
-from rodit.core.errors import RoditError, ShopInactive, TenantIsolationError
+from rodit.core.enums import ReviewState
+from rodit.core.errors import RoditError, TenantIsolationError
 from rodit.core.models import AfterSaleReview, EngineResult
 from rodit.core.ports import PlatformAdapter
 from rodit.feedback import AdoptionReport, FeedbackOutcome, QAReport
@@ -62,80 +75,11 @@ API_VERSION = "0.1.0"
 
 _NO_CONTENT = {204: {"description": "不是买家消息、重复消息或无法识别，没有处理"}}
 
-MSG_FORBIDDEN_ROLE = "当前角色不能执行这个操作"
 MSG_MANAGER_REQUIRED = "金额超过店铺上限，必须店长确认（R6，§7.3.2）"
 MSG_UNVERIFIABLE = "无法在处理前核对事件所属店铺，已拒绝（§9.2）"
 
 
-# ================================================================ 依赖
-
-
-def _service(request: Request) -> AssistService:
-    return request.app.state.rodit_service
-
-
-def _principal(request: Request) -> Principal:
-    """令牌 → 调用方身份。缺少、格式不对、未知都是 401；令牌不进日志、不进响应。"""
-    token = bearer_token(request.headers.get("authorization"))
-    if token is None:
-        raise unauthorized()
-    authenticator: Authenticator = request.app.state.rodit_authenticator
-    principal = authenticator.authenticate(token)
-    if not isinstance(principal, Principal):
-        raise unauthorized()
-    return principal
-
-
-ServiceDep = Annotated[AssistService, Depends(_service)]
-PrincipalDep = Annotated[Principal, Depends(_principal)]
-
-
-def _integration(principal: PrincipalDep) -> Principal:
-    """平台事件接口只给平台对接（integration 角色）用，客服、商家的令牌不行。"""
-    if principal.role not in INTEGRATION_ROLES:
-        raise ApiError(403, "forbidden_role", MSG_FORBIDDEN_ROLE)
-    return principal
-
-
-IntegrationDep = Annotated[Principal, Depends(_integration)]
-
-
-def _require_active_shop(service: AssistService, shop_id: str) -> None:
-    """店铺不存在（含取消订购后已删除）或已停用：停止处理（§8.4）。"""
-    shop = service.unit.repos.knowledge.get_shop(shop_id)
-    if shop is None:
-        raise ShopInactive(shop_id)
-    if shop.status == ShopStatus.SUSPENDED:
-        raise ShopInactive(shop_id, shop.status)
-
-
-def _shop_guard(roles: frozenset[str], *, require_active: bool = True) -> Callable[..., Principal]:
-    """店铺范围路由的鉴权：路径 shop_id 必须是调用方自己的店铺（§9.2），角色必须在 roles 里。"""
-
-    def guard(shop_id: str, principal: PrincipalDep, service: ServiceDep) -> Principal:
-        if principal.shop_id != shop_id:
-            raise tenant_violation()
-        if principal.role not in roles:
-            raise ApiError(403, "forbidden_role", MSG_FORBIDDEN_ROLE)
-        if require_active:
-            _require_active_shop(service, shop_id)
-        return principal
-
-    return guard
-
-
-AgentDep = Annotated[Principal, Depends(_shop_guard(HUMAN_ROLES))]
-ConsoleDep = Annotated[Principal, Depends(_shop_guard(CONSOLE_ROLES))]
-MerchantDep = Annotated[Principal, Depends(_shop_guard(MERCHANT_ROLES))]
-RevokeDep = Annotated[Principal, Depends(_shop_guard(MERCHANT_ROLES, require_active=False))]
-
-SuggestionId = Annotated[int, Path(ge=1)]
-KnowledgeId = Annotated[int, Path(ge=1)]
-AfterSaleId = Annotated[str, Path(min_length=1, max_length=128)]
-Since = Annotated[AwareDatetime | None, Query(description="只统计这个时间之后（带时区）")]
-
-
-EmptyBody = Annotated[EmptyRequest | None, Body()]
+# ================================================================ 依赖（rodit.api.deps）
 
 
 # ================================================================ 视图
@@ -207,6 +151,40 @@ def healthz() -> HealthView:
     return HealthView()
 
 
+@router.get("/v1/me", response_model=MeView, tags=["模式 C"])
+def whoami(principal: PrincipalDep, service: ServiceDep) -> MeView:
+    """当前令牌对应的身份（网页工具登录用：模式 C 话术助手、商家控制台）：
+    店铺、账号、角色、平台单元。
+
+    具体的人（PERSON_ROLES：客服、店长、商家、复核人员）都能用；平台对接的令牌不是人，
+    不能登录网页工具（403 forbidden_role）。各页面按角色决定显示什么：复核人员在话术助手页只看到
+    去控制台的提示，客服在控制台只看到去话术助手的提示。
+    只返回调用方自己的身份，不回显令牌、不读店铺数据；店铺停用时照常返回（之后的店铺接口是 403）。
+    """
+    if principal.role not in PERSON_ROLES:
+        raise ApiError(403, "forbidden_role", MSG_FORBIDDEN_ROLE)
+    return MeView(
+        shop_id=principal.shop_id,
+        user_id=principal.user_id,
+        role=principal.role,
+        platform=service.unit.platform,
+    )
+
+
+@router.get("/v1/shops/{shop_id}/items", response_model=list[ItemSummaryView], tags=["模式 C"])
+def list_items(principal: AgentDep, service: ServiceDep) -> list[ItemSummaryView]:
+    """本店的商品（按 item_id 升序，只有 ID 和标题）：模式 C 网页工具选当前商品（§5.3、§8.1）。
+
+    只读。
+    """
+    cards = service.unit.repos.knowledge.list_item_cards(principal.shop_id)
+    return [
+        ItemSummaryView(item_id=card.item_id, title=card.title)
+        for card in cards
+        if card.shop_id == principal.shop_id  # 纵深防御：仓储已按店铺隔离（§9.2）
+    ]
+
+
 @router.post(
     "/v1/shops/{shop_id}/standalone/ask",
     response_model=EngineResultView,
@@ -256,7 +234,7 @@ def platform_event(
         return Response(status_code=204)
     if shop_id != principal.shop_id:
         raise tenant_violation()
-    _require_active_shop(service, shop_id)
+    require_active_shop(service, shop_id)
     unit.auth.require(shop_id)  # 授权无效 → AuthExpired → 403，此时适配器还没有碰这条事件
     return _result_view(principal, service.handle_event(access, raw))
 
@@ -509,10 +487,13 @@ def revoke(principal: RevokeDep, service: ServiceDep, body: EmptyBody = None) ->
 # ================================================================ 工厂
 
 
-def create_app(service: AssistService, *, authenticator: Authenticator) -> FastAPI:
+def create_app(
+    service: AssistService, *, authenticator: Authenticator, web_page: bool = True
+) -> FastAPI:
     """创建一个平台单元（§9.1）的 HTTP 应用。
 
     service 和 authenticator 挂在这个应用的 app.state 上，没有模块级的全局状态。
+    web_page：是否挂模式 C 网页工具（GET / 和 /assist，§8.1）；只做模式 A / B 的单元可以关掉。
     """
     if not isinstance(service, AssistService):
         raise TypeError("service 必须是 AssistService")
@@ -527,6 +508,10 @@ def create_app(service: AssistService, *, authenticator: Authenticator) -> FastA
     app.state.rodit_authenticator = authenticator
     install_error_handlers(app)
     app.include_router(router)
+    app.include_router(routes_console.router)  # 商家控制台：知识编辑、店铺配置、商品同步（§9.1）
+    app.include_router(routes_rollout.router)  # 上线节奏与每周复核（§13.4、§13.5）
+    if web_page:
+        app.include_router(build_web_router(service.unit.platform))
     return app
 
 

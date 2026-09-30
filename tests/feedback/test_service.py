@@ -73,6 +73,8 @@ class Env:
             "question_text": QUESTION,
             "item_id": "i_555",
             "intent": Intent.SIZE_ADVICE,
+            "intent_confidence": 0.72,
+            "route_rule": 6,
             "text": "亲，建议您选 M 码哦~",
             "kind": DraftKind.LLM,
             "evidence_ids": [ev.item_size_advice("i_555"), ev.item_size_chart("i_555")],
@@ -115,6 +117,7 @@ def test_record_sent(env):
         Intent.SIZE_ADVICE,
         "feedback_adopt",
     )
+    assert label.predicted_confidence == 0.72  # §13.5 重算阈值的三元组要有置信度
     assert label.created_at == env.clock.now()
     [event] = [e for e in env.audit.events if e.action == AuditAction.FEEDBACK_SENT]
     assert event.actor == "kf_07" and event.shop_id == SHOP_A
@@ -179,7 +182,15 @@ def test_record_edited_creates_candidate_for_merchant_review(env):
     [cand_event] = env.events(AuditAction.KNOWLEDGE_CANDIDATE)
     assert cand_event["knowledge_id"] == cand.id and cand_event["item_id"] == "i_555"
     assert edited not in _audit_dump(env)
-    assert env.feedback.list_labels(SHOP_A) == []
+    # 编辑后发送：类型判断对了，记一条 feedback_edit 正样本（§5.8、§6.4），带置信度和路由规则
+    [label] = env.feedback.list_labels(SHOP_A)
+    assert label == out.label
+    assert (label.predicted_intent, label.true_intent, label.source) == (
+        Intent.SIZE_ADVICE,
+        Intent.SIZE_ADVICE,
+        "feedback_edit",
+    )
+    assert (label.predicted_confidence, label.route_rule) == (0.72, 6)
 
 
 def test_record_edited_masks_personal_info(env):
@@ -276,6 +287,20 @@ def test_reject_missing_knowledge_creates_gap(env):
     assert PHONE not in _audit_dump(env)
 
 
+@pytest.mark.parametrize(
+    ("rule", "labeled"), [(7, False), (3, False), (4, True), (1, True), (6, True)]
+)
+def test_only_answer_rules_confirm_the_intent(env, rule, labeled):
+    """澄清（规则 7）、安抚（规则 3）发出去不说明类型对了，不记正样本；按预测类型作答的记。"""
+    rec = env.add(route_rule=rule)
+    out = env.service.record_sent(SHOP_A, rec.id, agent_id=AGENT)
+    assert (out.label is not None) is labeled
+    edited = env.add(route_rule=rule, msg_id="m_e")
+    out = env.service.record_edited(SHOP_A, edited.id, agent_id=AGENT, edited_text="亲，改过的话术")
+    assert (out.label is not None) is labeled
+    assert len(env.feedback.list_labels(SHOP_A)) == (2 if labeled else 0)
+
+
 def test_reject_wrong_intent_creates_label(env):
     rec = env.add(question_text="这个会起球吗", intent=Intent.SIZE_ADVICE)
     out = env.service.record_rejected(
@@ -292,6 +317,7 @@ def test_reject_wrong_intent_creates_label(env):
         Intent.PRODUCT_SPEC,
         "feedback_reject",
     )
+    assert label.predicted_confidence == 0.72
     detail = env.events(AuditAction.FEEDBACK_REJECTED)[0]
     assert detail["reason"] == "wrong_intent" and detail["true_intent"] == "product_spec"
     # 只知道"不是这个类型"也记录

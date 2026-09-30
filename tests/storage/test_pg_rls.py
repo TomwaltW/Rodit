@@ -29,6 +29,7 @@ from rodit.core.models import (
     DecisionLogEntry,
     KnowledgeGap,
     LabeledSample,
+    QualityReview,
     ShopAuth,
     SuggestionRecord,
 )
@@ -41,6 +42,7 @@ from rodit.storage import (
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
 )
@@ -67,11 +69,14 @@ def seeded(db: Database, truncate, token_key: str) -> None:
     reviews = PgAfterSaleReviewRepository(db)
     auth = PgShopAuthRepository(db, encryption_key=token_key)
     audit = PgAuditLog(db)
+    quality = PgQualityReviewRepository(db)
     for shop in (SHOP_A, SHOP_B):
         conversations.add_message(
             make_message("在吗", world=world, shop_id=shop, msg_id=f"m_{shop}")
         )
-        suggestions.add(
+        # 撤回先于消息到达：message_recall 里的墓碑（迁移版本 3）
+        assert conversations.recall_message(shop, "conv_889", f"m_{shop}_later") is False
+        sug = suggestions.add(
             SuggestionRecord(
                 shop_id=shop,
                 conversation_id="conv_889",
@@ -81,6 +86,18 @@ def seeded(db: Database, truncate, token_key: str) -> None:
                 status=SuggestionStatus.SHOWN,
                 created_at=NOW,
             )
+        )
+        # 每周人工复核样本（迁移版本 4）
+        quality.add_many(
+            [
+                QualityReview(
+                    shop_id=shop,
+                    period="2026-W40",
+                    suggestion_id=sug.id or 1,
+                    intent=Intent.GREETING,
+                    sampled_at=NOW,
+                )
+            ]
         )
         feedback.add_gap(KnowledgeGap(shop_id=shop, missing="policy:invoice", created_at=NOW))
         feedback.add_label(LabeledSample(shop_id=shop, text="在吗", created_at=NOW))
@@ -276,7 +293,8 @@ def test_non_superuser_owner_can_migrate_and_is_still_bound_by_rls(pg_admin_dsn)
     try:
         with psycopg.connect(make_conninfo(pg_admin_dsn, dbname=dbname)) as conn:
             conn.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(owner)))
-            conn.execute(MIGRATIONS[0].sql())
+            for migration in MIGRATIONS:  # 全部版本（版本 3 新建了 message_recall）
+                conn.execute(migration.sql())
             owned = conn.execute(
                 "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
                 " AND tableowner = current_user"

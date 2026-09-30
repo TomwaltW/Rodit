@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rodit.core.enums import Intent, Platform, ProviderName
 from rodit.core.lexicon import ABSOLUTE_TERM_EXCEPTIONS, ABSOLUTE_TERMS
@@ -46,6 +46,9 @@ class RoutingConfig(_Model):
     multi_intent_min_prob: float = 0.2  # 规则 5 分条推荐：概率达到这个值的问题类型才单独成条
     max_parts: int = Field(default=3, ge=2, le=5)
     assist_threshold: float = 0.6  # 智能辅助有人把关，阈值可以低
+    # 按问题类型校准过的智能辅助阈值（§13.3 按类型扫描、§13.5 每月重算）；没列出的类型用
+    # assist_threshold。由我们统一校准，不开放给商家（§9.3）
+    assist_threshold_by_intent: dict[Intent, float] = Field(default_factory=dict)
     auto_threshold: dict[Intent, float] = Field(  # 全自动只对列出的类型生效
         default_factory=lambda: {
             Intent.GREETING: 0.95,
@@ -66,6 +69,18 @@ class RoutingConfig(_Model):
             Intent.COMPLAINT,
         ]
     )
+
+    @field_validator("assist_threshold_by_intent", "auto_threshold")
+    @classmethod
+    def _unit_interval(cls, v: dict[Intent, float]) -> dict[Intent, float]:
+        bad = sorted(str(k) for k, t in v.items() if not 0 < t <= 1)
+        if bad:
+            raise ValueError(f"阈值必须在 (0, 1] 之间：{bad}")
+        return v
+
+    def assist_threshold_for(self, intent: Intent) -> float:
+        """该问题类型的智能辅助阈值（校准过的优先，否则用统一值）。"""
+        return self.assist_threshold_by_intent.get(intent, self.assist_threshold)
 
 
 class QAGateConfig(_Model):

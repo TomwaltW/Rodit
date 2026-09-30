@@ -406,6 +406,14 @@ class RejectReason(StrEnum):
     OTHER = "other"
 
 
+class QualityReviewStatus(StrEnum):
+    """每周人工复核样本的状态（§13.5 每周从推荐中抽 50 条人工复核）。"""
+
+    PENDING = "pending"  # 已抽中，等复核
+    SCORED = "scored"  # 已按 §13.2 四个维度打分
+    SKIPPED = "skipped"  # 复核人判断没法评（如推荐已无意义），不计入满分率
+
+
 class DecisionStage(StrEnum):
     ROUTE = "route"
     QA = "qa"

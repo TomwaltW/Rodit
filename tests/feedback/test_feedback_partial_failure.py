@@ -128,6 +128,25 @@ def test_edited_retry_after_candidate_write_failure_completes():
         AuditAction.FEEDBACK_EDITED.value,
         AuditAction.KNOWLEDGE_CANDIDATE.value,
     ]
+    # 失败的那次没有留下标注：重试后只有一条 feedback_edit（不重复计数）
+    assert [s.source for s in env.feedback_store.list_labels(SHOP_A)] == ["feedback_edit"]
+
+
+def test_failed_edit_leaves_no_label_that_contradicts_a_later_reject():
+    """编辑后发送写候选知识失败（退回展示中），客服改点"理解错误"：只有 feedback_reject 一条。"""
+    env = Env(fail="add_knowledge")
+    rec = env.add()
+    with pytest.raises(KnowledgeUnavailable):
+        env.service.record_edited(SHOP_A, rec.id, agent_id=AGENT, edited_text="亲，建议 L 码哦")
+    assert env.status(rec) == SuggestionStatus.SHOWN
+    env.service.record_rejected(
+        SHOP_A,
+        rec.id,
+        agent_id=AGENT,
+        reason=RejectReason.WRONG_INTENT,
+        true_intent=Intent.SHIPPING_POLICY,
+    )
+    assert [s.source for s in env.feedback_store.list_labels(SHOP_A)] == ["feedback_reject"]
 
 
 def test_rejected_retry_after_gap_write_failure_completes():

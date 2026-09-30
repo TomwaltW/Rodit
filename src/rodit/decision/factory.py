@@ -1,6 +1,9 @@
 """按配置组装判断层实现（方案 §6.4、§6.6 decision.provider、D4）。
 
 - cfg.provider 选路由用的实现：incloud_llm（MVP 默认）/ classifier（数据攒够后）/ rules / jev；
+  classifier 用训练任务生成的模型文件（rodit.eval.train → ClassifierProvider.load，
+  部署入口从 RODIT_CLASSIFIER_PATH 加载后通过 classifier 传进来）；测试和演示也可以传
+  classifier_samples 现场训练；
 - 质检（purpose="qa"）的问题只有大模型（或满足 §6.3 条件的 Jev）能答：
   provider 是 classifier / rules 时，质检仍用 incloud_llm（§6.4 "质检用硬规则 + 大模型"）；
 - 投票次数：路由 cfg.vote_samples、质检 cfg.qa_vote_samples；
@@ -49,10 +52,14 @@ def build_decision_provider(
     purpose: JudgePurpose,
     llm: LLMClient | None = None,
     classifier_samples: Iterable[LabeledSample] | Iterable[tuple[str, Intent]] | None = None,
+    classifier: ClassifierProvider | None = None,
     jev: JevProvider | None = None,
 ) -> DecisionProvider:
     """按 cfg.provider 构造判断层。缺少所需依赖时抛 ValueError；Jev 不能处理买家数据时抛
-    ComplianceError（配置校验已禁止未批准的 jev，§6.2）。"""
+    ComplianceError（配置校验已禁止未批准的 jev，§6.2）。
+
+    provider=classifier 的路由：优先用传进来的 classifier（从模型文件加载好的），
+    其次用 classifier_samples 现场训练（加 §5.1 例句）；两样都没有抛 ValueError。"""
     provider = cfg.provider
     if provider == ProviderName.JEV:
         if jev is None:
@@ -63,6 +70,14 @@ def build_decision_provider(
         return build_llm_provider(cfg, purpose=purpose, llm=llm)
     if provider == ProviderName.RULES:
         return RuleProvider()
+    if classifier is not None:
+        if not classifier.is_trained:
+            raise ValueError("provider=classifier：传进来的路由分类器还没有训练")
+        require_buyer_data_ok(classifier)
+        return classifier
     if classifier_samples is None:
-        raise ValueError("provider=classifier 需要训练数据（classifier_samples）")
+        raise ValueError(
+            "provider=classifier 需要路由分类器：模型文件（RODIT_CLASSIFIER_PATH）"
+            "或训练数据（classifier_samples）"
+        )
     return ClassifierProvider(fallback=RuleProvider()).fit(classifier_samples, seed_examples=True)

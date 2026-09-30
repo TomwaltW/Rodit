@@ -9,11 +9,19 @@ from __future__ import annotations
 
 import itertools
 import threading
-from collections.abc import Sequence
-from datetime import datetime
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import Any
 
 from rodit.core.clock import Clock, SystemClock
-from rodit.core.enums import KnowledgeStatus, ReviewState, Role, SuggestionStatus
+from rodit.core.enums import (
+    KnowledgeStatus,
+    QualityReviewStatus,
+    ReviewState,
+    Role,
+    SuggestionStatus,
+)
 from rodit.core.errors import ConcurrencyConflict
 from rodit.core.models import (
     AfterSaleReview,
@@ -23,12 +31,16 @@ from rodit.core.models import (
     KnowledgeItem,
     LabeledSample,
     PolicyEntry,
+    QualityReview,
+    QualityScores,
     Shop,
     ShopAuth,
     StandardMessage,
     StoredMessage,
     SuggestionRecord,
+    merge_overrides,
 )
+from rodit.core.ports import RECALL_TOMBSTONE_TTL
 from rodit.inmemory.embedding import cosine
 
 
@@ -54,6 +66,17 @@ class InMemoryKnowledgeRepository:
         with self._lock:
             self._shops[shop.id] = shop.model_copy(deep=True)
 
+    def update_shop_config(self, shop_id: str, changes: Mapping[str, Any]) -> Shop | None:
+        with self._lock:
+            shop = self._shops.get(shop_id)
+            if shop is None:
+                return None
+            updated = shop.model_validate(
+                {**shop.model_dump(), "config_overrides": merge_overrides(shop, changes)}
+            )
+            self._shops[shop_id] = updated
+            return updated.model_copy(deep=True)
+
     # ---- 政策
     def get_policies(self, shop_id: str) -> dict[str, PolicyEntry]:
         with self._lock:
@@ -62,6 +85,10 @@ class InMemoryKnowledgeRepository:
     def upsert_policy(self, entry: PolicyEntry) -> None:
         with self._lock:
             self._policies.setdefault(entry.shop_id, {})[entry.key] = entry.model_copy()
+
+    def delete_policy(self, shop_id: str, key: str) -> bool:
+        with self._lock:
+            return self._policies.get(shop_id, {}).pop(key, None) is not None
 
     # ---- 商品
     def get_item_card(self, shop_id: str, item_id: str) -> ItemCard | None:
@@ -78,9 +105,36 @@ class InMemoryKnowledgeRepository:
         with self._lock:
             self._items[(card.shop_id, card.item_id)] = card.model_copy(deep=True)
 
+    def update_item_card(
+        self, shop_id: str, item_id: str, changes: Mapping[str, Any]
+    ) -> ItemCard | None:
+        with self._lock:
+            card = self._items.get((shop_id, item_id))
+            if card is None:
+                return None
+            updated = card.patched(changes)
+            self._items[(shop_id, item_id)] = updated
+            return updated.model_copy(deep=True)
+
     # ---- FAQ
+    def _pending_duplicate(self, item: KnowledgeItem, *, exclude_id: int | None = None) -> bool:
+        """本店已有同样的等审核候选（问题、回答、商品、问题类型都相同）。调用方持有锁。
+        和 PostgreSQL 的部分唯一索引 knowledge_item_pending_candidate_uniq 同一个判断。"""
+        return any(
+            k.id != exclude_id
+            and k.status == KnowledgeStatus.CANDIDATE
+            and k.shop_id == item.shop_id
+            and k.question == item.question
+            and k.answer == item.answer
+            and k.item_id == item.item_id
+            and k.intent == item.intent
+            for k in self._knowledge.values()
+        )
+
     def add_knowledge(self, item: KnowledgeItem) -> KnowledgeItem:
         with self._lock:
+            if item.status == KnowledgeStatus.CANDIDATE and self._pending_duplicate(item):
+                raise ConcurrencyConflict("同样的候选知识已在等商家审核")
             new_id = next(self._ids)
             saved = item.model_copy(
                 deep=True,
@@ -154,6 +208,12 @@ class InMemoryKnowledgeRepository:
                     f"知识 {knowledge_id} 的状态已是 {item.status.value}，"
                     f"不是 {expected_status.value}"
                 )
+            if (
+                status == KnowledgeStatus.CANDIDATE
+                and item.status != KnowledgeStatus.CANDIDATE
+                and self._pending_duplicate(item, exclude_id=knowledge_id)
+            ):
+                raise ConcurrencyConflict(f"知识 {knowledge_id} 和等审核的候选知识重复")
             update: dict[str, object] = {"status": status}
             if approved_by is not None:
                 update["approved_by"] = approved_by
@@ -185,14 +245,59 @@ class InMemoryKnowledgeRepository:
             return n
 
 
-class InMemoryConversationRepository:
-    """实现 core.ports.ConversationRepository。"""
+MAX_RECALL_TOMBSTONES = 10_000
+"""内存实现每个店铺最多记的撤回墓碑数（超出时淘汰最早的），另有有效期 recall_ttl。"""
 
-    def __init__(self) -> None:
+
+class InMemoryConversationRepository:
+    """实现 core.ports.ConversationRepository。
+
+    撤回先于消息到达（§8.3）：本店没见过的 msg_id 被撤回时按 (店铺, 会话, msg_id) 记墓碑，
+    有效期 recall_ttl（按注入的时钟判断），每个店铺最多 max_recall_tombstones 条（超出淘汰最早的）；
+    消息到达时用掉墓碑（不保存、返回 False，msg_id 算见过）。和 PostgreSQL 实现同一套语义。
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Clock | None = None,
+        recall_ttl: timedelta = RECALL_TOMBSTONE_TTL,
+        max_recall_tombstones: int = MAX_RECALL_TOMBSTONES,
+    ) -> None:
+        if recall_ttl <= timedelta(0) or max_recall_tombstones < 1:
+            raise ValueError("recall_ttl 必须为正，max_recall_tombstones 必须 ≥ 1")
         self._lock = threading.Lock()
+        self._clock = clock or SystemClock()
+        self._recall_ttl = recall_ttl
+        self._max_tombstones = max_recall_tombstones
         self._conversations: dict[tuple[str, str], Conversation] = {}
         self._messages: dict[tuple[str, str], list[StoredMessage]] = {}
         self._msg_ids: set[tuple[str, str]] = set()
+        # 店铺 → (会话, msg_id) → 过期时间；按写入顺序（有效期相同，也就是按过期顺序）
+        self._tombstones: dict[str, OrderedDict[tuple[str, str], datetime]] = {}
+
+    def _remember_recall(self, shop_id: str, conversation_id: str, msg_id: str) -> None:
+        """记撤回墓碑（调用方持有锁）：先清掉本店过期的；同一条还在有效期内不重新计时。"""
+        now = self._clock.now()
+        marks = self._tombstones.setdefault(shop_id, OrderedDict())
+        for key in [k for k, expires in marks.items() if expires <= now]:
+            del marks[key]
+        key = (conversation_id, msg_id)
+        if key in marks:
+            return
+        marks[key] = now + self._recall_ttl
+        while len(marks) > self._max_tombstones:
+            marks.popitem(last=False)
+
+    def _take_recall(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
+        """用掉这条消息的墓碑（过期的也删掉）；还在有效期内返回 True。调用方持有锁。"""
+        marks = self._tombstones.get(shop_id)
+        if not marks:
+            return False
+        expires = marks.pop((conversation_id, msg_id), None)
+        if not marks:
+            del self._tombstones[shop_id]
+        return expires is not None and expires > self._clock.now()
 
     def _ensure_conversation(
         self, shop_id: str, conversation_id: str, buyer_ref: str, at: datetime
@@ -218,6 +323,8 @@ class InMemoryConversationRepository:
             self._ensure_conversation(
                 msg.shop_id, msg.conversation_id, msg.buyer_ref, msg.received_at
             )
+            if self._take_recall(msg.shop_id, msg.conversation_id, msg.msg_id):
+                return False  # 先被撤回过（§8.3 撤回先到）：不保存，msg_id 算见过
             self._append(
                 (msg.shop_id, msg.conversation_id),
                 StoredMessage(
@@ -249,8 +356,10 @@ class InMemoryConversationRepository:
                 return False
             key = (shop_id, conversation_id)
             if key not in self._conversations:
-                return False  # 没有买家消息的会话不接受客服消息
+                return False  # 没有买家消息的会话不接受客服消息（墓碑留着）
             self._msg_ids.add((shop_id, msg_id))
+            if self._take_recall(shop_id, conversation_id, msg_id):
+                return False  # 先被撤回过：不保存
             self._append(
                 key,
                 StoredMessage(
@@ -279,14 +388,14 @@ class InMemoryConversationRepository:
     def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
         # 撤回：消息整条删掉（原文不留），msg_id 留在 _msg_ids 里继续去重
         with self._lock:
-            msgs = self._messages.get((shop_id, conversation_id))
-            if not msgs:
-                return False
+            msgs = self._messages.get((shop_id, conversation_id), [])
             kept = [m for m in msgs if m.msg_id != msg_id]
-            if len(kept) == len(msgs):
-                return False
-            self._messages[(shop_id, conversation_id)] = kept
-            return True
+            if len(kept) != len(msgs):
+                self._messages[(shop_id, conversation_id)] = kept
+                return True
+            if (shop_id, msg_id) not in self._msg_ids:
+                self._remember_recall(shop_id, conversation_id, msg_id)  # 撤回先到（§8.3）
+            return False
 
     def purge_shop(self, shop_id: str) -> int:
         with self._lock:
@@ -295,6 +404,7 @@ class InMemoryConversationRepository:
                 n += 1 + len(self._messages.pop(key, []))
                 del self._conversations[key]
             self._msg_ids = {k for k in self._msg_ids if k[0] != shop_id}
+            n += len(self._tombstones.pop(shop_id, {}))
             return n
 
 
@@ -388,9 +498,17 @@ class InMemoryFeedbackRepository:
             out = [s for s in self._labels if s.shop_id == shop_id]
             return [s.model_copy() for s in sorted(out, key=lambda s: s.created_at)]
 
-    def export_training_labels(self) -> list[LabeledSample]:
+    def export_training_labels(
+        self, *, since: datetime | None = None, until: datetime | None = None
+    ) -> list[LabeledSample]:
         with self._lock:
-            return [s.model_copy() for s in sorted(self._labels, key=lambda s: s.created_at)]
+            out = [
+                s
+                for s in self._labels
+                if (since is None or s.created_at >= since)
+                and (until is None or s.created_at < until)
+            ]
+            return [s.model_copy() for s in sorted(out, key=lambda s: s.created_at)]
 
     def purge_shop(self, shop_id: str) -> int:
         with self._lock:
@@ -398,6 +516,93 @@ class InMemoryFeedbackRepository:
             self._gaps = [g for g in self._gaps if g.shop_id != shop_id]
             self._labels = [s for s in self._labels if s.shop_id != shop_id]
             return before - len(self._gaps) - len(self._labels)
+
+
+class InMemoryQualityReviewRepository:
+    """实现 core.ports.QualityReviewRepository（§13.5 每周人工复核样本）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reviews: dict[int, QualityReview] = {}
+        self._keys: dict[tuple[str, str, int], int] = {}  # (店铺, 周期, 推荐) → id
+        self._ids = itertools.count(1)
+
+    def add_many(self, reviews: Sequence[QualityReview]) -> list[QualityReview]:
+        for r in reviews:
+            if r.id is not None or r.status != QualityReviewStatus.PENDING:
+                raise ValueError("新抽中的复核样本必须是 pending、且没有 id")
+        out: list[QualityReview] = []
+        with self._lock:
+            for r in reviews:
+                key = (r.shop_id, r.period, r.suggestion_id)
+                existing = self._keys.get(key)
+                if existing is None:
+                    existing = self._keys[key] = next(self._ids)
+                    self._reviews[existing] = r.model_copy(deep=True, update={"id": existing})
+                out.append(self._reviews[existing].model_copy(deep=True))
+        return out
+
+    def get(self, shop_id: str, review_id: int) -> QualityReview | None:
+        with self._lock:
+            r = self._reviews.get(review_id)
+            if r is None or r.shop_id != shop_id:
+                return None
+            return r.model_copy(deep=True)
+
+    def list(
+        self,
+        shop_id: str,
+        *,
+        period: str | None = None,
+        status: QualityReviewStatus | None = None,
+    ) -> list[QualityReview]:
+        with self._lock:
+            out = [
+                r
+                for _, r in sorted(self._reviews.items())
+                if r.shop_id == shop_id
+                and (period is None or r.period == period)
+                and (status is None or r.status == status)
+            ]
+            return [r.model_copy(deep=True) for r in out]
+
+    def record(
+        self,
+        shop_id: str,
+        review_id: int,
+        *,
+        status: QualityReviewStatus,
+        scores: QualityScores | None,
+        reviewer: str,
+        note: str | None,
+        reviewed_at: datetime,
+    ) -> QualityReview:
+        if QualityReviewStatus(status) == QualityReviewStatus.PENDING:
+            raise ValueError("复核结果不能是 pending")
+        with self._lock:
+            cur = self._reviews.get(review_id)
+            if cur is None or cur.shop_id != shop_id:
+                raise KeyError(review_id)
+            updated = QualityReview.model_validate(
+                {
+                    **cur.model_dump(),
+                    "status": status,
+                    "scores": scores.model_dump() if scores is not None else None,
+                    "reviewer": reviewer,
+                    "note": note,
+                    "reviewed_at": reviewed_at,
+                }
+            )
+            self._reviews[review_id] = updated
+            return updated.model_copy(deep=True)
+
+    def purge_shop(self, shop_id: str) -> int:
+        with self._lock:
+            ids = [i for i, r in self._reviews.items() if r.shop_id == shop_id]
+            for i in ids:
+                del self._reviews[i]
+            self._keys = {k: v for k, v in self._keys.items() if k[0] != shop_id}
+            return len(ids)
 
 
 class InMemoryAfterSaleReviewRepository:

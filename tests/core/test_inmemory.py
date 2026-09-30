@@ -9,6 +9,7 @@ from rodit.inmemory import (
     InMemoryConversationRepository,
     InMemoryFeedbackRepository,
     InMemoryKnowledgeRepository,
+    InMemoryQualityReviewRepository,
     InMemoryShopAuthRepository,
     InMemorySuggestionRepository,
     cosine,
@@ -33,6 +34,10 @@ def test_feedback_repository_contract():
     contracts.check_feedback_repository(InMemoryFeedbackRepository)
 
 
+def test_quality_review_repository_contract():
+    contracts.check_quality_review_repository(InMemoryQualityReviewRepository)
+
+
 def test_aftersale_review_repository_contract():
     contracts.check_aftersale_review_repository(InMemoryAfterSaleReviewRepository)
 
@@ -50,6 +55,7 @@ def test_cross_shop_isolation():
             feedback=InMemoryFeedbackRepository(),
             reviews=InMemoryAfterSaleReviewRepository(),
             auth=InMemoryShopAuthRepository(),
+            quality_reviews=InMemoryQualityReviewRepository(),
         )
     )
 
@@ -78,3 +84,36 @@ def test_hashing_embedder_is_deterministic_and_normalized():
     assert abs(cosine(a, b) - 1.0) < 1e-9  # 标点不影响
     assert cosine(a, emb.embed_one("发啥快递")) > cosine(a, c)
     assert emb.embed_one("") == [0.0] * 128
+
+
+# ---------------------------------------------------------------- 撤回先于消息、候选去重、清理
+
+
+def test_recall_before_message_contract():
+    contracts.check_recall_before_message(lambda clock: InMemoryConversationRepository(clock=clock))
+
+
+def test_candidate_uniqueness_contract():
+    contracts.check_candidate_uniqueness(lambda: InMemoryKnowledgeRepository(FakeClock()))
+
+
+def test_purge_is_idempotent_contract():
+    contracts.check_purge_is_idempotent(
+        lambda: contracts.RepoSet(
+            knowledge=InMemoryKnowledgeRepository(FakeClock()),
+            conversations=InMemoryConversationRepository(),
+            suggestions=InMemorySuggestionRepository(),
+            feedback=InMemoryFeedbackRepository(),
+            reviews=InMemoryAfterSaleReviewRepository(),
+            auth=InMemoryShopAuthRepository(),
+            quality_reviews=InMemoryQualityReviewRepository(),
+        )
+    )
+
+
+def test_atomic_shop_and_card_updates_contract():
+    contracts.check_atomic_shop_and_card_updates(lambda: InMemoryKnowledgeRepository(FakeClock()))
+
+
+def test_policy_delete_contract():
+    contracts.check_policy_delete(lambda: InMemoryKnowledgeRepository(FakeClock()))

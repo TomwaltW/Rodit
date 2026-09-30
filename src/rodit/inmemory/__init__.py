@@ -11,6 +11,7 @@ from rodit.inmemory.repositories import (
     InMemoryConversationRepository,
     InMemoryFeedbackRepository,
     InMemoryKnowledgeRepository,
+    InMemoryQualityReviewRepository,
     InMemoryShopAuthRepository,
     InMemorySuggestionRepository,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "InMemoryConversationRepository",
     "InMemoryFeedbackRepository",
     "InMemoryKnowledgeRepository",
+    "InMemoryQualityReviewRepository",
     "InMemoryShopAuthRepository",
     "InMemorySuggestionRepository",
     "cosine",

@@ -220,7 +220,7 @@ class RoutingPolicy:
             pending_alerts = [ALERT_MULTI_UNSPLIT, *alerts]
 
         # 规则 6：置信度够 → 出推荐
-        if _ge(confidence, cfg.assist_threshold):
+        if _ge(confidence, cfg.assist_threshold_for(intent)):
             auto_threshold = cfg.auto_threshold.get(intent)
             eligible = (
                 auto

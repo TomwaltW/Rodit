@@ -11,6 +11,7 @@ check_cross_shop_isolation 是方案 §9.2 要求的"串店测试"：
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -23,6 +24,7 @@ from rodit.core.enums import (
     Intent,
     KnowledgeSource,
     KnowledgeStatus,
+    QualityReviewStatus,
     ReviewAdvice,
     ReviewState,
     Role,
@@ -36,18 +38,23 @@ from rodit.core.models import (
     KnowledgeItem,
     LabeledSample,
     PolicyEntry,
+    QualityReview,
+    QualityScores,
     ShopAuth,
+    Sku,
     SuggestionRecord,
 )
 from rodit.core.ports import (
+    RECALL_TOMBSTONE_TTL,
     AfterSaleReviewRepository,
     ConversationRepository,
     FeedbackRepository,
     KnowledgeRepository,
+    QualityReviewRepository,
     ShopAuthRepository,
     SuggestionRepository,
 )
-from rodit.testing.fakes import make_message
+from rodit.testing.fakes import FakeClock, make_message
 from rodit.testing.fixtures import (
     BUYER,
     SHOP_A,
@@ -175,6 +182,113 @@ def check_knowledge_repository(make: Callable[[], KnowledgeRepository]) -> None:
     assert repo.get_shop(SHOP_A) is not None
 
 
+def check_atomic_shop_and_card_updates(make: Callable[[], KnowledgeRepository]) -> None:
+    """update_shop_config / update_item_card：部分修改、校验失败不写、不新建，并发改不同的键
+    （商家改配置和复核人员切换影子模式、商家改尺码建议和商品同步改标题）两边都留下。"""
+    repo = make()
+    seed_knowledge(repo, build_demo_world())
+    before = repo.get_shop(SHOP_A)
+    assert before is not None
+    shop = repo.update_shop_config(SHOP_A, {"tone": "专业", "suggestion_count": 3})
+    assert shop is not None and shop.config_overrides["tone"] == "专业"
+    assert repo.get_shop(SHOP_A) == shop
+    shop = repo.update_shop_config(SHOP_A, {"tone": None})  # None：删掉覆盖项，回到默认
+    assert "tone" not in shop.config_overrides and shop.config_overrides["suggestion_count"] == 3
+    for bad in ({"no_such_key": 1}, {"suggestion_count": 9}):
+        try:
+            repo.update_shop_config(SHOP_A, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非法的配置修改应抛 ValueError：{bad}")
+    assert repo.get_shop(SHOP_A) == shop
+    assert repo.update_shop_config("s_9999", {"tone": "专业"}) is None
+    assert repo.get_shop("s_9999") is None
+    assert repo.get_shop(SHOP_B) == repo.get_shop(SHOP_B)  # 别的店铺不受影响
+    assert "suggestion_count" not in (repo.get_shop(SHOP_B) or before).config_overrides
+
+    card = repo.update_item_card(
+        SHOP_A, "i_555", {"size_advice": "正常码", "updated_at": NOW + timedelta(hours=1)}
+    )
+    assert card is not None and card.size_advice == "正常码"
+    assert card.title == "法式碎花连衣裙" and card.updated_at == NOW + timedelta(hours=1)
+    assert repo.get_item_card(SHOP_A, "i_555") == card
+    assert repo.get_item_card(SHOP_B, "i_555").size_advice == "B 店专用尺码建议：正常码"
+    for bad in ({"no_such_field": 1}, {"shop_id": SHOP_B}, {"skus": "x"}, {"care": "不是列表"}):
+        try:
+            repo.update_item_card(SHOP_A, "i_555", bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非法的卡片修改应抛 ValueError：{bad}")
+    assert repo.get_item_card(SHOP_A, "i_555") == card
+    assert repo.update_item_card(SHOP_A, "i_nope", {"size_advice": "x"}) is None
+    assert repo.get_item_card(SHOP_A, "i_nope") is None
+
+    # 并发改不同的键：每个线程只改自己的键，最后全都在
+    shop_changes = [
+        {"tone": "简洁"},
+        {"salutation": "您"},
+        {"max_answer_chars": 200},
+        {"banned_words": ["最便宜"]},
+        {"shadow_mode": True},
+        {"display_name": "测试店"},
+    ]
+    card_changes = [
+        {"size_advice": "偏小一码"},
+        {"title": "法式碎花连衣裙（同步后）"},
+        {"care": ["冷水手洗"]},
+        {"forbidden_claims": ["抗皱"]},
+        {"usage": ["先试穿"]},
+        {"detail_text": "同步来的详情"},
+    ]
+    barrier = threading.Barrier(len(shop_changes) + len(card_changes))
+    errors: list[BaseException] = []
+
+    def run(fn: Callable[[], object]) -> None:
+        try:
+            barrier.wait(timeout=10)
+            fn()
+        except BaseException as e:  # noqa: BLE001 — 线程里的异常带回主线程断言
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=run, args=(lambda c=c: repo.update_shop_config(SHOP_A, c),))
+        for c in shop_changes
+    ] + [
+        threading.Thread(target=run, args=(lambda c=c: repo.update_item_card(SHOP_A, "i_555", c),))
+        for c in card_changes
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == [], errors
+    overrides = repo.get_shop(SHOP_A).config_overrides
+    for change in shop_changes:
+        for key, value in change.items():
+            assert overrides[key] == value, (key, overrides)
+    final = repo.get_item_card(SHOP_A, "i_555")
+    for change in card_changes:
+        for key, value in change.items():
+            assert getattr(final, key) == value, (key, final)
+
+
+def check_policy_delete(make: Callable[[], KnowledgeRepository]) -> None:
+    """delete_policy：只删这家店铺的这一项，重复删返回 False，别的店铺同名政策不动。"""
+    repo = make()
+    world = build_demo_world()
+    seed_knowledge(repo, world)
+    key = next(iter(repo.get_policies(SHOP_A)))
+    b_before = repo.get_policies(SHOP_B)
+    assert key in b_before, "合成数据里两家店铺要有同名政策"
+    assert repo.delete_policy(SHOP_A, key) is True
+    assert key not in repo.get_policies(SHOP_A)
+    assert repo.delete_policy(SHOP_A, key) is False
+    assert repo.delete_policy(SHOP_A, "no_such_policy") is False
+    assert repo.get_policies(SHOP_B) == b_before
+
+
 def check_knowledge_status_compare_and_set(make: Callable[[], KnowledgeRepository]) -> None:
     """set_knowledge_status 的 expected_status：当前状态不等于它就抛 ConcurrencyConflict、不写入。
 
@@ -237,6 +351,69 @@ def check_knowledge_status_compare_and_set(make: Callable[[], KnowledgeRepositor
     assert (
         repo.set_knowledge_status(SHOP_A, other.id, KnowledgeStatus.RETIRED).status
         == KnowledgeStatus.RETIRED
+    )
+
+
+def check_candidate_uniqueness(make: Callable[[], KnowledgeRepository]) -> None:
+    """等商家审核的候选知识不重复（§5.8）：同一店铺、同样的问题和回答、同一商品、同一问题类型的
+    CANDIDATE 只能有一条。多个实例同时把同一条编辑回复变成候选时由存储保证（PostgreSQL 部分唯一
+    索引，内存实现在同一把锁里检查）：后到的 add_knowledge 抛 ConcurrencyConflict、不写入。"""
+    repo = make()
+
+    def candidate(**kw: object) -> KnowledgeItem:
+        base: dict[str, object] = {
+            "shop_id": SHOP_A,
+            "question": "能改地址吗",
+            "answer": "亲，发货前可以改哦~",
+            "source": KnowledgeSource.ADOPTED,
+            "status": KnowledgeStatus.CANDIDATE,
+            "item_id": "i_555",
+            "intent": Intent.MODIFY_ORDER,
+            "created_at": NOW,
+        }
+        base.update(kw)
+        return KnowledgeItem.model_validate(base)
+
+    def conflicts(item: KnowledgeItem) -> bool:
+        try:
+            repo.add_knowledge(item)
+        except ConcurrencyConflict:
+            return True
+        return False
+
+    first = repo.add_knowledge(candidate())
+    assert conflicts(candidate())  # 同样的候选已在等审核
+    assert [k.id for k in repo.list_knowledge(SHOP_A, status=KnowledgeStatus.CANDIDATE)] == [
+        first.id
+    ]
+    # 任何一项不同都是另一条候选
+    for other in (
+        candidate(answer="亲，发货前可以改的"),
+        candidate(question="地址能改吗"),
+        candidate(item_id="i_777"),
+        candidate(item_id=None),
+        candidate(intent=Intent.SHIPPING_POLICY),
+        candidate(intent=None),
+        candidate(shop_id=SHOP_B),
+    ):
+        assert not conflicts(other), other
+    assert conflicts(candidate(item_id=None))  # 没有商品、没有类型的也按"相同"去重
+    assert conflicts(candidate(intent=None))
+    # 只管等审核的：已通过 / 已下线的同样内容不挡新候选，商家自己录的同样 FAQ 也不挡
+    repo.set_knowledge_status(SHOP_A, first.id, KnowledgeStatus.APPROVED, approved_by="merchant")
+    second = repo.add_knowledge(candidate())
+    assert not conflicts(candidate(status=KnowledgeStatus.APPROVED))
+    # 改回候选时撞上等审核的同样内容：比较后更新不写入
+    try:
+        repo.set_knowledge_status(SHOP_A, first.id, KnowledgeStatus.CANDIDATE)
+    except ConcurrencyConflict:
+        pass
+    else:
+        raise AssertionError("改回候选会和等审核的同样候选重复，应抛 ConcurrencyConflict")
+    assert repo.get_knowledge(SHOP_A, first.id).status == KnowledgeStatus.APPROVED
+    repo.set_knowledge_status(SHOP_A, second.id, KnowledgeStatus.RETIRED)
+    assert repo.set_knowledge_status(SHOP_A, first.id, KnowledgeStatus.CANDIDATE).status == (
+        KnowledgeStatus.CANDIDATE
     )
 
 
@@ -328,6 +505,70 @@ def check_conversation_recall(make: Callable[[], ConversationRepository]) -> Non
     assert repo.recent_messages(SHOP_A, conv) == []
 
 
+def check_recall_before_message(make: Callable[[FakeClock], ConversationRepository]) -> None:
+    """撤回先于被撤回的消息到达（§8.3 平台推送乱序、§5.3 撤回的消息不再进上下文）。
+
+    本店没见过的 msg_id 被撤回时记一条墓碑（按店铺 + 会话），recall_message 仍返回 False；
+    墓碑有效期（RECALL_TOMBSTONE_TTL）内这条消息到达时丢弃：不保存、add_message / add_outgoing
+    返回 False（引擎当作重复消息，不回答），之后按撤回过的消息去重。过期的墓碑不再生效；
+    取消订购时和会话一起删除。make 用传入的时钟判断过期。
+    """
+    clock = FakeClock(NOW)
+    repo = make(clock)
+    world = build_demo_world()
+    conv = "conv_early_recall"
+
+    def buyer(msg_id: str, text: str = "在吗", **kw: object) -> object:
+        kw.setdefault("conversation_id", conv)
+        kw.setdefault("at", clock.now())
+        return make_message(text, world=world, msg_id=msg_id, **kw)  # type: ignore[arg-type]
+
+    assert repo.recall_message(SHOP_A, conv, "m_e1") is False  # 没有消息被撤回
+    assert repo.recall_message(SHOP_A, conv, "m_e1") is False  # 平台重推的撤回：幂等
+    early = buyer("m_e1", "我的手机号13812345678，这件有M码吗")
+    assert repo.add_message(early) is False  # 到达时丢弃：不保存、不回答
+    assert repo.recent_messages(SHOP_A, conv) == []
+    assert repo.get_conversation(SHOP_A, conv) is not None  # 会话照常建立
+    assert repo.add_message(early) is False  # 平台重推：仍然去重
+    clock.advance(seconds=5)
+    assert repo.add_message(buyer("m_e2", "那黑色的吧")) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, conv)] == ["m_e2"]
+
+    # 客服 / 机器人发出的消息也可能先收到撤回
+    assert repo.recall_message(SHOP_A, conv, "out_e1") is False
+    for _ in range(2):  # 第二次是平台重推
+        assert not repo.add_outgoing(
+            shop_id=SHOP_A,
+            conversation_id=conv,
+            msg_id="out_e1",
+            role=Role.AGENT,
+            text="有的亲",
+            at=clock.now(),
+        )
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, conv)] == ["m_e2"]
+
+    # 按店铺 + 会话：别的会话、别的店铺同样的 msg_id 照常保存
+    assert repo.recall_message(SHOP_A, conv, "m_e3") is False
+    assert repo.add_message(buyer("m_e3", conversation_id="conv_early_other")) is True
+    assert repo.add_message(buyer("m_e3", shop_id=SHOP_B)) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_B, conv)] == ["m_e3"]
+    # 本店已经见过的 msg_id（在别的会话里）：不记墓碑，也不影响那条消息
+    assert repo.recall_message(SHOP_A, "conv_early_third", "m_e3") is False
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, "conv_early_other")] == ["m_e3"]
+
+    # 墓碑过期后到达的消息照常保存
+    assert repo.recall_message(SHOP_A, conv, "m_e4") is False
+    clock.advance(seconds=RECALL_TOMBSTONE_TTL.total_seconds() + 1)
+    assert repo.add_message(buyer("m_e4", "什么时候发货")) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_A, conv)] == ["m_e2", "m_e4"]
+
+    # 取消订购：墓碑一起删掉（之后同一个 msg_id 是新消息）
+    assert repo.recall_message(SHOP_A, conv, "m_e5") is False
+    assert repo.purge_shop(SHOP_A) > 0
+    assert repo.add_message(buyer("m_e5")) is True
+    assert [m.msg_id for m in repo.recent_messages(SHOP_B, conv)] == ["m_e3"]
+
+
 # ---------------------------------------------------------------- 推荐
 
 
@@ -339,6 +580,8 @@ def _suggestion(shop_id: str, conv: str, *, minutes: float, text: str = "推荐"
         question_text="发什么快递",
         item_id="i_555",
         intent=Intent.SHIPPING_POLICY,
+        intent_confidence=0.875,
+        route_rule=6,
         text=text,
         kind=DraftKind.FAQ,
         evidence_ids=["faq:1"],
@@ -358,6 +601,13 @@ def check_suggestion_repository(make: Callable[[], SuggestionRepository]) -> Non
     b1 = repo.add(_suggestion(SHOP_B, "c1", minutes=1, text="b1"))
     assert len({a1.id, a2.id, a3.id, b1.id}) == 4 and a1.id != 77
     assert repo.get(SHOP_A, a1.id) == a1
+    assert a1.intent_confidence == 0.875  # §13.5 重算阈值用的置信度、路由规则原样存取
+    assert a1.route_rule == 6
+    old = _suggestion(SHOP_B, "c9", minutes=9, text="旧")
+    no_conf = repo.add(old.model_copy(update={"intent_confidence": None}))
+    assert repo.get(SHOP_B, no_conf.id).intent_confidence is None
+    repo.purge_shop(SHOP_B)
+    b1 = repo.add(_suggestion(SHOP_B, "c1", minutes=1, text="b1"))
     assert repo.get(SHOP_B, a1.id) is None
     assert [r.text for r in repo.list(SHOP_A)] == ["a1", "a3", "a2"]  # created_at 升序
     assert [r.text for r in repo.list(SHOP_A, conversation_id="c1")] == ["a1", "a2"]
@@ -423,19 +673,135 @@ def check_feedback_repository(make: Callable[[], FeedbackRepository]) -> None:
             shop_id=SHOP_A,
             text="发啥快递",
             predicted_intent=Intent.OTHER,
+            predicted_confidence=0.625,
+            route_rule=6,
             true_intent=Intent.SHIPPING_POLICY,
             source="feedback_reject",
             created_at=NOW,
         )
     )
     repo.add_label(
+        LabeledSample(
+            shop_id=SHOP_A,
+            text="这件起球吗",
+            predicted_intent=Intent.PRODUCT_SPEC,
+            true_intent=Intent.PRODUCT_SPEC,
+            source="feedback_edit",
+            created_at=NOW - timedelta(days=40),
+        )
+    )
+    repo.add_label(
         LabeledSample(shop_id=SHOP_B, text="在吗", true_intent=Intent.GREETING, created_at=NOW)
     )
-    assert [s.text for s in repo.list_labels(SHOP_A)] == ["发啥快递"]
-    assert {s.shop_id for s in repo.export_training_labels()} == {SHOP_A, SHOP_B}
+    assert [s.text for s in repo.list_labels(SHOP_A)] == ["这件起球吗", "发啥快递"]
+    assert repo.list_labels(SHOP_A)[1].predicted_confidence == 0.625
+    assert repo.list_labels(SHOP_A)[1].route_rule == 6
+    assert repo.list_labels(SHOP_A)[0].source == "feedback_edit"
+    assert [s.text for s in repo.export_training_labels()] == ["这件起球吗", "发啥快递", "在吗"]
+    # 按时间窗口导出（§13.5 每月重算）：since ≤ created_at < until
+    recent = repo.export_training_labels(since=NOW - timedelta(days=30))
+    exported = {s.shop_id: s for s in recent}
+    assert set(exported) == {SHOP_A, SHOP_B} and len(recent) == 2
+    assert exported[SHOP_A].predicted_confidence == 0.625
+    assert exported[SHOP_B].predicted_confidence is None
+    assert [s.text for s in repo.export_training_labels(until=NOW)] == ["这件起球吗"]
+    assert repo.export_training_labels(since=NOW, until=NOW) == []
     assert repo.purge_shop(SHOP_B) == 2
     assert repo.list_gaps(SHOP_B) == [] and repo.list_labels(SHOP_B) == []
     assert len(repo.list_gaps(SHOP_A)) == 2
+
+
+# ---------------------------------------------------------------- 每周人工复核（§13.5）
+
+
+def _quality(shop_id: str, suggestion_id: int, *, period: str = "2026-W40") -> QualityReview:
+    return QualityReview(
+        shop_id=shop_id,
+        period=period,
+        suggestion_id=suggestion_id,
+        intent=Intent.SHIPPING_POLICY,
+        sampled_at=NOW,
+    )
+
+
+def check_quality_review_repository(make: Callable[[], QualityReviewRepository]) -> None:
+    repo = make()
+    a1, a2, b1 = repo.add_many([_quality(SHOP_A, 11), _quality(SHOP_A, 12), _quality(SHOP_B, 11)])
+    assert len({a1.id, a2.id, b1.id}) == 3 and a1.status == QualityReviewStatus.PENDING
+    assert repo.get(SHOP_A, a1.id) == a1 and repo.get(SHOP_B, a1.id) is None
+    # 幂等：同一店铺、周期、推荐不重复写，返回已有的那条；新周期是新样本
+    again, other_week = repo.add_many(
+        [_quality(SHOP_A, 11), _quality(SHOP_A, 11, period="2026-W41")]
+    )
+    assert again == a1 and other_week.id not in {a1.id, a2.id, b1.id}
+    assert [r.id for r in repo.list(SHOP_A, period="2026-W40")] == [a1.id, a2.id]
+    assert len(repo.list(SHOP_A)) == 3
+    for bad in (_quality(SHOP_A, 13).model_copy(update={"id": 5}),):
+        try:
+            repo.add_many([bad])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("带 id 的样本不能当新样本写入")
+    scores = QualityScores(factual=2, relevance=2, compliance=2, expression=1)
+    done = repo.record(
+        SHOP_A,
+        a1.id,
+        status=QualityReviewStatus.SCORED,
+        scores=scores,
+        reviewer="qa_01",
+        note="语气可以更自然",
+        reviewed_at=NOW + timedelta(hours=1),
+    )
+    assert done.status == QualityReviewStatus.SCORED and done.scores == scores
+    assert repo.get(SHOP_A, a1.id) == done
+    assert repo.get(SHOP_A, a1.id).reviewed_at == NOW + timedelta(hours=1)
+    # 已复核的再抽中也不会被重置成 pending
+    assert repo.add_many([_quality(SHOP_A, 11)])[0].status == QualityReviewStatus.SCORED
+    # 改判：后一次覆盖
+    skipped = repo.record(
+        SHOP_A,
+        a1.id,
+        status=QualityReviewStatus.SKIPPED,
+        scores=None,
+        reviewer="qa_02",
+        note=None,
+        reviewed_at=NOW + timedelta(hours=2),
+    )
+    assert skipped.status == QualityReviewStatus.SKIPPED and skipped.scores is None
+    assert skipped.reviewer == "qa_02"
+    assert [r.id for r in repo.list(SHOP_A, status=QualityReviewStatus.PENDING)] == [
+        a2.id,
+        other_week.id,
+    ]
+    for kwargs in (
+        {"status": QualityReviewStatus.SCORED, "scores": None},  # scored 必须有分数
+        {"status": QualityReviewStatus.PENDING, "scores": None},  # 不能改回 pending
+    ):
+        try:
+            repo.record(SHOP_A, a2.id, reviewer="qa_01", note=None, reviewed_at=NOW, **kwargs)  # type: ignore[arg-type]
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非法的复核结果应抛 ValueError：{kwargs}")
+    assert repo.get(SHOP_A, a2.id).status == QualityReviewStatus.PENDING
+    try:  # 别的店铺的样本：当作不存在
+        repo.record(
+            SHOP_A,
+            b1.id,
+            status=QualityReviewStatus.SKIPPED,
+            scores=None,
+            reviewer="qa_01",
+            note=None,
+            reviewed_at=NOW,
+        )
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("用别的店铺身份复核应抛 KeyError")
+    assert repo.get(SHOP_B, b1.id).status == QualityReviewStatus.PENDING
+    assert repo.purge_shop(SHOP_B) == 1 and repo.list(SHOP_B) == []
+    assert repo.purge_shop(SHOP_B) == 0 and len(repo.list(SHOP_A)) == 3
 
 
 # ---------------------------------------------------------------- 售后审核
@@ -562,6 +928,7 @@ class RepoSet:
     feedback: FeedbackRepository
     reviews: AfterSaleReviewRepository
     auth: ShopAuthRepository
+    quality_reviews: QualityReviewRepository
 
 
 def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
@@ -596,6 +963,7 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
             expires_at=NOW + timedelta(days=1),
         )
     )
+    (b_quality,) = repos.quality_reviews.add_many([_quality(SHOP_B, b_sug.id or 1)])
 
     k = repos.knowledge
     assert k.get_knowledge(SHOP_A, b_faq) is None
@@ -612,9 +980,92 @@ def check_cross_shop_isolation(make: Callable[[], RepoSet]) -> None:
     assert repos.reviews.get(SHOP_A, "as_9001") is None
     assert repos.reviews.list_by_state(SHOP_A) == []
     assert repos.auth.get(SHOP_A) is None
+    assert repos.quality_reviews.get(SHOP_A, b_quality.id) is None
+    assert repos.quality_reviews.list(SHOP_A) == []
     # B 自己读得到（证明数据确实写进去了）
     assert repos.suggestions.get(SHOP_B, b_sug.id) is not None
     assert repos.reviews.get(SHOP_B, "as_9001") is not None
+    assert repos.quality_reviews.get(SHOP_B, b_quality.id) is not None
+
+
+# ---------------------------------------------------------------- 取消订购后的清理（§8.4）
+
+
+def check_purge_is_idempotent(make: Callable[[], RepoSet]) -> None:
+    """purge_shop 删掉这家店铺的全部数据、返回删除条数，别的店铺一行不动；再调一次返回 0
+    （AuthGuard.revoke 中途失败时可以重试）。两种实现对同样的数据返回同样的条数。"""
+    repos = make()
+    world = build_demo_world()
+    seed_knowledge(repos.knowledge, world)
+    for shop in (SHOP_A, SHOP_B):
+        for i in (1, 2):
+            repos.conversations.add_message(
+                make_message(
+                    "在吗",
+                    world=world,
+                    shop_id=shop,
+                    msg_id=f"m_p{i}",
+                    conversation_id="conv_purge",
+                    at=NOW + timedelta(seconds=i),
+                )
+            )
+        repos.conversations.recall_message(shop, "conv_purge", "m_p_later")  # 撤回墓碑
+        for minutes in (1, 2):
+            repos.suggestions.add(_suggestion(shop, "conv_purge", minutes=minutes))
+        repos.feedback.add_gap(KnowledgeGap(shop_id=shop, missing="policy:gift", created_at=NOW))
+        repos.feedback.add_label(LabeledSample(shop_id=shop, text="在吗", created_at=NOW))
+        repos.reviews.save(
+            AfterSaleReview(
+                shop_id=shop,
+                aftersale_id="as_purge",
+                platform_status=AfterSaleStatus.PENDING_REVIEW,
+                state=ReviewState.NEW,
+            ),
+            expected_version=None,
+        )
+        repos.quality_reviews.add_many([_quality(shop, 1), _quality(shop, 2)])
+    k = repos.knowledge
+    knowledge_rows = (
+        1
+        + len(k.get_policies(SHOP_A))
+        + len(k.list_item_cards(SHOP_A))
+        + len(k.list_knowledge(SHOP_A, status=None))
+    )
+    purgers = {
+        "knowledge": (repos.knowledge, knowledge_rows),
+        "conversations": (repos.conversations, 4),  # 2 条消息 + 会话 + 撤回墓碑
+        "suggestions": (repos.suggestions, 2),
+        "feedback": (repos.feedback, 2),
+        "reviews": (repos.reviews, 1),
+        "quality_reviews": (repos.quality_reviews, 2),
+    }
+    for name, (repo, expected) in purgers.items():
+        assert repo.purge_shop(SHOP_A) == expected, name  # type: ignore[attr-defined]
+    for name, (repo, _) in purgers.items():
+        assert repo.purge_shop(SHOP_A) == 0, name  # type: ignore[attr-defined]
+    assert k.get_shop(SHOP_A) is None and k.list_knowledge(SHOP_A, status=None) == []
+    assert repos.conversations.recent_messages(SHOP_A, "conv_purge") == []
+    assert repos.suggestions.list(SHOP_A) == [] and repos.reviews.get(SHOP_A, "as_purge") is None
+    assert repos.feedback.list_gaps(SHOP_A) == [] and repos.feedback.list_labels(SHOP_A) == []
+    # 别的店铺不受影响（墓碑也还在：B 的 m_p_later 到达时照样丢弃）
+    assert k.get_shop(SHOP_B) is not None
+    assert len(repos.conversations.recent_messages(SHOP_B, "conv_purge")) == 2
+    assert (
+        repos.conversations.add_message(
+            make_message(
+                "在吗",
+                world=world,
+                shop_id=SHOP_B,
+                msg_id="m_p_later",
+                conversation_id="conv_purge",
+            )
+        )
+        is False
+    )
+    assert len(repos.suggestions.list(SHOP_B)) == 2 and repos.reviews.get(SHOP_B, "as_purge")
+    assert len(repos.feedback.list_gaps(SHOP_B)) == 1
+    assert repos.quality_reviews.list(SHOP_A) == []
+    assert len(repos.quality_reviews.list(SHOP_B)) == 2
 
 
 # ---------------------------------------------------------------- 文本清洗（NUL 等控制字符）
@@ -722,3 +1173,36 @@ def check_text_sanitation(make: Callable[[], RepoSet]) -> None:
     assert got_review is not None and got_review == saved
     assert got_review.reason == "买家说没收到"
     assert got_review.action_result == {"note": "已处理", "steps": ["ab"]}
+
+    (quality,) = repos.quality_reviews.add_many([_quality(SHOP_A, rec.id or 1)])
+    scored = repos.quality_reviews.record(
+        SHOP_A,
+        quality.id or 0,
+        status=QualityReviewStatus.SKIPPED,
+        scores=None,
+        reviewer="qa_01",
+        note=DIRTY_TEXT,
+        reviewed_at=NOW,
+    )
+    assert scored.note == CLEAN_TEXT
+    got_quality = repos.quality_reviews.get(SHOP_A, quality.id or 0)
+    assert got_quality is not None and got_quality.note == CLEAN_TEXT
+
+    # 商品卡片（商品同步写进来的平台字段：类目、SKU 规格、尺码表）
+    dirty_card = ItemCard(
+        shop_id=SHOP_A,
+        platform=world.items[0].platform,
+        item_id="i_nul",
+        title=DIRTY_TEXT,
+        category="女装\x00/连衣裙",
+        skus=[Sku(sku_id="k\x001", 颜色="黑\x00色")],
+        size_chart=[{"尺码": "M\x00", "胸围cm": 88}],
+        detail_text=DIRTY_TEXT,
+        updated_at=NOW,
+    )
+    repos.knowledge.upsert_item_card(dirty_card)
+    got_card = repos.knowledge.get_item_card(SHOP_A, "i_nul")
+    assert got_card is not None and got_card == dirty_card
+    assert got_card.title == CLEAN_TEXT and got_card.category == "女装/连衣裙"
+    assert got_card.skus[0].sku_id == "k1" and got_card.skus[0].props() == {"颜色": "黑色"}
+    assert got_card.size_chart == [{"尺码": "M", "胸围cm": 88}]

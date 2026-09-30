@@ -11,6 +11,9 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
+from api_routes import CORE_ROUTES, Route
+from api_routes_console import ROUTES as CONSOLE_ROUTES
+from api_routes_rollout import ROUTES as ROLLOUT_ROUTES
 from starlette.exceptions import StarletteDeprecationWarning
 
 from rodit.api import Principal, StaticTokenAuthenticator, create_app
@@ -37,6 +40,8 @@ CALLERS: dict[str, Principal] = {
     "manager_b": Principal(shop_id=SHOP_B, user_id="kf_b_mgr", role="manager"),
     "merchant_b": Principal(shop_id=SHOP_B, user_id="owner_b", role="merchant"),
     "integration_b": Principal(shop_id=SHOP_B, user_id="tb_push_b", role="integration"),
+    "reviewer_a": Principal(shop_id=SHOP_A, user_id="qa_reviewer_01", role="reviewer"),
+    "reviewer_b": Principal(shop_id=SHOP_B, user_id="qa_reviewer_02", role="reviewer"),
     "agent_c": Principal(shop_id=SHOP_C, user_id="kf_c01", role="agent"),
     "agent_d": Principal(shop_id=SHOP_D, user_id="kf_d01", role="agent"),
     "integration_d": Principal(shop_id=SHOP_D, user_id="dy_push_d", role="integration"),
@@ -45,7 +50,8 @@ CALLERS: dict[str, Principal] = {
 TOKENS: dict[str, str] = {name: f"test-token-{name}-0123456789abcdef" for name in CALLERS}
 """合成的开发令牌（只在测试进程里有效）。"""
 
-SHOP_B_CALLERS = ("agent_b", "manager_b", "merchant_b", "integration_b")
+SHOP_B_CALLERS = ("agent_b", "manager_b", "merchant_b", "integration_b", "reviewer_b")
+SHOP_A_CALLERS = ("agent_a", "manager_a", "merchant_a", "integration_a", "reviewer_a")
 
 
 def auth(name: str) -> dict[str, str]:
@@ -81,49 +87,7 @@ def build_api(platform: Platform = Platform.TAOBAO, *, raise_server_exceptions: 
     return Api(TestClient(app, raise_server_exceptions=raise_server_exceptions), service)
 
 
-@dataclass(frozen=True)
-class Route:
-    """一个店铺范围的路由。path 里的 {shop} 换成要访问的店铺。"""
-
-    method: str
-    path: str
-    body: Any = None
-    roles: frozenset[str] = frozenset({"agent", "manager", "merchant"})
-
-    def url(self, shop: str) -> str:
-        return self.path.format(shop=shop)
-
-    @property
-    def name(self) -> str:
-        return f"{self.method} {self.path}"
-
-
-_HUMAN = frozenset({"agent", "manager", "merchant"})
-_CONSOLE = frozenset({"manager", "merchant"})
-_MERCHANT = frozenset({"merchant"})
-
-SHOP_ROUTES: tuple[Route, ...] = (
-    Route("POST", "/v1/shops/{shop}/standalone/ask", {"session_id": "w", "question": "能开发票吗"}),
-    Route("POST", "/v1/shops/{shop}/suggestions/1/sent"),
-    Route("POST", "/v1/shops/{shop}/suggestions/1/edited", {"edited_text": "亲，可以开的哦"}),
-    Route("POST", "/v1/shops/{shop}/suggestions/1/rejected", {"reason": "other"}),
-    Route("GET", "/v1/shops/{shop}/knowledge/candidates", roles=_MERCHANT),
-    Route("POST", "/v1/shops/{shop}/knowledge/candidates/1/approve", roles=_MERCHANT),
-    Route("POST", "/v1/shops/{shop}/knowledge/1/retire", roles=_MERCHANT),
-    Route("GET", "/v1/shops/{shop}/knowledge/gaps", roles=_CONSOLE),
-    Route("POST", "/v1/shops/{shop}/questionnaire", {"answers": {"7": "不开发票"}}, _MERCHANT),
-    Route("GET", "/v1/shops/{shop}/reports/adoption", roles=_CONSOLE),
-    Route("GET", "/v1/shops/{shop}/reports/qa", roles=_CONSOLE),
-    Route("POST", "/v1/shops/{shop}/aftersales/as_2001/review"),
-    Route("POST", "/v1/shops/{shop}/aftersales/as_2001/negotiate", {"note": "先协商"}),
-    Route("POST", "/v1/shops/{shop}/aftersales/as_2001/negotiation-done", {"outcome": "谈妥"}),
-    Route(
-        "POST",
-        "/v1/shops/{shop}/aftersales/as_2001/confirm",
-        {"action": "agree_refund", "expected_status_version": "1"},
-    ),
-    Route("POST", "/v1/shops/{shop}/revoke", roles=_MERCHANT),
-)
+SHOP_ROUTES: tuple[Route, ...] = CORE_ROUTES + CONSOLE_ROUTES + ROLLOUT_ROUTES
 """全部店铺范围的路由（§9.2 串店测试要覆盖每一个）。"""
 
 EVENTS_PATH = "/v1/platform/B/events"
@@ -146,6 +110,8 @@ def shop_snapshot(api: Api, shop_id: str, conversations: tuple[str, ...] = ()) -
         "reviews": [
             (r.aftersale_id, r.state, r.version) for r in repos.reviews.list_by_state(shop_id)
         ],
+        "items": [(c.item_id, c.updated_at) for c in repos.knowledge.list_item_cards(shop_id)],
+        "quality": [(q.id, q.status, q.reviewer) for q in repos.quality_reviews.list(shop_id)],
         "audit": len(repos.audit.list_events(shop_id)),
         "gaps": len(repos.feedback.list_gaps(shop_id)),
         "actions": [c for c in (api.unit.action_port.calls if api.unit.action_port else [])],

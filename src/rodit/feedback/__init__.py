@@ -1,6 +1,7 @@
-"""反馈学习闭环（方案 §5.8、§12.4）：采纳记录、候选知识、缺失提醒、标注集、采纳率报表。
+"""反馈学习闭环（方案 §5.8、§12.4）：采纳记录、候选知识、缺失提醒、标注集、采纳率报表；
+上线节奏（§13.4 影子对比、阶段门槛）与每周人工复核（§13.5 抽样、按 §13.2 打分、复核报表）。
 
-负责：T5。只依赖 rodit.core。
+负责：T5；review.py、rollout.py 归 R。只依赖 rodit.core。
 """
 
 from rodit.feedback.metrics import (
@@ -36,6 +37,40 @@ from rodit.feedback.metrics import (
     qa_report,
     shadow_report,
 )
+from rodit.feedback.review import (
+    DEFAULT_MIN_SCORED,
+    DEFAULT_SAMPLE_SIZE,
+    LAUNCH_MIN_FULL_RATE,
+    MAX_SAMPLE_SIZE,
+    SAMPLE_STATUSES,
+    DimensionStats,
+    GateStatus,
+    LaunchGate,
+    QualityIntentStats,
+    QualityReport,
+    ReviewedSuggestion,
+    ReviewItem,
+    SampleResult,
+    iso_period,
+    launch_gate,
+    period_range,
+    plan_sample,
+    previous_period,
+    quality_report,
+    review_item,
+)
+from rodit.feedback.rollout import (
+    RolloutAdvice,
+    RolloutStage,
+    RolloutStatus,
+    ShadowSummary,
+    UncheckedCondition,
+    WeeklyAdoption,
+    rollout_status,
+    shadow_comparison,
+    shadow_gate,
+    stage_of,
+)
 from rodit.feedback.service import (
     KNOWLEDGE_RETIRED,
     SKIP_DUPLICATE,
@@ -47,8 +82,12 @@ from rodit.feedback.service import (
 )
 
 __all__ = [
+    "DEFAULT_MIN_SCORED",
+    "DEFAULT_SAMPLE_SIZE",
     "E2E_P95_TARGET_MS",
     "KNOWLEDGE_RETIRED",
+    "LAUNCH_MIN_FULL_RATE",
+    "MAX_SAMPLE_SIZE",
     "REJECT_REASON_LABELS",
     "RESULT_ACTION",
     "RESULT_DEGRADED",
@@ -62,27 +101,53 @@ __all__ = [
     "RESULT_QA_REASONS",
     "RESULT_SUGGESTIONS",
     "RESULT_TRANSFER",
+    "SAMPLE_STATUSES",
     "SKIP_DUPLICATE",
     "SKIP_NO_QUESTION",
     "SKIP_REALTIME",
     "AdoptionReport",
+    "DimensionStats",
     "FeedbackOutcome",
     "FeedbackService",
     "GateCheck",
     "GateResult",
+    "GateStatus",
     "IntentStats",
     "LatencyStats",
+    "LaunchGate",
     "QAReport",
+    "QualityIntentStats",
+    "QualityReport",
+    "ReviewItem",
+    "ReviewedSuggestion",
+    "RolloutAdvice",
+    "RolloutStage",
+    "RolloutStatus",
+    "SampleResult",
     "ShadowIntentStats",
     "ShadowItem",
     "ShadowReport",
+    "ShadowSummary",
+    "UncheckedCondition",
+    "WeeklyAdoption",
     "adoption_report",
     "agent_replies_by_msg",
     "char_similarity",
     "intent_gate",
+    "iso_period",
+    "launch_gate",
     "minimize_text",
     "percentile",
+    "period_range",
     "phase_gate",
+    "plan_sample",
+    "previous_period",
     "qa_report",
+    "quality_report",
+    "review_item",
+    "rollout_status",
+    "shadow_comparison",
+    "shadow_gate",
     "shadow_report",
+    "stage_of",
 ]

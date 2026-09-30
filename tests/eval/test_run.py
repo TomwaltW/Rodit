@@ -1,15 +1,17 @@
 """python -m rodit.eval：在合成评测集上跑本地演示单元（§13），不崩、报告齐全、指标不低于基线。
 
 下限比实测基线略低（留一两条用例的余量），用来发现回归（§13.5 指标不下降才上线），不是上线门槛。
-实测基线（离线大模型 + 关键词规则路由 + 启发式质检）：
+实测基线（离线大模型 + 关键词规则路由 + 启发式质检；评测集扩充到 324 条后）：
 
-| 评测集 | 条数 | 类型准确率 | 路由 | 出推荐 | 事实正确 | 切题 | 合规 | 表达 | ECE |
-|---|---|---|---|---|---|---|---|---|---|
-| dev  | 66 | 84.8% | 89.4% | 83.3% | 71.2% | 83.3% | 100% | 87.9% | 0.019 |
-| test | 15 | 93.3% | 100%  | 80.0% | 80.0% | 80.0% | 100% | 86.7% | 0.150 |
-| all  | 81 | 86.4% | 91.4% | 82.7% | 72.8% | 82.7% | 100% | 87.7% | 0.043 |
+| 评测集 | 条数 | 类型准确率 | 路由 | 出推荐 | 事实正确 | 切题 | 合规 | 表达 | 失败 | ECE |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dev  | 258 | 78.7% | 83.7% | 79.5% | 58.5% | 76.7% | 100% | 85.7% | 118 | 0.056 |
+| test | 66  | 81.8% | 84.8% | 83.3% | 65.2% | 78.8% | 100% | 90.9% | 30  | 0.037 |
+| all  | 324 | 79.3% | 84.0% | 80.2% | 59.9% | 77.2% | 100% | 86.7% | 148 | 0.050 |
 
-测试集门槛（事实正确、合规满分率 ≥ 95%）未通过：离线替身只会复述依据里最像的一句。
+测试集门槛（事实正确、合规满分率 ≥ 95%）未通过：离线替身只会复述依据里最像的一句，
+扩充的用例里多问题、依赖历史的追问、依据不足和售后细分场景更多，离线替身答不全。
+（初版 81 条上的结果不变：dev 66 条、test 15 条的失败清单和扩充前一样。）
 """
 
 from __future__ import annotations
@@ -27,34 +29,34 @@ from rodit.eval.dataset import cases
 
 FLOORS: dict[str, dict[str, float]] = {
     "dev": {
-        "intent_accuracy": 0.82,
-        "action_accuracy": 0.86,
-        "suggestion_rate": 0.80,
-        "factual": 0.68,
-        "on_topic": 0.80,
+        "intent_accuracy": 0.77,
+        "action_accuracy": 0.82,
+        "suggestion_rate": 0.78,
+        "factual": 0.57,
+        "on_topic": 0.75,
         "compliance": 1.0,
-        "expression": 0.85,
+        "expression": 0.84,
     },
     "test": {
-        "intent_accuracy": 0.86,
-        "action_accuracy": 0.93,
-        "suggestion_rate": 0.73,
-        "factual": 0.73,
-        "on_topic": 0.73,
+        "intent_accuracy": 0.79,
+        "action_accuracy": 0.81,
+        "suggestion_rate": 0.80,
+        "factual": 0.62,
+        "on_topic": 0.75,
         "compliance": 1.0,
-        "expression": 0.80,
+        "expression": 0.87,
     },
     "all": {
-        "intent_accuracy": 0.84,
-        "action_accuracy": 0.89,
-        "suggestion_rate": 0.80,
-        "factual": 0.70,
-        "on_topic": 0.80,
+        "intent_accuracy": 0.78,
+        "action_accuracy": 0.83,
+        "suggestion_rate": 0.79,
+        "factual": 0.59,
+        "on_topic": 0.76,
         "compliance": 1.0,
         "expression": 0.85,
     },
 }
-MAX_FAILURES = {"dev": 22, "test": 5, "all": 27}
+MAX_FAILURES = {"dev": 121, "test": 32, "all": 152}
 MAX_ECE = 0.10  # 全部用例上的期望校准误差
 
 
@@ -147,3 +149,47 @@ def test_module_entry_point(monkeypatch, capsys):
     assert exit_info.value.code == 0
     out = capsys.readouterr().out
     assert "上线门槛" in out and "仅供参考" in out  # 只跑测试集时阈值用测试集算，要提示
+
+
+# ================================================================ --classifier（§6.4、§13.5）
+
+
+def _train_classifier(path) -> None:
+    """用开发集的合成问句训练一个分类器（只为测试接线；真实训练见 rodit.eval.train）。"""
+    from datetime import datetime
+
+    from rodit.core.clock import CST
+    from rodit.decision import ClassifierProvider, RuleProvider
+
+    pairs = [(c.text, c.expected_intent) for c in cases("dev")]
+    model = ClassifierProvider(RuleProvider()).fit(pairs, seed_examples=True)
+    model.save(path, trained_at=datetime(2026, 9, 28, 10, 0, tzinfo=CST))
+
+
+def test_classifier_option_routes_with_the_trained_model(tmp_path):
+    target = tmp_path / "classifier.json"
+    _train_classifier(target)
+    out = io.StringIO()
+    argv = ["--split", "test", "--limit", "12", "--classifier", str(target), "--json"]
+    assert main(argv, out=out) == 0
+    report = json.loads(out.getvalue())
+    assert report["llm"]["decision_provider"] == "classifier"
+    assert report["cases"] and all(c["predicted_intent"] for c in report["cases"])
+
+
+def test_classifier_option_rejects_a_broken_model_file(tmp_path):
+    target = tmp_path / "classifier.json"
+    _train_classifier(target)
+    target.write_text(target.read_text(encoding="utf-8").replace('"alpha"', '"alpha2"'))
+    err = io.StringIO()
+    assert main(["--classifier", str(target)], out=io.StringIO(), err=err) == 2
+    assert "路由分类器模型文件不能用" in err.getvalue()
+
+
+def test_classifier_config_without_model_file_is_refused(tmp_path):
+    """provider 是 classifier 却没给 --classifier：不跑（否则测的是关键词规则）。"""
+    config = tmp_path / "rodit.yaml"
+    config.write_text("decision:\n  provider: classifier\n", encoding="utf-8")
+    err = io.StringIO()
+    assert main(["--config", str(config)], out=io.StringIO(), err=err) == 2
+    assert "--classifier" in err.getvalue()

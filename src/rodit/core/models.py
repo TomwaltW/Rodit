@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -22,6 +23,7 @@ from pydantic import (
     Field,
     SecretStr,
     field_validator,
+    model_validator,
 )
 
 from rodit.core.decision import DecisionResponse
@@ -42,6 +44,7 @@ from rodit.core.enums import (
     Mode,
     OrderStatus,
     Platform,
+    QualityReviewStatus,
     RejectReason,
     ReviewAdvice,
     ReviewState,
@@ -91,6 +94,8 @@ CleanText = Annotated[str, AfterValidator(strip_control_chars)]
 """会写进存储的自由文本：去掉 NUL 等控制字符。"""
 CleanJson = Annotated[dict[str, Any], AfterValidator(_strip_json)]
 """会写进 JSONB 的 dict：字符串逐个清洗。"""
+SizeRow = Annotated[dict[str, str | int | float], AfterValidator(_strip_json)]
+"""尺码表的一行（写进 JSONB）：字符串逐个清洗。"""
 
 
 # 约定：模型里的 dict[str, Any] 字段（Shop.config_overrides、Evidence.data、
@@ -185,6 +190,18 @@ class Shop(_Model):
         return v
 
 
+def merge_overrides(shop: Shop, changes: Mapping[str, Any]) -> dict[str, Any]:
+    """店铺配置覆盖项的合并规则（KnowledgeRepository.update_shop_config 共用）：
+    值为 None 的键删掉（回到默认），其余覆盖。不校验，校验交给 Shop。"""
+    merged = dict(shop.config_overrides)
+    for key, value in changes.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
+
+
 class ShopAuth(_Model):
     """店铺授权（§8.4）。access_token 只存放在对应平台云内，落库时加密；
     用 SecretStr 防止出现在 repr / 日志里。"""
@@ -210,8 +227,15 @@ class Sku(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    sku_id: str
+    sku_id: CleanText
     stock_source: str = "realtime"
+
+    @model_validator(mode="after")
+    def _clean_props(self) -> Sku:
+        # 规格属性来自平台商品接口（商品同步），会写进 JSONB：键和值都去掉 NUL 等控制字符
+        if self.__pydantic_extra__:
+            self.__pydantic_extra__ = _strip_json(self.__pydantic_extra__)
+        return self
 
     def props(self) -> dict[str, str]:
         return {k: str(v) for k, v in (self.model_extra or {}).items()}
@@ -224,19 +248,56 @@ class ItemCard(_Model):
     platform: Platform
     item_id: str
     title: CleanText
-    category: str | None = None
+    category: CleanText | None = None
     attributes: dict[str, CleanText] = Field(default_factory=dict)
     skus: list[Sku] = Field(default_factory=list)
-    size_chart: list[dict[str, str | int | float]] = Field(default_factory=list)
+    size_chart: list[SizeRow] = Field(default_factory=list)
     size_advice: CleanText | None = None  # 商家填写，尺码推荐最重要的依据
     care: list[CleanText] = Field(default_factory=list)
     usage: list[CleanText] = Field(default_factory=list)  # 使用 / 安装说明
     forbidden_claims: list[CleanText] = Field(default_factory=list)  # 不能说的卖点，质检用
     detail_text: CleanText | None = None  # 详情页文字 + 详情图 OCR 文字
+    # 上次商品同步时平台给的详情文字（不含 OCR；平台没有文字时为空串，从没同步过为 None）。
+    # 只给商品同步判断"平台文字变没变"用（有详情图识别失败时决定能不能保留上次的合并结果），回答不用
+    platform_detail_text: CleanText | None = None
     updated_at: AwareDatetime
 
     def find_sku(self, sku_id: str) -> Sku | None:
         return next((s for s in self.skus if s.sku_id == sku_id), None)
+
+    def patched(self, changes: Mapping[str, Any]) -> ItemCard:
+        """改部分字段后的新卡片（KnowledgeRepository.update_item_card 共用）：按模型重新校验，
+        不认识的字段、改归属（shop_id / item_id / platform）抛 ValueError。"""
+        unknown = set(changes) - set(ItemCard.model_fields)
+        if unknown:
+            raise ValueError(f"商品卡片没有这些字段：{sorted(unknown)}")
+        fixed = {"shop_id", "item_id", "platform"} & set(changes)
+        if fixed:
+            raise ValueError(f"商品卡片的归属不能改：{sorted(fixed)}")
+        return ItemCard.model_validate({**self.model_dump(), **changes})
+
+
+class PlatformItem(_Model):
+    """平台商品接口返回的商品（§5.2.3 商品自动同步）：只有平台维护的字段。
+
+    同步时覆盖 ItemCard 的标题、类目、属性、SKU、尺码表、详情文字；商家填写的字段
+    （size_advice、care、usage、forbidden_claims）不在这里，同步不会动。
+    detail_images 是详情图在平台上的引用（图片 ID 或平台 CDN 地址），交给 ImageTextExtractor
+    在平台云内做 OCR，文字并入 detail_text。价格、库存不在这里（回答时实时查）。
+    """
+
+    shop_id: str
+    platform: Platform
+    item_id: str
+    title: CleanText
+    category: CleanText | None = None
+    attributes: dict[str, CleanText] = Field(default_factory=dict)
+    skus: list[Sku] = Field(default_factory=list)
+    size_chart: list[SizeRow] = Field(default_factory=list)
+    detail_text: CleanText | None = None
+    detail_images: list[str] = Field(default_factory=list)
+    on_sale: bool = True  # 已下架的商品同步时不删卡片，只报告出来
+    updated_at: AwareDatetime
 
 
 class KnowledgeItem(_Model):
@@ -277,9 +338,64 @@ class LabeledSample(_Model):
     shop_id: str
     text: CleanText  # 已做个人信息最小化
     predicted_intent: Intent | None = None
+    # 路由给 predicted_intent 的置信度（SuggestionRecord.intent_confidence），§13.5 每月按采纳反馈
+    # 重算阈值用（§13.3 的 (预测类型, 置信度, 真实类型) 三元组）；手工标注、旧数据为 None
+    predicted_confidence: float | None = Field(default=None, ge=0, le=1)
+    # 这条推荐走的 §6.6 路由规则（SuggestionRecord.route_rule）：重算阈值只用规则 6
+    # （按置信度出推荐）的样本，安抚话术（规则 3）、分条（规则 5）不看辅助阈值
+    route_rule: int | None = Field(default=None, ge=1, le=8)
     true_intent: Intent | None = None
-    source: Literal["feedback_reject", "feedback_adopt", "manual"] = "manual"
+    # feedback_adopt 原样发送、feedback_edit 编辑后发送（类型判断对了、只是改了说法）、
+    # feedback_reject 点了"理解错误"
+    source: Literal["feedback_reject", "feedback_adopt", "feedback_edit", "manual"] = "manual"
     created_at: AwareDatetime
+
+
+class QualityScores(_Model):
+    """§13.2 回答质量评分：每个维度 0 / 1 / 2 分。"""
+
+    factual: int = Field(ge=0, le=2)  # 事实正确
+    relevance: int = Field(ge=0, le=2)  # 切题
+    compliance: int = Field(ge=0, le=2)  # 合规
+    expression: int = Field(ge=0, le=2)  # 表达
+
+
+QUALITY_PERIOD_PATTERN = r"^[0-9]{4}-W(0[1-9]|[1-4][0-9]|5[0-3])$"
+"""复核周期：ISO 周，如 "2026-W40"（datetime.isocalendar() 的年和周）。只认 ASCII 数字，
+和库里 quality_review 的 CHECK 一致（正则的数字类会放过全角数字）。"""
+
+
+class QualityReview(_Model):
+    """每周人工复核的一条样本（§13.5 每周从推荐中抽 50 条人工复核，按 §13.2 打分）。
+
+    只存推荐 ID 和打分，不复制推荐文字和买家问题：复核时从 SuggestionRecord 读（已做个人信息
+    最小化），取消订购时随店铺数据一起删除。同一店铺、同一周期、同一推荐只有一条。
+    scored 必须有 scores、reviewer、reviewed_at；pending 不能有 scores；skipped 要有 reviewer。
+    """
+
+    id: int | None = None
+    shop_id: str
+    period: str = Field(pattern=QUALITY_PERIOD_PATTERN)
+    suggestion_id: int = Field(ge=1)
+    intent: Intent
+    status: QualityReviewStatus = QualityReviewStatus.PENDING
+    scores: QualityScores | None = None
+    reviewer: str | None = None
+    note: CleanText | None = None  # 复核人备注（已做个人信息最小化）
+    sampled_at: AwareDatetime
+    reviewed_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> QualityReview:
+        if self.status == QualityReviewStatus.SCORED:
+            if self.scores is None or not self.reviewer or self.reviewed_at is None:
+                raise ValueError("已复核（scored）的样本必须有 scores、reviewer、reviewed_at")
+        elif self.status == QualityReviewStatus.PENDING:
+            if self.scores is not None or self.reviewer or self.reviewed_at is not None:
+                raise ValueError("待复核（pending）的样本不能有 scores、reviewer、reviewed_at")
+        elif not self.reviewer or self.reviewed_at is None:
+            raise ValueError("跳过（skipped）的样本必须有 reviewer、reviewed_at")
+        return self
 
 
 # ---------------------------------------------------------------- 平台工具数据（§7，只读）
@@ -701,6 +817,9 @@ class SuggestionRecord(_Model):
     question_text: CleanText | None = None  # 买家问题（已做个人信息最小化），反馈闭环生成候选知识用
     item_id: str | None = None  # 当前商品：采纳后生成的候选 FAQ 按商品限定范围
     intent: Intent
+    # 路由给 intent 的置信度（多问题分条时是这一条的概率，§6.6 规则 5）；§13.5 重算阈值用
+    intent_confidence: float | None = Field(default=None, ge=0, le=1)
+    route_rule: int | None = Field(default=None, ge=1, le=8)  # 命中的 §6.6 路由规则（整条消息的）
     text: CleanText
     kind: DraftKind = DraftKind.LLM
     evidence_ids: list[str] = Field(default_factory=list)

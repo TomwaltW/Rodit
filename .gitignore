@@ -26,3 +26,7 @@ build/
 
 # Claude Code 本机私有设置
 .claude/settings.local.json
+
+# 部署：访问令牌文件（只存哈希也不进仓库）、本地试用的密钥
+*tokens*.json
+deploy/secrets/

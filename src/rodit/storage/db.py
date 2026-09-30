@@ -22,6 +22,9 @@
   见 rodit.app.production）：库的默认值是不限时，语句被锁住或存储卡住时请求线程会一直挂着，
   "超时 → KnowledgeUnavailable → 不推荐"（§12.2）也就触发不了。迁移用的连接不设；
   §8.4 清理店铺数据（各仓储的 purge_shop）用 session(…, unbounded=True)，也不受这两个上限约束。
+- §8.4 清理店铺数据分批删（purge_rows）：每批最多 purge_batch_rows 行、每批一个短事务，删到没有
+  为止。一家大店铺一次删几百万行会长时间锁住这些行、撑大一个事务（WAL、回滚段）；分批提交后
+  中途失败也只丢当前这一批，重试接着删（purge_shop 幂等）。
 """
 
 from __future__ import annotations
@@ -57,10 +60,16 @@ BUSINESS_TABLES: tuple[str, ...] = (
     "audit_log",
     "knowledge_gap",
     "labeled_sample",
+    "message_recall",
+    "quality_review",
 )
-"""所有带店铺归属的表，全部启用并强制行级安全（shop 表的店铺列是 id，其余是 shop_id）。"""
+"""所有带店铺归属的表，全部启用并强制行级安全（shop 表的店铺列是 id，其余是 shop_id）。
+message_recall 由迁移版本 3 新建，quality_review 由版本 4 新建，其余由版本 1（schema.sql）建。"""
 
 _MIGRATION_LOCK = 0x526F646974  # advisory lock 的键（"Rodit"），只用于串行化迁移
+
+PURGE_BATCH_ROWS = 5000
+"""§8.4 清理店铺数据时每个事务最多删的行数（本机 5000 行约 20 毫秒）。"""
 
 Conn = psycopg.Connection[dict[str, Any]]
 
@@ -77,6 +86,8 @@ class Migration:
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "schema.sql"),
     Migration(2, "migration_0002_aftersale_status_version.sql"),
+    Migration(3, "migration_0003_recall_tombstone_candidate_unique.sql"),
+    Migration(4, "migration_0004_quality_review_confidence.sql"),
 )
 """按版本升序；已发布的脚本不再修改，结构变化加新版本（tests/storage/test_migrations.py
 按内容哈希锁定已发布的脚本）。"""
@@ -93,6 +104,7 @@ class Database:
     - lock_timeout_ms：每个事务等锁的上限（被清理、迁移等长事务挡住时尽快报错降级），
       None 用库的默认值。超时都抛 psycopg.OperationalError 的子类，知识库仓储转成
       KnowledgeUnavailable。
+    - purge_batch_rows：§8.4 清理店铺数据时每个事务最多删的行数（见 purge_rows）。
     """
 
     def __init__(
@@ -104,9 +116,12 @@ class Database:
         connect_timeout_s: int = 5,
         statement_timeout_ms: int | None = None,
         lock_timeout_ms: int | None = None,
+        purge_batch_rows: int = PURGE_BATCH_ROWS,
     ) -> None:
         if not dsn:
             raise ValueError("数据库连接串不能为空")
+        if purge_batch_rows < 1:
+            raise ValueError("purge_batch_rows 必须 ≥ 1")
         if statement_timeout_ms is not None and statement_timeout_ms <= 0:
             raise ValueError("statement_timeout_ms 必须为正数")
         if lock_timeout_ms is not None and lock_timeout_ms <= 0:
@@ -117,6 +132,7 @@ class Database:
         self._connect_timeout_s = connect_timeout_s
         self._statement_timeout_ms = statement_timeout_ms
         self._lock_timeout_ms = lock_timeout_ms
+        self.purge_batch_rows = purge_batch_rows
 
     @property
     def statement_timeout_ms(self) -> int | None:
@@ -178,6 +194,41 @@ class Database:
                 if value is not None and not unbounded:
                     conn.execute("SELECT set_config(%s, %s, true)", (setting, str(value)))
             yield conn
+
+    # ---------------------------------------------------------------- §8.4 清理
+
+    def purge_rows(self, shop_id: str, table: str, *, column: str = "shop_id") -> int:
+        """分批删除 table 里这家店铺的全部行（column = shop_id），返回删除的行数。
+
+        每批一个事务（session(shop_id, unbounded=True)：角色、店铺范围、行级安全照常，不受请求级
+        的语句 / 等锁超时约束），最多删 purge_batch_rows 行，提交后再删下一批，直到选不出行为止：
+        - 按 ctid 选出一批再删（= ANY(ARRAY(...)) 走 TID 扫描），不依赖主键，每张表都能用；
+          picked 被引用两次，PostgreSQL 只算一次（多次引用的 CTE 总是物化，不写 MATERIALIZED，
+          12 以前的版本也能跑）；
+        - 选出的不满一批、而且都删掉了：已经删完，不再多跑一个空事务；某一批里的行正好被别的
+          事务更新（换了 ctid）会漏删（删掉的少于选出的），这时接着删，直到选不出行；
+        - 中途失败时之前的批次已经提交，异常向外抛；再调一次从剩下的接着删（幂等）。
+        table / column 只能是代码里的常量（不是外部输入）。
+        """
+        query = sql.SQL(
+            "WITH picked AS ("
+            " SELECT ctid AS c FROM {table} WHERE {column} = %s LIMIT %s),"
+            " gone AS ("
+            " DELETE FROM {table} WHERE ctid = ANY(ARRAY(SELECT c FROM picked))"
+            " AND {column} = %s RETURNING 1)"
+            " SELECT (SELECT count(*) FROM picked) AS picked,"
+            " (SELECT count(*) FROM gone) AS deleted"
+        ).format(table=sql.Identifier(table), column=sql.Identifier(column))
+        total = 0
+        while True:
+            with self.session(shop_id, unbounded=True) as conn:
+                row = conn.execute(query, (shop_id, self.purge_batch_rows, shop_id)).fetchone()
+            if row is None:  # 聚合查询总有一行；没有就当作没选出来，不空转
+                return total
+            picked, deleted = int(row["picked"]), int(row["deleted"])
+            total += deleted
+            if picked == 0 or (picked < self.purge_batch_rows and deleted == picked):
+                return total
 
     # ---------------------------------------------------------------- 迁移
 

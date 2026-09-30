@@ -32,12 +32,20 @@ from rodit.core.models import EngineResult, ShopAuth
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import LLMClient
 from rodit.decision import RuleProvider
-from rodit.testing.fakes import FakeActionPort, FakeClock, InMemoryToolGateway
+from rodit.testing.fakes import (
+    FakeActionPort,
+    FakeClock,
+    FakeImageTextExtractor,
+    InMemoryItemCatalog,
+    InMemoryToolGateway,
+)
 from rodit.testing.fixtures import (
+    DEMO_OCR_TEXTS,
     RAW_BUYERS,
     TEST_SALT,
     DemoWorld,
     build_demo_world,
+    demo_platform_items,
 )
 
 # 演示用写接口支持的售后操作；拼多多没有查到拒绝售后接口（§7.1），只支持同意
@@ -125,6 +133,8 @@ def build_demo_unit(
         action_port=action_port,
         route_provider=route_provider,
         qa_provider=qa_provider,
+        catalog=InMemoryItemCatalog(demo_platform_items(world), platform),
+        ocr=FakeImageTextExtractor(DEMO_OCR_TEXTS),
     )
     seed_unit(unit, world)
     return unit
