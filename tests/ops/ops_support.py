@@ -108,6 +108,29 @@ class FakeReadinessDb:
         return _Result([{"version": v} for v in self.versions])
 
 
+# ================================================================ 单副本租约的替身
+
+
+class FakeServeLease:
+    """serve 的单副本租约替身（rodit.ops.lease.Lease）：不连数据库，只记录调用。
+    main(["serve"], lease_factory=FakeServeLease) 用它；真的锁在 test_lease.py 里测。"""
+
+    def __init__(self, settings: Any = None) -> None:
+        self.events: list[str] = []
+
+    def acquire(self) -> FakeServeLease:
+        self.events.append("acquire")
+        return self
+
+    def release(self) -> None:
+        self.events.append("release")
+
+    def probe(self) -> dict[str, Any]:
+        from rodit.ops.health import CheckResult
+
+        return {"lease": CheckResult("acquire" in self.events and "release" not in self.events)}
+
+
 # ================================================================ "平台云代码"的绑定
 
 

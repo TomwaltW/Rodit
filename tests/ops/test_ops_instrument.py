@@ -260,9 +260,9 @@ def test_tool_gateway_outcomes(metrics):
     assert sample(s, "rodit_platform_tool_calls_total", tool="get_order", outcome="ok") == 1
     assert sample(s, "rodit_platform_tool_calls_total", tool="get_order", outcome="not_found") == 1
     assert sample(s, "rodit_platform_tool_calls_total", tool="list_aftersales", outcome="ok") == 1
+    # 模拟的失败是限流（ToolUnavailable(reason="throttled")）：按原因分开统计
     assert (
-        sample(s, "rodit_platform_tool_calls_total", tool="get_logistics", outcome="unavailable")
-        == 1
+        sample(s, "rodit_platform_tool_calls_total", tool="get_logistics", outcome="throttled") == 1
     )
     assert sample(s, "rodit_platform_tool_latency_seconds_count", tool="get_order") == 2
     assert tools.calls  # 其余属性转给原始实现

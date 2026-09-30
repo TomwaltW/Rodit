@@ -309,6 +309,22 @@
   function showIdentity(me) {
     $('whoami').hidden = false;
     $('identity').textContent = `${label(LABELS.roles, me.role)} ${me.user_id} · 店铺 ${me.shop_id}`;
+    showDisclosure(me.llm);
+  }
+
+  /**
+   * 页脚的生成式人工智能公示（§12.3 所用模型的名称和备案号）：来自 /v1/me 的 llm，
+   * 部署没配置时没有这个字段，页脚不显示。只用 textContent 写。
+   */
+  function showDisclosure(llm) {
+    const text = (value) => (typeof value === 'string' ? value.trim() : '');
+    const name = text(llm && llm.public_name);
+    const filing = text(llm && llm.filing_no);
+    $('llm-public-name').textContent = name;
+    $('llm-filing-no').textContent = filing;
+    $('llm-name-part').hidden = !name;
+    $('llm-filing-part').hidden = !filing;
+    $('disclosure').hidden = !(name || filing);
   }
 
   function enterApp() {
@@ -357,6 +373,7 @@
     $('console').hidden = true;
     $('whoami').hidden = true;
     $('identity').textContent = '';
+    showDisclosure(null);
     $('notice').open = true;
     $('login').hidden = false;
     $('token').focus();

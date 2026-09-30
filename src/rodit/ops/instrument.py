@@ -7,10 +7,26 @@
   都经过它，顺手记指标，再原样转给真正的审计。解析 engine.result 用 rodit.feedback.metrics
   的同一套规则（和给商家看的质检报表口径一致）。
 - MeteredToolGateway：套在平台原始只读工具外面（缓存层之下），记平台接口的调用量、失败、耗时
-  （§12.4 平台接口调用量、失败率）。
-- AuthExpiryMonitor：抓取 /metrics 时（按间隔）检查授权即将过期的店铺（§12.4 授权过期告警）。
-- HttpMetricsMiddleware：按路由模板（不是实际路径）记请求数、耗时和错误码；错误码里的
-  tenant_isolation 就是串店拦截次数（§12.4 串店检查）。
+  （§12.4 平台接口调用量、失败率）；失败按 ToolUnavailable.reason 分成 unavailable（故障）/
+  throttled（限流，额度用完）/ timeout（超时）。
+- observe_tool_cache：抓取时导出缓存层（rodit.tools.CachingToolGateway.totals()）自己记的统计：
+  请求数、缓存命中、平台失败时用过期缓存兜底的次数、内层返回别家店铺数据的次数
+  （按工具，不按店铺）。
+- AuthExpiryMonitor：抓取 /metrics 时（按间隔）检查授权即将过期、已经过期的店铺
+  （§12.4 授权过期告警）。
+- ObservedReadinessChecker：就绪检查（/readyz，以及抓取时刷新）的结果记成 rodit_ready。
+- HttpMetricsMiddleware：按路由模板（不是实际路径）记请求数、耗时和错误码。
+
+串店（§9.2、§12.4 串店检查）：rodit_tenant_isolation_total{stage} 每次拦截记一次——
+tenant.violation 审计事件按它 detail 里的 stage（引擎在哪一步发现的），接口层按调用方身份拦下的
+403 tenant_isolation 记 stage="http"。同一次拦截在引擎的 engine.result 里还会有降级类型
+tenant_isolation（rodit_degradations_total{kind="tenant_isolation"}）、在缓存层还会记
+rodit_tool_cache_tenant_violations_total，这两个是另外的指标，不重复计入
+rodit_tenant_isolation_total；告警（deploy/prometheus/alerts.yml）三个都看。
+
+端到端耗时：engine.result 的 latency_ms 每一项都进 rodit_engine_latency_seconds{stage}；
+total 是引擎内的端到端，since_received（core.audit.LATENCY_SINCE_RECEIVED）从平台收到消息算起，
+含排队、会话锁等待，更接近 §12.1 "推荐出现（端到端）P95 ≤ 5 秒" 的口径。
 
 标签里不放买家数据：只有店铺 ID、问题类型、路由动作、规则名、降级类型、工具名、大模型用途、
 路由模板这类代码；所有值再过 metrics.safe_label_value（中文、空格、个人信息一律变成 "other"）。
@@ -32,10 +48,10 @@ from typing import Any
 from starlette.routing import Match
 
 from rodit.adapters import AuthGuard
-from rodit.core.audit import AuditAction
+from rodit.core.audit import DEGRADED_TENANT_ISOLATION, AuditAction
 from rodit.core.clock import Clock, SystemClock
 from rodit.core.enums import AfterSaleStatus, DecisionStage, Intent, Platform, RouteAction
-from rodit.core.errors import ToolUnavailable
+from rodit.core.errors import TOOL_FAILURE_REASONS, ToolUnavailable
 from rodit.core.models import (
     NON_BLOCKING_HARD_RULES,
     AfterSaleInfo,
@@ -48,6 +64,7 @@ from rodit.core.models import (
 )
 from rodit.core.ports import AuditLog, ToolGateway
 from rodit.feedback import metrics as report
+from rodit.ops.health import DEFAULT_CACHE_S, Probe, Readiness, ReadinessChecker
 from rodit.ops.metrics import MetricsRegistry
 
 logger = logging.getLogger(__name__)
@@ -83,6 +100,18 @@ _INTENTS = frozenset(i.value for i in Intent)
 _ACTIONS = frozenset(a.value for a in RouteAction)
 
 NO_SHOP = "none"  # 没有店铺归属的事件
+TENANT_STAGE_HTTP = "http"
+"""接口层按调用方身份拦下的串店（403 tenant_isolation）：rodit_tenant_isolation_total 的 stage。"""
+TENANT_STAGE_UNKNOWN = "unknown"
+"""tenant.violation 事件没写 stage（或不是代码）时的 stage。"""
+TENANT_ISOLATION_CODE = "tenant_isolation"  # 接口层的错误码（rodit.api.errors）
+TOOL_CACHE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("requests", "tool_cache_requests"),
+    ("cache_hits", "tool_cache_hits"),
+    ("stale_served", "tool_cache_stale"),
+    ("tenant_violations", "tool_cache_tenant"),
+)
+"""缓存层统计（rodit.tools.ToolCallStats 的字段）→ RoditMetrics 上的计数器。"""
 
 
 def _code(value: object, *, default: str = "other") -> str:
@@ -158,6 +187,15 @@ class RoditMetrics:
         self.degradations = r.counter(
             "rodit_degradations_total", "降级次数（§12.2），按降级类型", ["kind"]
         )
+        # 预先建好 0 值序列：第一次串店也能被 increase() 看到（序列从无到 1 时 increase 是 0）
+        self.degradations.inc({"kind": DEGRADED_TENANT_ISOLATION}, 0)
+        self.tenant_isolation = r.counter(
+            "rodit_tenant_isolation_total",
+            "串店拦截次数（§9.2、§12.4 串店检查）；stage = 在哪一步拦下"
+            "（tenant.violation 事件的 stage；http = 接口层按调用方身份拦下）",
+            ["stage"],
+        )
+        self.tenant_isolation.inc({"stage": TENANT_STAGE_HTTP}, 0)
         # ---- 大模型（llm.usage）
         self.llm_calls = r.counter(
             "rodit_llm_calls_total",
@@ -175,8 +213,8 @@ class RoditMetrics:
         # ---- 平台接口
         self.tool_calls = r.counter(
             "rodit_platform_tool_calls_total",
-            "平台只读接口调用次数（缓存未命中才会调用）；"
-            "outcome = ok / not_found / unavailable / error",
+            "平台只读接口调用次数（缓存未命中才会调用）；outcome = ok / not_found / "
+            "unavailable（故障）/ throttled（限流）/ timeout（超时）/ error（其他异常）",
             ["tool", "outcome"],
         )
         self.tool_latency = r.histogram(
@@ -184,6 +222,25 @@ class RoditMetrics:
             "平台只读接口耗时",
             ["tool"],
             buckets=TOOL_BUCKETS_S,
+        )
+        # ---- 缓存层（rodit.tools.CachingToolGateway 自己的统计，抓取时导出；按工具，各店相加）
+        self.tool_cache_requests = r.counter(
+            "rodit_tool_cache_requests_total",
+            "问答链路查平台只读工具的次数（含命中缓存）",
+            ["tool"],
+        )
+        self.tool_cache_hits = r.counter(
+            "rodit_tool_cache_hits_total", "有效期内命中缓存、没有调用平台接口的次数", ["tool"]
+        )
+        self.tool_cache_stale = r.counter(
+            "rodit_tool_cache_stale_served_total",
+            "平台接口限流或故障时用过期缓存兜底的次数（§12.2 用缓存数据并注明时间）",
+            ["tool"],
+        )
+        self.tool_cache_tenant = r.counter(
+            "rodit_tool_cache_tenant_violations_total",
+            "平台接口返回了别家店铺的数据、被缓存层拦下的次数（§9.2）",
+            ["tool"],
         )
         # ---- 审计
         self.audit_events = r.counter("rodit_audit_events_total", "审计事件数", ["action"])
@@ -194,6 +251,10 @@ class RoditMetrics:
         self.auth_expiring = r.gauge(
             "rodit_auth_expiring_shops", "授权在告警窗口内到期（含已过期、没有授权）的店铺数"
         )
+        self.auth_expired = r.gauge(
+            "rodit_auth_expired_shops",
+            "授权已经过期（含没有授权、需要重新授权、令牌读不出来）的店铺数：这些店铺已停止处理",
+        )
         self.auth_expiring_shop = r.gauge(
             "rodit_shop_auth_expiring", "授权在告警窗口内到期的店铺（值恒为 1）", ["shop_id"]
         )
@@ -203,6 +264,14 @@ class RoditMetrics:
         )
         self.auth_check_errors = r.counter(
             "rodit_auth_expiry_check_errors_total", "授权检查失败次数"
+        )
+        self.auth_check_errors.inc(amount=0)  # 0 值序列：第一次失败也能被 increase() 看到
+        # ---- 就绪（/readyz）
+        self.ready = r.gauge("rodit_ready", "就绪检查的结果：1 就绪，0 未就绪（不接流量）")
+        self.readiness_checks = r.gauge(
+            "rodit_readiness_check_ok",
+            "就绪检查各项的结果（1 通过，0 不通过）：database / migrations / llm / lease",
+            ["check"],
         )
         # ---- HTTP
         self.http_requests = r.counter(
@@ -229,6 +298,13 @@ class RoditMetrics:
             self.observe_engine_result(event.shop_id, event.detail)
         elif event.action == AuditAction.LLM_USAGE.value:
             self.observe_llm_usage(event.shop_id, event.detail)
+        elif event.action == AuditAction.TENANT_VIOLATION.value:
+            self.observe_tenant_violation(event.detail)
+
+    def observe_tenant_violation(self, detail: Mapping[str, Any]) -> None:
+        """tenant.violation 事件：只取 detail 里的 stage（代码），不看别的。"""
+        stage = _code(detail.get("stage"), default=TENANT_STAGE_UNKNOWN)
+        self.tenant_isolation.inc({"stage": stage})
 
     def observe_engine_result(self, shop_id: str | None, detail: Mapping[str, Any]) -> None:
         shop = shop_id or NO_SHOP
@@ -294,6 +370,25 @@ class RoditMetrics:
         self.http_latency.observe({"route": route, "method": method}, seconds)
         if code is not None:
             self.http_errors.inc({"route": route, "code": code})
+            if code == TENANT_ISOLATION_CODE:
+                self.tenant_isolation.inc({"stage": TENANT_STAGE_HTTP})
+
+    def observe_tool_cache(self, totals: Mapping[str, Any]) -> None:
+        """缓存层的累计统计（{工具名: ToolCallStats}，rodit.tools.CachingToolGateway.totals()）
+        → 按工具的计数器（整体替换）。"""
+        for field, attr in TOOL_CACHE_FIELDS:
+            counter = getattr(self, attr)
+            counter.set_totals(
+                ({"tool": _code(tool)}, report._as_int(getattr(stats, field, 0)))
+                for tool, stats in totals.items()
+            )
+
+    def observe_readiness(self, readiness: Readiness) -> None:
+        self.ready.set(value=1 if readiness.ready else 0)
+        self.readiness_checks.replace(
+            ({"check": _code(name)}, 1 if result.ok else 0)
+            for name, result in readiness.checks.items()
+        )
 
     def forget_shop(self, shop_id: str) -> int:
         """取消订购（§8.4）后删掉该店铺的指标序列。"""
@@ -392,8 +487,9 @@ class ObservedAuditLog:
 class MeteredToolGateway:
     """实现 core.ports.ToolGateway：转给平台原始工具，记调用次数、结果类别和耗时。
 
-    结果类别：ok（有数据，列表可以为空）/ not_found（返回 None）/ unavailable（ToolUnavailable，
-    限流或故障）/ error（其他异常）。异常原样抛出，调用方（缓存层）按 §12.2 降级。
+    结果类别：ok（有数据，列表可以为空）/ not_found（返回 None）/ ToolUnavailable 按它的 reason：
+    unavailable（故障）、throttled（限流，额度用完）、timeout（超时）/ error（其他异常）。
+    异常原样抛出，调用方（缓存层）按 §12.2 降级。
     """
 
     def __init__(
@@ -430,8 +526,9 @@ class MeteredToolGateway:
             result = fn()
             outcome = "not_found" if result is None else "ok"
             return result
-        except ToolUnavailable:
-            outcome = "unavailable"
+        except ToolUnavailable as exc:
+            reason = getattr(exc, "reason", None)
+            outcome = reason if reason in TOOL_FAILURE_REASONS else "unavailable"
             raise
         finally:
             elapsed = max(0.0, self._timer() - started)
@@ -484,7 +581,8 @@ class MeteredToolGateway:
 
 
 class AuthExpiryMonitor:
-    """按间隔检查本单元店铺的授权，写进 rodit_auth_expiring_shops / rodit_shop_auth_expiring。
+    """按间隔检查本单元店铺的授权，写进 rodit_auth_expiring_shops / rodit_shop_auth_expiring，
+    已经过期（到期时间已过、没有授权、需要重新授权）的店铺数写进 rodit_auth_expired_shops。
 
     - shop_ids：本单元服务的店铺（令牌文件里的店铺 + 平台云代码提供的订购列表）；
     - 挂在 /metrics 渲染前（MetricsRegistry.before_render），距上次检查不到 refresh_s 秒时不查库；
@@ -524,15 +622,46 @@ class AuthExpiryMonitor:
             try:
                 shops = sorted({s for s in self._shop_ids() if isinstance(s, str) and s.strip()})
                 expiring = self._guard.expiring(shops, within=self._within)
+                # 已经过期的一定在即将过期的里面：只查这一小部分，不再把全部店铺查一遍
+                expired = self._guard.expiring(expiring, within=timedelta(0)) if expiring else []
             except Exception as exc:  # noqa: BLE001  数据库故障等：保留上次结果
                 self._metrics.auth_check_errors.inc()
                 logger.warning("授权过期检查失败：%s", type(exc).__name__)
                 return True
             self._metrics.auth_expiring.set(value=len(expiring))
+            self._metrics.auth_expired.set(value=len(expired))
             self._metrics.auth_expiring_shop.replace(({"shop_id": s}, 1) for s in expiring)
             self._metrics.auth_checked.set(value=len(shops))
             self._metrics.auth_checked_at.set(value=self._clock.now().timestamp())
             return True
+
+
+# ================================================================ 就绪（/readyz）
+
+
+class ObservedReadinessChecker(ReadinessChecker):
+    """就绪检查（rodit.ops.health.ReadinessChecker），每次的结果顺手记成 rodit_ready 和
+    rodit_readiness_check_ok{check}。/readyz 和抓取 /metrics 时的刷新都经过它（结果有缓存）。
+    记指标失败只记日志，不影响就绪检查本身。"""
+
+    def __init__(
+        self,
+        probes: Mapping[str, Probe],
+        metrics: RoditMetrics,
+        *,
+        cache_s: float = DEFAULT_CACHE_S,
+        timer: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(probes, cache_s=cache_s, timer=timer)
+        self._metrics = metrics
+
+    def check(self, *, fresh: bool = False) -> Readiness:
+        result = super().check(fresh=fresh)
+        try:
+            self._metrics.observe_readiness(result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("指标采集失败：%s", type(exc).__name__)
+        return result
 
 
 # ================================================================ HTTP 中间件
@@ -644,12 +773,15 @@ def _error_code(body: bytes) -> str | None:
 
 __all__ = [
     "LATENCY_BUCKETS_S",
+    "TENANT_STAGE_HTTP",
+    "TENANT_STAGE_UNKNOWN",
     "TOOL_BUCKETS_S",
     "UNMATCHED_ROUTE",
     "AuthExpiryMonitor",
     "HttpMetricsMiddleware",
     "MeteredToolGateway",
     "ObservedAuditLog",
+    "ObservedReadinessChecker",
     "RoditMetrics",
     "package_version",
 ]

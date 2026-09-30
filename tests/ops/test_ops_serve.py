@@ -17,6 +17,7 @@ from ops_support import (
     SYNTHETIC_LLM_KEY,
     SYNTHETIC_TOKEN_KEY,
     FakeReadinessDb,
+    FakeServeLease,
     TestClient,
     label_values,
     parse_exposition,
@@ -420,6 +421,7 @@ def test_metrics_labels_contain_no_buyer_data(local_server):
         "platform",
         "mode",
         "version",
+        "check",  # 就绪检查的项名（database / migrations / llm / lease）
     }
 
 
@@ -454,7 +456,10 @@ def test_main_serve_runs_uvicorn_with_our_logging(ops_env, token_file, monkeypat
     monkeypatch.setenv("RODIT_MODE_C_ONLY", "1")
     monkeypatch.setenv("RODIT_PORT", "9123")
     calls: list[tuple[Any, dict[str, Any]]] = []
-    assert main(["serve"], run=lambda app, **kw: calls.append((app, kw))) == 0
+    assert (
+        main(["serve"], run=lambda app, **kw: calls.append((app, kw)), lease_factory=FakeServeLease)
+        == 0
+    )
     ((app, kw),) = calls
     assert kw["host"] == "127.0.0.1" and kw["port"] == 9123
     assert kw["log_config"] is None and kw["server_header"] is False
@@ -464,7 +469,7 @@ def test_main_serve_runs_uvicorn_with_our_logging(ops_env, token_file, monkeypat
 def test_main_defaults_to_serve(ops_env, token_file, monkeypatch):
     monkeypatch.setenv("RODIT_MODE_C_ONLY", "1")
     calls: list[Any] = []
-    assert main([], run=lambda app, **kw: calls.append(app)) == 0
+    assert main([], run=lambda app, **kw: calls.append(app), lease_factory=FakeServeLease) == 0
     assert len(calls) == 1
 
 
@@ -508,7 +513,7 @@ def test_main_migrate_on_start(ops_env, token_file, monkeypatch):
     done: list[str] = []
     monkeypatch.setattr(serve, "migrate", lambda env: done.append(env) or [])
     monkeypatch.setattr(serve, "grant_readiness_access", lambda db: done.append("grant"))
-    assert main(["serve"], run=lambda *a, **k: None) == 0
+    assert main(["serve"], run=lambda *a, **k: None, lease_factory=FakeServeLease) == 0
     assert done == ["RODIT_DATABASE_DSN", "grant"]
 
 

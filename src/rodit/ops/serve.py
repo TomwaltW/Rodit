@@ -17,15 +17,22 @@ serve 的组装（顺序：平台绑定 → 平台单元 → 接上 ctx.tokens �
 
 生产模式（RODIT_ENV=production，默认）下拒绝启动的情况：没有平台绑定又没有明确只部署模式 C；
 绑定里有模拟实现（合成数据）；缺少必需的环境变量（只报变量名）；令牌文件读不出来；
-/metrics 既没有抓取令牌也没有明确允许公开。
+/metrics 既没有抓取令牌也没有明确允许公开；配置要求公示大模型（llm.require_disclosure）却没填
+llm.public_name / llm.filing_no（§12.3 生成式人工智能服务要公示所用模型的名称和备案号）。
 本地试用（RODIT_ENV=local）允许合成数据的平台绑定，没配大模型时用离线替身（rodit.app.offline）。
+平台绑定给了 llm_transport（平台要求经它报备的通道调用大模型）时，大模型客户端经它发请求，
+计量（llm.usage）和密钥缺失时的就绪语义不变。
 
 decision.provider 是 classifier 时，serve 从 RODIT_CLASSIFIER_PATH 加载路由分类器的模型文件
 （train-classifier 生成）当路由判断层，质检仍用大模型（§6.4）；没设、文件不存在或校验不过都
 拒绝启动（退出码 2），日志里写明原因。
 
 一个进程一个平台单元，单进程运行：会话串行锁、适配器的去重记录、短时缓存都在进程内
-（CLAUDE.md 选型记录：多实例部署时再换 Redis）。
+（CLAUDE.md 选型记录：多实例部署时再换 Redis）。serve 用单副本租约强制执行（rodit.ops.lease：
+PostgreSQL 会话级 advisory lock，按平台单元取键）：组装好服务、通过启动前检查之后抢租约，另一个
+进程占着就拒绝启动（退出码 2，日志写明占用者），连不上数据库退出码 1；RODIT_MIGRATE_ON_START 的
+迁移在拿到租约之后跑；服务退出（包括异常退出）时释放。就绪检查多一项 lease（连接断了会重连再抢，
+被别的进程抢走就一直不就绪）。
 
 离线任务（在平台单元内跑，不需要 RODIT_PLATFORM；结果都由人确认后才上线）：
 
@@ -97,6 +104,7 @@ from rodit.ops.bindings import (
 )
 from rodit.ops.health import (
     CheckResult,
+    Probe,
     ReadinessChecker,
     SessionDatabase,
     database_probe,
@@ -107,8 +115,10 @@ from rodit.ops.instrument import (
     AuthExpiryMonitor,
     MeteredToolGateway,
     ObservedAuditLog,
+    ObservedReadinessChecker,
     RoditMetrics,
 )
+from rodit.ops.lease import Lease, LeaseError, serve_lease
 from rodit.ops.logconfig import configure_logging
 from rodit.ops.router import MetricsGuard, install_ops
 from rodit.ops.settings import ServerSettings, SettingsError
@@ -151,6 +161,10 @@ class StartupError(RuntimeError):
     """启动前检查不通过。消息里只有变量名、文件路径和原因，没有任何值。"""
 
 
+LeaseFactory = Callable[[ServerSettings], Lease]
+"""设置 → 单副本租约（默认 rodit.ops.lease.serve_lease；测试注入假的）。"""
+
+
 @dataclass
 class Server:
     """组装好的服务。app 交给 uvicorn；其余字段给测试和运维命令用。"""
@@ -179,7 +193,10 @@ def preflight(
     settings: ServerSettings, config: EngineConfig, environ: Mapping[str, str] | None = None
 ) -> None:
     """必需的环境变量都有值（只看有没有，报错只列变量名）。大模型密钥缺失不在这里拦：
-    /readyz 报 missing_api_key，进程不接流量，日志里看得到原因。"""
+    /readyz 报 missing_api_key，进程不接流量，日志里看得到原因。
+
+    生产模式下配置要求公示大模型（llm.require_disclosure）时，公示名称和备案号都要填
+    （§12.3 生成式人工智能服务登记：公示所用模型的名称和备案号 / 上线编号）。"""
     env = os.environ if environ is None else environ
     required = [DATABASE_DSN_ENV, TOKEN_KEY_ENV, config.privacy.buyer_salt_env]
     missing = [name for name in required if not env.get(name, "").strip()]
@@ -187,6 +204,18 @@ def preflight(
         missing.append(f"{LLM_ENV_PREFIX}BASE_URL / {LLM_ENV_PREFIX}MODEL（或配置文件 llm 段）")
     if missing:
         raise StartupError("缺少必需的环境变量：" + "、".join(missing))
+    if settings.is_production and config.llm.require_disclosure:
+        blank = [
+            f"llm.{name}"
+            for name in ("public_name", "filing_no")
+            if not (getattr(config.llm, name) or "").strip()
+        ]
+        if blank:
+            raise StartupError(
+                "配置 llm.require_disclosure 为 true，缺少 "
+                + "、".join(blank)
+                + "（§12.3 要公示所用大模型的名称和备案号，D5 选定后填进部署配置）"
+            )
 
 
 def resolve_bindings(
@@ -316,9 +345,12 @@ def compose_unit(
             catalog=bindings.catalog,
             ocr=bindings.ocr,
             route_provider=classifier,
+            llm_transport=bindings.llm_transport,  # 平台可报备的通道（§9.1、§12.3），没给用默认出口
         )
         probe = llm_probe(config.llm, environ=env, env_prefix=LLM_ENV_PREFIX)
     else:
+        if bindings.llm_transport is not None:
+            logger.warning("本地试用没有配置大模型（离线替身）：平台绑定的 llm_transport 用不到")
         unit = _offline_unit(
             settings, config, clock, hasher, bindings, tools, observe, repos, classifier
         )
@@ -392,8 +424,12 @@ def build_server(
     repos: Repos | None = None,
     database: SessionDatabase | None = None,
     environ: Mapping[str, str] | None = None,
+    lease: Lease | None = None,
 ) -> Server:
-    """组装完整的服务（见模块说明）。database 覆盖就绪检查用的数据库（测试用）。"""
+    """组装完整的服务（见模块说明）。database 覆盖就绪检查用的数据库（测试用）。
+
+    lease：单副本租约（main 在组装之后、跑服务之前 acquire），给了就在就绪检查里加一项 lease。
+    /metrics 渲染前刷新就绪结果（rodit_ready）和缓存层的统计（缓存命中、过期兜底、串店）。"""
     composed = compose_unit(
         settings, bindings_factory=bindings_factory, clock=clock, repos=repos, environ=environ
     )
@@ -402,13 +438,17 @@ def build_server(
         settings.tokens_file, reload_interval_s=settings.tokens_reload_s, clock=unit.clock
     )
     guard = _metrics_guard(settings, authenticator)
-    readiness = ReadinessChecker(
-        {
-            "database": database_probe(database or production_database()),
-            "llm": composed.llm_probe,
-        },
-        cache_s=settings.readiness_cache_s,
-    )
+    probes: dict[str, Probe] = {
+        "database": database_probe(database or production_database()),
+        "llm": composed.llm_probe,
+    }
+    if lease is not None:
+        probes["lease"] = lease.probe
+    readiness = ObservedReadinessChecker(probes, metrics, cache_s=settings.readiness_cache_s)
+    # 抓取时就绪结果也是新的（结果有缓存，抓得再勤也不会打满数据库）
+    metrics.registry.before_render(readiness.check)
+    gateway = unit.gateway
+    metrics.registry.before_render(lambda: metrics.observe_tool_cache(gateway.totals()))
     monitor: AuthExpiryMonitor | None = None
     if not composed.bindings.mode_c_only:  # 模式 C 不需要平台授权（§8.1），不告警
         platform_shops = composed.bindings.shop_ids
@@ -816,6 +856,20 @@ def _early_logging(environ: Mapping[str, str]) -> None:
     configure_logging(level, fmt if fmt in {"json", "text"} else "json")
 
 
+def _default_lease(settings: ServerSettings) -> Lease:
+    return serve_lease(settings.platform)
+
+
+def _release(lease: Lease | None) -> None:
+    """放租约（没拿到、已经放过都可以调用）。放不掉只记日志：进程退出时连接断开，锁照样释放。"""
+    if lease is None:
+        return
+    try:
+        lease.release()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("释放单副本租约失败：%s", type(exc).__name__)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -823,11 +877,15 @@ def main(
     out: TextIO | None = None,
     label_source: LabelSource | None = None,
     clock: Clock | None = None,
+    lease_factory: LeaseFactory | None = None,
 ) -> int:
     """命令行入口。run 默认是 uvicorn.run（测试注入假的）。返回进程退出码。
 
     label_source / clock 只给离线任务（recalibrate、train-classifier）用：默认从 PostgreSQL 读
-    标注（trainer_label_source）、用系统时间；测试注入假的，不连数据库。"""
+    标注（trainer_label_source）、用系统时间；测试注入假的，不连数据库。
+    lease_factory 只给 serve 用：默认是 PostgreSQL 的单副本租约（rodit.ops.lease）。
+
+    serve 的顺序：设置 → 组装服务（启动前检查，不连库）→ 抢租约 → 按需迁移 → 跑服务 → 放租约。"""
     out = out or sys.stdout
     args = _parser().parse_args(list(argv) if argv is not None else None)
     command = args.command or "serve"
@@ -836,6 +894,7 @@ def main(
     _early_logging(os.environ)
     if command in ("recalibrate", "train-classifier"):
         return _run_job(command, args, out, label_source=label_source, clock=clock)
+    lease: Lease | None = None
     try:
         # 任务模块认领的命令（rodit.ops.jobs）：抛出的异常和内置命令一样按下面映射退出码
         code = jobs.dispatch(args, os.environ)
@@ -850,34 +909,47 @@ def main(
         configure_logging(settings.log_level, settings.log_format)
         if command == "local-init":
             return local_init(settings, out)
+        candidate = (lease_factory or _default_lease)(settings)
+        server = build_server(settings, lease=candidate)
+        lease = candidate  # 从这里起失败都要放租约（没拿到时放也没关系）
+        lease.acquire()  # 另一个进程占着 → LeaseHeld：启动失败，退出码 2
         if settings.migrate_on_start:
             migrate_database()
-        server = build_server(settings)
-    except (SettingsError, StartupError, BindingError, TokenFileError) as exc:
+    except (SettingsError, StartupError, BindingError, TokenFileError, LeaseError) as exc:
+        _release(lease)
         logger.error("启动失败：%s", exc)
         return EXIT_STARTUP
     except RuntimeError as exc:  # 其他模块缺环境变量时的报错（只含变量名）
+        _release(lease)
         logger.error("启动失败：%s", exc)
         return EXIT_STARTUP
     except (StorageUnavailable, psycopg.Error) as exc:  # 只记类型：说明里可能有主机名、账号
+        _release(lease)
         logger.error("数据库不可用：%s", type(exc).__name__)
         return EXIT_FAILURE
     # 配置值不对（超时不是正整数、配置文件不存在、YAML 写错……）
     except (ValueError, OSError, yaml.YAMLError) as exc:
+        _release(lease)
         logger.error("启动失败：%s", exc)
         return EXIT_STARTUP
+    except BaseException:
+        _release(lease)
+        raise
     if run is None:
         import uvicorn
 
         run = uvicorn.run
-    run(
-        server.app,
-        host=settings.host,
-        port=settings.port,
-        log_config=None,  # 用 configure_logging 的 JSON 日志和过滤
-        server_header=False,
-        timeout_graceful_shutdown=20,
-    )
+    try:
+        run(
+            server.app,
+            host=settings.host,
+            port=settings.port,
+            log_config=None,  # 用 configure_logging 的 JSON 日志和过滤
+            server_header=False,
+            timeout_graceful_shutdown=20,
+        )
+    finally:
+        _release(lease)  # 正常退出、异常退出都放租约（被杀时连接断开，数据库自动释放）
     return 0
 
 

@@ -105,6 +105,13 @@
       </form>
     </details>
   </section>
+
+  <!-- 生成式人工智能公示（§12.3）：登录后由脚本按 /v1/me 的 llm 填写、显示；页面本身不含数据 -->
+  <footer id="disclosure" class="hint" hidden>
+    <span>推荐回答由生成式人工智能生成，发出前请核对。</span>
+    <span id="llm-name-part">所用模型：<span id="llm-public-name"></span></span>
+    <span id="llm-filing-part">备案号：<span id="llm-filing-no"></span></span>
+  </footer>
 </main>
 </body>
 </html>

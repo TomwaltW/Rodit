@@ -18,7 +18,13 @@ from typing import Any
 import psycopg
 import pytest
 import yaml
-from ops_support import SYNTHETIC_LLM_KEY, SYNTHETIC_TOKEN_KEY, FakeReadinessDb, TestClient
+from ops_support import (
+    SYNTHETIC_LLM_KEY,
+    SYNTHETIC_TOKEN_KEY,
+    FakeReadinessDb,
+    FakeServeLease,
+    TestClient,
+)
 
 from rodit.app.demo import seed_unit
 from rodit.app.unit import in_memory_repos
@@ -419,7 +425,8 @@ def test_production_unit_routes_with_loaded_classifier(
     assert isinstance(unit.gate._provider, InCloudLLMProvider)  # type: ignore[attr-defined]  质检仍用大模型
     assert "路由分类器已加载" in caplog.text
     ran: list[Any] = []
-    assert main(["serve"], run=lambda app, **kw: ran.append(app)) == 0 and ran
+    assert main(["serve"], run=lambda app, **kw: ran.append(app), lease_factory=FakeServeLease) == 0
+    assert ran
 
 
 def test_classifier_path_ignored_for_other_providers(
