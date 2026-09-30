@@ -189,18 +189,72 @@ def test_compliance_scan_flags_sent_text_without_returning_it(api: Api):
     r = api.get(f"{BASE}/rollout/status", "manager_a")
     s = r.json()
     gate = checks(s["assist_gate"])
-    assert not gate["compliance_scan"]["passed"] and gate["compliance_scan"]["value"] == 1
-    assert "compliance_scan" in s["blocking"]
+    # 扫描命中只是候选：等复核人员确认，列为 unchecked（写明 ID），不算没通过
+    assert "compliance_scan" not in gate and "compliance_scan" in s["assist_gate"]["unchecked"]
+    [unchecked] = [u for u in s["unchecked"] if u["name"] == "compliance_scan"]
+    assert "out_scan_1" in unchecked["reason"]
     assert gate["platform_violations"]["passed"]  # 两条分开报告
     scan = s["evidence"]["compliance"]
     assert scan["message_ids"] == ["out_scan_1"] and scan["by_period"][W39] == 1
+    assert scan["pending"] == 1 and scan["pending_message_ids"] == ["out_scan_1"]
     # 店铺 A 的禁用词里有"全网最低"（合成配置）
     assert scan["rule_counts"] == {"off_platform": 1, "absolute_term": 1, "banned_word": 1}
     for word in ("全网最低价", "微信", "abc123", "有优惠吗"):
         assert word not in r.text
+    # 复核人员确认是违规：门槛没通过
+    body = {"msg_id": "out_scan_1", "decision": "confirmed"}
+    confirmed = api.post(f"{BASE}/rollout/compliance-reviews", "reviewer_a", json=body)
+    assert confirmed.status_code == 201, confirmed.text
+    s = status(api)
+    gate = checks(s["assist_gate"])
+    assert not gate["compliance_scan"]["passed"] and gate["compliance_scan"]["value"] == 1
+    assert "compliance_scan" in s["blocking"]
+    assert s["evidence"]["compliance"]["confirmed"] == 1
 
 
-def test_test_set_is_checked_only_with_a_matching_verdict(api: Api):
+def test_compliance_review_endpoint_validates_the_flag(api: Api):
+    """确认 / 标记误报：只能是最近扫描出来的疑似违规（否则 404），ID 给且只给一个（否则 422），
+    复核人取自调用方身份（请求体带 reviewer 422）。"""
+    conv = api.unit.repos.conversations
+    at = W39_START + timedelta(days=2)
+    conv.add_message(make_message("有优惠吗", at=at, conversation_id="conv_fp", msg_id="b_fp"))
+    conv.add_outgoing(
+        shop_id=SHOP_A,
+        conversation_id="conv_fp",
+        msg_id="out_fp_1",
+        role=Role.AGENT,
+        text="亲，面料：桑蚕丝 100%",
+        at=at + timedelta(minutes=1),
+    )
+    path = f"{BASE}/rollout/compliance-reviews"
+    for body in (
+        {"decision": "dismissed"},
+        {"msg_id": "out_fp_1", "suggestion_id": 1, "decision": "dismissed"},
+        {"msg_id": "out_fp_1", "decision": "ignore"},
+        {"suggestion_id": "1", "decision": "dismissed"},
+        {"msg_id": "out_fp_1", "decision": "dismissed", "reviewer": "someone_else"},
+    ):
+        r = api.post(path, "reviewer_a", json=body)
+        assert r.status_code == 422, (body, r.text)
+    r = api.post(path, "reviewer_a", json={"msg_id": "out_nope", "decision": "dismissed"})
+    assert r.status_code == 404, r.text
+    r = api.post(
+        path,
+        "reviewer_a",
+        json={"msg_id": "out_fp_1", "decision": "dismissed", "note": f"误报，联系 {PHONE}"},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["decision"] == "dismissed" and body["reviewer"] == "qa_reviewer_01"
+    assert body["rules"] == ["absolute_term"] and PHONE not in r.text
+    scan = status(api)["evidence"]["compliance"]
+    assert (scan["flagged"], scan["dismissed"], scan["pending"]) == (1, 1, 0)
+
+
+def test_test_set_is_checked_only_with_a_matching_verdict(api: Api, monkeypatch):
+    # 线上的大模型（合成的地址和模型名）：测试集依据要知道线上用的是哪个模型
+    monkeypatch.setenv("RODIT_LLM_BASE_URL", "https://llm.example.invalid/v1")
+    monkeypatch.setenv("RODIT_LLM_MODEL", "synthetic-model")
     assert api.post(f"{BASE}/rollout/stage", "reviewer_a", json={"stage": "shadow"}).status_code
     s = status(api)
     [unchecked] = s["unchecked"]

@@ -171,7 +171,11 @@ def test_violations_and_the_scan_are_reported_separately():
     one = violations(SHOP_A, {**dict.fromkeys(WEEKS, 0), "2026-W38": 1})
     r = report([shop_input(SHOP_A, violations=one)])
     assert r.failing == ["platform_violations"]
+    # 扫描命中只是候选：没确认的是缺数据（等复核人员确认），确认是违规的才算没通过
     r = report([shop_input(SHOP_A, compliance=scan(2))])
+    assert r.failing == [] and r.unchecked == ["compliance_scan"] and not r.passed
+    confirmed = ComplianceSummary(since=SINCE, until=NOW, flagged=2, confirmed=1, dismissed=1)
+    r = report([shop_input(SHOP_A, compliance=confirmed)])
     assert r.failing == ["compliance_scan"]
     missing = violations(SHOP_A, {"2026-W36": 0, "2026-W37": 0})
     r = report([shop_input(SHOP_A, violations=missing), shop_input(SHOP_B)])

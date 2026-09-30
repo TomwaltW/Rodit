@@ -21,6 +21,12 @@ ROUTES: tuple[Route, ...] = (
         REVIEWER,
     ),
     Route("GET", "/v1/shops/{shop}/rollout/incidents", roles=ROLLOUT_READ),
+    Route(
+        "POST",
+        "/v1/shops/{shop}/rollout/compliance-reviews",
+        {"msg_id": "out_1", "decision": "dismissed"},
+        REVIEWER,
+    ),
     Route("POST", "/v1/shops/{shop}/quality/sample", {"size": 5}, REVIEWER),
     Route("GET", "/v1/shops/{shop}/quality/reviews", roles=REVIEWER),
     Route("POST", "/v1/shops/{shop}/quality/reviews/1", {"status": "skipped"}, REVIEWER),

@@ -38,6 +38,11 @@ W39 = W38 + timedelta(days=7)
 WEEKS = ("2026-W36", "2026-W37", "2026-W38", "2026-W39")
 REVIEWER = "qa_reviewer_01"
 FULL = QualityScores(factual=2, relevance=2, compliance=2, expression=2)
+# 线上的大模型（合成的地址和模型名）：任务和线上服务读同样的环境变量
+LLM_ENV = {
+    "RODIT_LLM_BASE_URL": "https://llm.example.invalid/v1",
+    "RODIT_LLM_MODEL": "synthetic-model",
+}
 _ids = iter(range(1, 100_000))
 
 
@@ -60,7 +65,7 @@ def eval_report(*, mode: str = "env", passes: bool = True, **over) -> dict:
             "passes": passes,
         },
         "llm": {"mode": mode, "model": "synthetic-model", "decision_provider": "incloud_llm"},
-        "fingerprint": current_fingerprint(EngineConfig()).model_dump(mode="json"),
+        "fingerprint": current_fingerprint(EngineConfig(), environ=LLM_ENV).model_dump(mode="json"),
         "cases": [],
     }
     data.update(over)
@@ -75,7 +80,11 @@ def test_record_eval_writes_a_system_event(tmp_path: Path):
     path.write_text(json.dumps(eval_report(), ensure_ascii=False), encoding="utf-8")
     audit, out = InMemoryAuditSink(), io.StringIO()
     code = rollout_jobs.run(
-        parse("record-eval", "--report", str(path)), {}, audit=audit, clock=FakeClock(NOW), out=out
+        parse("record-eval", "--report", str(path)),
+        LLM_ENV,
+        audit=audit,
+        clock=FakeClock(NOW),
+        out=out,
     )
     assert code == 0
     [event] = audit.list_system_events(action=AuditAction.EVAL_VERDICT.value)
@@ -83,6 +92,7 @@ def test_record_eval_writes_a_system_event(tmp_path: Path):
     assert event.detail["fingerprint"]["config_fingerprint"] == config_fingerprint(EngineConfig())
     assert event.detail["gate_passes"] is True and event.detail["llm_mode"] == "env"
     assert "一致" in out.getvalue() and "达标" in out.getvalue()
+    assert "不一致" not in out.getvalue()
 
 
 def test_record_eval_warns_when_the_deployed_config_differs(tmp_path: Path):
@@ -92,8 +102,10 @@ def test_record_eval_warns_when_the_deployed_config_differs(tmp_path: Path):
     config.write_text("routing:\n  assist_threshold: 0.75\n", encoding="utf-8")
     audit, out = InMemoryAuditSink(), io.StringIO()
     args = parse("record-eval", "--report", str(path))
-    assert rollout_jobs.run(args, {"RODIT_CONFIG": str(config)}, audit=audit, out=out) == 0
+    environ = {**LLM_ENV, "RODIT_CONFIG": str(config)}
+    assert rollout_jobs.run(args, environ, audit=audit, out=out) == 0
     assert "不一致" in out.getvalue() and str(config) in out.getvalue()
+    assert "配置指纹" in out.getvalue()
     assert len(audit.list_system_events()) == 1  # 照样记下（以后换回这套配置时还能用）
 
 
@@ -215,7 +227,7 @@ def repos():
 def acceptance(repos, *argv: str) -> tuple[int, str]:
     out = io.StringIO()
     args = parse("acceptance-report", "--since", "2026-09-01", *argv)
-    code = rollout_jobs.run(args, {}, repos=repos, clock=FakeClock(NOW), out=out)
+    code = rollout_jobs.run(args, LLM_ENV, repos=repos, clock=FakeClock(NOW), out=out)
     return code, out.getvalue()
 
 

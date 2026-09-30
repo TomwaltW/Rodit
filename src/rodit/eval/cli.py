@@ -16,17 +16,20 @@
 两种模式（--llm）：
 - offline（默认）：离线替身——生成只复述依据、关键词规则路由、启发式质检，全部合成数据、不联网。
   离线替身的回答质量远不如真实大模型，这里的数字是回归基线（§13.5），不是上线判断；
-- env：真实的 OpenAI 兼容大模型（rodit.eval.llm_env：RODIT_LLM_BASE_URL / RODIT_LLM_MODEL /
-  RODIT_LLM_API_KEY / RODIT_LLM_TIMEOUT_S），路由和质检按 EngineConfig.decision 组装
+- env：真实的 OpenAI 兼容大模型，和线上取同一个（app.production.build_production_unit 的规则）：
+  --config 里 llm.base_url 和 llm.model 都写了用配置，否则用环境变量（rodit.eval.llm_env：
+  RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_LLM_TIMEOUT_S）；密钥从 llm.api_key_env 指的
+  环境变量读（默认 RODIT_LLM_API_KEY）。路由和质检按 EngineConfig.decision 组装
   （默认 incloud_llm）。只在本地开发机上这样做：密钥放本地 .env，不进仓库；评测集全是合成数据。
 
 部分评测：--intent 只跑某个问题类型，--limit N 用 --seed 随机抽 N 条（可复现）。
 路由分类器（§6.4）：--classifier 模型文件（python -m rodit.ops train-classifier 的输出）代替路由的
 判断层，两种模式都可以；上线前和 --baseline 一起跑回归（§13.5）。
 完整结果：--json 输出 JSON 到标准输出；--json out.json 写文件（文本报告照常输出）。
-报告带配置指纹（rodit.eval.fingerprint：配置的 config_fingerprint、路由 / 质检问题定义版本、
-代码版本、--classifier 模型文件的 SHA-256）；python -m rodit.ops record-eval --report out.json
-把完整评测的结论记成 eval.verdict，上线状态只认指纹和线上配置一致的结论（§13.4、§13.5）。
+报告带指纹（rodit.eval.fingerprint）：按实际跑的记——配置的 config_fingerprint（--classifier 时
+判断层记为 classifier）、路由 / 质检问题定义版本、生成环节的版本、用的大模型（模型名、接口主机）、
+--classifier 模型文件的 SHA-256、代码版本；python -m rodit.ops record-eval --report out.json
+把完整评测的结论记成 eval.verdict，上线状态只认指纹和线上一致的结论（§13.4、§13.5）。
 退出码：0 正常；1 回归比较有指标下降；2 配置错误（环境变量、基线文件、筛选后没有用例等）。
 """
 
@@ -34,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -61,7 +65,7 @@ from rodit.eval.calibration import (
     reliability,
 )
 from rodit.eval.dataset import EvalCase, cases
-from rodit.eval.fingerprint import EvalFingerprint, current_fingerprint, file_sha256
+from rodit.eval.fingerprint import EvalFingerprint, file_sha256, fingerprint_of
 from rodit.eval.harness import DEMO_PLATFORM, DemoHarness, demo_harness, llm_harness
 from rodit.eval.llm_env import (
     PRICE_INPUT_ENV,
@@ -86,6 +90,7 @@ from rodit.eval.perf import (
 )
 from rodit.eval.runner import CaseTrace, Progress, run_eval, select_cases
 from rodit.eval.scoring import DIMENSIONS, CaseScore, summarize
+from rodit.llm import OpenAICompatibleClient
 from rodit.testing import fixtures
 from rodit.testing.fixtures import build_demo_world
 
@@ -359,11 +364,13 @@ def evaluate(
     pricing: Pricing | None = None,
     progress: Progress | None = None,
     route_provider: DecisionProvider | None = None,
+    classifier_sha256: str | None = None,
 ) -> EvalCliReport:
     """在演示单元上跑评测集的一部分，汇总成报告。
 
     llm 为空用离线替身；给了就用它（真实模型或测试替身），路由和质检按 config.decision 组装。
-    route_provider 给了就用它路由（--classifier：训练好的分类器，§6.4 上线前的 §13.5 回归）。
+    route_provider 给了就用它路由（--classifier：训练好的分类器，§6.4 上线前的 §13.5 回归），
+    classifier_sha256 是它的模型文件的 SHA-256（记进指纹）。
     intent / limit / seed 见 runner.select_cases；pricing 为空时只报 token。
     """
     wanted = Intent(intent) if intent is not None else None
@@ -440,7 +447,33 @@ def evaluate(
         latency=latency_report([t.latency_ms for t in traces]),
         usage=usage_report([t.llm_calls for t in traces], pricing) if metered else None,
         degraded_counts=dict(Counter(d for t in traces for d in t.degraded).most_common()),
-        fingerprint=current_fingerprint(config or EngineConfig(), git=True),
+        fingerprint=_run_fingerprint(llm, config, route_provider, classifier_sha256),
+    )
+
+
+def _run_fingerprint(
+    llm: LLMClient | None,
+    config: EngineConfig | None,
+    route_provider: DecisionProvider | None,
+    classifier_sha256: str | None,
+) -> EvalFingerprint:
+    """这次评测实际跑的指纹：用分类器路由时判断层记为 classifier（配置里写的是别的也一样——
+    分类器跑出来的结论只能给分类器路由的部署作依据，反过来也一样）；大模型记实际用的客户端
+    （离线替身记替身的名字，没有接口地址）。"""
+    effective = config or EngineConfig()
+    if route_provider is not None:
+        decision = effective.decision.model_copy(update={"provider": ProviderName.CLASSIFIER})
+        effective = effective.model_copy(update={"decision": decision})
+    if llm is None:
+        model, endpoint = EvidenceEchoLLM.model, None
+    else:
+        model, endpoint = describe_model(llm), describe_endpoint(llm)
+    return fingerprint_of(
+        effective,
+        llm_model=model,
+        llm_endpoint=endpoint,
+        classifier_sha256=classifier_sha256 if route_provider is not None else None,
+        git=True,
     )
 
 
@@ -697,9 +730,12 @@ def _render_fingerprint(fp: EvalFingerprint, add: Add) -> None:
     if fp.git_dirty:
         code += "（有未提交的改动）"
     classifier = f"，分类器 {fp.classifier_sha256[:12]}" if fp.classifier_sha256 else ""
+    model = fp.llm_model or "未知"
+    where = f" @ {fp.llm_endpoint}" if fp.llm_endpoint else ""
     add(
         f"== 配置指纹 {fp.config_fingerprint[:12]}（路由问题 {fp.router_questions_ver}，"
-        f"质检问题 {fp.qa_questions_ver}，代码 {code}{classifier}）"
+        f"质检问题 {fp.qa_questions_ver}，生成环节 {fp.generation_ver or '未知'}，"
+        f"判断层 {fp.decision_provider or '未知'}{classifier}，大模型 {model}{where}，代码 {code}）"
     )
     add("记录这次的结论（完整评测才行）：python -m rodit.ops record-eval --report <--json 的文件>")
 
@@ -769,6 +805,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def env_client(config: EngineConfig | None) -> OpenAICompatibleClient:
+    """--llm env 的大模型客户端，和 app.production.build_production_unit 取同一个：配置里
+    llm.base_url 和 llm.model 都写了用配置（超时 llm.timeout_s），否则用环境变量 RODIT_LLM_*
+    （llm_env.client_from_env）。密钥从 llm.api_key_env 指的环境变量读，没设时抛 RuntimeError
+    （信息里只有变量名）。评测记下的大模型（指纹）就是它。"""
+    llm = (config or EngineConfig()).llm
+    if not (llm.base_url and llm.model):
+        return client_from_env(api_key_env=llm.api_key_env)
+    client = OpenAICompatibleClient(
+        base_url=llm.base_url,
+        model=llm.model,
+        api_key_env=llm.api_key_env,
+        timeout_s=llm.timeout_s,
+    )
+    if not os.environ.get(client.api_key_env, "").strip():
+        raise RuntimeError(f"环境变量 {client.api_key_env} 未设置：没有大模型 API key")
+    return client
+
+
 def _progress_printer(err: TextIO) -> Progress:
     def show(index: int, total: int, case: EvalCase, trace: CaseTrace) -> None:
         ms = trace.latency_ms.get("total")
@@ -788,7 +843,8 @@ def main(
 ) -> int:
     """命令行入口，返回退出码（见模块说明）。
 
-    client_factory：--llm env 时构造大模型客户端（默认 llm_env.client_from_env；测试注入替身）。
+    client_factory：--llm env 时构造大模型客户端（默认 env_client：和线上同一条规则，
+    先看 --config 的 llm，再看环境变量；测试注入替身）。
     """
     args = build_parser().parse_args(argv)
     out = out or sys.stdout
@@ -812,7 +868,7 @@ def main(
                 raise ValueError(f"路由分类器模型文件不能用：{e}") from None
         llm: LLMClient | None = None
         if args.llm == "env":
-            llm = (client_factory or client_from_env)()
+            llm = client_factory() if client_factory is not None else env_client(config)
             try:
                 preflight(llm)
             except LLMError as e:  # 客户端的错误信息里已经抹掉了密钥
@@ -827,6 +883,7 @@ def main(
             pricing=pricing,
             progress=_progress_printer(err) if llm is not None else None,
             route_provider=route_provider,
+            classifier_sha256=file_sha256(args.classifier) if args.classifier else None,
         )
         if baseline is not None:
             check = compare_to_baseline(
@@ -836,11 +893,6 @@ def main(
                 source=args.baseline,
             )
             report = report.model_copy(update={"baseline": check})
-        if args.classifier and report.fingerprint is not None:
-            fp = report.fingerprint.model_copy(
-                update={"classifier_sha256": file_sha256(args.classifier)}
-            )
-            report = report.model_copy(update={"fingerprint": fp})
     except (ValueError, RuntimeError, OSError, yaml.YAMLError) as e:
         print(f"评测没有运行：{e}", file=err)
         return 2
@@ -870,6 +922,7 @@ __all__ = [
     "LLMInfo",
     "build_parser",
     "demo_harness",
+    "env_client",
     "evaluate",
     "main",
     "render_text",

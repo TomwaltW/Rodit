@@ -17,14 +17,17 @@
   不算，见 feedback.metrics）。平台违规分两条报告：
   platform_violations = 复核人员按周登记的平台违规通知（shop.rollout_incident，见 incident_total：
   这 2 周都登记过、或登记的条数已经大于 0 才算检查过，否则 unchecked 并写明缺哪几周）；
-  compliance_scan = 实际发出去的文字的合规扫描（feedback.compliance，代理指标，同一窗口到现在）。
-  两条都要为 0。
+  compliance_scan = 实际发出去的文字的合规扫描（feedback.compliance，代理指标，同一窗口到现在）：
+  扫描命中只是候选，复核人员逐条确认——确认是违规的条数要为 0；还有没确认的（且没有确认的违规）时
+  这一条是 unchecked，写明几条、哪些 ID；误报标记后不计。
 - 全自动（按类型，§13.4 "该类型连续 4 周原样采纳率 ≥ 90%，且没有因此产生的投诉"）：
   config.routing.auto_threshold 列出的类型各跑 intent_gate(min_periods=4)，每周至少
   AUTO_MIN_GROUPS 个推荐组；投诉 = 复核人员按周登记的投诉（最近 4 周，口径同平台违规），
   没登记全时列为 unchecked。开不开由平台准入和人工决定，这里只报告。
 - 复核人员的登记（shop.rollout_incident）：每条是某一周的总数，同一类型、同一周再登记以最后一次为准
-  （改错用）；没有也要登记 0，门槛才算检查过。本周的登记（不是完整周）有大于 0 的也计入。
+  （改错用）；没有也要登记 0，门槛才算检查过。0 要在那一周结束之后登记（或结束后再登记一次确认）
+  才算：周中登记的 0 只说明到登记时还没有，平台通知常常滞后（provisional_zero）。本周的登记
+  （不是完整周）有大于 0 的也计入。
 - GateResult.passed 只看已检查的条件；unchecked 的条件由复核人员确认（切换时写进审计）。
 """
 
@@ -48,7 +51,7 @@ from rodit.core.models import (
     StoredMessage,
     SuggestionRecord,
 )
-from rodit.feedback.compliance import ComplianceSummary
+from rodit.feedback.compliance import ComplianceSummary, pending_reason
 from rodit.feedback.metrics import (
     AdoptionReport,
     GateCheck,
@@ -68,6 +71,7 @@ from rodit.feedback.review import (
     QualityReport,
     iso_period,
     launch_gate,
+    period_range,
     week_start,
 )
 
@@ -129,6 +133,9 @@ UNCHECKED_LABELS: dict[str, str] = {
     ),
     "platform_violations": "平台违规为 0（§13.4：复核人员按周登记平台下发的违规通知）",
     "complaints": "没有因自动回复产生的投诉（§13.4：复核人员按周登记）",
+    "compliance_scan": (
+        "发出去的文字没有违规（合规扫描命中的疑似违规由复核人员逐条确认，误报标记后不计）"
+    ),
     "consecutive": "统计周期首尾相接",
 }
 """没有数据、需要人工确认的条件（GateResult.unchecked 的名字 → 说明）。"""
@@ -226,10 +233,23 @@ class IncidentTotal(_Model):
     kind: IncidentKind
     weeks: list[str]  # 必须登记的周（完整周）
     by_week: dict[str, int] = Field(default_factory=dict)  # 已登记的周（含本周）→ 条数
-    missing: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)  # 还要登记（或结束后再确认）的周
+    provisional: list[str] = Field(default_factory=list)  # 其中登记了 0、但是在那一周结束前登记的
     known: int = 0  # 已登记的条数合计
     count: int | None = None
     reason: str | None = None
+
+
+def provisional_zero(entry: IncidentEntry, *, as_of: datetime | None = None) -> bool:
+    """这条登记是不是"暂定的 0"：条数为 0、登记时那一周还没结束——它只说明到登记时为止没有，
+    不能代表整周（通知常常滞后）。as_of 给了、那一周到 as_of 还没结束时不算暂定（那一周本来就只能
+    看到现在为止，如不到一周的验收窗口）。"""
+    if entry.count > 0:
+        return False
+    end = period_range(entry.week)[1]
+    if as_of is not None and end > as_of:
+        return False
+    return entry.recorded_at < end
 
 
 def incident_total(
@@ -238,33 +258,58 @@ def incident_total(
     weeks: Sequence[str],
     *,
     extra_weeks: Sequence[str] = (),
+    as_of: datetime | None = None,
 ) -> IncidentTotal:
-    """weeks 是必须登记的周，extra_weeks（如本周）有登记就计入。
+    """weeks 是必须登记的周，extra_weeks（如本周）有登记就计入。as_of：按哪个时间点判断
+    （上线状态用现在，验收报告用窗口终点）。
+
+    必须登记的周里，登记的 0 要在那一周结束之后登记（或结束后再登记一次确认）才算检查过：
+    周一早上登记的 0 不能代表整周（provisional_zero），这一周仍算缺登记，reason 写明要在结束后确认。
+    大于 0 的登记什么时候登记都算。
 
     登记的条数大于 0 → count = 合计（门槛不通过，不管缺不缺登记）；都登记了且合计为 0 → count = 0；
     否则 count = None，reason 写明缺哪几周。"""
     latest = current_entries(e for e in entries if e.kind == kind)
     wanted = list(dict.fromkeys([*weeks, *extra_weeks]))
-    by_week = {w: latest[(kind, w)].count for w in wanted if (kind, w) in latest}
+    required = set(weeks)
+    provisional = [
+        w for w in weeks if (kind, w) in latest and provisional_zero(latest[(kind, w)], as_of=as_of)
+    ]
+    by_week = {
+        w: latest[(kind, w)].count
+        for w in wanted
+        if (kind, w) in latest and not (w in required and w in provisional)
+    }
     missing = [w for w in weeks if w not in by_week]
     known = sum(by_week.values())
     label = INCIDENT_KIND_LABELS[kind]
     count: int | None
+    reason: str | None = None
     if known > 0:
-        count, reason = known, None
+        count = known
     elif not missing:
-        count, reason = 0, None
+        count = 0
     else:
         count = None
-        reason = (
-            f"还没登记 {'、'.join(missing)} 的{label}"
-            "（复核人员按周登记平台下发的通知，没有也要登记 0）"
-        )
+        parts = []
+        unregistered = [w for w in missing if w not in provisional]
+        if unregistered:
+            parts.append(
+                f"还没登记 {'、'.join(unregistered)} 的{label}"
+                "（复核人员按周登记平台下发的通知，没有也要登记 0）"
+            )
+        if provisional:
+            parts.append(
+                f"{'、'.join(provisional)} 的{label}登记 0 是在那一周结束前登记的，"
+                "只能说明登记时还没有：那一周结束后再登记一次确认"
+            )
+        reason = "；".join(parts)
     return IncidentTotal(
         kind=kind,
         weeks=list(weeks),
         by_week=by_week,
         missing=missing,
+        provisional=provisional,
         known=known,
         count=count,
         reason=reason,
@@ -356,13 +401,16 @@ def assist_gate(
     *,
     platform_violations: int | None = None,
     potential_violations: int | None = None,
+    unreviewed_violations: int = 0,
     min_groups: int = ASSIST_MIN_GROUPS,
 ) -> GateResult:
     """智能辅助 → 下一阶段：最近 2 周（weekly 的最后两份）推荐组采纳率都 ≥ 60%，平台违规为 0。
 
     platform_violations：复核人员登记的平台违规（None → unchecked）；
-    potential_violations：合规扫描的疑似违规条数（代理指标，单独一条 compliance_scan；
-    None 时不加这一条）。"""
+    potential_violations：合规扫描命中、复核人员确认是违规的条数（代理指标，单独一条
+    compliance_scan；None 时不加这一条）；
+    unreviewed_violations：扫描命中、复核人员还没确认的条数——只是候选，不算不通过：没有确认的
+    违规、又有没确认的时，compliance_scan 列为 unchecked（由复核人员确认或标记误报）。"""
     gate = phase_gate(
         list(weekly)[-ASSIST_PERIODS:],
         min_adoption=ASSIST_MIN_ADOPTION,
@@ -372,6 +420,8 @@ def assist_gate(
     )
     if potential_violations is None:
         return gate
+    if potential_violations == 0 and unreviewed_violations > 0:
+        return gate.model_copy(update={"unchecked": [*gate.unchecked, COMPLIANCE_SCAN_CHECK]})
     checks = [
         *gate.checks,
         GateCheck(
@@ -379,7 +429,7 @@ def assist_gate(
             passed=potential_violations == 0,
             value=potential_violations,
             threshold=0,
-            detail="实际发出去的文字里疑似违规的条数（合规扫描，代理指标）",
+            detail=("实际发出去的文字里复核人员确认的违规条数（合规扫描命中后逐条确认，代理指标）"),
         ),
     ]
     return gate.model_copy(
@@ -637,21 +687,25 @@ def rollout_status(
     shadow 是影子窗口内的对比（shadow_comparison）；reviews 是影子窗口涉及周期的复核样本。
 
     evidence 给了时，测试集、平台违规、投诉取自它（覆盖 test_set_passed / platform_violations /
-    complaints），并加上合规扫描一条；没法检查的条件带上原因。"""
+    complaints），并加上合规扫描一条（复核人员确认的违规；只有没确认的疑似违规时是 unchecked）；
+    没法检查的条件带上原因。"""
     stage = stage_of(config)
     reasons: dict[str, str | None] = {}
     test_set_detail: str | None = None
     potential: int | None = None
+    unreviewed = 0
     if evidence is not None:
         test_set_passed = evidence.test_set.passed
         test_set_detail = evidence.test_set.detail or None
         platform_violations = evidence.platform_violations.count
         complaints = evidence.complaints.count
-        potential = evidence.compliance.flagged
+        potential = evidence.compliance.confirmed
+        unreviewed = evidence.compliance.pending
         reasons = {
             "test_set": evidence.test_set.reason,
             "platform_violations": evidence.platform_violations.reason,
             "complaints": evidence.complaints.reason,
+            "compliance_scan": pending_reason(evidence.compliance),
         }
     by_id = {r.id: r for r in records if r.id is not None and r.shop_id == shop_id}
     in_shadow = shadow_reviews(reviews, by_id, shop_id=shop_id, since=shadow_since)
@@ -663,6 +717,7 @@ def rollout_status(
         weekly,
         platform_violations=platform_violations,
         potential_violations=potential,
+        unreviewed_violations=unreviewed,
         min_groups=assist_min_groups,
     )
     i_gates = auto_intent_gates(
@@ -733,6 +788,7 @@ __all__ = [
     "incident_detail",
     "incident_total",
     "parse_incidents",
+    "provisional_zero",
     "rollout_status",
     "shadow_comparison",
     "shadow_gate",

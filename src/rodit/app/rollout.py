@@ -12,10 +12,13 @@
   §13.4 的门槛（feedback.rollout.shadow_gate），没过时只能强制切换并写明原因；门槛摘要、是否强制、
   原因写进 shop.rollout_stage。已经在目标阶段时什么都不写。全自动的开关（auto_reply_enabled）
   要平台准入，不在这里改。
-- 门槛里原来没有数据来源的条件（rollout_evidence）：测试集 = eval.verdict 系统事件里和线上配置
-  指纹一致、用真实大模型跑的最近一次结论（rodit.eval.fingerprint）；平台违规、投诉 = 复核人员按周
-  登记的 shop.rollout_incident（record_incident：周、条数、备注，不记原文）；另加实际发出去的文字的
-  合规扫描（feedback.compliance，代理指标，单独一条）。查看上线状态只读这些，不写任何东西。
+- 门槛里原来没有数据来源的条件（rollout_evidence）：测试集 = eval.verdict 系统事件里和线上一致
+  （配置、问题定义、生成环节、判断层和分类器、大模型）、用真实大模型跑的最近一次结论
+  （rodit.eval.fingerprint）；平台违规、投诉 = 复核人员按周登记的 shop.rollout_incident
+  （record_incident：周、条数、备注，不记原文）；另加实际发出去的文字的合规扫描（feedback.compliance，
+  代理指标，单独一条）：扫描命中是候选，复核人员逐条确认或标记误报（review_compliance，写
+  compliance.reviewed：推荐 / 消息 ID、结论、规则名、备注，不记文字），确认的违规才算不通过、
+  没确认的列为 unchecked。查看上线状态只读这些，不写任何东西。
 写操作开始前先确认店铺还在（取消订购删掉店铺后不会把样本、审计、配置写回来）。
 """
 
@@ -47,8 +50,15 @@ from rodit.core.ports import AuditLog
 from rodit.eval.fingerprint import current_fingerprint, test_set_evidence
 from rodit.feedback.acceptance import ShopAcceptanceInput, message_latencies
 from rodit.feedback.compliance import (
+    COMPLIANCE_REVIEWED,
+    ComplianceDecision,
+    ComplianceReviewEntry,
     ComplianceRules,
     ComplianceWeek,
+    check_flag_ref,
+    find_flag,
+    parse_reviews,
+    review_detail,
     scan_sent,
     summarize_scan,
 )
@@ -105,6 +115,7 @@ ShopGate = Callable[[str], AbstractContextManager[None]]
 MAX_NOTE_CHARS = 500
 LATEST_QUALITY_LOOKBACK = 4  # 最近一个有样本的周期：本周和之前 4 周里找
 INCIDENT_LIST_WEEKS = 8  # 登记列表默认看本周和之前 8 周
+COMPLIANCE_REVIEW_WEEKS = 13  # 复核人员能确认 / 标记误报的疑似违规：本周和之前 13 周扫描出来的
 
 MSG_GATE_NOT_PASSED = "影子对比还没达到进入智能辅助的门槛（§13.4）；确需切换请强制切换并写明原因"
 MSG_AUTO_ENABLED = (
@@ -183,6 +194,31 @@ class IncidentRecord(_Model):
         )
 
 
+class ComplianceReviewRecord(_Model):
+    """复核人员对一条疑似违规的结论（compliance.reviewed）。没有文字：推荐 / 消息 ID、命中的规则名、
+    结论、备注（已做个人信息最小化）。"""
+
+    suggestion_id: int | None = None
+    msg_id: str | None = None
+    decision: ComplianceDecision
+    rules: list[str] = Field(default_factory=list)
+    note: str | None = None
+    reviewer: str
+    recorded_at: AwareDatetime
+
+    @classmethod
+    def of(cls, entry: ComplianceReviewEntry) -> ComplianceReviewRecord:
+        return cls(
+            suggestion_id=entry.suggestion_id,
+            msg_id=entry.msg_id,
+            decision=entry.decision,
+            rules=list(entry.rules),
+            note=entry.note,
+            reviewer=entry.reviewer,
+            recorded_at=entry.recorded_at,
+        )
+
+
 class IncidentList(_Model):
     """一段时间里的登记（新的周在前，同一周新的登记在前）。只有计数和复核人员的备注，没有原文。"""
 
@@ -194,16 +230,30 @@ class IncidentList(_Model):
 # ================================================================ 门槛的依据（§13.4）
 
 
-def eval_evidence(audit: AuditLog, config: EngineConfig) -> TestSetEvidence:
-    """测试集依据：eval.verdict 系统事件里和这套配置一致、用真实大模型跑的最近一次结论。"""
+def eval_evidence(
+    audit: AuditLog, config: EngineConfig, *, environ: Mapping[str, str] | None = None
+) -> TestSetEvidence:
+    """测试集依据：eval.verdict 系统事件里和线上一致（配置、问题定义、生成环节、判断层和分类器、
+    大模型都一样）、用真实大模型跑的最近一次结论。线上的大模型和分类器按部署规则从配置和环境变量
+    解析（rodit.eval.fingerprint.current_fingerprint；environ 默认 os.environ，和线上单元读的是
+    同一份）。"""
     events = audit.list_system_events(action=AuditAction.EVAL_VERDICT.value)
-    return test_set_evidence(events, current_fingerprint(config))
+    return test_set_evidence(events, current_fingerprint(config, environ=environ))
 
 
 def incident_entries(audit: AuditLog, shop_id: str, *, since: datetime) -> list[IncidentEntry]:
     """since 以后记下的登记（登记的周不会晚于登记时间：将来的周不让登记）。"""
     events = audit.list_events(shop_id, action=AuditAction.ROLLOUT_INCIDENT.value, since=since)
     return parse_incidents(events, shop_id=shop_id)
+
+
+def compliance_reviews(
+    audit: AuditLog, shop_id: str, *, since: datetime
+) -> list[ComplianceReviewEntry]:
+    """since 以后记下的复核人员结论（确认 / 误报）。疑似违规发生之后才能确认，since 取扫描
+    窗口的起点。"""
+    events = audit.list_events(shop_id, action=COMPLIANCE_REVIEWED, since=since)
+    return parse_reviews(events, shop_id=shop_id)
 
 
 def compliance_weeks(
@@ -231,15 +281,20 @@ def rollout_evidence(
     current = [iso_period(now)]
     entries = incident_entries(repos.audit, shop.id, since=auto[0][1])
     weeks = compliance_weeks(repos, config, shop, since=assist[0][1], until=now)
+    reviews = compliance_reviews(repos.audit, shop.id, since=assist[0][1])
     return RolloutEvidence(
         test_set=eval_evidence(repos.audit, config),
         platform_violations=incident_total(
-            entries, IncidentKind.VIOLATION, [p for p, _, _ in assist], extra_weeks=current
+            entries,
+            IncidentKind.VIOLATION,
+            [p for p, _, _ in assist],
+            extra_weeks=current,
+            as_of=now,
         ),
         complaints=incident_total(
-            entries, IncidentKind.COMPLAINT, [p for p, _, _ in auto], extra_weeks=current
+            entries, IncidentKind.COMPLAINT, [p for p, _, _ in auto], extra_weeks=current, as_of=now
         ),
-        compliance=summarize_scan(weeks),
+        compliance=summarize_scan(weeks, reviews=reviews),
     )
 
 
@@ -247,8 +302,8 @@ def acceptance_input(
     repos: Repos, config: EngineConfig, shop: Shop, *, since: datetime, until: datetime
 ) -> ShopAcceptanceInput:
     """一家店的 Phase 1 验收数据（feedback.acceptance）：采纳率的 2 周推荐记录、窗口里的推荐
-    出现耗时、平台违规登记（窗口里每个完整周都要登记；窗口不到一周时要登记所在的周）、合规扫描、
-    每周复核样本。只读。"""
+    出现耗时、平台违规登记（窗口里每个完整周都要登记，登记的 0 要在那一周结束后登记才算；窗口
+    不到一周时要登记所在的周）、合规扫描（带复核人员的确认 / 误报标记）、每周复核样本。只读。"""
     adoption_start = week_windows(until, ASSIST_PERIODS)[0][1]
     records = [
         r
@@ -276,8 +331,12 @@ def acceptance_input(
             IncidentKind.VIOLATION,
             required,
             extra_weeks=[p for p in periods if p not in required],
+            as_of=until,
         ),
-        compliance=summarize_scan(compliance_weeks(repos, config, shop, since=since, until=until)),
+        compliance=summarize_scan(
+            compliance_weeks(repos, config, shop, since=since, until=until),
+            reviews=compliance_reviews(repos.audit, shop.id, since=since),
+        ),
         reviews=reviews,
     )
 
@@ -318,12 +377,14 @@ class RolloutService:
             raise ShopInactive(shop_id, shop.status)
         return shop
 
-    def _audit(self, shop_id: str, actor: str, action: AuditAction, detail: dict[str, Any]) -> None:
+    def _audit(
+        self, shop_id: str, actor: str, action: AuditAction | str, detail: dict[str, Any]
+    ) -> None:
         self.unit.repos.audit.record(
             AuditEvent(
                 shop_id=shop_id,
                 actor=actor,
-                action=action.value,
+                action=str(action),
                 detail=detail,
                 created_at=self.unit.clock.now(),
             )
@@ -543,7 +604,9 @@ class RolloutService:
     ) -> IncidentRecord:
         """复核人员登记某一周平台下发的违规通知、买家投诉的总数（没有也登记 0）。写
         shop.rollout_incident（周、条数、备注——个人信息最小化后；不记通知或投诉的原文）。
-        同一类、同一周再登记以最后一次为准。还没开始的周不能登记。"""
+        同一类、同一周再登记以最后一次为准。还没开始的周不能登记。
+        那一周还没结束时登记的 0 是暂定的：门槛只认那一周结束后登记（或再确认）的 0
+        （feedback.rollout.incident_total），大于 0 的随时登记都算。"""
         kind = IncidentKind(kind)
         week = check_period(week)
         if isinstance(count, bool) or not isinstance(count, int):
@@ -582,6 +645,50 @@ class RolloutService:
         ordered = sorted(enumerate(entries), key=lambda x: (x[1].week, x[1].recorded_at, x[0]))
         items = [IncidentRecord.of(e, current=id(e) in latest) for _, e in reversed(ordered)]
         return IncidentList(shop_id=shop_id, since=since, items=items)
+
+    # ================================================================ 合规扫描的确认（§13.4）
+
+    def review_compliance(
+        self,
+        shop_id: str,
+        *,
+        decision: ComplianceDecision | str,
+        reviewer: str,
+        suggestion_id: int | None = None,
+        msg_id: str | None = None,
+        note: str | None = None,
+    ) -> ComplianceReviewRecord:
+        """复核人员确认合规扫描的一条疑似违规（confirmed：确实违规，门槛不通过）或标记误报
+        （dismissed：不计入）。suggestion_id（编辑后发送的推荐）和 msg_id（客服 / 机器人发出的消息）
+        给且只给一个，要是本周和之前 COMPLIANCE_REVIEW_WEEKS 周扫描出来的疑似违规（否则 KeyError，
+        接口层 404）。同一条再标记以最后一次为准。写 compliance.reviewed：ID、结论、命中的规则名、
+        备注（个人信息最小化），不记文字。"""
+        result = ComplianceDecision(decision)
+        suggestion_id, msg_id = check_flag_ref(suggestion_id, msg_id)
+        reviewer = _require_person(reviewer, "复核人")
+        clean_note = _clean_note(note)
+        now = self.unit.clock.now()
+        since = week_start(now) - timedelta(days=7 * COMPLIANCE_REVIEW_WEEKS)
+        with self._processing(shop_id):
+            shop = self._shop(shop_id)
+            weeks = compliance_weeks(
+                self.unit.repos, self.unit.config, shop, since=since, until=now
+            )
+            flag = find_flag(weeks, suggestion_id=suggestion_id, msg_id=msg_id)
+            if flag is None:
+                raise KeyError(suggestion_id if suggestion_id is not None else msg_id)
+            entry = ComplianceReviewEntry(
+                shop_id=shop_id,
+                suggestion_id=suggestion_id,
+                msg_id=msg_id,
+                decision=result,
+                rules=list(flag.rules),
+                note=clean_note,
+                reviewer=reviewer,
+                recorded_at=now,
+            )
+            self._audit(shop_id, reviewer, COMPLIANCE_REVIEWED, review_detail(entry))
+        return ComplianceReviewRecord.of(entry)
 
     # ================================================================ 每周人工复核（§13.5）
 
@@ -756,8 +863,10 @@ class RolloutService:
 
 
 __all__ = [
+    "COMPLIANCE_REVIEW_WEEKS",
     "INCIDENT_LIST_WEEKS",
     "MAX_NOTE_CHARS",
+    "ComplianceReviewRecord",
     "IncidentList",
     "IncidentRecord",
     "ReviewList",
@@ -766,6 +875,7 @@ __all__ = [
     "ShadowComparison",
     "StageChange",
     "acceptance_input",
+    "compliance_reviews",
     "compliance_weeks",
     "eval_evidence",
     "incident_entries",

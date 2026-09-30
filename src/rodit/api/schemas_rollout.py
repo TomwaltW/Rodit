@@ -19,6 +19,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from rodit.app.rollout import MAX_NOTE_CHARS, ShadowComparison
 from rodit.core.enums import Intent, QualityReviewStatus
 from rodit.core.models import QUALITY_PERIOD_PATTERN, QualityReview, QualityScores
+from rodit.feedback.compliance import MAX_MSG_ID_CHARS
 from rodit.feedback.metrics import ShadowIntentStats
 from rodit.feedback.review import DEFAULT_SAMPLE_SIZE, MAX_SAMPLE_SIZE
 from rodit.feedback.rollout import MAX_INCIDENT_COUNT
@@ -60,6 +61,24 @@ class IncidentRequest(_Request):
     week: str = Field(pattern=QUALITY_PERIOD_PATTERN)
     count: int = Field(ge=0, le=MAX_INCIDENT_COUNT, strict=True)
     note: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
+
+
+class ComplianceReviewRequest(_Request):
+    """复核人员确认合规扫描的一条疑似违规（confirmed：确实违规，门槛不通过）或标记误报
+    （dismissed：不计入，如依据里原样有的"桑蚕丝 100%"）。suggestion_id（编辑后发送的推荐）和
+    msg_id（客服 / 机器人发出的消息）给且只给一个——上线状态里合规扫描列出的 ID。备注会做个人信息
+    最小化，不要贴原文。复核人取自调用方身份。"""
+
+    suggestion_id: int | None = Field(default=None, ge=1, strict=True)
+    msg_id: str | None = Field(default=None, min_length=1, max_length=MAX_MSG_ID_CHARS)
+    decision: Literal["confirmed", "dismissed"]
+    note: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
+
+    @model_validator(mode="after")
+    def _one_ref(self) -> ComplianceReviewRequest:
+        if (self.suggestion_id is None) == (self.msg_id is None):
+            raise ValueError("suggestion_id 和 msg_id 要给且只给一个")
+        return self
 
 
 class ScoreRequest(_Request):
@@ -160,6 +179,7 @@ class QualityReviewView(_View):
 
 
 __all__ = [
+    "ComplianceReviewRequest",
     "IncidentRequest",
     "QualityReviewView",
     "SampleRequest",
