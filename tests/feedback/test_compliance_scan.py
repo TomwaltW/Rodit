@@ -11,10 +11,12 @@ from rodit.core.config import EngineConfig
 from rodit.core.enums import DraftKind, Intent, Role, SuggestionStatus
 from rodit.core.models import ShopConfig, StoredMessage, SuggestionRecord
 from rodit.feedback.compliance import (
+    PAIR_LOOKBACK,
     RULE_ABSOLUTE,
     RULE_BANNED,
     RULE_OFF_PLATFORM,
     ComplianceRules,
+    flag_key,
     scan_sent,
     scan_text,
     summarize_scan,
@@ -172,3 +174,66 @@ def test_listed_ids_are_capped_but_counts_are_not():
     messages = [msg(AGENT_TEXT) for _ in range(7)]
     summary = summarize_scan(scan([], messages), max_ids=3)
     assert summary.flagged == 7 and len(summary.message_ids) == 3 and summary.ids_truncated
+
+
+# ================================================================ 同一次发送都是同一个 ID
+
+
+def shown_at(text: str, at: datetime, *, conv: str = "c9"):
+    """在 at 展示、之后编辑发送的推荐（created_at 是展示时间）。"""
+    return edited(text, at=at - timedelta(hours=10), conv=conv)
+
+
+def sent_at(text: str, at: datetime, *, msg_id: str, conv: str = "c9"):
+    return msg(text, at=at - timedelta(hours=11), msg_id=msg_id, conv=conv)
+
+
+def keys(weeks) -> list[tuple[str, str]]:
+    return [flag_key(f) for w in weeks for f in w.flags]
+
+
+def test_a_send_straddling_the_window_start_is_keyed_on_its_suggestion():
+    """周日 23:58 展示、周一 00:03 编辑发送，窗口从周一 00:00 起：推荐在窗口外，写回的消息在窗口里。
+    这次发送照样记在推荐上（和更大的窗口里同一个 ID），按发出的时间落到周，消息不重复计。"""
+    record = shown_at(EDITED, W40 - timedelta(minutes=2))
+    write_back = sent_at(EDITED, W40 + timedelta(minutes=3), msg_id=f"agent:{record.id}")
+    echo = sent_at(EDITED.replace(" ", "  "), W40 + timedelta(minutes=3), msg_id="platform_78")
+    for message in (write_back, echo):
+        [week] = scan([record], [message], since=W40, until=W40 + timedelta(days=7))
+        assert keys([week]) == [("suggestion", str(record.id))]
+        [flag] = week.flags
+        assert flag.source == "edited_suggestion" and flag.at == message.created_at
+        assert (week.scanned_suggestions, week.scanned_messages, week.duplicates) == (1, 1, 1)
+        # 包含两份记录的大窗口（复核确认用的 13 周）：同一个 ID
+        wide = scan([record], [message], since=W39, until=W40 + timedelta(days=7))
+        assert keys(wide) == [("suggestion", str(record.id))]
+        summary = summarize_scan([week])
+        assert summary.pending_suggestion_ids == [record.id] and summary.pending_message_ids == []
+
+
+def test_a_suggestion_just_after_the_window_end_still_pairs_its_echo():
+    """平台回声的时间比推荐的展示时间早一点（两边的时钟），刚好落在窗口结束的两边：回声照样配上推荐。"""
+    until = W40
+    record = shown_at(EDITED, until + timedelta(minutes=1))
+    echo = sent_at(EDITED, until - timedelta(minutes=1), msg_id="platform_79")
+    [week] = scan([record], [echo], since=W39, until=until)
+    assert keys([week]) == [("suggestion", str(record.id))] and week.duplicates == 1
+    wide = scan([record], [echo], since=W39, until=W40 + timedelta(days=7))
+    assert keys(wide) == [("suggestion", str(record.id))]
+
+
+def test_pairing_does_not_depend_on_the_window():
+    """推荐展示之后 PAIR_LOOKBACK 以内发出的才配成一对；再晚的两份记录各算一条——
+    在哪个窗口里都一样。"""
+    late = shown_at(EDITED, W40 - PAIR_LOOKBACK - timedelta(minutes=5), conv="c11")
+    late_msg = sent_at(EDITED, W40 + timedelta(minutes=5), msg_id=f"agent:{late.id}", conv="c11")
+    ok = shown_at(EDITED, W40 - PAIR_LOOKBACK + timedelta(minutes=5), conv="c12")
+    ok_msg = sent_at(EDITED, W40 + timedelta(minutes=5), msg_id=f"agent:{ok.id}", conv="c12")
+    records, messages = [late, ok], [late_msg, ok_msg]
+    narrow = keys(scan(records, messages, since=W40, until=W40 + timedelta(days=7)))
+    wide = keys(
+        scan(records, messages, since=W39 - timedelta(days=7), until=W40 + timedelta(days=7))
+    )
+    assert set(narrow) == {("message", late_msg.msg_id), ("suggestion", str(ok.id))}
+    assert set(narrow) <= set(wide)
+    assert set(wide) == set(narrow) | {("suggestion", str(late.id))}

@@ -1,18 +1,22 @@
 """评测结论的指纹要覆盖一切会改变回答的东西（方案 §13.5 "换大模型、改提示词、升级判断层之前，
 先在测试集上跑回归"）：大模型（配置或环境变量给的）、路由判断层和分类器模型文件、生成环节的
-提示词 / 模板；线上按部署规则算出同样的指纹来比较。分类器路由的评测不能给大模型路由的线上作依据，
-反过来也不行。数据全部合成，不联网。"""
+提示词 / 模板、判断层的提示词和输出解析；线上按部署规则算出同样的指纹来比较。分类器路由的评测
+不能给大模型路由的线上作依据，反过来也不行。数据全部合成，不联网。"""
 
 from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import rodit
 from rodit.app.offline import EvidenceEchoLLM
 from rodit.core.clock import CST
 from rodit.core.config import EngineConfig, load_config
@@ -26,12 +30,15 @@ from rodit.eval.fingerprint import (
     CLASSIFIER_PATH_ENV,
     LLM_BASE_URL_ENV,
     LLM_MODEL_ENV,
+    EvalFingerprint,
     EvalVerdict,
     current_fingerprint,
     endpoint_of,
     generation_version,
+    judge_prompt_version,
     running_llm,
     same_setup,
+    source_version,
     test_set_evidence,
     verdict_event,
     verdict_from_report,
@@ -142,33 +149,143 @@ def test_the_eval_client_follows_the_production_rule(monkeypatch):
         env_client(pinned)
 
 
-# ================================================================ 生成环节（§13.5 改提示词）
+# ================================================================ 提示词（§13.5 改提示词）
 
 
-def test_generation_version_changes_when_the_generation_code_changes(tmp_path, monkeypatch):
+def test_source_version_changes_when_any_listed_module_changes(tmp_path, monkeypatch):
     version = generation_version()
     assert version is not None and len(version) == 12
-    assert current_fingerprint(EngineConfig(), environ=LLM_ENV).generation_ver == version
+    running = current_fingerprint(EngineConfig(), environ=LLM_ENV)
+    assert running.generation_ver == version
+    assert running.judge_prompt_ver == judge_prompt_version() != version
     package = tmp_path / "synthetic_generation_pkg"
     package.mkdir()
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "prompt.py").write_text('REQ = "先回答问题。"\n', encoding="utf-8")
+    line = tmp_path / "synthetic_evidence_line.py"
+    line.write_text('HEAD = "[{id}] {label}："\n', encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
-    monkeypatch.setattr(fp_module, "GENERATION_PACKAGE", "synthetic_generation_pkg")
-    generation_version.cache_clear()
+    modules = ("synthetic_generation_pkg", "synthetic_evidence_line")
+    monkeypatch.setattr(fp_module, "GENERATION_MODULES", modules)
+    versions = []
     try:
-        before = generation_version()
-        (package / "prompt.py").write_text('REQ = "先回答问题，再追问一句。"\n', encoding="utf-8")
-        generation_version.cache_clear()
-        after = generation_version()
+        for path, text in (
+            (None, ""),
+            (package / "prompt.py", 'REQ = "先回答问题，再追问一句。"\n'),  # 包里的文件
+            (line, 'HEAD = "<{id}> {label} -> "\n'),  # 单独的模块
+        ):
+            if path is not None:
+                path.write_text(text, encoding="utf-8")
+            source_version.cache_clear()
+            versions.append(generation_version())
+        assert source_version(("synthetic_evidence_line", "synthetic_no_such_module")) is None
     finally:
-        generation_version.cache_clear()
-        sys.modules.pop("synthetic_generation_pkg", None)
-    assert before and after and before != after
-    running = current_fingerprint(EngineConfig(), environ=LLM_ENV)
-    stale = verdict_for(running.model_copy(update={"generation_ver": before}))
+        source_version.cache_clear()
+        for name in modules:
+            sys.modules.pop(name, None)
+    assert all(versions) and len(set(versions)) == 3
+    stale = verdict_for(running.model_copy(update={"generation_ver": versions[0]}))
     ev = evidence(stale, running)
     assert ev.passed is None and "生成提示词" in (ev.reason or "")
+
+
+def test_a_verdict_without_the_judge_prompt_version_does_not_count():
+    """以前记的结论没有判断层提示词的版本：和线上对不上，要重新评测。"""
+    running = current_fingerprint(EngineConfig(), environ=LLM_ENV)
+    assert evidence(verdict_for(running), running).passed is True
+    old = running.model_copy(update={"judge_prompt_ver": None})
+    ev = evidence(verdict_for(old), running)
+    assert ev.passed is None and "判断层提示词" in (ev.reason or "")
+
+
+_FINGERPRINT_SCRIPT = """
+import json, sys
+import rodit
+from rodit.core.config import EngineConfig
+from rodit.eval.fingerprint import current_fingerprint
+fp = current_fingerprint(EngineConfig(), environ=json.loads(sys.argv[1]))
+print(json.dumps({"rodit": rodit.__file__, "fingerprint": fp.model_dump(mode="json")}))
+"""
+
+JUDGE_PROMPT = "判断层提示词"
+GENERATION_PROMPT = "生成提示词"
+PROMPT_EDITS = {
+    # 判断层的 system 提示词（路由和质检的每一票都变）
+    "judge_system_prompt": (
+        "decision/llm.py",
+        "1. 只根据 state 里的内容判断",
+        "1. 宁可判为需要人工也不要漏判；只根据 state 里的内容判断",
+        JUDGE_PROMPT,
+    ),
+    # 判断层输出的解析和计票
+    "voting_parser": (
+        "decision/voting.py",
+        'nested = obj.get("answers")',
+        'nested = obj.get("answer_map")',
+        JUDGE_PROMPT,
+    ),
+    # 每条生成提示词里的依据行格式
+    "evidence_line": (
+        "core/evidence_line.py",
+        'head = f"[{e.id}] {e.label}："',
+        'head = f"<{e.id}> {e.label} -> "',
+        GENERATION_PROMPT,
+    ),
+    # 提示词里的问题类型名
+    "intent_labels": (
+        "core/enums.py",
+        'Intent.SIZE_ADVICE: "尺码 / 选型"',
+        'Intent.SIZE_ADVICE: "尺码推荐"',
+        GENERATION_PROMPT,
+    ),
+}
+
+
+def _fingerprint_of_copy(tmp_path: Path, edit: tuple[str, str, str] | None) -> dict:
+    """把 rodit 源码拷一份、改一处，在子进程里算线上指纹（配置和大模型都不变）。"""
+    root = tmp_path / "src"
+    shutil.copytree(
+        Path(rodit.__file__).parent, root / "rodit", ignore=shutil.ignore_patterns("__pycache__")
+    )
+    if edit is not None:
+        rel, old, new = edit
+        target = root / "rodit" / rel
+        text = target.read_text(encoding="utf-8")
+        assert old in text, (rel, old)
+        target.write_text(text.replace(old, new, 1), encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(root), "PYTHONDONTWRITEBYTECODE": "1"}
+    done = subprocess.run(
+        [sys.executable, "-c", _FINGERPRINT_SCRIPT, json.dumps(LLM_ENV)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    assert Path(out["rodit"]).resolve().is_relative_to(root.resolve())  # 用的是改过的拷贝
+    return out["fingerprint"]
+
+
+def test_an_unchanged_copy_gives_the_running_fingerprint(tmp_path):
+    """对照：源码没改时，子进程算出来的和这里的一样（下面改一处就变的比较才有意义）。"""
+    running = current_fingerprint(EngineConfig(), environ=LLM_ENV)
+    assert _fingerprint_of_copy(tmp_path, None) == running.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("name", sorted(PROMPT_EDITS))
+def test_a_prompt_change_outside_the_generation_package_needs_a_new_verdict(tmp_path, name):
+    """改了判断层的提示词 / 输出解析、依据行格式、问题类型名：旧结论不再算测试集依据（§13.5）。"""
+    rel, old, new, label = PROMPT_EDITS[name]
+    running = current_fingerprint(EngineConfig(), environ=LLM_ENV)
+    verdict = verdict_for(running)  # 改之前跑的评测
+    assert evidence(verdict, running).passed is True
+    changed = EvalFingerprint.model_validate(_fingerprint_of_copy(tmp_path, (rel, old, new)))
+    assert changed.config_fingerprint == running.config_fingerprint
+    assert not same_setup(verdict.fingerprint, changed)
+    ev = evidence(verdict, changed)
+    assert ev.passed is None and label in (ev.reason or "")
 
 
 # ================================================================ 路由判断层和分类器（§13.5）

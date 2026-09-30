@@ -15,6 +15,7 @@ from rodit.app import AssistService
 from rodit.app.demo import build_demo_unit, taobao_event
 from rodit.app.rollout import acceptance_input, compliance_weeks
 from rodit.core.audit import AuditAction
+from rodit.core.clock import CST
 from rodit.core.enums import Platform, Role
 from rodit.core.errors import ShopInactive
 from rodit.core.models import AuditEvent
@@ -190,3 +191,68 @@ def test_reviews_of_another_shop_or_malformed_events_are_ignored():
     ]
     [entry] = parse_reviews(events, shop_id=SHOP_A)
     assert entry.msg_id == "m1" and entry.decision == ComplianceDecision.DISMISSED
+
+
+# ================================================================ 跨窗口起点的发送
+
+W41 = datetime(2026, 10, 5, tzinfo=CST)  # 周一 00:00：窗口起点
+SILK_EDITED = "面料：桑蚕丝 100%，不易皱"  # 典型误报：成分标注按绝对化用语命中
+
+
+def edit_send_across(service: AssistService, shown: datetime, sent: datetime) -> int:
+    """shown 展示推荐，sent 客服编辑后发送（写回会话 agent:{推荐 id}）。返回推荐 ID。"""
+    clock = service.unit.clock
+    clock.set(shown)
+    result = service.handle_event(
+        "B", taobao_event("真丝的会不会皱", msg_id="fp_straddle", item_id="i_888")
+    )
+    assert result is not None and result.suggestions
+    sid = result.suggestions[0].suggestion_id
+    clock.set(sent)
+    service.feedback_edited(SHOP_A, sid, agent_id="kf_a01", edited_text=SILK_EDITED)
+    return sid
+
+
+def dismiss_every_listed(service: AssistService, summary) -> None:
+    """复核人员按列出的 ID 逐条标记误报：每一条都要找得到（接口不能 404）。"""
+    ro = service.rollout
+    for sid in summary.pending_suggestion_ids:
+        ro.review_compliance(SHOP_A, suggestion_id=sid, decision="dismissed", reviewer=REVIEWER)
+    for mid in summary.pending_message_ids:
+        ro.review_compliance(SHOP_A, msg_id=mid, decision="dismissed", reviewer=REVIEWER)
+
+
+@pytest.mark.parametrize("shown_offset", [timedelta(minutes=-2), timedelta(minutes=1)])
+def test_a_send_straddling_the_status_window_start_can_be_reviewed(
+    service: AssistService, shown_offset: timedelta
+):
+    """周日 23:58 展示、周一 00:03 编辑发送；智能辅助门槛窗口从这个周一 00:00 起（W43 看状态）。
+    上线状态列出的待确认 ID，复核接口（13 周的扫描）都找得到，确认后不再待确认。
+    对照：展示也在窗口里（00:01）时结果一样。"""
+    sid = edit_send_across(service, W41 + shown_offset, W41 + timedelta(minutes=3))
+    service.unit.clock.set(W41 + timedelta(days=14, hours=10))
+    ro = service.rollout
+    before = ro.status(SHOP_A).evidence.compliance
+    assert before.since == W41
+    assert (before.flagged, before.pending) == (1, 1)
+    assert before.pending_suggestion_ids == [sid] and before.pending_message_ids == []
+    dismiss_every_listed(service, before)
+    after = ro.status(SHOP_A).evidence.compliance
+    assert (after.flagged, after.pending, after.dismissed) == (1, 0, 1)
+    assert "compliance_scan" not in [u.name for u in ro.status(SHOP_A).unchecked]
+
+
+def test_a_send_straddling_the_acceptance_since_can_be_reviewed(service: AssistService):
+    """验收报告的 --since 落在展示和发送之间：列出的 ID 能确认，确认后验收这一项通过。"""
+    sid = edit_send_across(service, W41 - timedelta(minutes=2), W41 + timedelta(minutes=3))
+    until = W41 + timedelta(days=14)
+    service.unit.clock.set(until + timedelta(minutes=30))
+    shop = service.unit.repos.knowledge.get_shop(SHOP_A)
+    repos, config = service.unit.repos, service.unit.config
+    before = acceptance_input(repos, config, shop, since=W41, until=until).compliance
+    assert before.pending_suggestion_ids == [sid] and before.pending_message_ids == []
+    assert scan_criterion(before).status == CriterionStatus.UNCHECKED
+    dismiss_every_listed(service, before)
+    after = acceptance_input(repos, config, shop, since=W41, until=until).compliance
+    assert (after.pending, after.dismissed) == (0, 1)
+    assert scan_criterion(after).status == CriterionStatus.PASSED

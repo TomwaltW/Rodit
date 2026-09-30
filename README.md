@@ -249,13 +249,18 @@ FAQ / 模板；超时的只留已经通过质检的 FAQ / 模板卡片，降级�
 - `compliance-scan [--week …]`：扫描实际发出去的文字（编辑后发送、客服和机器人的回复）里的站外引流、绝对化用语、
   店铺禁用词，只输出条数和 ID，不输出原文。命中的是疑似违规（候选）：上线状态和验收报告里显示"未复核"，
   复核人员 `POST /v1/shops/{shop_id}/rollout/compliance-reviews` 确认或标记误报（审计 `compliance.reviewed`，
-  不记原文），只有确认的才算违规；
+  不记原文），只有确认的才算违规。编辑后发送的推荐和它发出去的那条消息只算一次、记在推荐 ID 上：展示在窗口
+  开始之前、发送在窗口里的也一样（配对时往前多看 7 天），所以上线状态、验收报告列出的 ID 都能确认；
 - 某周登记的"0 条"要在那一周结束之后登记才算那一周的依据，周中登记的是"暂定"，要复核人员周末后再确认一次；
 - `python -m rodit.eval --json 结果.json` 带配置指纹；`record-eval --report 结果.json` 把结论记下来，
   指纹和运行中的配置一致时才算测试集门槛的依据（离线替身的结论不算）。指纹包括配置、判断层问题版本、
-  路由用的判断层（分类器时还有模型文件的 SHA-256）、大模型名称和接口主机、生成环节代码的版本：换模型（哪怕只改
-  环境变量）、换分类器文件、改提示词都要重新评测。`record-eval` / `acceptance-report` 要和 `serve` 用同样的
-  `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL`（按分类器路由时还有 `RODIT_CLASSIFIER_PATH`），否则测试集一项显示"未核对"；
+  路由用的判断层（分类器时还有模型文件的 SHA-256）、大模型名称和接口主机、生成环节的版本（`rodit.generation`
+  整个包和依据行格式、类型名等进提示词的 `core` 模块）、判断层提示词的版本（`decision.llm` 的提示词、
+  `decision.voting` 的输出解析、路由 / 质检的 state）：换模型（哪怕只改环境变量）、换分类器文件、改提示词都要
+  重新评测，模块清单见 `rodit.eval.fingerprint`（清单以外的代码改动只记代码版本、不比较）。上线状态按 `serve`
+  启动时实际加载的分类器核对：原地覆盖模型文件（`train-classifier --overwrite`）后不重启，给新文件跑的评测不算。
+  `record-eval` / `acceptance-report` 要和 `serve` 用同样的 `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL`（按分类器
+  路由时还有 `RODIT_CLASSIFIER_PATH`，这两个命令读的是文件），否则测试集一项显示"未核对"；
 - `acceptance-report --since … [--until …] [--json]`：按店铺和全单元汇总 Phase 1 验收（§13.2 门槛、连续两周
   采纳率 ≥ 60%、P95 ≤ 5 秒、违规为 0、每周复核事实正确和合规满分率 ≥ 95%），全部通过退出码 0，否则 1 并写明哪一项；
 - 采纳率不再把全自动发出的回复算进去，单列"全自动"。

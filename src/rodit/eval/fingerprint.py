@@ -1,20 +1,32 @@
 """评测结论的指纹与上线门槛的测试集依据（方案 §13.5 "换大模型、改提示词、升级判断层之前，
 先在测试集上跑回归"、§13.2 测试集门槛、§13.4 影子 → 智能辅助）。
 
-- 指纹（EvalFingerprint）：凡是会改变回答的都在里面——
+- 指纹（EvalFingerprint）：配置、提示词、判断层、分类器、大模型——
   - 配置的 config_fingerprint（core.config：阈值、判断层、生成参数……都在配置里）；
   - 路由 / 质检问题定义的版本（core.questions，改文字就变）；
-  - 生成环节的版本（generation_version：rodit.generation 包的源码——提示词骨架、要求、模板话术、
-    依据的排法、输出解析，改了任何一处就变）；
+  - 生成环节的版本（generation_version：GENERATION_MODULES 这几个模块的源码——
+    rodit.generation 整个包（提示词骨架、要求、模板话术、依据的排法、输出解析），加上文字会进
+    生成提示词和模板的 core 模块：依据行的格式 core.evidence_line、类型名 core.enums、平台名和
+    缺依据的说法 core.evidence、最近几轮对话 core.states、个人信息遮挡 core.pii、
+    时间写法 core.clock；改了任何一处就变）；
+  - 判断层提示词的版本（judge_prompt_version：JUDGE_PROMPT_MODULES 的源码——大模型判断层的
+    system 提示词、user 模板和回答格式 decision.llm、输出解析和计票 decision.voting、
+    题型和回答校验 core.decision、路由 / 质检的 state（core.states、core.pii、qa.masking）。
+    质检一直用大模型判断层，分类器路由时也比较这一项）；
   - 路由判断层（decision_provider）和路由分类器模型文件的 SHA-256（classifier 路由时）；
   - 大模型：模型名和接口地址（只留协议和主机）。
-  另记代码版本（git，拿得到时；部署镜像里没有 .git 时由环境变量 RODIT_GIT_SHA 提供），只作记录。
+  模块按名字排序、按 importlib 找到源文件来算。列表以外的代码（阈值判断、质检硬规则……）
+  改了指纹不变：它们的改动靠代码版本留痕（git，拿得到时；部署镜像里没有 .git 时由环境变量
+  RODIT_GIT_SHA 提供），代码版本只作记录，same_setup 不比较。
   python -m rodit.eval --json 的报告带上它：评测按实际跑的记——用的大模型客户端、--classifier 时
   判断层是 classifier（配置里写的是别的也一样）、分类器文件的 SHA-256。
 - 线上的指纹（current_fingerprint）按部署的规则解析，和线上单元实际用的一致：大模型和
   app.production.build_production_unit 同一条规则（配置里 llm.base_url、llm.model 都写了用配置，
   否则都取环境变量 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL）；decision.provider 是 classifier 时
-  分类器取环境变量 RODIT_CLASSIFIER_PATH 指向的文件（和 serve 加载的是同一个）。拿不到的项是 None，
+  分类器用 serve 启动时实际加载的模型文件的 SHA-256：同一进程里的调用方（上线状态、切换阶段的
+  门槛）传 loaded_classifier_sha256，取自 ClassifierProvider.file_sha256，文件启动后被换掉也照旧
+  是加载的那个；别的进程（运维任务 record-eval、acceptance-report）看不到 serve 加载的是什么，
+  读环境变量 RODIT_CLASSIFIER_PATH 指向的文件（下次重启 serve 加载的就是它）。拿不到的项是 None，
   None 和什么都对不上（不知道线上用的是什么，就不能说跑过回归）。
 - 评测结论（EvalVerdict）：python -m rodit.ops record-eval --report 报告.json 从报告里取出
   指纹、测试集判定（§13.2 事实正确、合规满分率 ≥ 95%）、回归比较结果、用的大模型，记成系统事件
@@ -32,6 +44,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -60,7 +73,25 @@ LLM_MODEL_ENV = "RODIT_LLM_MODEL"
 """配置里没写 llm.base_url / llm.model 时线上用的大模型（OpenAICompatibleClient.from_env）。"""
 CLASSIFIER_PATH_ENV = "RODIT_CLASSIFIER_PATH"
 """decision.provider 是 classifier 时 serve 加载的路由分类器模型文件（rodit.ops.serve）。"""
-GENERATION_PACKAGE = "rodit.generation"
+GENERATION_MODULES: tuple[str, ...] = (
+    "rodit.generation",  # 整个包：提示词骨架和要求、模板话术、依据的排法、输出解析
+    "rodit.core.clock",  # fmt_time：依据行、模板里的时间写法
+    "rodit.core.enums",  # INTENT_LABELS、POLICY_LABELS：提示词和模板里的类型名
+    "rodit.core.evidence",  # PLATFORM_NAMES、缺依据时的说法
+    "rodit.core.evidence_line",  # 依据行 "[id] 标签：内容" 的格式
+    "rodit.core.pii",  # 放进提示词之前的个人信息遮挡
+    "rodit.core.states",  # 最近几轮对话（recent_turns）
+)
+"""生成环节的版本（generation_version）算哪些模块的源码：包算包里各 .py（不含子包）。"""
+JUDGE_PROMPT_MODULES: tuple[str, ...] = (
+    "rodit.decision.llm",  # 判断层的 system 提示词、user 模板、回答格式
+    "rodit.decision.voting",  # 输出解析和计票
+    "rodit.core.decision",  # 题型（Jev 格式）和回答校验
+    "rodit.core.states",  # 路由 / 质检的 state
+    "rodit.core.pii",  # state 里的个人信息遮挡
+    "rodit.qa.masking",  # 质检 state 里的对话、依据、回答的遮挡
+)
+"""判断层提示词的版本（judge_prompt_version）算哪些模块的源码。"""
 GIT_TIMEOUT_S = 5
 SHORT = 12  # 报告、原因里显示的指纹长度
 
@@ -83,6 +114,7 @@ class EvalFingerprint(_Model):
     router_questions_ver: str
     qa_questions_ver: str
     generation_ver: str | None = None  # 生成环节的版本（generation_version）
+    judge_prompt_ver: str | None = None  # 判断层提示词的版本（judge_prompt_version）
     decision_provider: str | None = None  # 路由判断层（ProviderName 的值）
     llm_model: str | None = None  # 大模型的模型名
     llm_endpoint: str | None = None  # 大模型接口的协议和主机（端口），没有路径、用户名密码
@@ -147,28 +179,53 @@ def _cached_file_sha256(path: str) -> str | None:
         return None
 
 
-@lru_cache(maxsize=1)
-def generation_version() -> str | None:
-    """生成环节的版本：rodit.generation 包里各 .py 源文件（按文件名排序，换行统一成 LF）的
-    SHA-256 前 12 位。提示词骨架和要求、模板话术、依据的排法、输出解析都在这个包里，改了任何一处
-    版本就变（§13.5 改提示词之前先在测试集上跑回归）。读不到源文件时返回 None（和什么都对不上）。"""
-    try:
-        package = resources.files(GENERATION_PACKAGE)
+def _module_sources(name: str) -> list[tuple[str, bytes]]:
+    """一个模块的源码：[(标识, 内容)]。包是包里各 .py（按文件名排序，不含子包），
+    标识 "包名/文件名"；普通模块是它的 .py，标识是模块名。找不到、不是 .py 源文件抛
+    OSError / ImportError。"""
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        raise ModuleNotFoundError(name)
+    if spec.submodule_search_locations is not None:
+        package = resources.files(name)
         files = sorted(
             (f for f in package.iterdir() if f.is_file() and f.name.endswith(".py")),
             key=lambda f: f.name,
         )
         if not files:
-            return None
+            raise FileNotFoundError(name)
+        return [(f"{name}/{f.name}", f.read_bytes()) for f in files]
+    if not spec.origin or not spec.origin.endswith(".py"):
+        raise FileNotFoundError(name)
+    return [(name, Path(spec.origin).read_bytes())]
+
+
+@lru_cache(maxsize=8)
+def source_version(modules: tuple[str, ...]) -> str | None:
+    """几个模块源码的版本：按模块名排序，逐个文件摘标识、内容（换行统一成 LF，各跟一个 NUL
+    分隔），SHA-256 前 12 位。改了任何一处版本就变（§13.5 改提示词之前先在测试集上跑回归）。
+    任何一个读不到返回 None（和什么都对不上）。进程里按模块列表缓存：源码在进程运行期间不变。"""
+    try:
         digest = hashlib.sha256()
-        for f in files:
-            digest.update(f.name.encode())
-            digest.update(b"\0")
-            digest.update(f.read_bytes().replace(b"\r\n", b"\n"))
-            digest.update(b"\0")
-    except (OSError, ModuleNotFoundError):
+        for name in sorted(set(modules)):
+            for label, data in _module_sources(name):
+                digest.update(label.encode())
+                digest.update(b"\0")
+                digest.update(data.replace(b"\r\n", b"\n"))
+                digest.update(b"\0")
+    except (OSError, ImportError, ValueError):
         return None
     return digest.hexdigest()[:SHORT]
+
+
+def generation_version() -> str | None:
+    """生成环节的版本：GENERATION_MODULES 的源码（source_version）。"""
+    return source_version(GENERATION_MODULES)
+
+
+def judge_prompt_version() -> str | None:
+    """判断层提示词的版本：JUDGE_PROMPT_MODULES 的源码（source_version）。"""
+    return source_version(JUDGE_PROMPT_MODULES)
 
 
 def endpoint_of(base_url: str | None) -> str | None:
@@ -197,12 +254,19 @@ def running_llm(
 
 
 def running_classifier_sha256(
-    config: EngineConfig, environ: Mapping[str, str] | None = None
+    config: EngineConfig,
+    environ: Mapping[str, str] | None = None,
+    *,
+    loaded: str | None = None,
 ) -> str | None:
-    """decision.provider 是 classifier 时，线上加载的分类器文件（RODIT_CLASSIFIER_PATH）的 SHA-256；
-    不是 classifier、没设、读不了都返回 None。"""
+    """decision.provider 是 classifier 时线上路由分类器模型文件的 SHA-256：loaded 是同一进程里
+    serve 实际加载的（ClassifierProvider.file_sha256），给了就用它；没给（别的进程）按
+    RODIT_CLASSIFIER_PATH 读文件——下次重启 serve 加载的那个。不是 classifier、没设、读不了都
+    返回 None。"""
     if config.decision.provider != ProviderName.CLASSIFIER:
         return None
+    if loaded:
+        return loaded
     env = os.environ if environ is None else environ
     path = env.get(CLASSIFIER_PATH_ENV, "").strip()
     return _cached_file_sha256(path) if path else None
@@ -225,6 +289,7 @@ def fingerprint_of(
         router_questions_ver=ROUTER_QUESTIONS_VER,
         qa_questions_ver=QA_QUESTIONS_VER,
         generation_ver=generation_version(),
+        judge_prompt_ver=judge_prompt_version(),
         decision_provider=config.decision.provider.value,
         llm_model=llm_model,
         llm_endpoint=llm_endpoint,
@@ -239,16 +304,18 @@ def current_fingerprint(
     *,
     git: bool = False,
     classifier: str | Path | None = None,
+    loaded_classifier_sha256: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> EvalFingerprint:
-    """线上这套部署的指纹：大模型按部署规则解析（running_llm），分类器取 RODIT_CLASSIFIER_PATH
-    （classifier 给了就用它）。线上比较用 git=False（same_setup 不比较代码版本）。
+    """线上这套部署的指纹：大模型按部署规则解析（running_llm）；分类器按 running_classifier_sha256——
+    同一进程里的调用方传 serve 实际加载的 loaded_classifier_sha256，否则读 RODIT_CLASSIFIER_PATH
+    （classifier 给了就算这个文件）。线上比较用 git=False（same_setup 不比较代码版本）。
     environ 默认 os.environ：线上服务、运维任务和线上单元读的是同一份环境变量。"""
     model, endpoint = running_llm(config, environ)
     if classifier:
         classifier_sha = file_sha256(classifier)
     else:
-        classifier_sha = running_classifier_sha256(config, environ)
+        classifier_sha = running_classifier_sha256(config, environ, loaded=loaded_classifier_sha256)
     return fingerprint_of(
         config,
         llm_model=model,
@@ -296,6 +363,8 @@ def differences(verdict: EvalFingerprint, running: EvalFingerprint) -> list[str]
         out.append("质检问题版本")
     if not _known_and_equal(a.generation_ver, b.generation_ver):
         out.append("生成提示词 / 模板的版本")
+    if not _known_and_equal(a.judge_prompt_ver, b.judge_prompt_ver):
+        out.append("判断层提示词 / 输出解析的版本")
     if not _known_and_equal(a.decision_provider, b.decision_provider):
         evaluated, deployed = a.decision_provider or "没记录", b.decision_provider or "未知"
         out.append(f"路由判断层（评测 {evaluated}，线上 {deployed}）")
@@ -503,8 +572,10 @@ test_set_evidence.__test__ = False  # type: ignore[attr-defined]  # 名字以 te
 
 __all__ = [
     "CLASSIFIER_PATH_ENV",
+    "GENERATION_MODULES",
     "GIT_SHA_ENV",
     "HOW_TO_RECORD",
+    "JUDGE_PROMPT_MODULES",
     "LLM_BASE_URL_ENV",
     "LLM_MODEL_ENV",
     "EvalFingerprint",
@@ -517,10 +588,12 @@ __all__ = [
     "fingerprint_of",
     "generation_version",
     "git_revision",
+    "judge_prompt_version",
     "parse_verdicts",
     "running_classifier_sha256",
     "running_llm",
     "same_setup",
+    "source_version",
     "test_set_evidence",
     "verdict_event",
     "verdict_from_report",

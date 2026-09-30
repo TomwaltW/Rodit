@@ -17,6 +17,10 @@
 - metadata：训练时间、训练样本数、例句条数、路由问题定义的版本（core.questions）、评估指标；
 - sha256 是除它以外全部内容的规范 JSON（键排序、紧凑、UTF-8）的摘要，只防损坏和误改，
   不防有意篡改：模型文件和标注数据一样只放在平台单元内、只有部署账号能写；
+- 另一个摘要是文件字节的 SHA-256（ClassifierProvider.file_sha256，和 eval.fingerprint.file_sha256
+  同一个值）：加载时对读进来的那份字节算，评测指纹用它核对线上实际加载的是哪个文件——
+  文件在 serve 启动后被换掉（train-classifier --overwrite 是原子改名），
+  运行中的实例照旧是加载的那个；
 - 加载时校验格式名、版本、摘要、问题类型（不认识的类型直接拒绝：问题分类改过就要重新训练）、
   计数的结构和一致性，任何一项不对都抛 ClassifierArtifactError，不会带着半个模型上线。
 - 模型里的 n 元组计数来自已脱敏（mask_pii）的买家问题，不含原句，但罕见的二元组可能是原文片段：
@@ -252,6 +256,12 @@ def write_artifact(path: str | os.PathLike[str], artifact: Mapping[str, Any]) ->
 
 def read_artifact(path: str | os.PathLike[str]) -> dict[str, Any]:
     """读模型文件并校验（格式、版本、校验和、结构、问题类型），返回原始 dict。"""
+    return read_artifact_with_digest(path)[0]
+
+
+def read_artifact_with_digest(path: str | os.PathLike[str]) -> tuple[dict[str, Any], str]:
+    """同 read_artifact，另返回读到的字节的 SHA-256（十六进制）：校验和解析用的就是这份字节，
+    读和算摘要之间文件被换掉也对得上。"""
     p = Path(path)
     try:
         size = p.stat().st_size
@@ -273,7 +283,7 @@ def read_artifact(path: str | os.PathLike[str]) -> dict[str, Any]:
         _validate_artifact(data)
     except ClassifierArtifactError as e:
         raise ClassifierArtifactError(f"{e}：{p}") from None
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
 
 
 def _validate_artifact(data: Any) -> _Artifact:
@@ -335,7 +345,8 @@ class ClassifierProvider:
     """朴素贝叶斯路由分类器（实现 core.decision.DecisionProvider）。
 
     fallback 回答 intent 以外的路由问题，也会拿到买家数据，所以构造时同样要求它能处理买家数据。
-    从模型文件加载的实例带 meta（ClassifierMeta）和 artifact_sha256，便于启动日志和留痕核对。
+    从模型文件加载的实例带 meta（ClassifierMeta）和 artifact_sha256，便于启动日志和留痕核对；
+    load / save 的实例另带 file_sha256（模型文件字节的 SHA-256，评测指纹核对线上加载的是哪个文件）。
     """
 
     accepts_buyer_data = True
@@ -359,6 +370,7 @@ class ClassifierProvider:
         self.name = name
         self.meta: ClassifierMeta | None = None
         self.artifact_sha256: str | None = None
+        self.file_sha256: str | None = None  # 加载 / 写入的模型文件字节的 SHA-256
         self._fitted: _Fitted | None = None
         self._lock = threading.Lock()
 
@@ -395,6 +407,7 @@ class ClassifierProvider:
             self._fitted = fitted
             self.meta = None  # 新训练的模型还没有模型文件
             self.artifact_sha256 = None
+            self.file_sha256 = None
         return self
 
     def predict_proba(self, text: str) -> dict[Intent, float]:
@@ -510,8 +523,12 @@ class ClassifierProvider:
         fallback: DecisionProvider,
         name: str = "classifier",
     ) -> ClassifierProvider:
-        """读模型文件（read_artifact）并重建。不对抛 ClassifierArtifactError。"""
-        return cls.from_artifact(read_artifact(path), fallback=fallback, name=name)
+        """读模型文件（read_artifact）并重建，记下读到的字节的 SHA-256（file_sha256）。
+        不对抛 ClassifierArtifactError。"""
+        data, digest = read_artifact_with_digest(path)
+        provider = cls.from_artifact(data, fallback=fallback, name=name)
+        provider.file_sha256 = digest
+        return provider
 
     def save(
         self,
@@ -525,4 +542,5 @@ class ClassifierProvider:
         write_artifact(path, artifact)
         self.meta = ClassifierMeta.model_validate(artifact["metadata"])
         self.artifact_sha256 = artifact["sha256"]
+        self.file_sha256 = hashlib.sha256(dump_artifact(artifact)).hexdigest()  # 写入的字节
         return artifact
