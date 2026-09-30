@@ -147,7 +147,7 @@ def test_refresh_token_never_reaches_the_database_in_plaintext(pg_dsn, truncate,
 
 
 def test_refresh_ciphertext_is_bound_to_its_shop_and_role(pg_dsn, admin_db, truncate, token_key):
-    """续期令牌的附加认证数据是"店铺 ID:refresh"：
+    """续期令牌的附加认证数据是"店铺 ID + NUL + refresh"：
     和 access_token 的密文互换、挪到别的店铺都解不开。"""
     repo = PgShopAuthRepository(Database(pg_dsn), encryption_key=token_key)
     repo.save(_with_refresh(SHOP_A))
@@ -170,6 +170,38 @@ def test_refresh_ciphertext_is_bound_to_its_shop_and_role(pg_dsn, admin_db, trun
         )
     with pytest.raises(TokenDecryptionError):
         repo.get(SHOP_B)
+
+
+def test_refresh_ciphertext_cannot_pose_as_the_access_token_of_a_lookalike_shop(
+    pg_dsn, admin_db, truncate, token_key
+):
+    """店铺 ID 可以含冒号：店铺 X 的续期令牌密文挪到店铺 "X:refresh" 的 access_token 列，
+    也解不开（附加认证数据用 NUL 分隔，TEXT 里不会有 NUL）。"""
+    lookalike = SHOP_A + ":refresh"
+    repo = PgShopAuthRepository(Database(pg_dsn), encryption_key=token_key)
+    repo.save(_with_refresh(SHOP_A))
+    repo.save(_auth(lookalike, "tok-synthetic-lookalike"))
+    assert repo.get(lookalike).access_token.get_secret_value() == "tok-synthetic-lookalike"
+    with admin_db.session(None) as conn:
+        conn.execute(
+            "UPDATE shop_auth SET access_token ="
+            " (SELECT refresh_token FROM shop_auth WHERE shop_id = %s) WHERE shop_id = %s",
+            (SHOP_A, lookalike),
+        )
+    with pytest.raises(TokenDecryptionError):
+        repo.get(lookalike)
+    # 反过来：假冒店铺的 access_token 密文当成 X 的续期令牌也解不开
+    repo.save(_auth(lookalike, "tok-synthetic-lookalike"))
+    with admin_db.session(None) as conn:
+        conn.execute(
+            "UPDATE shop_auth SET refresh_token ="
+            " (SELECT access_token FROM shop_auth WHERE shop_id = %s) WHERE shop_id = %s",
+            (lookalike, SHOP_A),
+        )
+    with pytest.raises(TokenDecryptionError):
+        repo.get(SHOP_A)
+    with pytest.raises(ValueError, match="NUL"):
+        repo.save(_auth(SHOP_A + "\x00x"))
 
 
 def test_unreadable_tokens_can_still_be_listed_and_marked(pg_dsn, admin_db, truncate, token_key):

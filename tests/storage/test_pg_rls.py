@@ -384,6 +384,10 @@ def test_auth_expiring_function_is_locked_down(db, admin_db, truncate, token_key
         assert conn.execute("SELECT count(*) AS n FROM shop_auth").fetchone()["n"] == 0
     with db.session(SHOP_A) as conn:
         assert [r["shop_id"] for r in conn.execute("SELECT shop_id FROM shop_auth")] == [SHOP_A]
+    # 设了店铺范围的事务（商家请求等）不能借它列出别的店铺
+    with pytest.raises(psycopg.errors.InsufficientPrivilege, match="不设店铺范围"):
+        with db.session(SHOP_A) as conn:
+            conn.execute("SELECT * FROM rodit_auth_expiring(%s)", (NOW + timedelta(3),))
     # 训练导出角色不能调用
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         with db.session(None, trainer=True) as conn:

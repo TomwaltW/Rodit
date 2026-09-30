@@ -1,16 +1,22 @@
 """每条消息的时间预算（方案 §12.1 端到端 ≤ 5 秒、§12.2 超时降级）。
 
-引擎处理一条买家消息时用 deadline_scope(LatencyConfig.message_budget_s) 包住，各步骤用
-remaining() / expired() 判断还来不来得及（如剩余时间不够就不调大模型、退回 FAQ / 模板）。
+引擎处理一条买家消息时用
+
+    deadline_scope(latency.message_budget_s, min_llm_remaining_s=latency.min_llm_remaining_s)
+
+包住（latency 是 EngineConfig.latency），各步骤用 remaining() / expired() 判断还来不来得及；
+生成、质检调大模型之前用 llm_allowed() 判断：剩余时间少于 min_llm_remaining_s 就不调，
+退回 FAQ / 模板。这个下限跟着截止时间走（contextvar），生成器、质检不用另外拿配置。
 
 - 截止时间放在 contextvar 里：同一线程里的调用都看得到；线程池里的任务要用 submit_in_context
   提交（contextvars.copy_context().run），才能看到提交时的截止时间（和 core.context.shop_scope
   一样的做法）。
-- 嵌套：内层的截止时间不会晚于外层（取两者中较早的），外层的预算不会被内层"续命"。
+- 嵌套：内层的截止时间不会晚于外层（取两者中较早的），外层的预算不会被内层"续命"；
+  调大模型的剩余时间下限也只会更严（取两者中较大的），内层没给时沿用外层的。
 - 用单调时钟（time.monotonic），不受系统时间调整影响；测试可以注入假的 now 函数。
   嵌套的几层要用同一个时钟。
-- 没有截止时间时 remaining() 返回 None、expired() 返回 False：不在引擎里的调用（离线任务、
-  控制台）不受影响。
+- 没有截止时间时 remaining() 返回 None、expired() 返回 False、llm_allowed() 返回 True：
+  不在引擎里的调用（离线任务、控制台）不受影响。
 """
 
 from __future__ import annotations
@@ -28,26 +34,61 @@ T = TypeVar("T")
 MonotonicNow = Callable[[], float]
 
 
+def _check_floor(min_llm_remaining_s: float) -> float:
+    if min_llm_remaining_s < 0:
+        raise ValueError("调大模型的剩余时间下限不能是负数")
+    return float(min_llm_remaining_s)
+
+
 class Deadline:
-    """一个截止时间：从创建时起 seconds 秒（seconds 必须 ≥ 0）。"""
+    """一个截止时间：从创建时起 seconds 秒（seconds 必须 ≥ 0）。
 
-    __slots__ = ("_now", "budget_s", "expires_at", "started_at")
+    min_llm_remaining_s：剩余时间少于它就不再调大模型（LatencyConfig.min_llm_remaining_s，
+    默认 0 = 没过期就可以调），见 llm_allowed。"""
 
-    def __init__(self, seconds: float, *, now: MonotonicNow = time.monotonic) -> None:
+    __slots__ = ("_now", "budget_s", "expires_at", "min_llm_remaining_s", "started_at")
+
+    def __init__(
+        self,
+        seconds: float,
+        *,
+        now: MonotonicNow = time.monotonic,
+        min_llm_remaining_s: float = 0.0,
+    ) -> None:
         if seconds < 0:
             raise ValueError("时间预算不能是负数")
         self._now = now
         self.budget_s = float(seconds)
+        self.min_llm_remaining_s = _check_floor(min_llm_remaining_s)
         self.started_at = now()
         self.expires_at = self.started_at + self.budget_s
 
     @classmethod
-    def until(cls, expires_at: float, *, now: MonotonicNow = time.monotonic) -> Deadline:
+    def until(
+        cls,
+        expires_at: float,
+        *,
+        now: MonotonicNow = time.monotonic,
+        min_llm_remaining_s: float = 0.0,
+    ) -> Deadline:
         """截止到单调时钟的 expires_at（已经过了也可以，此时立即过期）。"""
-        deadline = cls(0.0, now=now)
+        deadline = cls(0.0, now=now, min_llm_remaining_s=min_llm_remaining_s)
         deadline.expires_at = expires_at
         deadline.budget_s = max(0.0, expires_at - deadline.started_at)
         return deadline
+
+    def with_llm_floor(self, min_llm_remaining_s: float) -> Deadline:
+        """同一个截止时间（开始时间、预算、时钟都不变），换一个调大模型的剩余时间下限。"""
+        floor = _check_floor(min_llm_remaining_s)
+        if floor == self.min_llm_remaining_s:
+            return self
+        copy = Deadline.__new__(Deadline)
+        copy._now = self._now
+        copy.budget_s = self.budget_s
+        copy.started_at = self.started_at
+        copy.expires_at = self.expires_at
+        copy.min_llm_remaining_s = floor
+        return copy
 
     def remaining(self) -> float:
         """还剩多少秒（不会小于 0）。"""
@@ -59,8 +100,16 @@ class Deadline:
     def expired(self) -> bool:
         return self._now() >= self.expires_at
 
+    def llm_allowed(self) -> bool:
+        """还来得及调一次大模型：没过期，且剩余时间不少于 min_llm_remaining_s。"""
+        left = self.expires_at - self._now()
+        return left > 0 and left >= self.min_llm_remaining_s
+
     def __repr__(self) -> str:
-        return f"Deadline(budget_s={self.budget_s:.3f}, remaining={self.remaining():.3f})"
+        return (
+            f"Deadline(budget_s={self.budget_s:.3f}, remaining={self.remaining():.3f},"
+            f" min_llm_remaining_s={self.min_llm_remaining_s:.3f})"
+        )
 
 
 _current: ContextVar[Deadline | None] = ContextVar("rodit_deadline", default=None)
@@ -73,19 +122,35 @@ def current_deadline() -> Deadline | None:
 
 @contextmanager
 def deadline_scope(
-    seconds: float | None, *, now: MonotonicNow = time.monotonic
+    seconds: float | None,
+    *,
+    min_llm_remaining_s: float | None = None,
+    now: MonotonicNow = time.monotonic,
 ) -> Iterator[Deadline | None]:
     """在这段代码里设置截止时间（seconds 秒后），返回生效的 Deadline。
 
     外层已经有更早的截止时间时沿用外层的（内层不能延长外层的预算）。seconds 为 None 表示不设新的
     截止时间：沿用外层的（没有外层就是没有截止时间，返回 None）。退出时恢复外层的。
+
+    min_llm_remaining_s：调大模型的剩余时间下限（见 llm_allowed）。为 None 时沿用外层的（没有外层
+    就是 0）；给了时取它和外层的较大值（内层不能放宽外层的下限）。
     """
     outer = _current.get()
+    outer_floor = outer.min_llm_remaining_s if outer is not None else 0.0
+    floor = (
+        outer_floor
+        if min_llm_remaining_s is None
+        else max(outer_floor, _check_floor(min_llm_remaining_s))
+    )
+    effective: Deadline | None
     if seconds is None:
-        effective = outer
+        effective = outer.with_llm_floor(floor) if outer is not None else None
     else:
-        inner = Deadline(seconds, now=now)
-        effective = outer if outer is not None and outer.expires_at <= inner.expires_at else inner
+        inner = Deadline(seconds, now=now, min_llm_remaining_s=floor)
+        if outer is not None and outer.expires_at <= inner.expires_at:
+            effective = outer.with_llm_floor(floor)
+        else:
+            effective = inner
     token = _current.set(effective)
     try:
         yield effective
@@ -103,6 +168,14 @@ def expired() -> bool:
     """当前截止时间已经过了；没有截止时间返回 False。"""
     deadline = _current.get()
     return deadline is not None and deadline.expired()
+
+
+def llm_allowed() -> bool:
+    """还来得及调一次大模型（见 Deadline.llm_allowed）；没有截止时间返回 True。
+
+    生成、质检调大模型之前判断：返回 False 时不调，退回 FAQ / 模板（§12.2）。"""
+    deadline = _current.get()
+    return deadline is None or deadline.llm_allowed()
 
 
 def clamp_timeout(timeout_s: float) -> float:
@@ -129,6 +202,7 @@ __all__ = [
     "current_deadline",
     "deadline_scope",
     "expired",
+    "llm_allowed",
     "remaining",
     "submit_in_context",
 ]

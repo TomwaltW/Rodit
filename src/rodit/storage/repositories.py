@@ -1186,7 +1186,10 @@ _TOKEN_FORMAT = b"RDT1"  # 密文格式标记（版本 1：AES-256-GCM）
 _TOKEN_NONCE_BYTES = 12
 _TOKEN_TAG_BYTES = 16
 _TOKEN_KDF_INFO = b"rodit shop_auth access_token v1"
-_REFRESH_AAD_SUFFIX = ":refresh"  # 续期令牌的附加认证数据 = 店铺 ID + ":refresh"
+# 续期令牌的附加认证数据 = 店铺 ID + NUL + "refresh"。店铺 ID 存在 TEXT 列里，不会有 NUL，
+# 所以它和任何店铺 access_token 的附加认证数据（店铺 ID 本身）都不相同；用 ":refresh" 的话，
+# 店铺 X 的续期令牌密文能当成店铺 "X:refresh" 的 access_token 解开
+_REFRESH_AAD_SUFFIX = "\x00refresh"
 _AUTH_COLS = (
     "shop_id, access_token, scopes, expires_at, refresh_token, refresh_expires_at,"
     " refreshed_at, needs_reauth"
@@ -1209,7 +1212,8 @@ class PgShopAuthRepository:
       绑定参数会原样写进数据库日志。
     - 密文格式：b"RDT1" + 12 字节随机 nonce + 密文 + 16 字节认证标签；店铺 ID 作为附加认证数据，
       把一个店铺的密文挪到别的店铺名下解不出来。续期令牌（refresh_token，迁移版本 5）同样加密，
-      附加认证数据是"店铺 ID:refresh"：和 access_token 的密文互换也解不出来。
+      附加认证数据是"店铺 ID + NUL 字节 + refresh"：和 access_token 的密文互换、挪到任何店铺
+      （包括名字是"店铺 ID:refresh"这样的店铺）的 access_token 列都解不出来。
     - expiring_shop_ids 经 SECURITY DEFINER 函数 rodit_auth_expiring 跨店读（只有店铺 ID 和到期
       时间，不解密）；mark_needs_reauth 只改标记、不解密。
     - 密钥不对、密文损坏、旧格式（v0.x 用库内 pgcrypto 加密的令牌）都抛 TokenDecryptionError，
@@ -1237,6 +1241,8 @@ class PgShopAuthRepository:
 
     @staticmethod
     def _aad(shop_id: str, *, refresh: bool) -> bytes:
+        if "\x00" in shop_id:  # 库里存不下；也保证和续期令牌的附加认证数据分得开
+            raise ValueError("店铺 ID 不能含 NUL 字符")
         return (shop_id + _REFRESH_AAD_SUFFIX if refresh else shop_id).encode("utf-8")
 
     def _encrypt(self, shop_id: str, token: str, *, refresh: bool = False) -> bytes:

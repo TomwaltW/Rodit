@@ -283,8 +283,8 @@ def compose_unit(
     其他情况一律 PostgreSQL（build_production_unit）。
 
     顺序：先调绑定工厂（它拿到的 ctx.tokens / ctx.on_subscription 是代理），再组装平台单元，
-    然后把 ctx.tokens 接到 Unit.tokens；ctx.on_subscription 由 build_server
-    在服务组装好之后接上。"""
+    把绑定里的 token_refresher / parse_subscription 挂到单元上，然后把 ctx.tokens 接到
+    Unit.tokens；ctx.on_subscription 由 build_server 在服务组装好之后接上。"""
     env = os.environ if environ is None else environ
     config = load_config(settings.config_path or None)
     preflight(settings, config, env)
@@ -323,6 +323,10 @@ def compose_unit(
             settings, config, clock, hasher, bindings, tools, observe, repos, classifier
         )
         probe = static_probe("llm", CheckResult(True, {"offline": True}))
+    # 平台云代码的续期接口、订购推送解析挂到单元上：店铺生命周期（续期任务、平台推送订购事件的
+    # 接口）经 Unit / AssistService 取用
+    unit.token_refresher = bindings.token_refresher
+    unit.parse_subscription = bindings.parse_subscription
     bind_context(ctx, tokens=unit.tokens)  # 单元组装好了：平台云代码可以取店铺令牌了
     return _Composed(unit=unit, bindings=bindings, metrics=metrics, llm_probe=probe, ctx=ctx)
 
@@ -832,10 +836,11 @@ def main(
     _early_logging(os.environ)
     if command in ("recalibrate", "train-classifier"):
         return _run_job(command, args, out, label_source=label_source, clock=clock)
-    code = jobs.dispatch(args, os.environ)  # 任务模块认领的命令（rodit.ops.jobs）
-    if code is not None:
-        return code
     try:
+        # 任务模块认领的命令（rodit.ops.jobs）：抛出的异常和内置命令一样按下面映射退出码
+        code = jobs.dispatch(args, os.environ)
+        if code is not None:
+            return code
         if command == "issue-token":
             return issue_token_command(args, out)
         if command == "migrate":
@@ -857,7 +862,8 @@ def main(
     except (StorageUnavailable, psycopg.Error) as exc:  # 只记类型：说明里可能有主机名、账号
         logger.error("数据库不可用：%s", type(exc).__name__)
         return EXIT_FAILURE
-    except (ValueError, OSError) as exc:  # 配置值不对（超时不是正整数、配置文件不存在……）
+    # 配置值不对（超时不是正整数、配置文件不存在、YAML 写错……）
+    except (ValueError, OSError, yaml.YAMLError) as exc:
         logger.error("启动失败：%s", exc)
         return EXIT_STARTUP
     if run is None:

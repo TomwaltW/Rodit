@@ -148,7 +148,8 @@ class PrivacyConfig(_Model):
 
 
 class LatencyConfig(_Model):
-    """每条消息的时间预算（§12.1 端到端 ≤ 5 秒）。引擎用 core.budget.deadline_scope 执行。"""
+    """每条消息的时间预算（§12.1 端到端 ≤ 5 秒）。引擎用 core.budget.deadline_scope 执行
+    （两个值都交给它）；生成、质检用 core.budget.llm_allowed() 判断还能不能调大模型。"""
 
     # 从引擎开始处理到出结果的上限：留出接入层、展示的余量（5 秒 − 0.5 秒）
     message_budget_s: float = Field(default=4.5, gt=0, le=30)

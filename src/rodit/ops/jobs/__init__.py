@@ -11,6 +11,12 @@ rodit.ops.serve 的 _parser 对每个模块调 register，main 解析完参数�
 返回退出码的模块处理了这条命令（dispatch）。模块按 JOB_MODULES 的顺序导入，只在用到时导入
 （serve 不会因为任务模块的依赖而多导入东西）。
 
+run 抛出的异常由 main 按内置命令的约定映射退出码，任务模块不用各自再写一遍：
+设置 / 启动 / 绑定错误、缺环境变量（RuntimeError）、配置值不对（ValueError、OSError、YAML）
+→ EXIT_STARTUP，日志记异常说明；数据库错误（StorageUnavailable、psycopg.Error）→ EXIT_FAILURE，
+日志只记异常类型（libpq 的说明里有主机名、账号）。所以异常说明里不能放令牌等机密；
+需要更具体的退出码时 run 自己处理后返回。
+
 - rodit.ops.jobs.tenancy：店铺生命周期（开通、续期、过期清理、取消订购，§8.4）；
 - rodit.ops.jobs.rollout：上线节奏（评测结论、验收报告，§13.4、§13.5）。
 """

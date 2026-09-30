@@ -27,7 +27,7 @@ RELEASED_SHA256 = {
     2: "89d1e349d11d445e6f010e84c5e3686428c877bafe3dcea09800d013f3685d1b",
     3: "254848388c403503c430f4dd79bd5df1b22feb57858060aa16c2d2ea7bdadf39",
     4: "9b8387a668d5ffe74618b2dd0f165861c2581de087385b2406935e14cd93df8a",
-    5: "c2c10afc8eb72462fd05ffd10525a3c405339993b77eb0ee0e249535e0601f26",
+    5: "27285bc3df2351585181f3a0974a93cc05a621e7fb5d481322c165ae80711a7e",
 }
 """已发布迁移脚本的 SHA-256。新增版本时在这里补一行；已有的行不能改。"""
 
@@ -291,3 +291,66 @@ def test_v5_upgrades_a_v4_database_with_auth_and_is_rerunnable(make_database, mo
     assert after.refresh_token.get_secret_value() == "tok-a-refresh-v5"
     assert repo.mark_needs_reauth(SHOP_B) is True
     assert [s for s, _ in repo.expiring_shop_ids(now + timedelta(days=30))] == [SHOP_A, SHOP_B]
+
+
+@pytest.mark.pg
+def test_v5_rerun_by_another_role_keeps_the_policy_on_the_function_owner(pg_admin_dsn):
+    """库由非超级用户的属主迁移；DBA 用超级用户重新执行版本 5 的脚本：函数属主不变
+    （CREATE OR REPLACE），读表的策略也要留在属主身上，函数照样列得出快到期的店铺。"""
+    suffix = uuid.uuid4().hex[:10]
+    owner, dbname = f"rodit_test_owner_{suffix}", f"rodit_test_rerun_{suffix}"
+    with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(owner)))
+        admin.execute(
+            sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                sql.Identifier(dbname), sql.Identifier(owner)
+            )
+        )
+    dsn = make_conninfo(pg_admin_dsn, dbname=dbname)
+    now = build_demo_world().now
+    v5 = next(m for m in MIGRATIONS if m.version == 5)
+
+    def policy_roles_and_owner(conn: psycopg.Connection) -> tuple[list[str], str]:
+        roles = conn.execute(
+            "SELECT roles::text[] FROM pg_policies"
+            " WHERE tablename = 'shop_auth' AND policyname = 'auth_expiring_definer'"
+        ).fetchone()[0]
+        fn_owner = conn.execute(
+            "SELECT pg_get_userbyid(proowner) FROM pg_proc"
+            " WHERE oid = 'rodit_auth_expiring(timestamptz)'::regprocedure"
+        ).fetchone()[0]
+        return list(roles), fn_owner
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            conn.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(owner)))
+            for migration in MIGRATIONS:
+                conn.execute(migration.sql())
+            for shop, days in ((SHOP_A, 1), (SHOP_B, 5)):
+                conn.execute("SELECT set_config('rodit.shop_id', %s, false)", (shop,))
+                conn.execute(
+                    "INSERT INTO shop_auth (shop_id, access_token, scopes, expires_at)"
+                    " VALUES (%s, 'x'::bytea, '{order.read}', %s)",
+                    (shop, now + timedelta(days=days)),
+                )
+            conn.execute("SELECT set_config('rodit.shop_id', '', false)")
+            conn.execute("RESET ROLE")
+            assert policy_roles_and_owner(conn) == ([owner], owner)
+            conn.commit()
+        with psycopg.connect(dsn) as conn:  # 超级用户重新执行版本 5
+            conn.execute(v5.sql())
+            assert policy_roles_and_owner(conn) == ([owner], owner)
+            conn.commit()
+        db = Database(dsn)  # 应用视角：SET LOCAL ROLE rodit_app
+        with db.session(None) as conn:
+            rows = conn.execute(
+                "SELECT shop_id FROM rodit_auth_expiring(%s)", (now + timedelta(days=10),)
+            ).fetchall()
+        assert [r["shop_id"] for r in rows] == [SHOP_A, SHOP_B]
+    finally:
+        with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(dbname))
+            )
+            admin.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(owner)))
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(owner)))

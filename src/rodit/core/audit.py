@@ -88,6 +88,15 @@ class ResultKey(StrEnum):
 
 
 RESULT_DETAIL_KEYS: tuple[str, ...] = tuple(k.value for k in ResultKey)
+"""engine.result 的 detail 每次都有的键（按这个顺序）。"""
+
+RESULT_BUDGET_EXCEEDED = "budget_exceeded"
+"""engine.result detail 的可选键（bool，只写 True）：这条消息超过了时间预算
+（LatencyConfig.message_budget_s）。只在超时的时候写，正常的消息 detail 仍然正好是
+RESULT_DETAIL_KEYS；degraded 里同时有 DEGRADED_BUDGET。报表按这个常量读，没有这个键就是没超时。"""
+
+OPTIONAL_RESULT_DETAIL_KEYS: tuple[str, ...] = (RESULT_BUDGET_EXCEEDED,)
+"""engine.result detail 里可能出现、但不是每次都有的键。"""
 
 SYSTEM_EVENT_ACTIONS: frozenset[str] = frozenset(
     {AuditAction.SHOP_PURGED.value, AuditAction.EVAL_VERDICT.value}

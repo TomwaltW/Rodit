@@ -24,6 +24,7 @@ buyer_ref，§8.3），还有两个"先交出、后接上"的入口（工厂被�
 from __future__ import annotations
 
 import importlib
+import inspect
 import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -216,7 +217,8 @@ def mode_c_bindings(ctx: BindingContext) -> PlatformBindings:
 def validate_bindings(
     bindings: object, platform: Platform, *, allow_mock: bool
 ) -> PlatformBindings:
-    """核对工厂返回的绑定：类型、平台一致（§9.1 数据不跨云）；生产模式下不许有模拟实现。"""
+    """核对工厂返回的绑定：类型、平台一致（§9.1 数据不跨云）、适配器的 show_suggestions 签名；
+    生产模式下不许有模拟实现。"""
     if not isinstance(bindings, PlatformBindings):
         raise BindingError("平台绑定工厂必须返回 rodit.ops.PlatformBindings")
     if getattr(bindings.tools, "platform", None) != platform:
@@ -227,6 +229,7 @@ def validate_bindings(
     for adapter in adapters:
         if getattr(adapter, "platform", None) != platform:
             raise BindingError(f"适配器 {type(adapter).__name__} 不属于本单元的平台")
+        _check_show_suggestions(adapter)
     if isinstance(bindings.tools, NullToolGateway) and not bindings.mode_c_only:
         raise BindingError("NullToolGateway 只能用于模式 C 单独部署（RODIT_MODE_C_ONLY=1）")
     if bindings.catalog is not None and getattr(bindings.catalog, "platform", None) != platform:
@@ -258,6 +261,41 @@ def validate_bindings(
                 "生产模式不能用模拟实现（合成数据）：" + "、".join(sorted(set(mocks)))
             )
     return bindings
+
+
+SHOW_SUGGESTION_KEYWORDS: tuple[str, ...] = ("alerts", "notice")
+"""PlatformAdapter.show_suggestions 必须接受的关键字参数（标红提醒、没有推荐的原因）。"""
+
+
+def _check_show_suggestions(adapter: object) -> None:
+    """适配器的 show_suggestions 要能接受 alerts / notice 关键字参数（core.ports.PlatformAdapter）。
+
+    服务每次展示推荐都带上这两个参数；按旧签名（只有 shop_id、conversation_id、cards）写的适配器
+    每次都会 TypeError，而展示失败只记一条警告（不抛给平台）：侧边栏从此看不到任何推荐。
+    runtime_checkable 协议只核对属性名，查不出来，所以启动时按签名核对，不对就拒绝启动。
+    看不到签名（如 C 实现）时不拦。"""
+    name = type(adapter).__name__
+    show = getattr(adapter, "show_suggestions", None)
+    if not callable(show):
+        raise BindingError(f"适配器 {name} 没有 show_suggestions")
+    try:
+        params = inspect.signature(show).parameters
+    except (TypeError, ValueError):
+        return
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return
+    keyword_kinds = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    missing = [
+        kw
+        for kw in SHOW_SUGGESTION_KEYWORDS
+        if kw not in params or params[kw].kind not in keyword_kinds
+    ]
+    if missing:
+        raise BindingError(
+            f"适配器 {name}.show_suggestions 要接受关键字参数 "
+            + " / ".join(missing)
+            + "（core.ports.PlatformAdapter：标红提醒和没有推荐的原因）"
+        )
 
 
 def is_mock(obj: object) -> bool:
@@ -320,6 +358,7 @@ def demo_bindings(ctx: BindingContext) -> PlatformBindings:
 
 __all__ = [
     "MOCK_MODULE_PREFIXES",
+    "SHOW_SUGGESTION_KEYWORDS",
     "BindingContext",
     "BindingError",
     "BindingsFactory",

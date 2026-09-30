@@ -15,6 +15,9 @@ from rodit.core.audit import (
     DEGRADED_BUDGET,
     DEGRADED_TENANT_ISOLATION,
     LATENCY_SINCE_RECEIVED,
+    OPTIONAL_RESULT_DETAIL_KEYS,
+    RESULT_BUDGET_EXCEEDED,
+    RESULT_DETAIL_KEYS,
     SYSTEM_EVENT_ACTIONS,
     AuditAction,
     InMemoryAuditSink,
@@ -147,6 +150,10 @@ def test_new_audit_actions_and_constants():
         "budget",
         "since_received",
     )
+    # 超时的可选键：不在每次都有的键里（正常的消息 detail 仍然正好是 RESULT_DETAIL_KEYS）
+    assert RESULT_BUDGET_EXCEEDED == "budget_exceeded"
+    assert OPTIONAL_RESULT_DETAIL_KEYS == (RESULT_BUDGET_EXCEEDED,)
+    assert not set(OPTIONAL_RESULT_DETAIL_KEYS) & set(RESULT_DETAIL_KEYS)
 
 
 # ================================================================ 配置

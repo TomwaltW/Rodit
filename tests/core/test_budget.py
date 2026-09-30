@@ -17,6 +17,7 @@ from rodit.core.budget import (
     current_deadline,
     deadline_scope,
     expired,
+    llm_allowed,
     remaining,
     submit_in_context,
 )
@@ -40,6 +41,7 @@ def test_no_deadline_by_default():
     assert current_deadline() is None
     assert remaining() is None and expired() is False
     assert clamp_timeout(2.5) == 2.5
+    assert llm_allowed() is True  # 不在引擎里（离线任务、控制台）：不受限
 
 
 def test_deadline_counts_down_and_expires():
@@ -162,6 +164,79 @@ def test_public_names():
         "current_deadline",
         "deadline_scope",
         "expired",
+        "llm_allowed",
         "remaining",
         "submit_in_context",
     }
+
+
+# ================================================================ 调大模型的剩余时间下限
+
+
+def test_llm_floor_blocks_llm_calls_near_the_deadline():
+    """剩余时间少于 min_llm_remaining_s 就不调大模型
+    （LatencyConfig 的两个值都交给 deadline_scope）。"""
+    from rodit.core.config import LatencyConfig
+
+    latency = LatencyConfig()
+    mono = Mono()
+    with deadline_scope(
+        latency.message_budget_s, min_llm_remaining_s=latency.min_llm_remaining_s, now=mono
+    ) as d:
+        assert d is not None and d.min_llm_remaining_s == latency.min_llm_remaining_s
+        assert llm_allowed()
+        mono.advance(latency.message_budget_s - latency.min_llm_remaining_s - 0.1)
+        assert llm_allowed() and not expired()  # 比下限多 0.1 秒
+        mono.advance(0.2)
+        assert not llm_allowed() and not expired()  # 没过期，但来不及调一次大模型
+    assert llm_allowed()  # 退出后恢复：没有截止时间
+
+
+def test_zero_floor_allows_llm_until_expired():
+    mono = Mono()
+    with deadline_scope(1.0, now=mono) as d:
+        assert d is not None and d.min_llm_remaining_s == 0.0
+        mono.advance(0.99)
+        assert llm_allowed()
+        mono.advance(0.01)
+        assert expired() and not llm_allowed()
+
+
+def test_nested_scopes_inherit_and_never_relax_the_llm_floor():
+    mono = Mono()
+    with deadline_scope(4.5, min_llm_remaining_s=0.8, now=mono) as outer:
+        with deadline_scope(10.0, now=mono) as longer:  # 没给下限：沿用外层的
+            assert longer is outer
+        with deadline_scope(2.0, now=mono) as tighter:  # 更早的截止时间，下限照旧
+            assert tighter is not None and tighter.min_llm_remaining_s == 0.8
+        with deadline_scope(None, min_llm_remaining_s=0.2, now=mono) as relaxed:  # 不能放宽
+            assert relaxed is outer
+        with deadline_scope(None, min_llm_remaining_s=1.5, now=mono) as stricter:  # 可以收紧
+            assert stricter is not None and stricter is not outer
+            assert stricter.min_llm_remaining_s == 1.5
+            assert stricter.expires_at == outer.expires_at
+            assert stricter.started_at == outer.started_at
+            mono.advance(3.2)  # 剩 1.3：外层还能调，这一层不能
+            assert not llm_allowed()
+        assert current_deadline() is outer and llm_allowed()
+    with deadline_scope(None, min_llm_remaining_s=1.0) as none:  # 没有外层、没设预算：没有截止时间
+        assert none is None and llm_allowed()
+
+
+def test_llm_floor_is_visible_in_workers():
+    mono = Mono()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with deadline_scope(4.5, min_llm_remaining_s=0.8, now=mono):
+            assert submit_in_context(pool, llm_allowed).result() is True
+            mono.advance(4.0)
+            assert submit_in_context(pool, llm_allowed).result() is False
+
+
+def test_negative_llm_floor_rejected():
+    with pytest.raises(ValueError):
+        Deadline(1.0, min_llm_remaining_s=-0.1)
+    with pytest.raises(ValueError):
+        with deadline_scope(1.0, min_llm_remaining_s=-0.1):
+            pass
+    d = Deadline.until(1003.0, now=Mono(), min_llm_remaining_s=0.5)
+    assert d.min_llm_remaining_s == 0.5 and "min_llm_remaining_s" in repr(d)
