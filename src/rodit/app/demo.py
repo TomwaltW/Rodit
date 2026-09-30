@@ -18,6 +18,7 @@ from pydantic import SecretStr
 
 from rodit.adapters import (
     MVP_SCOPES,
+    PHASE2_SCOPES,
     DouyinMockAdapter,
     StandaloneAssistAdapter,
     TaobaoMockAdapter,
@@ -57,8 +58,12 @@ SUPPORTED_ACTIONS = {
 
 
 def seed_unit(unit: Unit, world: DemoWorld) -> None:
-    """只把本平台的店铺、政策、商品、FAQ 写进本单元（§9.1），并给每家店铺一份演示授权。"""
+    """只把本平台的店铺、政策、商品、FAQ 写进本单元（§9.1），并给每家店铺一份演示授权。
+
+    演示单元带了售后写接口（替身）时授权也带上写售后权限（二期，§15 Phase 2），否则只有只读权限
+    （§8.4 最小权限）：确认执行售后前要检查这项权限。"""
     repo = unit.repos.knowledge
+    scopes = PHASE2_SCOPES if unit.action_port is not None else MVP_SCOPES
     shop_ids = {s.id for s in world.shops.values() if s.platform == unit.platform}
     for shop_id in sorted(shop_ids):
         repo.upsert_shop(world.shop(shop_id))
@@ -66,7 +71,7 @@ def seed_unit(unit: Unit, world: DemoWorld) -> None:
             ShopAuth(
                 shop_id=shop_id,
                 access_token=SecretStr(f"demo-token-{shop_id}"),  # 合成，不是真实令牌
-                scopes=sorted(MVP_SCOPES),
+                scopes=sorted(scopes),
                 expires_at=world.now + timedelta(days=30),
             )
         )

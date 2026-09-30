@@ -56,6 +56,7 @@ from rodit.core.models import (
 from rodit.core.pii import mask_pii
 from rodit.core.ports import LLMRequest, LLMResponse
 from rodit.core.questions import (
+    NO_SECOND_INTENT,
     Q_ANSWERS_QUESTION,
     Q_EMOTION,
     Q_GROUNDED,
@@ -64,6 +65,7 @@ from rodit.core.questions import (
     Q_NEED_HUMAN,
     Q_PLATFORM_VIOLATION,
     Q_PROMISE_RISK,
+    Q_SECOND_INTENT,
     Q_TONE,
 )
 from rodit.core.scopes import MVP_SCOPES
@@ -238,6 +240,7 @@ JUDGE_DEFAULT_ANSWERS: dict[str, dict[str, Any]] = {
     Q_NEED_HUMAN: {"answer": "否", "p": 0.02},
     Q_EMOTION: {"score": 0},
     Q_MULTI_INTENT: {"answer": "否", "p": 0.05},
+    Q_SECOND_INTENT: {"choice": NO_SECOND_INTENT},  # 投票制判断层的追问：没有第二个问题
     # 质检（§5.5）：全部通过
     Q_GROUNDED: {"answer": "是", "p": 0.95},
     Q_ANSWERS_QUESTION: {"answer": "是", "p": 0.95},

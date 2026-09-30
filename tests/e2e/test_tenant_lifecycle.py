@@ -369,7 +369,9 @@ def test_tenant_lifecycle_on_postgres(pg_service: AssistService, e2e_pg_dsn: str
 def test_cancel_and_auth_checks_on_postgres(pg_service: AssistService):
     service = pg_service
     unit = service.unit
-    # 只有 MVP 只读权限：写售后在调写接口之前被拒
+    # 只有 MVP 只读权限（演示单元带写接口时默认给了写售后权限，这里收回）：写售后在调写接口之前被拒
+    auth = unit.repos.auth.get(SHOP_A)
+    unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(MVP_SCOPES)}))
     review = service.review_aftersale(SHOP_A, "as_2001")
     with pytest.raises(AuthExpired, match="refund.write"):
         service.confirm_aftersale(

@@ -37,7 +37,13 @@ MERCHANT_TOKEN = "test-token-merchant-a-auth-0123456789"
 
 @pytest.fixture
 def service() -> AssistService:
-    return AssistService(build_demo_unit(Platform.TAOBAO))
+    """演示单元带售后写接口（替身）时默认授权含写售后权限；这里的店铺 A 只授权了只读（MVP），
+    才能测"没有 refund.write 不碰写接口"。"""
+    svc = AssistService(build_demo_unit(Platform.TAOBAO))
+    auth = svc.unit.repos.auth.get(SHOP_A)
+    assert auth is not None
+    svc.unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(MVP_SCOPES)}))
+    return svc
 
 
 def _auth(service: AssistService, *, days: float = 30, scopes=MVP_SCOPES, **kw) -> None:

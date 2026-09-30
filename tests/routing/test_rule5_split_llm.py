@@ -300,3 +300,14 @@ def test_shop_scope_of_the_logged_decision():
     router, audit, _ = _llm_router(script)
     router.route(make_context("165 110斤穿什么码", W))
     assert [e.shop_id for e in audit.decisions] == [SHOP_A]
+
+
+def test_off_platform_as_the_second_question_still_triggers_rule_1():
+    """ "这件多少钱？加个微信聊"：主要问题是价格，站外交易只出现在追问里——规则 1 优先，
+    给平台规则标准话术，不把站外交易当成分条里的一条回答（§6.6 规则 1 防止违规）。"""
+    resp = _resp({"price_promo": 1.0}, {"off_platform": 1.0}, multi=1.0)
+    d = _apply(resp)
+    assert (d.action, d.rule, d.intent) == (A.OFF_PLATFORM_SCRIPT, 1, Intent.OFF_PLATFORM)
+    # 只有 1/3 票提到：不到 off_platform 阈值（0.6），照常分条或回答
+    weak = _resp({"price_promo": 1.0}, {"off_platform": 1 / 3, NO_SECOND_INTENT: 2 / 3}, multi=1.0)
+    assert _apply(weak).rule != 1

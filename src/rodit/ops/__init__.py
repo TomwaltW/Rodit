@@ -27,8 +27,10 @@ from rodit.ops.instrument import (
     HttpMetricsMiddleware,
     MeteredToolGateway,
     ObservedAuditLog,
+    ObservedReadinessChecker,
     RoditMetrics,
 )
+from rodit.ops.lease import LeaseError, LeaseHeld, ServeLease, serve_lease
 from rodit.ops.metrics import MetricsRegistry
 from rodit.ops.router import install_ops
 from rodit.ops.serve import Server, StartupError, build_server, main
@@ -41,14 +43,18 @@ __all__ = [
     "BindingError",
     "CheckResult",
     "HttpMetricsMiddleware",
+    "LeaseError",
+    "LeaseHeld",
     "MeteredToolGateway",
     "MetricsRegistry",
+    "ObservedReadinessChecker",
     "ObservedAuditLog",
     "PlatformBindings",
     "Readiness",
     "ReadinessChecker",
     "RoditMetrics",
     "Server",
+    "ServeLease",
     "ServerSettings",
     "SettingsError",
     "StartupError",
@@ -58,5 +64,6 @@ __all__ = [
     "demo_bindings",
     "install_ops",
     "main",
+    "serve_lease",
     "mode_c_bindings",
 ]

@@ -2,7 +2,8 @@
 
 按顺序判断，命中就停，rule 记下命中的规则序号：
 
-1. P(off_platform) ≥ off_platform → 平台规则标准话术（优先级最高；即使店铺关了这一类也照样给）；
+1. P(off_platform) ≥ off_platform → 平台规则标准话术（优先级最高；即使店铺关了这一类也照样给；
+                                    投票制判断层的追问里提到站外交易也算，按"被问到"的占比）；
 2. need_human ≥ need_human       → 辅助 / 影子：提醒客服优先处理；自动：转人工；
                                     自动模式另看关键词规则的"要求人工"信号（§5.7 兜底）；
 3. emotion ≥ emotion_escalate    → 辅助 / 影子：安抚话术并标红；自动：转人工；
@@ -164,8 +165,12 @@ class RoutingPolicy:
         def decide(action: RouteAction, rule: int, **extra: object) -> RouteDecision:
             return RouteDecision.model_validate({**base, "action": action, "rule": rule, **extra})
 
-        # 规则 1：站外交易请求（优先级最高，防止违规）
-        p_off = probs.get(Intent.OFF_PLATFORM, 0.0)
+        # 规则 1：站外交易请求（优先级最高，防止违规）。买家把站外交易当成第二个问题提时
+        # （投票制判断层的追问 second_intent）也算：按"被问到"的占比取大的，不让它变成分条里的一条
+        p_off = max(
+            probs.get(Intent.OFF_PLATFORM, 0.0),
+            self._mentioned(answers, probs).get(Intent.OFF_PLATFORM, 0.0),
+        )
         if intent == Intent.OFF_PLATFORM:
             p_off = max(p_off, confidence)
         if _ge(p_off, cfg.off_platform):
