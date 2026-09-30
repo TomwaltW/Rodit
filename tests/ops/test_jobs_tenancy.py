@@ -32,6 +32,7 @@ from rodit.core.scopes import MVP_SCOPES
 from rodit.ops import serve
 from rodit.ops.bindings import BindingContext, PlatformBindings, demo_bindings
 from rodit.ops.jobs import tenancy as tenancy_jobs
+from rodit.ops.lease import LeaseHeld
 from rodit.ops.serve import build_server
 from rodit.ops.settings import ServerSettings
 from rodit.storage.db import MIGRATIONS
@@ -58,9 +59,48 @@ ONBOARD = [
 # ================================================================ 命令行（内存单元）
 
 
+class FakeJobLease:
+    """改数据的命令拿的单副本租约替身（不连数据库）；held_by 不为空时模拟 serve 或另一个任务
+    占着。"""
+
+    def __init__(self, command: str, *, held_by: str | None = None) -> None:
+        self.command = command
+        self.held_by = held_by
+        self.events: list[str] = []
+
+    def acquire(self) -> FakeJobLease:
+        self.events.append("acquire")
+        if self.held_by is not None:
+            raise LeaseHeld(Platform.TAOBAO, holder=self.held_by)
+        return self
+
+    def release(self) -> None:
+        self.events.append("release")
+
+    def probe(self) -> dict:
+        from rodit.ops.health import CheckResult
+
+        return {"lease": CheckResult(self.events[-1:] == ["acquire"])}
+
+
 @pytest.fixture
-def cli(monkeypatch):
-    """命令行跑在演示单元上（带假的续期接口）；返回应用服务和 build_service 的调用次数。"""
+def job_leases(monkeypatch):
+    """替换 tenancy.job_lease：返回（造出来的租约列表, {"held_by": 占用者}）。"""
+    made: list[FakeJobLease] = []
+    state: dict[str, str | None] = {"held_by": None}
+
+    def factory(environ, command):
+        made.append(FakeJobLease(command, held_by=state["held_by"]))
+        return made[-1]
+
+    monkeypatch.setattr(tenancy_jobs, "job_lease", factory)
+    return made, state
+
+
+@pytest.fixture
+def cli(monkeypatch, job_leases):
+    """命令行跑在演示单元上（带假的续期接口）；返回应用服务和 build_service 的调用次数。
+    单副本租约换成替身（job_leases）。"""
     unit = build_demo_unit(Platform.TAOBAO)
     unit.token_refresher = FakeTokenRefresher(Platform.TAOBAO, clock=unit.clock)
     service = AssistService(unit)
@@ -309,6 +349,163 @@ def test_job_database_errors_map_to_exit_1(cli, monkeypatch, caplog):
     assert "db.internal" not in caplog.text
 
 
+# ================================================================ 单副本租约：不和 serve 同时改数据
+
+
+SERVE_HOLDER = "rodit-serve/taobao/host-1/42，自 2026-09-30 08:00:00 起"
+MUTATING = {
+    "onboard-shop": [*ONBOARD, "--token-stdin"],
+    "refresh-tokens": ["refresh-tokens"],
+    "purge-expired": ["purge-expired"],
+    "revoke": ["revoke", "--shop-id", SHOP_A],
+    "set-status": ["set-status", "--shop-id", SHOP_A, "--status", "suspended"],
+}
+ALTERNATIVE = {
+    "onboard-shop": "POST /v1/platform/{access}/subscription",
+    "refresh-tokens": "RODIT_TOKEN_REFRESH_INTERVAL_S",
+    "purge-expired": "RODIT_PURGE_EXPIRED_INTERVAL_S",
+    "revoke": "POST /v1/shops/{shop_id}/revoke",
+    "set-status": "停 serve",
+}
+
+
+@pytest.mark.parametrize("command", sorted(MUTATING))
+def test_mutating_commands_refuse_while_serve_holds_the_lease(
+    cli, job_leases, monkeypatch, caplog, command
+):
+    """取消订购的闸门、缓存都在 serve 进程内：serve 在跑时改数据的命令一律不执行（退出码 2），
+    日志写明改用哪个接口或 serve 里的哪个定时任务，什么都不改、不组装单元。"""
+    service, built = cli
+    leases, state = job_leases
+    state["held_by"] = SERVE_HOLDER
+    unit = service.unit
+    _grant(service, SHOP_A, hours=3)
+    _expire(service, SHOP_B, 45)
+    before = (unit.repos.auth.get(SHOP_A), unit.repos.auth.get(SHOP_B))
+    status = unit.repos.knowledge.get_shop(SHOP_A).status
+    _stdin(monkeypatch, f"{TOKEN}\n")
+    with caplog.at_level(logging.ERROR):
+        assert serve.main(MUTATING[command]) == 2
+    assert built == []  # 没组装单元
+    assert [lease.command for lease in leases] == [command]
+    assert leases[0].events == ["acquire"]  # 没拿到，不用放
+    assert "serve 正在运行" in caplog.text and "rodit-serve/taobao/host-1/42" in caplog.text
+    assert ALTERNATIVE[command] in caplog.text
+    assert TOKEN not in caplog.text
+    # 什么都没改
+    assert (unit.repos.auth.get(SHOP_A), unit.repos.auth.get(SHOP_B)) == before
+    assert unit.repos.knowledge.get_shop(SHOP_A).status == status
+    assert unit.repos.knowledge.get_shop(NEW) is None
+    assert unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED) == []
+
+
+@pytest.mark.parametrize("command", sorted(MUTATING))
+def test_mutating_commands_hold_the_lease_while_they_run(cli, job_leases, monkeypatch, command):
+    service, built = cli
+    leases, _ = job_leases
+    _grant(service, SHOP_A, hours=3)
+    seen: list[list[str]] = []
+    real = tenancy_jobs.build_service
+
+    def build(environ):
+        seen.append(list(leases[0].events))
+        return real(environ)
+
+    monkeypatch.setattr(tenancy_jobs, "build_service", build)
+    _stdin(monkeypatch, f"{TOKEN}\n")
+    assert serve.main(MUTATING[command]) == 0
+    assert seen == [["acquire"]]  # 组装单元、改数据时已经拿着租约
+    assert leases[0].events == ["acquire", "release"]
+    assert leases[0].command == command
+
+
+def test_lease_is_released_when_the_job_fails(cli, job_leases, caplog):
+    leases, _ = job_leases
+    with caplog.at_level(logging.ERROR):
+        assert serve.main(["set-status", "--shop-id", "s_nope", "--status", "active"]) == 2
+    assert leases[0].events == ["acquire", "release"]
+
+
+def test_dry_run_is_read_only_and_can_run_next_to_serve(cli, job_leases, capsys):
+    service, built = cli
+    leases, state = job_leases
+    state["held_by"] = SERVE_HOLDER
+    _expire(service, SHOP_A, 45)
+    assert serve.main(["purge-expired", "--dry-run"]) == 0
+    assert "待清理的店铺：1 家" in capsys.readouterr().out
+    assert leases == [] and len(built) == 1
+    assert service.unit.repos.auth.get(SHOP_A) is not None
+
+
+def test_another_job_holding_the_lease_is_named(cli, job_leases, caplog):
+    service, built = cli
+    leases, state = job_leases
+    state["held_by"] = "rodit-job/taobao/purge-expired/host-2/7"
+    with caplog.at_level(logging.ERROR):
+        assert serve.main(["revoke", "--shop-id", SHOP_A]) == 2
+    assert "另一个运维任务" in caplog.text and "rodit-job/taobao/purge-expired" in caplog.text
+    assert built == [] and service.unit.repos.auth.get(SHOP_A) is not None
+
+
+def test_revoke_output_reminds_to_remove_the_token_file_entries(cli, capsys):
+    assert serve.main(["revoke", "--shop-id", SHOP_A]) == 0
+    assert "令牌文件" in capsys.readouterr().out
+
+
+def test_job_lease_uses_the_unit_platform_and_names_the_job(monkeypatch):
+    from rodit.ops.lease import ServeLease, lease_key
+
+    lease = tenancy_jobs.job_lease(
+        {"RODIT_PLATFORM": "douyin", "RODIT_DATABASE_DSN": "dbname=never_connected"}, "revoke"
+    )
+    assert isinstance(lease, ServeLease) and not lease.held  # 构造时不连库
+    assert lease.key == lease_key(Platform.DOUYIN)  # 和 serve 同一个键
+    assert lease.application_name.startswith("rodit-job/douyin/revoke/")
+    assert "never_connected" not in repr(lease)
+
+
+# ================================================================ 参数：--expires-days
+
+
+@pytest.mark.parametrize("days", ["inf", "-inf", "nan", "1e12", "4000000", "3650.5", "-1", "0"])
+def test_bad_expires_days_is_a_usage_error_before_reading_the_token(
+    cli, job_leases, monkeypatch, caplog, days
+):
+    """inf、1e12 换成到期时间会溢出（原来是没有说明的崩溃、退出码 1）：一律退出码 2，
+    令牌还没读、单元还没组装、租约还没拿。"""
+    service, built = cli
+    leases, _ = job_leases
+    stdin = io.StringIO(f"{TOKEN}\n")
+    monkeypatch.setattr(sys, "stdin", stdin)
+    with caplog.at_level(logging.ERROR):
+        assert serve.main([*ONBOARD, "--token-stdin", f"--expires-days={days}"]) == 2
+    assert "--expires-days" in caplog.text and TOKEN not in caplog.text
+    assert stdin.tell() == 0  # 没读令牌
+    assert built == [] and leases == []
+    assert service.unit.repos.auth.get(NEW) is None
+
+
+def test_expires_days_upper_bound_is_accepted(cli, monkeypatch):
+    service, _ = cli
+    _stdin(monkeypatch, f"{TOKEN}\n")
+    assert serve.main([*ONBOARD, "--token-stdin", "--expires-days", "3650"]) == 0
+    auth = service.unit.repos.auth.get(NEW)
+    assert auth.expires_at == service.unit.clock.now() + timedelta(days=3650)
+
+
+def test_overflow_inside_a_job_is_a_usage_error_not_a_traceback(cli, monkeypatch, caplog):
+    """兜底：任务里别的地方溢出（OverflowError 不是 ValueError）也按参数不对处理。"""
+    service, _ = cli
+
+    def overflow(*args, **kwargs):
+        raise OverflowError("date value out of range")
+
+    monkeypatch.setattr(service.tenancy, "set_status", overflow)
+    with caplog.at_level(logging.ERROR):
+        assert serve.main(["set-status", "--shop-id", SHOP_A, "--status", "active"]) == 2
+    assert "out of range" in caplog.text
+
+
 # ================================================================ serve：平台代码推订购事件
 
 
@@ -485,6 +682,69 @@ def test_cli_onboard_refresh_and_purge_on_postgres(pg_cli, monkeypatch):
     assert record.detail["shop_id"] == NEW and record.detail["reason"] == "expired"
     assert set(record.detail) == {"shop_id", "reason", "counts", "event_at"}
     assert record.detail["counts"]["auth"] == 1
+
+
+@pytest.mark.pg
+def test_cli_refuses_to_purge_while_serve_holds_the_lease_on_postgres(pg_cli, monkeypatch):
+    """复现（修复前）：serve 在跑时 python -m rodit.ops revoke 另起进程直接删数据，serve 手上的
+    消息之后照样写进推荐和审计，没有人再删。现在命令先拿单副本租约：serve 占着就退出码 2，
+    什么都不删；serve 退出之后照常执行。"""
+    from rodit.ops.lease import ServeLease
+
+    dsn, env = pg_cli
+    done = _run(env, *ONBOARD, "--token-stdin", stdin=f"{TOKEN}\n")
+    assert done.returncode == 0, done.stderr
+    knowledge, auth_repo, audit = _pg_repos(dsn, monkeypatch)
+    serve_lease = ServeLease(
+        Platform.TAOBAO, dsn=dsn, application_name="rodit-serve/taobao/test-host/1"
+    ).acquire()
+    try:
+        done = _run(env, "revoke", "--shop-id", NEW)
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "serve 正在运行" in done.stderr and "rodit-serve/taobao/test-host/1" in done.stderr
+        assert "POST /v1/platform/{access}/subscription" in done.stderr
+        assert "rodit_ops_" not in done.stderr  # 不带连接串（库名）
+        assert knowledge.get_shop(NEW) is not None and auth_repo.get(NEW) is not None
+        assert audit.list_system_events(action=AuditAction.SHOP_PURGED) == []
+        # 只读的 --dry-run 可以和 serve 同时跑
+        done = _run(env, "purge-expired", "--dry-run")
+        assert done.returncode == 0, done.stderr
+    finally:
+        serve_lease.release()
+    done = _run(env, "revoke", "--shop-id", NEW)
+    assert done.returncode == 0, done.stderr
+    assert knowledge.get_shop(NEW) is None and auth_repo.get(NEW) is None
+    # 任务做完释放了租约：serve 能拿到
+    ServeLease(Platform.TAOBAO, dsn=dsn).acquire().release()
+
+
+@pytest.mark.pg
+def test_serve_refuses_to_start_while_a_job_holds_the_lease_on_postgres(
+    pg_cli, monkeypatch, capsys
+):
+    """反过来：任务在跑时 serve 起不来（退出码 2），日志说明是运维任务占着、做完再启动。"""
+    import json
+
+    from rodit.ops.lease import job_lease
+
+    dsn, env = pg_cli
+    for name, value in env.items():
+        if name.startswith("RODIT_"):
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv("RODIT_LOG_FORMAT", "json")
+    monkeypatch.setenv("RODIT_MODE_C_ONLY", "1")
+    monkeypatch.setenv("RODIT_METRICS_PUBLIC", "1")
+    Path(env["RODIT_TOKENS_FILE"]).write_text('{"principals": [], "metrics": []}', "utf-8")
+    job = job_lease(Platform.TAOBAO, "purge-expired", environ=env).acquire()
+    ran: list[object] = []
+    try:
+        assert serve.main(["serve"], run=lambda *a, **k: ran.append(a)) == serve.EXIT_STARTUP
+    finally:
+        job.release()
+    assert not ran
+    records = [json.loads(line) for line in capsys.readouterr().err.strip().splitlines()]
+    (record,) = [r for r in records if r["level"] == "ERROR"]
+    assert "运维任务" in record["msg"] and "rodit-job/taobao/purge-expired/" in record["msg"]
 
 
 @pytest.mark.pg

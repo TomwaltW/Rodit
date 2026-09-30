@@ -12,15 +12,25 @@
 - observe_tool_cache：抓取时导出缓存层（rodit.tools.CachingToolGateway.totals()）自己记的统计：
   请求数、缓存命中、平台失败时用过期缓存兜底的次数、内层返回别家店铺数据的次数
   （按工具，不按店铺）。
-- AuthExpiryMonitor：抓取 /metrics 时（按间隔）检查授权即将过期、已经过期的店铺
+- AuthExpiryMonitor：（serve 的后台线程按间隔）检查授权即将过期、已经过期的店铺
   （§12.4 授权过期告警）。
-- ObservedReadinessChecker：就绪检查（/readyz，以及抓取时刷新）的结果记成 rodit_ready。
+- ObservedReadinessChecker：就绪检查（/readyz、serve 的后台线程）的结果记成 rodit_ready；
+  抓取 /metrics 时只输出上次的结果和它的年龄（publish），不查库，太旧了记成不就绪。
 - HttpMetricsMiddleware：按路由模板（不是实际路径）记请求数、耗时和错误码。
+- 后台任务（rodit.ops.background）每一轮的结果：rodit_background_task_runs_total{task,outcome}
+  （标签不叫 job：job 是 Prometheus 抓取目标的标签，重名会被改成 exported_job）。
+
+抓取 /metrics 时的钩子（before_render）只做内存里的事，不连数据库：数据库网络不通时连接要等
+超时，抓取会超过 Prometheus 的抓取超时，结果是一个样本都没有、"不就绪"的告警反而发不出来。
 
 串店（§9.2、§12.4 串店检查）：rodit_tenant_isolation_total{stage} 每次拦截记一次——
-tenant.violation 审计事件按它 detail 里的 stage（引擎在哪一步发现的），接口层按调用方身份拦下的
-403 tenant_isolation 记 stage="http"。同一次拦截在引擎的 engine.result 里还会有降级类型
-tenant_isolation（rodit_degradations_total{kind="tenant_isolation"}）、在缓存层还会记
+tenant.violation 审计事件按它 detail 里的 stage（引擎在哪一步发现的）；接口层按调用方身份拦下的
+403 tenant_isolation（令牌不是这家店的）记 stage="http"；接口处理中服务端自己发现的串店
+（TenantIsolationError：平台工具、知识仓储返回了别家店铺的数据等，响应同样是 403 tenant_isolation）
+记 stage="server"（mark_server_tenant_isolation 给错误映射包一层、在请求状态里做标记）。
+告警里 stage="http" 是 warning（调用方的问题），其余都是 critical（真的拿到了别家店铺的数据）。
+同一次拦截在引擎的 engine.result 里还会有降级类型 tenant_isolation
+（rodit_degradations_total{kind="tenant_isolation"}）、在缓存层还会记
 rodit_tool_cache_tenant_violations_total，这两个是另外的指标，不重复计入
 rodit_tenant_isolation_total；告警（deploy/prometheus/alerts.yml）三个都看。
 
@@ -35,6 +45,7 @@ total 是引擎内的端到端，since_received（core.audit.LATENCY_SINCE_RECEI
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -51,7 +62,7 @@ from rodit.adapters import AuthGuard
 from rodit.core.audit import DEGRADED_TENANT_ISOLATION, AuditAction
 from rodit.core.clock import Clock, SystemClock
 from rodit.core.enums import AfterSaleStatus, DecisionStage, Intent, Platform, RouteAction
-from rodit.core.errors import TOOL_FAILURE_REASONS, ToolUnavailable
+from rodit.core.errors import TOOL_FAILURE_REASONS, TenantIsolationError, ToolUnavailable
 from rodit.core.models import (
     NON_BLOCKING_HARD_RULES,
     AfterSaleInfo,
@@ -65,7 +76,7 @@ from rodit.core.models import (
 from rodit.core.ports import AuditLog, ToolGateway
 from rodit.feedback import metrics as report
 from rodit.ops.health import DEFAULT_CACHE_S, Probe, Readiness, ReadinessChecker
-from rodit.ops.metrics import MetricsRegistry
+from rodit.ops.metrics import MetricsRegistry, safe_label_value
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +111,14 @@ _INTENTS = frozenset(i.value for i in Intent)
 _ACTIONS = frozenset(a.value for a in RouteAction)
 
 NO_SHOP = "none"  # 没有店铺归属的事件
+DEFAULT_READINESS_STALE_S = 60.0
+"""/metrics 输出的就绪结果最多多旧（秒）：再旧就记成不就绪（后台刷新卡住了）。"""
 TENANT_STAGE_HTTP = "http"
 """接口层按调用方身份拦下的串店（403 tenant_isolation）：rodit_tenant_isolation_total 的 stage。"""
+TENANT_STAGE_SERVER = "server"
+"""接口处理中服务端发现的串店（TenantIsolationError → 403 tenant_isolation）的 stage。"""
+TENANT_STAGE_STATE_KEY = "rodit_tenant_stage"
+"""请求状态（scope["state"]）里的标记：服务端发现的串店在这里写上 stage，中间件按它记指标。"""
 TENANT_STAGE_UNKNOWN = "unknown"
 """tenant.violation 事件没写 stage（或不是代码）时的 stage。"""
 TENANT_ISOLATION_CODE = "tenant_isolation"  # 接口层的错误码（rodit.api.errors）
@@ -196,6 +213,7 @@ class RoditMetrics:
             ["stage"],
         )
         self.tenant_isolation.inc({"stage": TENANT_STAGE_HTTP}, 0)
+        self.tenant_isolation.inc({"stage": TENANT_STAGE_SERVER}, 0)
         # ---- 大模型（llm.usage）
         self.llm_calls = r.counter(
             "rodit_llm_calls_total",
@@ -267,7 +285,14 @@ class RoditMetrics:
         )
         self.auth_check_errors.inc(amount=0)  # 0 值序列：第一次失败也能被 increase() 看到
         # ---- 就绪（/readyz）
-        self.ready = r.gauge("rodit_ready", "就绪检查的结果：1 就绪，0 未就绪（不接流量）")
+        self.ready = r.gauge(
+            "rodit_ready",
+            "就绪检查的结果：1 就绪，0 未就绪（不接流量；还没检查过、上次的结果太旧也是 0）",
+        )
+        self.readiness_age = r.gauge(
+            "rodit_readiness_age_seconds",
+            "上次就绪检查距今的秒数（/metrics 只输出上次的结果，不在抓取时查库）",
+        )
         self.readiness_checks = r.gauge(
             "rodit_readiness_check_ok",
             "就绪检查各项的结果（1 通过，0 不通过）：database / migrations / llm / lease",
@@ -287,6 +312,18 @@ class RoditMetrics:
             "rodit_http_errors_total",
             "错误响应的错误码（tenant_isolation = 串店拦截，§9.2）",
             ["route", "code"],
+        )
+        # ---- serve 的后台任务（rodit.ops.background：续期、过期清理、就绪和授权检查）
+        self.background_runs = r.counter(
+            "rodit_background_task_runs_total",
+            "serve 后台任务每一轮的结果；outcome = ok / error（出错或没做完）/ "
+            "skipped（前提不满足，如单副本租约不在本进程）",
+            ["task", "outcome"],
+        )
+        self.background_last_ok = r.gauge(
+            "rodit_background_task_last_success_timestamp_seconds",
+            "serve 后台任务上次成功的时间（Unix 秒）",
+            ["task"],
         )
 
     # ================================================================ 审计事件
@@ -364,14 +401,24 @@ class RoditMetrics:
         self.tool_latency.observe({"tool": tool}, seconds)
 
     def observe_http(
-        self, route: str, method: str, status: int, seconds: float, code: str | None
+        self,
+        route: str,
+        method: str,
+        status: int,
+        seconds: float,
+        code: str | None,
+        *,
+        tenant_stage: str | None = None,
     ) -> None:
+        """tenant_stage：错误码是 tenant_isolation 时记在哪个 stage（服务端发现的是 server，
+        没有标记的是接口层按调用方身份拦下的 http）。"""
         self.http_requests.inc({"route": route, "method": method, "status": status})
         self.http_latency.observe({"route": route, "method": method}, seconds)
         if code is not None:
             self.http_errors.inc({"route": route, "code": code})
             if code == TENANT_ISOLATION_CODE:
-                self.tenant_isolation.inc({"stage": TENANT_STAGE_HTTP})
+                stage = _code(tenant_stage, default=TENANT_STAGE_HTTP)
+                self.tenant_isolation.inc({"stage": stage})
 
     def observe_tool_cache(self, totals: Mapping[str, Any]) -> None:
         """缓存层的累计统计（{工具名: ToolCallStats}，rodit.tools.CachingToolGateway.totals()）
@@ -389,6 +436,18 @@ class RoditMetrics:
             ({"check": _code(name)}, 1 if result.ok else 0)
             for name, result in readiness.checks.items()
         )
+
+    def register_background(self, tasks: Iterable[str]) -> None:
+        """预先建好各后台任务 error 的 0 值序列：第一次出错也能被 increase() 看到。"""
+        for task in tasks:
+            self.background_runs.inc({"task": _code(task), "outcome": "error"}, 0)
+
+    def observe_background(self, task: str, outcome: str, *, at: float | None = None) -> None:
+        """后台任务一轮的结果；成功时记下时间（Unix 秒，默认现在）。"""
+        name = _code(task)
+        self.background_runs.inc({"task": name, "outcome": _code(outcome)})
+        if outcome == "ok":
+            self.background_last_ok.set({"task": name}, time.time() if at is None else at)
 
     def forget_shop(self, shop_id: str) -> int:
         """取消订购（§8.4）后删掉该店铺的指标序列。"""
@@ -584,8 +643,10 @@ class AuthExpiryMonitor:
     """按间隔检查本单元店铺的授权，写进 rodit_auth_expiring_shops / rodit_shop_auth_expiring，
     已经过期（到期时间已过、没有授权、需要重新授权）的店铺数写进 rodit_auth_expired_shops。
 
-    - shop_ids：本单元服务的店铺（令牌文件里的店铺 + 平台云代码提供的订购列表）；
-    - 挂在 /metrics 渲染前（MetricsRegistry.before_render），距上次检查不到 refresh_s 秒时不查库；
+    - shop_ids：本单元服务的店铺（令牌文件里的店铺 + 平台云代码提供的订购列表，去掉已经取消订购
+      清理过、没有再开通的店铺，见 rodit.ops.serve）；
+    - serve 的后台线程按间隔调 refresh（rodit.ops.background），不挂在抓取 /metrics 的路径上
+      （要查库）；距上次检查不到 refresh_s 秒时不查库（force 除外）；
     - 检查失败（数据库故障等）计入 rodit_auth_expiry_check_errors_total，保留上次的结果。
     """
 
@@ -641,8 +702,12 @@ class AuthExpiryMonitor:
 
 class ObservedReadinessChecker(ReadinessChecker):
     """就绪检查（rodit.ops.health.ReadinessChecker），每次的结果顺手记成 rodit_ready 和
-    rodit_readiness_check_ok{check}。/readyz 和抓取 /metrics 时的刷新都经过它（结果有缓存）。
-    记指标失败只记日志，不影响就绪检查本身。"""
+    rodit_readiness_check_ok{check}。/readyz 和 serve 的后台线程刷新它（结果有缓存）。
+    记指标失败只记日志，不影响就绪检查本身。
+
+    publish 挂在 /metrics 渲染前：不跑探针（不查库），输出上次的结果和它的年龄
+    （rodit_readiness_age_seconds）；还没检查过、或者上次的结果超过 stale_after_s 秒（后台刷新
+    卡住了）时 rodit_ready 记 0。"""
 
     def __init__(
         self,
@@ -650,18 +715,45 @@ class ObservedReadinessChecker(ReadinessChecker):
         metrics: RoditMetrics,
         *,
         cache_s: float = DEFAULT_CACHE_S,
+        stale_after_s: float = DEFAULT_READINESS_STALE_S,
         timer: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(probes, cache_s=cache_s, timer=timer)
+        if stale_after_s <= 0:
+            raise ValueError("stale_after_s 必须大于 0")
         self._metrics = metrics
+        self._stale_after_s = stale_after_s
+        self._last: tuple[float, Readiness] | None = None  # (检查完成的时刻, 结果)
 
     def check(self, *, fresh: bool = False) -> Readiness:
         result = super().check(fresh=fresh)
+        cached = self._cached  # 父类的缓存：(检查完成的时刻, 结果)
+        fresh_at = cached[0] if cached is not None and cached[1] is result else self._timer()
+        self._last = (fresh_at, result)
         try:
             self._metrics.observe_readiness(result)
         except Exception as exc:  # noqa: BLE001
             logger.warning("指标采集失败：%s", type(exc).__name__)
         return result
+
+    @property
+    def last(self) -> Readiness | None:
+        """上次检查的结果（还没检查过是 None）。不跑探针。"""
+        last = self._last
+        return None if last is None else last[1]
+
+    def publish(self) -> None:
+        """/metrics 渲染前：输出上次的结果和年龄，不跑探针（见类说明）。"""
+        last = self._last
+        if last is None:
+            self._metrics.ready.set(value=0)
+            return
+        age = max(0.0, self._timer() - last[0])
+        self._metrics.readiness_age.set(value=age)
+        if age > self._stale_after_s:
+            self._metrics.ready.set(value=0)
+        else:
+            self._metrics.observe_readiness(last[1])
 
 
 # ================================================================ HTTP 中间件
@@ -698,6 +790,9 @@ class HttpMetricsMiddleware:
             return
         started = time.perf_counter()
         state: dict[str, Any] = {"status": 500, "json": False, "body": b"", "code": None}
+        # 请求状态先建好：下层即使复制了 scope，拿到的也是同一个 dict（服务端串店的标记写在这里）
+        if not isinstance(scope.get("state"), MutableMapping):
+            scope["state"] = {}
 
         async def send_wrapper(message: Mapping[str, Any]) -> None:
             if message.get("type") == "http.response.start":
@@ -737,7 +832,13 @@ class HttpMetricsMiddleware:
         elif state["status"] >= 400:
             code = _error_code(state["body"]) if state["json"] else None
             code = code or f"http_{state['status']}"
-        self.metrics.observe_http(route_label, method, state["status"], seconds, code)
+        request_state = scope.get("state")
+        tenant_stage = None
+        if isinstance(request_state, Mapping):
+            tenant_stage = request_state.get(TENANT_STAGE_STATE_KEY)
+        self.metrics.observe_http(
+            route_label, method, state["status"], seconds, code, tenant_stage=tenant_stage
+        )
 
 
 _HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
@@ -762,6 +863,31 @@ def _route_label(scope: Mapping[str, Any], status: int) -> str:
     return UNMATCHED_ROUTE
 
 
+def mark_server_tenant_isolation(app: Any) -> None:
+    """给接口层 TenantIsolationError 的错误映射包一层（响应不变，仍是 403 tenant_isolation）：
+    在请求状态里标上 stage=server，HttpMetricsMiddleware 据此把它记成
+    rodit_tenant_isolation_total{stage="server"}（critical 告警），不和调用方令牌不对的
+    stage="http"（warning）混在一起；日志记路由模板和路径里的店铺 ID（不记异常说明）。
+
+    在接口层注册完错误映射之后、应用处理第一个请求之前调用（rodit.ops.serve.build_server）。"""
+    original = app.exception_handlers.get(TenantIsolationError)
+    if original is None:
+        raise RuntimeError("接口层没有注册 TenantIsolationError 的错误映射")
+
+    async def handler(request: Any, exc: Exception) -> Any:
+        try:
+            setattr(request.state, TENANT_STAGE_STATE_KEY, TENANT_STAGE_SERVER)
+            route = getattr(request.scope.get("route"), "path", None) or UNMATCHED_ROUTE
+            shop = safe_label_value(request.path_params.get("shop_id"))
+            logger.error("接口处理中发现串店（§9.2，已拒绝）：route=%s shop_id=%s", route, shop)
+        except Exception as err:  # noqa: BLE001  标记失败不影响响应
+            logger.warning("指标采集失败：%s", type(err).__name__)
+        response = original(request, exc)
+        return await response if inspect.isawaitable(response) else response
+
+    app.add_exception_handler(TenantIsolationError, handler)
+
+
 def _error_code(body: bytes) -> str | None:
     try:
         parsed = json.loads(body.decode("utf-8"))
@@ -774,6 +900,7 @@ def _error_code(body: bytes) -> str | None:
 __all__ = [
     "LATENCY_BUCKETS_S",
     "TENANT_STAGE_HTTP",
+    "TENANT_STAGE_SERVER",
     "TENANT_STAGE_UNKNOWN",
     "TOOL_BUCKETS_S",
     "UNMATCHED_ROUTE",
@@ -783,5 +910,6 @@ __all__ = [
     "ObservedAuditLog",
     "ObservedReadinessChecker",
     "RoditMetrics",
+    "mark_server_tenant_isolation",
     "package_version",
 ]

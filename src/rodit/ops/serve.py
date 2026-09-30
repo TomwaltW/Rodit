@@ -32,7 +32,19 @@ decision.provider 是 classifier 时，serve 从 RODIT_CLASSIFIER_PATH 加载路
 PostgreSQL 会话级 advisory lock，按平台单元取键）：组装好服务、通过启动前检查之后抢租约，另一个
 进程占着就拒绝启动（退出码 2，日志写明占用者），连不上数据库退出码 1；RODIT_MIGRATE_ON_START 的
 迁移在拿到租约之后跑；服务退出（包括异常退出）时释放。就绪检查多一项 lease（连接断了会重连再抢，
-被别的进程抢走就一直不就绪）。
+被别的进程抢走就一直不就绪）。改数据的运维任务（onboard-shop、refresh-tokens、purge-expired、
+revoke、set-status）拿同一个租约，serve 在跑时拒绝执行（见 rodit.ops.jobs.tenancy）。
+
+serve 的后台任务（rodit.ops.background，拿到租约之后启动、退出时停下）：
+    readiness     每 RODIT_READINESS_REFRESH_S 秒刷新就绪检查（/metrics 只输出上次的结果和年龄，
+                  抓取时不查库；结果超过 max(60, 3 × 间隔) 秒没更新就记成不就绪）；
+    auth_expiry   每 RODIT_AUTH_EXPIRY_CHECK_S 秒检查授权即将过期 / 已过期的店铺（取消订购清理过、
+                  没有再开通的店铺不算，令牌文件里还有它也一样）；
+    refresh_tokens / purge_expired
+                  每 RODIT_TOKEN_REFRESH_INTERVAL_S / RODIT_PURGE_EXPIRED_INTERVAL_S 秒续期、
+                  过期清理（和平台推送、接口用同一个 AssistService：同一把取消订购的闸门、
+                  同一份缓存）；每轮之前确认租约还在本进程，不在就跳过。
+出错只记日志（异常类型）和 rodit_background_task_runs_total{task,outcome}，不影响服务。
 
 离线任务（在平台单元内跑，不需要 RODIT_PLATFORM；结果都由人确认后才上线）：
 
@@ -60,9 +72,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -79,10 +92,11 @@ from rodit.api.auth import PrincipalRole
 from rodit.app.production import build_production_unit, migrate, production_database
 from rodit.app.service import AssistService
 from rodit.app.unit import Repos, Unit, build_unit
+from rodit.core.audit import AuditAction
 from rodit.core.clock import CST, Clock, SystemClock
 from rodit.core.config import EngineConfig, load_config
 from rodit.core.enums import ProviderName
-from rodit.core.errors import StorageUnavailable
+from rodit.core.errors import StorageUnavailable, TokenDecryptionError
 from rodit.core.models import LabeledSample
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import AuditLog, ToolGateway
@@ -91,6 +105,7 @@ from rodit.decision import ClassifierArtifactError, ClassifierProvider, RuleProv
 from rodit.eval.recalibrate import DEFAULT_MIN_SUPPORT
 from rodit.eval.train import DEFAULT_MIN_SAMPLES
 from rodit.llm import MeteredLLMClient
+from rodit.ops.background import BackgroundRunner, PeriodicJob
 from rodit.ops.bindings import (
     BindingContext,
     BindingError,
@@ -105,18 +120,19 @@ from rodit.ops.bindings import (
 from rodit.ops.health import (
     CheckResult,
     Probe,
-    ReadinessChecker,
     SessionDatabase,
     database_probe,
     llm_probe,
     static_probe,
 )
 from rodit.ops.instrument import (
+    DEFAULT_READINESS_STALE_S,
     AuthExpiryMonitor,
     MeteredToolGateway,
     ObservedAuditLog,
     ObservedReadinessChecker,
     RoditMetrics,
+    mark_server_tenant_isolation,
 )
 from rodit.ops.lease import Lease, LeaseError, serve_lease
 from rodit.ops.logconfig import configure_logging
@@ -175,9 +191,10 @@ class Server:
     unit: Unit
     bindings: PlatformBindings
     metrics: RoditMetrics
-    readiness: ReadinessChecker
+    readiness: ObservedReadinessChecker
     authenticator: TokenFileAuthenticator
     auth_monitor: AuthExpiryMonitor | None
+    background: BackgroundRunner  # main 拿到租约之后 start、退出时 stop；测试可以 run_once
 
 
 # ================================================================ 启动前检查
@@ -428,8 +445,10 @@ def build_server(
 ) -> Server:
     """组装完整的服务（见模块说明）。database 覆盖就绪检查用的数据库（测试用）。
 
-    lease：单副本租约（main 在组装之后、跑服务之前 acquire），给了就在就绪检查里加一项 lease。
-    /metrics 渲染前刷新就绪结果（rodit_ready）和缓存层的统计（缓存命中、过期兜底、串店）。"""
+    lease：单副本租约（main 在组装之后、跑服务之前 acquire），给了就在就绪检查里加一项 lease，
+    续期、过期清理每轮之前也先确认它。后台任务在这里组装好、不启动（main 启动）。
+    /metrics 渲染前只做内存里的事：输出上次的就绪结果和年龄、缓存层的统计（缓存命中、过期兜底、
+    串店），不查库。"""
     composed = compose_unit(
         settings, bindings_factory=bindings_factory, clock=clock, repos=repos, environ=environ
     )
@@ -444,34 +463,52 @@ def build_server(
     }
     if lease is not None:
         probes["lease"] = lease.probe
-    readiness = ObservedReadinessChecker(probes, metrics, cache_s=settings.readiness_cache_s)
-    # 抓取时就绪结果也是新的（结果有缓存，抓得再勤也不会打满数据库）
-    metrics.registry.before_render(readiness.check)
+    readiness = ObservedReadinessChecker(
+        probes,
+        metrics,
+        cache_s=settings.readiness_cache_s,
+        stale_after_s=max(DEFAULT_READINESS_STALE_S, 3 * settings.readiness_refresh_s),
+    )
+    # 抓取时不跑探针：数据库网络不通时一次检查要十几秒，超过抓取超时，反而一个样本都没有
+    metrics.registry.before_render(readiness.publish)
     gateway = unit.gateway
     metrics.registry.before_render(lambda: metrics.observe_tool_cache(gateway.totals()))
+    service = AssistService(unit)
+    periodic: list[PeriodicJob] = [
+        PeriodicJob("readiness", readiness.check, settings.readiness_refresh_s)
+    ]
     monitor: AuthExpiryMonitor | None = None
     if not composed.bindings.mode_c_only:  # 模式 C 不需要平台授权（§8.1），不告警
-        platform_shops = composed.bindings.shop_ids
-
-        def shop_ids() -> list[str]:
-            shops = set(authenticator.shop_ids())
-            if platform_shops is not None:
-                shops.update(platform_shops())
-            return sorted(shops)
-
         monitor = AuthExpiryMonitor(
             unit.auth,
-            shop_ids,
+            monitored_shop_ids(unit, authenticator, composed.bindings.shop_ids),
             metrics,
             within=timedelta(days=settings.auth_expiry_warn_days),
             refresh_s=settings.auth_expiry_check_s,
             clock=unit.clock,
         )
-        metrics.registry.before_render(monitor.refresh)
-    service = AssistService(unit)
+        refresh_auth = monitor.refresh
+        periodic.append(
+            PeriodicJob(
+                "auth_expiry", lambda: refresh_auth(force=True), settings.auth_expiry_check_s
+            )
+        )
+    from rodit.ops.jobs.tenancy import serve_jobs  # 任务模块用到时才导入（rodit.ops.jobs）
+
+    periodic.extend(
+        serve_jobs(
+            service,
+            refresh_interval_s=settings.token_refresh_interval_s,
+            purge_interval_s=settings.purge_expired_interval_s,
+            guard=_lease_guard(lease),
+        )
+    )
+    background = BackgroundRunner(periodic, on_result=metrics.observe_background)
+    metrics.register_background(background.jobs)
     if composed.ctx is not None:  # 服务组装好了：平台推送的订购事件交给店铺生命周期处理
         bind_context(composed.ctx, on_subscription=service.tenancy.handle_subscription)
     app = create_app(service, authenticator=authenticator)
+    mark_server_tenant_isolation(app)  # 服务端发现的串店记 stage="server"（critical 告警）
     install_ops(app, readiness=readiness, metrics=metrics, metrics_guard=guard)
     if not settings.is_production:
         logger.warning("本地试用模式（RODIT_ENV=local）：合成数据、模拟适配器，不能用于生产")
@@ -492,7 +529,49 @@ def build_server(
         readiness=readiness,
         authenticator=authenticator,
         auth_monitor=monitor,
+        background=background,
     )
+
+
+def monitored_shop_ids(
+    unit: Unit,
+    authenticator: TokenFileAuthenticator,
+    platform_shops: Callable[[], Iterable[str]] | None,
+) -> Callable[[], list[str]]:
+    """授权过期检查覆盖的店铺：令牌文件里的店铺 + 平台云代码提供的订购列表，去掉取消订购清理过
+    （系统事件 shop.purged）、之后没有再开通（没有授权记录）的店铺。
+
+    取消订购只删库里的数据，挂载的令牌文件还留着这家店的令牌；不去掉的话它永远算"授权已过期"，
+    critical 告警按说明处理完（purge-expired / revoke）也消不掉。再开通会写授权记录，
+    自动回到检查里。"""
+
+    def shop_ids() -> list[str]:
+        shops = set(authenticator.shop_ids())
+        if platform_shops is not None:
+            shops.update(platform_shops())
+        purged = {
+            e.detail.get("shop_id")
+            for e in unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+        }
+        return sorted(s for s in shops if s not in purged or _has_auth(unit, s))
+
+    return shop_ids
+
+
+def _has_auth(unit: Unit, shop_id: str) -> bool:
+    """有没有授权记录（不关心是否有效）。令牌读不出来也算有：让授权检查按过期报出来。"""
+    try:
+        return unit.repos.auth.get(shop_id) is not None
+    except TokenDecryptionError:
+        return True
+
+
+def _lease_guard(lease: Lease | None) -> Callable[[], bool] | None:
+    """续期、过期清理每轮之前确认单副本租约还在本进程（连接断了会重连再抢）。"""
+    if lease is None:
+        return None
+    probe = lease.probe
+    return lambda: all(result.ok for result in probe().values())
 
 
 # ================================================================ 迁移
@@ -789,7 +868,12 @@ def _parser() -> argparse.ArgumentParser:
     issue.add_argument("--role", choices=sorted(get_args(PrincipalRole)))
     issue.add_argument("--metrics", action="store_true", help="签发 /metrics 的抓取令牌")
     issue.add_argument("--name", help="抓取令牌的名字（--metrics 时）")
-    issue.add_argument("--expires-days", type=float, default=0, help="有效天数（0 = 不过期）")
+    issue.add_argument(
+        "--expires-days",
+        type=_token_days,
+        default=0,
+        help=f"有效天数（0 = 不过期，最多 {MAX_TOKEN_DAYS:g}）",
+    )
     issue.add_argument("--append", metavar="FILE", help="直接写进这个令牌文件（没有就新建）")
     config_help = "对照的部署配置（默认 RODIT_CONFIG，都没有时用内置默认值）"
     recal = sub.add_parser("recalibrate", help="§13.5 用采纳反馈重算阈值（只输出建议）")
@@ -824,6 +908,21 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--config", metavar="YAML", help=config_help)
     jobs.register_all(sub)  # 任务模块的子命令（rodit.ops.jobs）
     return parser
+
+
+MAX_TOKEN_DAYS = 3650.0
+
+
+def _token_days(text: str) -> float:
+    """issue-token 的有效天数：0（不过期）到 MAX_TOKEN_DAYS 之间的有限数。负数签出来就是过期的，
+    inf / 1e12 换成到期时间会溢出（没有说明的崩溃）。"""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("必须是数字") from None
+    if not (math.isfinite(value) and 0 <= value <= MAX_TOKEN_DAYS):
+        raise argparse.ArgumentTypeError(f"必须在 0（不过期）到 {MAX_TOKEN_DAYS:g} 之间")
+    return value
 
 
 def _positive_int(text: str) -> int:
@@ -885,7 +984,8 @@ def main(
     标注（trainer_label_source）、用系统时间；测试注入假的，不连数据库。
     lease_factory 只给 serve 用：默认是 PostgreSQL 的单副本租约（rodit.ops.lease）。
 
-    serve 的顺序：设置 → 组装服务（启动前检查，不连库）→ 抢租约 → 按需迁移 → 跑服务 → 放租约。"""
+    serve 的顺序：设置 → 组装服务（启动前检查，不连库）→ 抢租约 → 按需迁移 → 启动后台任务
+    → 跑服务 → 停后台任务 → 放租约。"""
     out = out or sys.stdout
     args = _parser().parse_args(list(argv) if argv is not None else None)
     command = args.command or "serve"
@@ -940,6 +1040,7 @@ def main(
 
         run = uvicorn.run
     try:
+        server.background.start()  # 拿到租约之后才跑续期、过期清理
         run(
             server.app,
             host=settings.host,
@@ -949,6 +1050,7 @@ def main(
             timeout_graceful_shutdown=20,
         )
     finally:
+        server.background.stop()  # 先停后台任务（等手上这一轮做完，有上限），再放租约
         _release(lease)  # 正常退出、异常退出都放租约（被杀时连接断开，数据库自动释放）
     return 0
 

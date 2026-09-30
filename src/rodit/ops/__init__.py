@@ -9,11 +9,16 @@
 - tokens：生产用的调用方鉴权，令牌哈希来自挂载的密钥文件（TokenFileAuthenticator）；
 - health / router：/healthz、/readyz、/metrics；
 - metrics / instrument：Prometheus 文本格式的指标，和不改业务代码的采集（审计、平台工具、HTTP）；
+- lease：单副本租约（serve 和改数据的运维任务共用一个键，同一时间只有一个进程改这个平台单元的
+  数据）；
+- background：serve 进程里的后台任务（就绪、授权过期检查、令牌续期、过期清理），抓取 /metrics
+  时不查库；
 - logconfig：结构化 JSON 日志，个人信息和密钥过滤。
 
 负责：部署打包（成员 D）。和 rodit.app、rodit.api 一样可以依赖所有子包。
 """
 
+from rodit.ops.background import BackgroundRunner, PeriodicJob
 from rodit.ops.bindings import (
     BindingContext,
     BindingError,
@@ -30,7 +35,7 @@ from rodit.ops.instrument import (
     ObservedReadinessChecker,
     RoditMetrics,
 )
-from rodit.ops.lease import LeaseError, LeaseHeld, ServeLease, serve_lease
+from rodit.ops.lease import LeaseError, LeaseHeld, ServeLease, job_lease, serve_lease
 from rodit.ops.metrics import MetricsRegistry
 from rodit.ops.router import install_ops
 from rodit.ops.serve import Server, StartupError, build_server, main
@@ -39,6 +44,7 @@ from rodit.ops.tokens import TokenFileAuthenticator, TokenFileError
 
 __all__ = [
     "AuthExpiryMonitor",
+    "BackgroundRunner",
     "BindingContext",
     "BindingError",
     "CheckResult",
@@ -49,6 +55,7 @@ __all__ = [
     "MetricsRegistry",
     "ObservedReadinessChecker",
     "ObservedAuditLog",
+    "PeriodicJob",
     "PlatformBindings",
     "Readiness",
     "ReadinessChecker",
@@ -63,6 +70,7 @@ __all__ = [
     "build_server",
     "demo_bindings",
     "install_ops",
+    "job_lease",
     "main",
     "serve_lease",
     "mode_c_bindings",
