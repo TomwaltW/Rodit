@@ -61,10 +61,10 @@ min_llm_remaining_s=latency.min_llm_remaining_s) 里处理（EngineConfig.latenc
   跑完，引擎和质检自己的记录都不在后台写：handle() 返回之后没有迟到的审计、推荐记录、
   decision_log（质检截止之后不写）。后台线程调用的平台工具、大模型照常留下副作用：工具结果写进
   缓存、大模型用量计量（llm.MeteredLLMClient 的 llm.usage，调用确实发生了，成本要算到店铺上，
-  §12.4）。引擎提交的任务（分条、质检）都记在引擎的 concurrency.BackgroundWork 里（按店铺，
-  handle 里的 background_scope）：取消订购删数据之前 AssistService.revoke_shop 用 wait_background
-  等它们做完，迟到的写入一并删掉（§8.4）。生成器自己并行的大模型调用（generation 的线程池）
-  还不在里面：它的单次超时不超过剩余预算（clamp_timeout），按时返回的客户端在截止时刻就结束；
+  §12.4）。handle 里提交到线程池的任务（分条、质检、生成器并行生成的几份草稿、路由投票）都经
+  core.budget.submit_in_context 记在引擎的 BackgroundWork 里（按店铺，handle 里的
+  background_scope）：取消订购删数据之前 AssistService.revoke_shop 用 wait_background 等它们
+  做完，迟到的写入一并删掉（§8.4）；
 - 以上任何一种"时间不够、丢了东西"都记降级 "budget"，engine.result 另加
   budget_exceeded=True（core.audit.RESULT_BUDGET_EXCEEDED）。
 

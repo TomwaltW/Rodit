@@ -66,6 +66,7 @@ from rodit.api.schemas import (
 )
 from rodit.api.web import build_web_router
 from rodit.app.service import AssistService
+from rodit.app.tenancy import PURGE_REASON_MERCHANT
 from rodit.core.enums import ReviewState
 from rodit.core.errors import RoditError, TenantIsolationError
 from rodit.core.models import AfterSaleReview, EngineResult
@@ -492,9 +493,13 @@ def aftersale_confirm(
 def revoke(principal: RevokeDep, service: ServiceDep, body: EmptyBody = None) -> RevokeView:
     """取消订购 / 授权过期：删令牌、停止处理，删除该店铺在本单元的全部数据（§8.4）。
 
-    可以重试（各存储的删除是幂等的）；之后该店铺的所有请求都是 403。
+    走 TenancyService.revoke：删完写系统事件 shop.purged（操作人是商家账号），之后迟到的旧订购
+    事件按它判断先后（见 rodit.app.tenancy）。可以重试（各存储的删除是幂等的）；之后该店铺的
+    所有请求都是 403。
     """
-    counts = service.revoke_shop(principal.shop_id)
+    counts = service.tenancy.revoke(
+        principal.shop_id, reason=PURGE_REASON_MERCHANT, actor=principal.user_id
+    )
     return RevokeView(counts=dict(counts), total=sum(counts.values()))
 
 

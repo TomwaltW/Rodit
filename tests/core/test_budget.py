@@ -157,8 +157,30 @@ def test_expired_deadline_is_visible_in_workers():
             assert submit_in_context(pool, remaining).result() == 0.0
 
 
+def test_submit_in_context_tracks_background_work_per_shop():
+    """background_scope 里提交的任务（含任务里再提交的嵌套任务）按店铺记着，做完才减。"""
+    work = budget.BackgroundWork()
+    release = threading.Event()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+
+        def outer() -> int:
+            inner = submit_in_context(pool, release.wait, 5)
+            return int(inner.result())
+
+        with budget.background_scope(work, "s_a"):
+            future = submit_in_context(pool, outer)
+        submit_in_context(pool, int)  # 不在范围里：不记
+        assert work.pending("s_a") >= 1 and work.pending("s_b") == 0
+        assert not work.wait_idle("s_a", timeout=0.05)
+        release.set()
+        assert future.result() == 1
+        assert work.wait_idle("s_a", timeout=5) and work.pending("s_a") == 0
+
+
 def test_public_names():
     assert set(budget.__all__) == {
+        "BackgroundWork",
+        "background_scope",
         "Deadline",
         "clamp_timeout",
         "current_deadline",

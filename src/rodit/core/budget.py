@@ -17,11 +17,16 @@
   嵌套的几层要用同一个时钟。
 - 没有截止时间时 remaining() 返回 None、expired() 返回 False、llm_allowed() 返回 True：
   不在引擎里的调用（离线任务、控制台）不受影响。
+- 到截止时间没做完的线程池任务不等（Python 线程不能强行停止），它们会在后台跑完、照常留下
+  副作用（工具结果写缓存、大模型用量计量）。在 background_scope(work, shop_id) 里经
+  submit_in_context 提交的任务都按店铺记在 BackgroundWork 里（含任务里再提交的嵌套任务）：
+  取消订购删数据之前等它们做完，迟到的写入一并删掉（§8.4）。
 """
 
 from __future__ import annotations
 
 import contextvars
+import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Executor, Future
@@ -184,6 +189,65 @@ def clamp_timeout(timeout_s: float) -> float:
     return timeout_s if left is None else min(timeout_s, left)
 
 
+class BackgroundWork:
+    """按店铺记着交给线程池、还没做完的任务（含到截止时间被丢下、还在后台跑的）。线程安全。
+
+    track 在提交之后马上调（任务已经做完也没关系：做完的回调立即执行）；wait_idle 等这家店
+    的任务全部做完。没有进行中的任务时不占内存。"""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._pending: dict[str, int] = {}
+
+    def track(self, shop_id: str, future: Future[Any]) -> None:
+        with self._cond:
+            self._pending[shop_id] = self._pending.get(shop_id, 0) + 1
+        future.add_done_callback(lambda _f: self._done(shop_id))
+
+    def _done(self, shop_id: str) -> None:
+        with self._cond:
+            left = self._pending.get(shop_id, 0) - 1
+            if left > 0:
+                self._pending[shop_id] = left
+            else:
+                self._pending.pop(shop_id, None)
+            self._cond.notify_all()
+
+    def pending(self, shop_id: str) -> int:
+        with self._cond:
+            return self._pending.get(shop_id, 0)
+
+    def wait_idle(self, shop_id: str, timeout: float | None = None) -> bool:
+        """等这家店的任务全部做完；timeout 秒之内做完（或本来就没有）返回 True。"""
+        limit = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._cond:
+            while self._pending.get(shop_id):
+                if limit is None:
+                    self._cond.wait()
+                    continue
+                left = limit - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+            return True
+
+
+_background: ContextVar[tuple[BackgroundWork, str] | None] = ContextVar(
+    "rodit_background_work", default=None
+)
+
+
+@contextmanager
+def background_scope(work: BackgroundWork, shop_id: str) -> Iterator[None]:
+    """这段代码里（含它提交到线程池的任务里）submit_in_context 提交的任务都记到 work 的
+    shop_id 名下。"""
+    token = _background.set((work, shop_id))
+    try:
+        yield
+    finally:
+        _background.reset(token)
+
+
 def submit_in_context(pool: Executor, fn: Callable[..., T], *args: Any, **kwargs: Any) -> Future[T]:
     """把任务提交到线程池，并带上当前的 contextvars（截止时间、店铺范围等）：
 
@@ -191,13 +255,22 @@ def submit_in_context(pool: Executor, fn: Callable[..., T], *args: Any, **kwargs
 
     线程池的工作线程不会继承提交方的 contextvar；这里复制一份上下文、在里面运行 fn。
     每个任务一份拷贝，任务里对 contextvar 的修改不影响提交方和其他任务。
+    在 background_scope 里提交时，任务记到那个 BackgroundWork 的店铺名下（做完才减）；
+    嵌套提交在外层任务还没做完时就已经记上，计数不会中途归零。
     """
     context = contextvars.copy_context()
-    return pool.submit(context.run, fn, *args, **kwargs)
+    future = pool.submit(context.run, fn, *args, **kwargs)
+    scope = _background.get()
+    if scope is not None:
+        work, shop_id = scope
+        work.track(shop_id, future)
+    return future
 
 
 __all__ = [
+    "BackgroundWork",
     "Deadline",
+    "background_scope",
     "clamp_timeout",
     "current_deadline",
     "deadline_scope",

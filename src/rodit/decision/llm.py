@@ -5,7 +5,7 @@
   题型、说明、选项 / 等级，要求只输出 JSON：{问题名: {...}}。
   state 由 core.states 构造、已做个人信息最小化（§5.3），这里原样放进提示词、不再拼别的买家信息。
 - 自一致性投票（§6.4）：同一请求采样 samples 次；多于一次时在线程池里并行调用
-  （§12.1 路由 ≤ 1 秒），用 contextvars.copy_context().run 提交，
+  （§12.1 路由 ≤ 1 秒），用 core.budget.submit_in_context 提交，
   保证 core.context.current_shop_id 在线程里可见（§12.4 成本归属）。
   解析与计票见 decision.voting。
 - 多问题（§6.6 规则 5）：请求里带了追问 second_intent（core.questions.ROUTER_VOTE_QUESTIONS，
@@ -20,11 +20,11 @@
 
 from __future__ import annotations
 
-import contextvars
 import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
+from rodit.core.budget import submit_in_context
 from rodit.core.context import current_shop_id
 from rodit.core.decision import (
     Answer,
@@ -184,10 +184,10 @@ class InCloudLLMProvider:
         if self.samples == 1:
             return [self._call(llm_request)]
         with ThreadPoolExecutor(max_workers=self.samples, thread_name_prefix="rodit-vote") as pool:
-            # 每次提交都复制一份当前上下文：同一个 Context 不能被多个线程同时进入
+            # 每次提交都复制一份当前上下文（同一个 Context 不能被多个线程同时进入）；
+            # 在引擎的 background_scope 里时还记进 BackgroundWork（取消订购等它们做完）
             futures = [
-                pool.submit(contextvars.copy_context().run, self._call, llm_request)
-                for _ in range(self.samples)
+                submit_in_context(pool, self._call, llm_request) for _ in range(self.samples)
             ]
             return [f.result() for f in futures]
 

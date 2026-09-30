@@ -21,7 +21,7 @@ from dataclasses import replace
 
 from rodit.app.unit import Repos, Unit, build_unit
 from rodit.core.clock import Clock, SystemClock
-from rodit.core.config import EngineConfig
+from rodit.core.config import EngineConfig, llm_endpoint
 from rodit.core.decision import DecisionProvider
 from rodit.core.enums import Platform
 from rodit.core.pii import BuyerRefHasher
@@ -132,10 +132,11 @@ def build_production_unit(
     repos = postgres_repos(db, clock=clock)
     if audit_wrapper is not None:
         repos = replace(repos, audit=audit_wrapper(repos.audit))
-    if config.llm.base_url and config.llm.model:
+    base_url, model, from_config = llm_endpoint(config.llm)
+    if from_config:
         client = OpenAICompatibleClient(
-            base_url=config.llm.base_url,
-            model=config.llm.model,
+            base_url=base_url,
+            model=model,
             api_key_env=config.llm.api_key_env,
             timeout_s=config.llm.timeout_s,
             transport=llm_transport,

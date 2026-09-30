@@ -93,8 +93,8 @@ class LazyTokenProvider:
     def access_token(self, shop_id: str, scopes: Iterable[str] = MVP_SCOPES) -> SecretStr:
         return self._get().access_token(shop_id, scopes)
 
-    def report_rejected(self, shop_id: str) -> None:
-        self._get().report_rejected(shop_id)
+    def report_rejected(self, shop_id: str, token: SecretStr | None = None) -> None:
+        self._get().report_rejected(shop_id, token)
 
 
 SubscriptionHandler = Callable[[SubscriptionEvent], None]

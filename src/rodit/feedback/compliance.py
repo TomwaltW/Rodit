@@ -42,6 +42,7 @@ from pydantic import (
     model_validator,
 )
 
+from rodit.core.audit import AuditAction
 from rodit.core.config import QAGateConfig
 from rodit.core.enums import Role, SuggestionStatus
 from rodit.core.lexicon import find_absolute_terms, find_off_platform_in_answer
@@ -67,7 +68,7 @@ MAX_LISTED_IDS = 100
 
 MAX_MSG_ID_CHARS = 200
 
-COMPLIANCE_REVIEWED = "compliance.reviewed"
+COMPLIANCE_REVIEWED = AuditAction.COMPLIANCE_REVIEWED.value
 """复核人员确认 / 标记误报一条疑似违规的审计动作（shop_id 是店铺；detail 见 review_detail）。"""
 
 _CONTACT_PLACEHOLDERS = (PHONE_MASK, CONTACT_MASK, EMAIL_MASK)

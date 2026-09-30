@@ -135,6 +135,19 @@ def test_llm_config_file_takes_precedence_and_key_value_is_never_reported():
     assert result.ok and "sk-very-secret-value" not in str(result.as_dict())
 
 
+def test_half_configured_file_falls_back_to_the_environment_for_both_fields():
+    """配置里只写了地址：和 build_production_unit 一样两项都取环境变量，不把配置的地址和环境变量
+    的模型名拼在一起（core.config.llm_endpoint）。"""
+    config = LLMConfig(base_url="https://file.example.invalid/v1", api_key_env="MY_KEY")
+    only_model = {"RODIT_LLM_MODEL": "m", "MY_KEY": "k"}
+    assert llm_probe(config, environ=only_model)()["llm"].as_dict() == {
+        "ok": False,
+        "reason": "not_configured",
+    }
+    both = {**only_model, "RODIT_LLM_BASE_URL": "https://env.example.invalid/v1"}
+    assert llm_probe(config, environ=both)()["llm"].ok
+
+
 def test_results_are_cached():
     db = FakeReadinessDb(versions=ALL)
     now = [0.0]

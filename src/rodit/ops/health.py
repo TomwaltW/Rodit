@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 import psycopg
 
-from rodit.core.config import LLMConfig
+from rodit.core.config import LLM_ENV_PREFIX, LLMConfig, llm_endpoint
 from rodit.core.errors import StorageUnavailable
 from rodit.storage import MIGRATIONS, Migration
 
@@ -193,16 +193,16 @@ def llm_probe(
     config: LLMConfig,
     *,
     environ: Mapping[str, str] | None = None,
-    env_prefix: str = "RODIT_LLM_",
+    env_prefix: str = LLM_ENV_PREFIX,
 ) -> Probe:
-    """大模型是否配好：地址、模型名（配置文件优先，否则环境变量），密钥环境变量有值。
-    和 rodit.app.production.build_production_unit 取值的规则一致。只看有没有，不输出值。"""
+    """大模型是否配好：地址、模型名（core.config.llm_endpoint：配置里两项都写了用配置，否则两项
+    都取环境变量，和 rodit.app.production.build_production_unit 同一条规则），密钥环境变量有值。
+    只看有没有，不输出值。"""
 
     def probe() -> dict[str, CheckResult]:
         env = os.environ if environ is None else environ
-        base_url = config.base_url or env.get(f"{env_prefix}BASE_URL", "")
-        model = config.model or env.get(f"{env_prefix}MODEL", "")
-        if not base_url.strip() or not model.strip():
+        base_url, model, _ = llm_endpoint(config, env, prefix=env_prefix)
+        if not base_url or not model:
             return {"llm": CheckResult(False, {"reason": "not_configured"})}
         if not env.get(config.api_key_env, "").strip():
             return {"llm": CheckResult(False, {"reason": "missing_api_key"})}

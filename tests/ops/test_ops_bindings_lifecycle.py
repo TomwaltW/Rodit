@@ -87,16 +87,18 @@ def test_bind_context_binds_once():
         def access_token(self, shop_id, scopes=()):
             return SecretStr(f"tok-{shop_id}")
 
-        def report_rejected(self, shop_id):
-            seen.append(("rejected", shop_id))
+        def report_rejected(self, shop_id, token=None):
+            seen.append(("rejected", shop_id, token))
 
     provider = Provider()
     bind_context(ctx, tokens=provider, on_subscription=seen.append)
     assert ctx.tokens.access_token(SHOP_A).get_secret_value() == f"tok-{SHOP_A}"
     ctx.tokens.report_rejected(SHOP_A)
+    rejected = SecretStr("tok-rejected")
+    ctx.tokens.report_rejected(SHOP_A, rejected)  # 被拒的令牌原样转给实现
     event = parse_subscription(subscription_push("cancelled", SHOP_A))
     ctx.on_subscription(event)
-    assert seen == [("rejected", SHOP_A), event]
+    assert seen == [("rejected", SHOP_A, None), ("rejected", SHOP_A, rejected), event]
     bind_context(ctx, tokens=provider)  # 同一个实现：幂等
     with pytest.raises(RuntimeError, match="已经绑定过"):
         bind_context(ctx, tokens=Provider())
@@ -159,7 +161,9 @@ def test_serve_binds_tokens_to_the_unit_and_subscriptions_to_tenancy(local_env):
         )
     )
     assert ctx.tokens.access_token(SHOP_A).get_secret_value() == "tok-synthetic-bound"
-    ctx.tokens.report_rejected(SHOP_A)
+    ctx.tokens.report_rejected(SHOP_A, SecretStr("tok-synthetic-replaced"))  # 不是现在这份
+    assert server.unit.repos.auth.get(SHOP_A).needs_reauth is False
+    ctx.tokens.report_rejected(SHOP_A, SecretStr("tok-synthetic-bound"))
     assert server.unit.repos.auth.get(SHOP_A).needs_reauth is True
     # on_subscription 交给店铺生命周期（AssistService.tenancy.handle_subscription）
     assert ctx.on_subscription._target == server.service.tenancy.handle_subscription  # noqa: SLF001

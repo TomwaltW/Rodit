@@ -28,6 +28,7 @@ from rodit.core.config import (
     LLMConfig,
     TenancyConfig,
     config_fingerprint,
+    llm_endpoint,
     load_config,
 )
 from rodit.core.decision import DecisionRequest
@@ -139,6 +140,7 @@ def test_new_audit_actions_and_constants():
         "TENANT_VIOLATION": "tenant.violation",
         "ROLLOUT_INCIDENT": "shop.rollout_incident",
         "COMPLIANCE_FLAG": "compliance.flag",
+        "COMPLIANCE_REVIEWED": "compliance.reviewed",
         "EVAL_VERDICT": "eval.verdict",
     }
     for name, value in expected.items():
@@ -177,6 +179,19 @@ def test_latency_and_tenancy_defaults():
         TenancyConfig(purge_after_expiry_days=-1)
     disclosed = LLMConfig(public_name="某模型", filing_no="备案-合成-0001", require_disclosure=True)
     assert disclosed.public_name == "某模型"
+
+
+def test_llm_endpoint_uses_the_file_only_when_both_fields_are_set():
+    env = {"RODIT_LLM_BASE_URL": " https://env.example.invalid/v1 ", "RODIT_LLM_MODEL": "env-m"}
+    full = LLMConfig(base_url="https://file.example.invalid/v1", model="file-m")
+    assert llm_endpoint(full, env) == ("https://file.example.invalid/v1", "file-m", True)
+    half = LLMConfig(base_url="https://file.example.invalid/v1")  # 只写一项：不生效
+    assert llm_endpoint(half, env) == ("https://env.example.invalid/v1", "env-m", False)
+    assert llm_endpoint(LLMConfig(), {}) == ("", "", False)
+    assert llm_endpoint(LLMConfig(), {"X_BASE_URL": "u", "X_MODEL": "m"}, prefix="X_")[:2] == (
+        "u",
+        "m",
+    )
 
 
 def test_yaml_matches_new_defaults():

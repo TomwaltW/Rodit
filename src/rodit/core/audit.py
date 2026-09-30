@@ -58,6 +58,8 @@ class AuditAction(StrEnum):
     ROLLOUT_INCIDENT = "shop.rollout_incident"
     # 合规扫描（§13.4）：实际发出去的文字里疑似违规（规则 ID、推荐 / 消息 ID，不记原文）
     COMPLIANCE_FLAG = "compliance.flag"
+    # 复核人员确认 / 标记误报一条疑似违规（规则名、推荐 / 消息 ID、备注，不记原文）
+    COMPLIANCE_REVIEWED = "compliance.reviewed"
     # 系统事件（shop_id 为空）：离线评测的结论（§13.5 上线前回归），带配置指纹
     EVAL_VERDICT = "eval.verdict"
     # 售后审核

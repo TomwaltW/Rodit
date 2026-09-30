@@ -131,7 +131,7 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `RODIT_PLATFORM` | 必填 | `taobao` / `douyin` / `pdd` |
 | `RODIT_PLATFORM_BINDINGS` | | 平台云代码的绑定工厂 `包.模块:函数`（见下） |
 | `RODIT_MODE_C_ONLY` | `false` | 只部署模式 C（Phase 0，§8.1）：不需要平台绑定 |
-| `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` / `RODIT_LLM_TIMEOUT_S` | | 境内已备案大模型（也可以写在配置文件 `llm` 段） |
+| `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` / `RODIT_LLM_TIMEOUT_S` | | 境内已备案大模型。也可以写在配置文件 `llm` 段：`base_url` 和 `model` 都写了才用配置文件，否则两项都取环境变量（启动检查、就绪检查、评测指纹同一条规则） |
 | `RODIT_DB_STATEMENT_TIMEOUT_MS` / `RODIT_DB_LOCK_TIMEOUT_MS` | 2000 / 1000 | 请求事务的语句 / 等锁超时（§12.1、§12.2） |
 | `RODIT_CONFIG` | 镜像里 `/app/config/rodit.yaml` | 引擎配置 |
 | `RODIT_METRICS_PUBLIC` | `false` | `/metrics` 不要令牌（只在网络策略已经限制访问时用） |
@@ -207,10 +207,16 @@ sessionStorage）按角色显示知识、政策、商品、设置、上线、复
   或平台云代码进程内调用 `BindingContext.on_subscription`，或运维命令 `onboard-shop`（令牌只从标准输入或文件读，
   不进命令行参数）。开通时权限按 `tenancy.onboarding_phase` 核对（1 = MVP 只读；写售后要到二期）。
 - 续期：给 `tenancy.refresh_ahead_hours` 内到期、有续期令牌的店铺续期；续不了的标记"要重新授权"，
-  之后的处理一律拒绝。续期令牌同样应用内加密（附加认证数据和访问令牌不同）。
+  之后的处理一律拒绝。续期令牌同样应用内加密（附加认证数据和访问令牌不同）。每份授权有一个不重复的写入版本：
+  续期结果按版本条件写回，"要重新授权"只标记被拒的那一份（平台拒绝旧令牌时，已经换上的新授权不受影响）；
+  平台云代码调 `TokenProvider.report_rejected(shop_id, token)` 时带上被拒的令牌。
 - 取消订购 / 授权过期：取消推送立即删除该店铺在本单元的数据；过期超过 `tenancy.purge_after_expiry_days`
-  （默认 30 天，【待定：委托处理协议】）的按约定删除。删除后留一条不带店铺数据的系统事件
-  `shop.purged`（只有店铺 ID、原因和各类数据的条数）。令牌文件里这家店的访问令牌要另外删掉（清理过、没有再开通的
+  （默认 30 天，【待定：委托处理协议】）的按约定删除。删除之前先等这家店留在后台的线程（到截止时间没做完的分条、
+  质检、生成、平台查询）做完，最多 30 秒，它们迟到的缓存、用量记录一并删掉。删除后留一条不带店铺数据的系统事件
+  `shop.purged`（只有店铺 ID、原因、各类数据的条数和触发它的平台事件时间 `event_at`）；商家令牌调
+  `POST /v1/shops/{shop_id}/revoke` 也写这条（原因 `merchant_revoke`）。
+- 订购事件按平台的事件时间排先后：每家店记着已经处理过的最新事件时间（授权的开通时间、`shop.purged` 的
+  `event_at`），不晚于它的开通或取消（重放的、乱序迟到的）一律 `ignored`，判断和写入都在这家店的写方闸门里做。令牌文件里这家店的访问令牌要另外删掉（清理过、没有再开通的
   店铺不再计入授权过期告警）。`revoke --shop-id` 手动取消，`set-status` 切换试用 / 正式 / 停用。
 - 续期和过期清理在 `serve` 进程里按间隔跑（`RODIT_TOKEN_REFRESH_INTERVAL_S` 默认 1 小时、
   `RODIT_PURGE_EXPIRED_INTERVAL_S` 默认 6 小时，起来 1 分钟后跑第一轮），不用另外排定时任务：取消订购的闸门
@@ -235,9 +241,15 @@ FAQ / 模板；超时的只留已经通过质检的 FAQ / 模板卡片，降级�
 **上线门槛的数据（§13.2、§13.4、§15）**：
 - 复核人员登记平台判定的违规和投诉：`POST /v1/shops/{shop_id}/rollout/incidents`（按周）；
 - `compliance-scan [--week …]`：扫描实际发出去的文字（编辑后发送、客服和机器人的回复）里的站外引流、绝对化用语、
-  店铺禁用词，只输出条数和 ID，不输出原文；
+  店铺禁用词，只输出条数和 ID，不输出原文。命中的是疑似违规（候选）：上线状态和验收报告里显示"未复核"，
+  复核人员 `POST /v1/shops/{shop_id}/rollout/compliance-reviews` 确认或标记误报（审计 `compliance.reviewed`，
+  不记原文），只有确认的才算违规；
+- 某周登记的"0 条"要在那一周结束之后登记才算那一周的依据，周中登记的是"暂定"，要复核人员周末后再确认一次；
 - `python -m rodit.eval --json 结果.json` 带配置指纹；`record-eval --report 结果.json` 把结论记下来，
-  指纹和运行中的配置一致时才算测试集门槛的依据（离线替身的结论不算）；
+  指纹和运行中的配置一致时才算测试集门槛的依据（离线替身的结论不算）。指纹包括配置、判断层问题版本、
+  路由用的判断层（分类器时还有模型文件的 SHA-256）、大模型名称和接口主机、生成环节代码的版本：换模型（哪怕只改
+  环境变量）、换分类器文件、改提示词都要重新评测。`record-eval` / `acceptance-report` 要和 `serve` 用同样的
+  `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL`（按分类器路由时还有 `RODIT_CLASSIFIER_PATH`），否则测试集一项显示"未核对"；
 - `acceptance-report --since … [--until …] [--json]`：按店铺和全单元汇总 Phase 1 验收（§13.2 门槛、连续两周
   采纳率 ≥ 60%、P95 ≤ 5 秒、违规为 0、每周复核事实正确和合规满分率 ≥ 95%），全部通过退出码 0，否则 1 并写明哪一项；
 - 采纳率不再把全自动发出的回复算进去，单列"全自动"。

@@ -9,6 +9,8 @@ import pytest
 from api_support import EVENTS_PATH, MERCHANT_A, Api
 
 from rodit.app.demo import taobao_event
+from rodit.app.tenancy import PURGE_REASON_MERCHANT
+from rodit.core.audit import AuditAction
 from rodit.core.enums import AfterSaleStatus, KnowledgeStatus, SuggestionStatus
 from rodit.core.errors import ToolUnavailable
 from rodit.core.pii import BuyerRefHasher
@@ -516,6 +518,10 @@ def test_revoke_purges_shop_and_blocks_later_requests(api: Api):
     counts = r.json()["counts"]
     assert counts["auth"] == 1 and r.json()["total"] == sum(counts.values()) > 5
     assert api.unit.repos.knowledge.get_shop(SHOP_A) is None
+    # 写系统事件 shop.purged（操作人是商家账号），迟到的旧订购事件按它判断先后
+    [purged] = api.unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+    assert purged.detail["shop_id"] == SHOP_A and purged.actor == MERCHANT_A
+    assert purged.detail["reason"] == PURGE_REASON_MERCHANT
 
     # 之后店铺 A 的一切请求都是 403（§8.4 停止处理）
     r = _event(api, "在吗", "v2")

@@ -237,6 +237,34 @@ def test_cancel_waits_for_a_late_qa_judge_so_its_usage_record_is_purged():
     assert [e.action for e in unit.repos.audit.events if e.shop_id == SHOP_A] == []
 
 
+def test_cancel_waits_for_a_late_generator_call_so_its_usage_record_is_purged():
+    """生成器并行生成的几份草稿（generation 自己的线程池）比预算慢：handle() 到点退回模板，
+    调用留在后台；取消订购同样等它们做完再删，迟到的大模型用量记录一并删掉。"""
+    from rodit.llm import MeteredLLMClient
+
+    slow = SlowLLM(generate_s=6.0, qa_s=0)
+    holder: dict[str, Any] = {}
+
+    class Metered:
+        model = slow.model
+
+        def complete(self, request: LLMRequest) -> LLMResponse:
+            return holder["llm"].complete(request)
+
+    unit = build_demo_unit(llm=Metered(), route_provider=RuleProvider())
+    holder["llm"] = MeteredLLMClient(slow, unit.repos.audit, unit.clock)
+    service = AssistService(unit)
+    result = say(service, SINGLE, item_id="i_555")
+    assert DEGRADED_BUDGET in result.degraded
+    assert slow.finished < slow.started  # 生成调用还在后台跑
+    assert not unit.engine.wait_background(SHOP_A, timeout=0)  # 记在引擎的后台任务里
+
+    service.revoke_shop(SHOP_A)
+    assert slow.finished == slow.started  # 等它们做完才删
+    time.sleep(0.3)
+    assert [e.action for e in unit.repos.audit.events if e.shop_id == SHOP_A] == []
+
+
 def test_cancel_stops_waiting_for_background_work_after_the_limit():
     """后台任务迟迟不结束：最多等 background_drain_s，照常删除（不能让取消订购一直卡住）。"""
     service = service_with(SlowLLM(generate_s=0, qa_s=0))

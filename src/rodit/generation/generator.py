@@ -65,8 +65,9 @@ _CallResult = LLMResponse | BaseException | _Unfinished
 
 def _complete_concurrently(llm: LLMClient, requests: list[LLMRequest]) -> list[_CallResult]:
     """并行调用大模型，按原顺序返回：LLMResponse、调用抛出的异常，或 _UNFINISHED（到截止时间
-    还没返回）。任务带着调用方的 contextvars（店铺范围、截止时间，core.budget.submit_in_context）。
-    没有截止时间、只有一条请求时直接在调用方线程里调。"""
+    还没返回）。任务带着调用方的 contextvars（店铺范围、截止时间，core.budget.submit_in_context）；
+    在引擎的 background_scope 里时，到点没返回、留在后台的调用记在 BackgroundWork 里（取消订购
+    等它们做完再删数据）。没有截止时间、只有一条请求时直接在调用方线程里调。"""
     if not requests:
         return []
     deadline = budget.current_deadline()

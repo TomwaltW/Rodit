@@ -325,6 +325,27 @@ def test_compliance_scan_records_a_flag_per_shop_without_text(repos):
     assert bad == 2
 
 
+def test_compliance_scan_removes_its_flags_when_the_shop_is_purged_meanwhile(repos):
+    """扫描期间 serve 清理了这家店（先删令牌、后删审计）：迟到的 compliance.flag 不留下。"""
+    original = repos.audit.record
+
+    def record_then_purge(event):  # type: ignore[no-untyped-def]
+        original(event)
+        if event.shop_id == SHOP_A:  # 写入之后 serve 才删令牌，但审计已经删过了
+            repos.auth.delete(SHOP_A)
+
+    repos.audit.purge_shop(SHOP_A)
+    repos.audit.record = record_then_purge
+    out = io.StringIO()
+    assert (
+        rollout_jobs.run(parse("compliance-scan"), {}, repos=repos, clock=FakeClock(NOW), out=out)
+        == 0
+    )
+    assert repos.audit.list_events(SHOP_A, action=AuditAction.COMPLIANCE_FLAG.value) == []
+    assert repos.audit.list_events(SHOP_B, action=AuditAction.COMPLIANCE_FLAG.value) != []
+    assert f"{SHOP_A} 扫描期间被取消订购" in out.getvalue()
+
+
 # ================================================================ PostgreSQL
 
 

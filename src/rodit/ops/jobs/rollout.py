@@ -286,6 +286,12 @@ def compliance_command(
                 + (f"（{rules}；等复核人员确认或标记误报）" if rules else ""),
                 file=out,
             )
+        if weeks and repos.auth.stamp(shop.id) is None:  # 不解密令牌
+            # 扫描期间 serve 取消订购 / 过期清理了这家店（本任务和 serve 不共用闸门）：清理先删
+            # 令牌、后删审计，令牌不在了说明这里的写入可能晚于清理——再删一次这家店的审计，
+            # 不留下迟到的记录（§8.4；purge_shop 是幂等的）
+            repos.audit.purge_shop(shop.id)
+            print(f"{shop.id} 扫描期间被取消订购，已删除这次写入的记录", file=out)
     if not shops:
         print("本单元没有有授权的店铺", file=out)
     return 0

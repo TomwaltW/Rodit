@@ -78,7 +78,10 @@ REVOKE_KINDS: frozenset[str] = frozenset({"cancelled", "auth_revoked"})
 
 PURGE_REASON_EXPIRED = "expired"
 """shop.purged 的原因：授权过期超过宽限期（purge_expired）。取消订购用事件的 kind
-（cancelled / auth_revoked），运维命令默认 ops。"""
+（cancelled / auth_revoked），运维命令默认 ops，商家在控制台取消用 PURGE_REASON_MERCHANT。"""
+
+PURGE_REASON_MERCHANT = "merchant_revoke"
+"""shop.purged 的原因：商家经 POST /v1/shops/{shop_id}/revoke 取消（操作人是商家账号）。"""
 
 _EVENT_CLOCK_SKEW = timedelta(days=1)
 """找清理记录时按写入时间（本单元的时钟）预先筛选的余量：清理记录的 event_at 是平台的事件时间，
@@ -537,6 +540,7 @@ __all__ = [
     "ONBOARD_STATUSES",
     "PLATFORM_ACTOR",
     "PURGE_REASON_EXPIRED",
+    "PURGE_REASON_MERCHANT",
     "REVOKE_KINDS",
     "STATUS_TRANSITIONS",
     "SYSTEM_ACTOR",

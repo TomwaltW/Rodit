@@ -15,7 +15,8 @@ from rodit.core.models import SubscriptionKind
 
 class SubscriptionView(BaseModel):
     """订购事件处理结果：granted（开通 / 续订，带店铺状态）、revoked（取消订购，带各项删除条数和
-    合计）、ignored（清理之后才到的旧事件，没有处理）。"""
+    合计）、ignored（过时的事件，没有处理：事件时间不晚于这家店已经处理过的最新一个订购事件——
+    重放的、乱序迟到的开通或取消都算，见 rodit.app.tenancy）。"""
 
     model_config = ConfigDict(extra="forbid")
 

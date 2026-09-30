@@ -47,7 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
-from rodit.core.config import EngineConfig, config_fingerprint
+from rodit.core.config import EngineConfig, config_fingerprint, llm_endpoint
 from rodit.core.enums import ProviderName
 from rodit.core.models import AuditEvent
 from rodit.core.questions import QA_QUESTIONS_VER, ROUTER_QUESTIONS_VER
@@ -190,13 +190,9 @@ def running_llm(
     config: EngineConfig, environ: Mapping[str, str] | None = None
 ) -> tuple[str | None, str | None]:
     """线上单元实际用的大模型：（模型名，接口的协议和主机）。和 app.production.build_production_unit
-    同一条规则：配置里 llm.base_url 和 llm.model 都写了用配置，否则两项都取环境变量
-    RODIT_LLM_BASE_URL / RODIT_LLM_MODEL。拿不到的项是 None。"""
-    env = os.environ if environ is None else environ
-    if config.llm.base_url and config.llm.model:
-        base_url, model = config.llm.base_url, config.llm.model
-    else:
-        base_url, model = env.get(LLM_BASE_URL_ENV, ""), env.get(LLM_MODEL_ENV, "")
+    同一条规则（core.config.llm_endpoint）：配置里 llm.base_url 和 llm.model 都写了用配置，否则
+    两项都取环境变量 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL。拿不到的项是 None。"""
+    base_url, model, _ = llm_endpoint(config.llm, environ)
     return (model or None), endpoint_of(base_url)
 
 

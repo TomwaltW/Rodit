@@ -94,7 +94,7 @@ from rodit.app.service import AssistService
 from rodit.app.unit import Repos, Unit, build_unit
 from rodit.core.audit import AuditAction
 from rodit.core.clock import CST, Clock, SystemClock
-from rodit.core.config import EngineConfig, load_config
+from rodit.core.config import LLM_ENV_PREFIX, EngineConfig, llm_endpoint, load_config
 from rodit.core.enums import ProviderName
 from rodit.core.errors import StorageUnavailable, TokenDecryptionError
 from rodit.core.models import LabeledSample
@@ -154,7 +154,6 @@ from rodit.storage import APP_ROLE, Database, PgFeedbackRepository
 
 logger = logging.getLogger("rodit.ops")
 
-LLM_ENV_PREFIX = "RODIT_LLM_"
 MIGRATE_DSN_ENV = "RODIT_MIGRATE_DSN"
 DATABASE_DSN_ENV = "RODIT_DATABASE_DSN"
 TOKEN_KEY_ENV = "RODIT_TOKEN_KEY"
@@ -201,9 +200,8 @@ class Server:
 
 
 def _llm_configured(config: EngineConfig, env: Mapping[str, str]) -> bool:
-    base_url = config.llm.base_url or env.get(f"{LLM_ENV_PREFIX}BASE_URL", "")
-    model = config.llm.model or env.get(f"{LLM_ENV_PREFIX}MODEL", "")
-    return bool(base_url.strip() and model.strip())
+    base_url, model, _ = llm_endpoint(config.llm, env, prefix=LLM_ENV_PREFIX)
+    return bool(base_url and model)
 
 
 def preflight(

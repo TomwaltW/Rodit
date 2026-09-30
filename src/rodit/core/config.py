@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -140,6 +142,27 @@ class LLMConfig(_Model):
     public_name: str | None = None  # 公示的模型名称【待定：D5 选定后填】
     filing_no: str | None = None  # 备案号【待定：D5 选定后填】
     require_disclosure: bool = False
+
+
+LLM_ENV_PREFIX = "RODIT_LLM_"
+"""配置里没写全 llm.base_url / llm.model 时读的环境变量前缀：{前缀}BASE_URL、{前缀}MODEL
+（OpenAICompatibleClient.from_env）。"""
+
+
+def llm_endpoint(
+    config: LLMConfig, environ: Mapping[str, str] | None = None, *, prefix: str = LLM_ENV_PREFIX
+) -> tuple[str, str, bool]:
+    """线上单元实际用的大模型：（接口地址，模型名，是否来自配置文件）。
+
+    规则：配置里 llm.base_url 和 llm.model 都写了用配置；否则两项都取环境变量
+    {prefix}BASE_URL / {prefix}MODEL（只写了一项的配置不生效，不和环境变量拼）。
+    拿不到的项是空字符串。
+    组装客户端（app.production）、启动前检查和就绪检查（ops.serve、ops.health）、评测指纹
+    （eval.fingerprint）都用它，几处不会各算各的。只读变量，不读密钥。"""
+    if config.base_url and config.model:
+        return config.base_url, config.model, True
+    env = os.environ if environ is None else environ
+    return env.get(f"{prefix}BASE_URL", "").strip(), env.get(f"{prefix}MODEL", "").strip(), False
 
 
 class PrivacyConfig(_Model):
