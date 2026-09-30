@@ -20,7 +20,12 @@
 取消订购（§8.4）与处理互斥：按店铺的读写闸，处理消息、客服 / 商家操作是读方，取消订购是写方——
 等在途的处理做完、期间不开始新的，删完数据再放行（之后的事件授权检查不过）。
 商家操作：审核候选知识、看缺失知识、填政策问卷（附录 C）、看报表（§12.4）。
-售后审核（§7.3.2）：拉单、刷新、协商、客服确认后执行（写操作一律要人确认）。
+售后审核（§7.3.2）：拉单、刷新、协商、客服确认后执行（写操作一律要人确认）。每一步先查店铺授权
+（§8.4 授权过期时停止处理）：授权无效时抛 AuthExpired，一次平台接口都不调；客服确认执行写操作时
+（单元接了售后写接口）还要有写售后权限（refund.write，二期才申请，§8.4 最小权限），
+没有就不碰写接口。
+店铺生命周期（§8.4）：开通、状态、订购事件、续期、过期清理见 rodit.app.tenancy
+（AssistService.tenancy）。
 """
 
 from __future__ import annotations
@@ -66,6 +71,7 @@ from rodit.core.models import (
 )
 from rodit.core.pii import mask_pii
 from rodit.core.ports import MessageRecall, PlatformAdapter
+from rodit.core.scopes import MVP_SCOPES, SCOPE_REFUND_WRITE
 from rodit.feedback import (
     AdoptionReport,
     FeedbackOutcome,
@@ -83,6 +89,18 @@ REASON_SEND_FAILED = "全自动回复发送失败，转人工（§12.2）"
 _OUTGOING_DEDUPE_WINDOW = timedelta(minutes=2)
 _OUTGOING_DEDUPE_SCAN = 20
 _MIRRORED_PREFIXES = ("agent:", "bot:")
+
+AFTERSALE_WRITE_SCOPES: dict[AfterSaleAction, frozenset[str]] = {
+    AfterSaleAction.AGREE_REFUND: frozenset({SCOPE_REFUND_WRITE}),
+    AfterSaleAction.AGREE_RETURN: frozenset({SCOPE_REFUND_WRITE}),
+    AfterSaleAction.REFUSE: frozenset({SCOPE_REFUND_WRITE}),
+}
+"""客服确认后执行的售后写操作要的权限（§8.4 写售后到二期再申请）。没列出的操作也按写售后处理。"""
+
+
+def aftersale_scopes(action: AfterSaleAction) -> frozenset[str]:
+    """执行这个售后写操作时店铺授权必须具备的权限：只读权限 + 写售后。"""
+    return MVP_SCOPES | AFTERSALE_WRITE_SCOPES.get(action, frozenset({SCOPE_REFUND_WRITE}))
 
 
 def _is_mirrored(msg_id: str) -> bool:
@@ -220,14 +238,24 @@ class AssistService:
         self._gate = _ShopGate()
         self.console = ConsoleService(unit, self.processing)  # 商家控制台（§9.1、§5.2）
         self.rollout = RolloutService(unit, self.processing)  # 上线节奏与每周复核（§13.4、§13.5）
-        # 店铺生命周期：开通、状态、订购事件、过期清理（§8.4）
-        self.tenancy = TenancyService(unit, self.processing, self.revoke_shop)
+        # 店铺生命周期：开通、状态、订购事件、续期、过期清理（§8.4）
+        self.tenancy = TenancyService(
+            unit, self.processing, self.revoke_shop, exclusive=self.exclusive
+        )
 
     @contextmanager
     def processing(self, shop_id: str) -> Iterator[None]:
         """按店铺的读方闸门：客服 / 商家 / 复核操作都在里面做，取消订购等它们做完再删数据（§8.4）。
         不可重入：持有时不能再调取消订购。"""
         with self._gate.processing(shop_id):
+            yield
+
+    @contextmanager
+    def exclusive(self, shop_id: str) -> Iterator[None]:
+        """按店铺的写方闸门（和取消订购同一把）：等这家店在途的处理做完、期间新来的排队。
+        店铺生命周期改店铺记录（开通、切换状态）时用，读改写之间不会插进同一进程里的其他修改。
+        不可重入：持有时不能再调 processing 或取消订购。"""
+        with self._gate.revoking(shop_id):
             yield
 
     # ================================================================ 买家消息
@@ -608,7 +636,9 @@ class AssistService:
     # ================================================================ 售后审核（§7.3.2）
 
     def review_aftersale(self, shop_id: str, aftersale_id: str) -> AfterSaleReview:
+        """拉单给建议（已有记录时重读平台状态）。授权无效抛 AuthExpired，不调平台接口（§8.4）。"""
         with self._gate.processing(shop_id):
+            self.unit.auth.require(shop_id)
             existing = self.unit.repos.reviews.get(shop_id, aftersale_id)
             if existing is None:
                 return self.unit.reviews.review(shop_id, aftersale_id)
@@ -618,12 +648,14 @@ class AssistService:
         self, shop_id: str, aftersale_id: str, *, operator: str, note: str | None = None
     ) -> AfterSaleReview:
         with self._gate.processing(shop_id):
+            self.unit.auth.require(shop_id)
             return self.unit.reviews.negotiate(shop_id, aftersale_id, operator=operator, note=note)
 
     def negotiation_done(
         self, shop_id: str, aftersale_id: str, *, operator: str, outcome: str | None = None
     ) -> AfterSaleReview:
         with self._gate.processing(shop_id):
+            self.unit.auth.require(shop_id)
             return self.unit.reviews.negotiation_done(
                 shop_id, aftersale_id, operator=operator, outcome=outcome
             )
@@ -640,7 +672,11 @@ class AssistService:
         reason_code: str | None = None,
         reason_text: str | None = None,
     ) -> AfterSaleReview:
-        """客服确认后执行（§7.3.2）：确认人、看到的平台状态版本都要带上，助手会重读再操作。"""
+        """客服确认后执行（§7.3.2）：确认人、看到的平台状态版本都要带上，助手会重读再操作。
+
+        先查授权（§8.4）：授权无效抛 AuthExpired；单元接了售后写接口时还要有写售后权限
+        （aftersale_scopes，二期才申请），没有就抛 AuthExpired，写接口一次都不调。
+        没接写接口（MVP）时审核助手本来就拒绝执行（ActionNotAllowed），不另查写权限。"""
         confirmation = HumanConfirmation(
             operator=operator,
             confirmed_at=self.unit.clock.now(),
@@ -648,6 +684,8 @@ class AssistService:
             by_manager=by_manager,
         )
         with self._gate.processing(shop_id):
+            scopes = aftersale_scopes(action) if self.unit.action_port is not None else MVP_SCOPES
+            self.unit.auth.require(shop_id, scopes)
             return self.unit.reviews.confirm(
                 shop_id,
                 aftersale_id,
@@ -675,4 +713,4 @@ class AssistService:
             return self.unit.auth.revoke(shop_id, purgers)
 
 
-__all__ = ["AssistService"]
+__all__ = ["AFTERSALE_WRITE_SCOPES", "AssistService", "aftersale_scopes"]

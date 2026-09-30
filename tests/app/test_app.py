@@ -25,6 +25,7 @@ from rodit.core.errors import (
     ShopInactive,
     TenantIsolationError,
 )
+from rodit.core.scopes import PHASE2_SCOPES
 from rodit.testing.fixtures import AGENT, MANAGER, SHOP_A, SHOP_B, SHOP_C, SHOP_D
 
 
@@ -148,7 +149,14 @@ def test_shadow_shop_generates_but_shows_nothing():
     assert records and all(r.status == SuggestionStatus.SHADOW for r in records)
 
 
+def _grant_refund_write(service, shop_id: str = SHOP_A) -> None:
+    """这家店申请了写售后权限（二期，§8.4）：客服确认后执行售后写操作要有 refund.write。"""
+    auth = service.unit.repos.auth.get(shop_id)
+    service.unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(PHASE2_SCOPES)}))
+
+
 def test_aftersale_review_and_confirm_requires_manager_for_r6(service: AssistService):
+    _grant_refund_write(service)
     review = service.review_aftersale(SHOP_A, "as_2005")
     assert review.requires_manager and review.state == ReviewState.CONFIRM
     info = service.unit.tools.get_aftersale(SHOP_A, "as_2005")
