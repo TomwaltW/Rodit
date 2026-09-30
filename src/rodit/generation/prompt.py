@@ -11,6 +11,8 @@
   提示词里没有 buyer_ref、昵称、手机号、地址；
 - 多问题分条（§6.6 规则 5）：引擎按 part 复制出来的路由仍带 rule=5，据此只回答该部分，也可以显式传
   focus_intent；安抚（规则 3）要求先道歉安抚；高风险（规则 4）加谨慎要求和 route.risk_hints；
+- 签收未收到（§7.3.1、§11.3）加一条要求：说明签收细分状态、驿站 / 快递柜给取件指引、
+  还是没找到就在订单页申请售后；
 - 重新生成时附上"上次回答未通过质检：…，请修改"。
 """
 
@@ -19,6 +21,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
+from rodit.core.budget import clamp_timeout
 from rodit.core.config import GenerationConfig
 from rodit.core.enums import INTENT_LABELS, Intent, Mode, Role, RouteAction
 from rodit.core.evidence import PLATFORM_NAMES
@@ -35,6 +38,13 @@ SPLIT_MULTI_RULE = 5
 引擎按 part 复制路由时 rule 不变，据此识别"只答这一部分"。"""
 
 CONFIRM_PHRASE = "这个我帮您确认一下"
+
+NOT_RECEIVED_REQUIREMENT = (
+    "买家说显示签收但没收到：先按【依据】说明物流的签收细分状态（本人签收、驿站或快递柜代收），"
+    "驿站或快递柜代收时给出地点和取件指引；再告诉买家，如果还是没找到，可以在订单页申请售后。"
+    "不要替买家申请售后，也不要承诺赔偿或补发。"
+)
+"""签收未收到（§7.3.1、§11.3）的回答要求：物流细分状态、驿站 / 快递柜信息、没找到引导申请售后。"""
 
 _ROLE_NAMES = {Role.BUYER: "买家", Role.AGENT: "客服", Role.BOT: "客服（自动回复）"}
 _TONE_HINTS = {
@@ -139,6 +149,8 @@ def _requirements(
         reqs.append("买家情绪比较激动：先用一句道歉或安抚的话开头，再回答问题。")
     elif intent == Intent.QUALITY_ISSUE:  # §7.3.1 收到的东西坏了：情绪平稳也要先安抚
         reqs.append("买家反映收到的商品有问题：先用一句道歉安抚的话开头，再说明怎么处理。")
+    if intent == Intent.NOT_RECEIVED:  # §7.3.1、§11.3 显示签收但没收到
+        reqs.append(NOT_RECEIVED_REQUIREMENT)
     if route.high_risk or route.action == RouteAction.HIGH_RISK_ANSWER:
         reqs.append(
             "这是高风险问题：只说依据里有的事实，不做任何依据之外的承诺；"
@@ -207,7 +219,10 @@ def build_generation_request(
     retry_feedback: list[str] | None = None,
     focus_intent: Intent | None = None,
 ) -> LLMRequest:
-    """生成请求：purpose="generate"、JSON 输出，成本归属当前店铺（§12.4）。"""
+    """生成请求：purpose="generate"、JSON 输出，成本归属当前店铺（§12.4）。
+
+    单次调用的超时不超过当前截止时间的剩余时间（core.budget.clamp_timeout，§12.1）；
+    没有截止时间时就是 GenerationConfig.timeout_s。"""
     return LLMRequest(
         purpose="generate",
         messages=build_generation_messages(
@@ -222,6 +237,6 @@ def build_generation_request(
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         json_mode=True,
-        timeout_s=config.timeout_s,
+        timeout_s=clamp_timeout(config.timeout_s),
         shop_id=ctx.shop_id,
     )

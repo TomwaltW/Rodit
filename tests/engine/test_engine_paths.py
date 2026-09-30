@@ -560,18 +560,24 @@ def test_split_multi_one_card_per_part(kit: Kit) -> None:
         parts=[(Intent.SHIPPING_POLICY, 0.55), (Intent.PRICE_PROMO, 0.9)],
         multi_intent=0.85,
     )
-    kit.generator.script = [[llm("发货一"), llm("发货二")], [llm("优惠一")]]
+    # 各条并行生成，调用先后不固定：按问题类型写脚本
+    kit.generator.script_for = {
+        Intent.SHIPPING_POLICY: [[llm("发货一"), llm("发货二")]],
+        Intent.PRICE_PROMO: [[llm("优惠一")]],
+    }
     result = kit.engine().handle(kit.msg("什么时候发货？能便宜点吗？"))
     assert result is not None
     assert [(c.intent, c.text) for c in result.suggestions] == [
         (Intent.SHIPPING_POLICY, "发货一"),
         (Intent.PRICE_PROMO, "优惠一"),
     ]
+    # 每条检索一次（并行，检索的先后不固定；卡片顺序见上面）
     part_routes = [route for _, route in kit.retriever.calls]
-    assert [(r.intent, r.action, r.parts) for r in part_routes] == [
-        (Intent.SHIPPING_POLICY, RouteAction.ANSWER, []),
-        (Intent.PRICE_PROMO, RouteAction.HIGH_RISK_ANSWER, []),
-    ]
+    assert len(part_routes) == 2
+    assert {r.intent: (r.action, r.parts) for r in part_routes} == {
+        Intent.SHIPPING_POLICY: (RouteAction.ANSWER, []),
+        Intent.PRICE_PROMO: (RouteAction.HIGH_RISK_ANSWER, []),
+    }
     assert result.route is not None and result.route.action == RouteAction.SPLIT_MULTI
     # 分条的置信度按该条的概率算
     assert [c.confidence for c in result.suggestions] == [Confidence.MEDIUM, Confidence.HIGH]

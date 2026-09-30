@@ -42,11 +42,13 @@ def test_split_parts_carry_only_their_own_risk_hint(kit: Kit) -> None:
     )
     result = kit.engine().handle(kit.msg("穿什么码合适？能便宜点吗"))
     assert result is not None
+    # 各条并行检索，调用先后不固定：按问题类型比
     part_routes = [route for _, route in kit.retriever.calls]
-    assert [(r.intent, r.risk_hints, r.high_risk) for r in part_routes] == [
-        (Intent.SIZE_ADVICE, [], False),
-        (Intent.PRICE_PROMO, [PRICE_HINT], True),
-    ]
+    assert len(part_routes) == 2
+    assert {r.intent: (r.risk_hints, r.high_risk) for r in part_routes} == {
+        Intent.SIZE_ADVICE: ([], False),
+        Intent.PRICE_PROMO: ([PRICE_HINT], True),
+    }
     assert [(c.intent, c.risk_hints) for c in result.suggestions] == [
         (Intent.SIZE_ADVICE, []),
         (Intent.PRICE_PROMO, [PRICE_HINT]),

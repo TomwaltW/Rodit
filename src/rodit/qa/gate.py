@@ -10,6 +10,11 @@
   写失败只记警告（只记异常类型），质检结论照常返回；
 - 进判断层的回答先遮个人信息（回答可能复述了买家的手机号、地址，§5.3）；
   QAResult.text 不遮，它是要展示给客服、发给这位买家的文本。
+- 时间预算（§12.1、§12.2，core.budget；引擎给每条消息设截止时间）：大模型草稿在剩余时间不够调
+  一次判断层（core.budget.llm_allowed() 为 False）时不调，判断层答完时截止时间已过的结论也不用
+  （引擎已经不等了）；这两种都不放行，原因"时间不够，没有做完模型质检"（QA_OUT_OF_TIME），
+  不算判断层不可用（degraded=False），也不写 decision_log——截止之后不留迟到的写入。
+  FAQ / 模板只跑硬规则，不受影响。没有截止时间时（离线任务、测试）照常调。
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from __future__ import annotations
 import logging
 import time
 
+from rodit.core import budget
 from rodit.core.clock import Clock
 from rodit.core.config import QAGateConfig
 from rodit.core.decision import (
@@ -55,6 +61,7 @@ from rodit.qa.masking import mask_text, masked_context, masked_evidence
 logger = logging.getLogger(__name__)
 
 QA_UNAVAILABLE = "质检不可用"
+QA_OUT_OF_TIME = "时间不够，没有做完模型质检"
 EMPTY_ANSWER = "回答为空"
 
 
@@ -143,6 +150,8 @@ class DefaultQualityGate:
             return QAResult(passed=not reasons, text=text, hard_hits=hits, reasons=reasons)
         if self._provider is None:
             return self._degraded(text, hits, reasons, provider=None)
+        if not budget.llm_allowed():  # 剩余时间不够调一次判断层（§12.2）
+            return self._out_of_time(text, hits, reasons, provider=self._provider.name)
         return self._model_check(ctx, draft, evidence, text, hits, reasons)
 
     # ---- 第二道：判断层质检
@@ -172,6 +181,8 @@ class DefaultQualityGate:
             scores = _scores(response)
         except (DecisionError, LLMError, KeyError, TypeError):
             return self._degraded(text, hits, hard_reasons, provider=provider.name)
+        if budget.expired():  # 答完时截止时间已过：结论不用，也不写 decision_log
+            return self._out_of_time(text, hits, hard_reasons, provider=provider.name)
         latency_ms = int((time.perf_counter() - started) * 1000)
         clarify = draft.need_clarify or draft.variant == "clarify"
         reasons = [*hard_reasons, *model_reasons(scores, self._config, clarify=clarify)]
@@ -201,6 +212,22 @@ class DefaultQualityGate:
             model_checked=True,
             provider=provider.name,
             answers=response,
+        )
+
+    @staticmethod
+    def _out_of_time(
+        text: str,
+        hits: list[HardRuleHit],
+        hard_reasons: list[str],
+        *,
+        provider: str | None,
+    ) -> QAResult:
+        return QAResult(
+            passed=False,
+            text=text,
+            hard_hits=hits,
+            reasons=[*hard_reasons, QA_OUT_OF_TIME],
+            provider=provider,
         )
 
     def _degraded(
