@@ -234,6 +234,47 @@ def test_onboard_shop_rejects_past_expiry(cli, monkeypatch):
     assert service.unit.repos.auth.get(NEW) is None
 
 
+def test_onboard_shop_does_not_stamp_local_time_as_the_platform_grant_time(cli, monkeypatch):
+    """复现（修复前）：onboard-shop 把本机时间 N 记成这份授权的平台开通时间。商家在 N 之前
+    （停服务窗口里）取消订购，推送在 serve 重启之后才到：按"旧事件"忽略，数据留到过期清理
+    （约 60 天）。现在不给 --granted-at 时不记开通时间，这条取消照常删除。"""
+    service, _ = cli
+    unit = service.unit
+    _stdin(monkeypatch, f"{TOKEN}\n")
+    assert serve.main([*ONBOARD, "--token-stdin"]) == 0
+    assert unit.repos.auth.stamp(NEW).granted_at is None
+    cancel = parse_subscription(
+        subscription_push("cancelled", NEW, at=unit.clock.now() - timedelta(minutes=10))
+    )
+    assert service.tenancy.handle_subscription(cancel).action == "revoked"
+    assert unit.repos.auth.get(NEW) is None and unit.repos.knowledge.get_shop(NEW) is None
+
+
+def test_onboard_shop_records_the_given_platform_grant_time(cli, monkeypatch, caplog):
+    """--granted-at（服务市场订单上的开通时间）记进授权：比它早的订购推送才算旧事件；
+    晚于现在的不收（退出码 2，什么都不写）。"""
+    service, _ = cli
+    unit = service.unit
+    p0 = unit.clock.now() - timedelta(hours=2)
+    _stdin(monkeypatch, f"{TOKEN}\n")
+    assert serve.main([*ONBOARD, "--token-stdin", "--granted-at", p0.isoformat()]) == 0
+    assert unit.repos.auth.stamp(NEW).granted_at == p0
+    [granted] = unit.repos.audit.list_events(NEW, action=AuditAction.AUTH_GRANTED)
+    assert granted.detail["event_at"] == p0.isoformat()
+    stale = parse_subscription(subscription_push("cancelled", NEW, at=p0 - timedelta(seconds=1)))
+    assert service.tenancy.handle_subscription(stale).action == "ignored"
+    assert unit.auth.is_authorized(NEW)
+
+    future = (unit.clock.now() + timedelta(hours=1)).isoformat()
+    _stdin(monkeypatch, f"{TOKEN}\n")
+    argv = [*ONBOARD, "--token-stdin", "--granted-at", future]
+    argv[argv.index(NEW)] = "s_new_future"
+    with caplog.at_level(logging.ERROR):
+        assert serve.main(argv) == 2
+    assert "--granted-at" in caplog.text and TOKEN not in caplog.text
+    assert unit.repos.auth.get("s_new_future") is None
+
+
 def _grant(service: AssistService, shop_id: str, *, hours: float, refresh: bool = True) -> None:
     unit = service.unit
     unit.repos.auth.save(
@@ -306,6 +347,42 @@ def test_purge_expired_failure_exits_1_and_logs_the_shop(cli, capsys, caplog):
         assert serve.main(["purge-expired"]) == 1
     assert "没有删完的店铺：1 家" in capsys.readouterr().out
     assert SHOP_A in caplog.text  # 日志里有要重试的店铺
+
+
+def test_purge_expired_finishes_what_an_earlier_run_left(cli, capsys, caplog):
+    """复现（修复前）：清理删了令牌之后出错，下一次 purge-expired 再也列不出这家店（令牌没了），
+    数据一直留着，只能靠日志里的店铺 ID 手动 revoke。现在下一次接着删完（开始清理的标记）。"""
+    service, _ = cli
+    unit = service.unit
+    _expire(service, SHOP_A, 45)
+
+    class FailsOnce:
+        failed = False
+
+        def purge_shop(self, shop_id: str) -> int:
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("模拟清理失败")
+            return 0
+
+    unit.extra_purgers.append(FailsOnce())
+    with caplog.at_level(logging.ERROR):
+        assert serve.main(["purge-expired"]) == 1
+    assert "没有删完的店铺：1 家" in capsys.readouterr().out
+    assert unit.repos.auth.get(SHOP_A) is None
+
+    assert serve.main(["purge-expired", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "待清理的店铺：0 家" in out and "上次没删完、要接着删的店铺：1 家" in out
+    assert SHOP_A not in out
+    assert unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED) == []
+
+    assert serve.main(["purge-expired"]) == 0
+    assert "已清理授权过期超过 30 天的店铺：1 家" in capsys.readouterr().out
+    [record] = unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+    assert record.detail["shop_id"] == SHOP_A and record.detail["reason"] == "expired"
+    assert serve.main(["purge-expired", "--dry-run"]) == 0
+    assert "上次没删完" not in capsys.readouterr().out
 
 
 def test_revoke_command_leaves_a_system_record(cli, capsys):

@@ -102,7 +102,7 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `healthcheck` | 镜像 HEALTHCHECK 用：请求本机 `/healthz` |
 | `recalibrate [--since …] [--until …] [--min-support N] [--out 文件] [--config YAML]` | §13.5 每月按采纳反馈重算阈值：只输出建议（中文摘要 + 只含改动的 YAML 片段），不改任何配置 |
 | `train-classifier --out 文件 [--min-samples N] [--force] [--overwrite] [--config YAML]` | §6.4 用反馈标注训练路由分类器：报告留出集和评测集上对比关键词规则的效果，原子写入模型文件（JSON） |
-| `onboard-shop --shop-id … (--token-stdin \| --token-file 文件) …` / `refresh-tokens` / `purge-expired [--dry-run]` / `revoke --shop-id …` / `set-status --shop-id … --status …` | §8.4 店铺生命周期（见下文"上线就绪"）。除了 `--dry-run` 都要拿单副本租约：`serve` 在跑时拒绝执行（退出码 2），日志写明改用哪个接口或 `serve` 里的哪个定时任务 |
+| `onboard-shop --shop-id … (--token-stdin \| --token-file 文件) [--granted-at 平台开通时间] …` / `refresh-tokens` / `purge-expired [--dry-run]` / `revoke --shop-id …` / `set-status --shop-id … --status …` | §8.4 店铺生命周期（见下文"上线就绪"）。除了 `--dry-run` 都要拿单副本租约：`serve` 在跑时拒绝执行（退出码 2），日志写明改用哪个接口或 `serve` 里的哪个定时任务 |
 | `record-eval --report 结果.json` / `acceptance-report --since … [--json]` / `compliance-scan [--week …]` | §13.2、§13.4、§15 上线门槛的数据和 Phase 1 验收报告 |
 
 `recalibrate` 和 `train-classifier` 是离线任务，标注从 `RODIT_TRAINER_DSN` 读（这个登录账号要能
@@ -205,23 +205,29 @@ sessionStorage）按角色显示知识、政策、商品、设置、上线、复
 **店铺生命周期（§8.4）**：
 - 开通：平台订购 / 授权推送 → `POST /v1/platform/{access}/subscription`（平台对接身份，只能推自己店铺的），
   或平台云代码进程内调用 `BindingContext.on_subscription`，或运维命令 `onboard-shop`（令牌只从标准输入或文件读，
-  不进命令行参数）。开通时权限按 `tenancy.onboarding_phase` 核对（1 = MVP 只读；写售后要到二期）。
+  不进命令行参数；`--granted-at` 填服务市场订单上的平台开通时间，不填时不记开通时间——不拿本机时间冒充平台时间，
+  否则在它之前发生、之后才送到的取消订购会被当成旧事件忽略）。开通时权限按 `tenancy.onboarding_phase` 核对
+  （1 = MVP 只读；写售后要到二期）。
 - 续期：给 `tenancy.refresh_ahead_hours` 内到期、有续期令牌的店铺续期；续不了的标记"要重新授权"，
   之后的处理一律拒绝。续期令牌同样应用内加密（附加认证数据和访问令牌不同）。每份授权有一个不重复的写入版本：
   续期结果按版本条件写回，"要重新授权"只标记被拒的那一份（平台拒绝旧令牌时，已经换上的新授权不受影响）；
   平台云代码调 `TokenProvider.report_rejected(shop_id, token)` 时带上被拒的令牌。
 - 取消订购 / 授权过期：取消推送立即删除该店铺在本单元的数据；过期超过 `tenancy.purge_after_expiry_days`
   （默认 30 天，【待定：委托处理协议】）的按约定删除。删除之前先等这家店留在后台的线程（到截止时间没做完的分条、
-  质检、生成、平台查询）做完，最多 30 秒，它们迟到的缓存、用量记录一并删掉。删除后留一条不带店铺数据的系统事件
+  质检、生成、平台查询）做完，最多 30 秒，它们迟到的缓存、用量记录一并删掉。删令牌之前先留一条开始清理的标记
+  `shop.purge_started`（系统事件，只有店铺 ID、原因和 `event_at`），删除后留一条不带店铺数据的系统事件
   `shop.purged`（只有店铺 ID、原因、各类数据的条数和触发它的平台事件时间 `event_at`）；商家令牌调
   `POST /v1/shops/{shop_id}/revoke` 也写这条（原因 `merchant_revoke`）。
 - 订购事件按平台的事件时间排先后：每家店记着已经处理过的最新事件时间（授权的开通时间、`shop.purged` 的
-  `event_at`），不晚于它的开通或取消（重放的、乱序迟到的）一律 `ignored`，判断和写入都在这家店的写方闸门里做。令牌文件里这家店的访问令牌要另外删掉（清理过、没有再开通的
+  `event_at`；开通还要比 `shop.purge_started` 的 `event_at`，清理没做完时被删的那份授权晚到也不写回来），
+  不晚于它的开通或取消（重放的、乱序迟到的）一律 `ignored`，判断和写入都在这家店的写方闸门里做。令牌文件里这家店的访问令牌要另外删掉（清理过、没有再开通的
   店铺不再计入授权过期告警）。`revoke --shop-id` 手动取消，`set-status` 切换试用 / 正式 / 停用。
 - 续期和过期清理在 `serve` 进程里按间隔跑（`RODIT_TOKEN_REFRESH_INTERVAL_S` 默认 1 小时、
   `RODIT_PURGE_EXPIRED_INTERVAL_S` 默认 6 小时，起来 1 分钟后跑第一轮），不用另外排定时任务：取消订购的闸门
   （等在途处理做完再删）、工具缓存、适配器去重记录都在 `serve` 进程内，另起一个进程删数据时 `serve` 手上的消息
-  照样把推荐和审计写进来、再也没有人删。没删完的店铺下一轮重试；出错只记日志和
+  照样把推荐和审计写进来、再也没有人删。清理中途出错或进程被杀的店铺（令牌已删、数据没删完、没有
+  `shop.purged`）每轮先接着删完（按开始清理的标记找，重启之后也一样；原因、`event_at` 沿用，期间重新订购了的
+  不删），`purge-expired --dry-run` 也数出这些店铺；出错只记日志和
   `rodit_background_task_runs_total{task,outcome}`（告警 `RoditBackgroundTaskFailing`）。
 - 命令行里改数据的店铺生命周期命令（`onboard-shop`、`refresh-tokens`、`purge-expired`、`revoke`、`set-status`）
   和 `serve` 拿同一个单副本租约：`serve` 在跑时拒绝执行（退出码 2），改用 `POST /v1/platform/{access}/subscription`

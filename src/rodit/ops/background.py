@@ -98,7 +98,8 @@ class BackgroundRunner:
 
     def stop(self, timeout_s: float = DEFAULT_STOP_TIMEOUT_S) -> None:
         """通知线程退出，最多等 timeout_s 秒让它们跑完手上这一轮。没退出的是守护线程，
-        进程退出时一起结束（续期、清理都可以重跑）。"""
+        进程退出时一起结束：续期可以重跑；清理删令牌之前写了开始清理的标记
+        shop.purge_started，删到一半被打断的店铺下一轮过期清理接着删完（重启之后也一样）。"""
         self._stop.set()
         deadline = time.monotonic() + max(0.0, timeout_s)
         with self._lock:

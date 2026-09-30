@@ -12,22 +12,33 @@
   POST /v1/platform/{access}/subscription）：subscribed / renewed → onboard；
   cancelled / auth_revoked → 取消订购（revoke）+ 系统事件 shop.purged；
   按平台的事件时间（SubscriptionEvent.at）排序：这家店已经处理过不早于它的订购事件（现在这份授权的
-  ShopAuth.granted_at、清理记录 shop.purged 的 event_at），它就是晚到或重推的旧事件，什么都不做
-  （ignored）——旧的取消订购不会删掉之后重新订购的店铺，旧的开通不会盖掉新令牌，也不会把取消之前的
-  授权写回来。比较和写入在同一次写方闸门里做（开通在 exclusive 里；取消订购在 revoke_shop 的闸门里
+  ShopAuth.granted_at、清理记录 shop.purged 的 event_at；开通 / 续订还要比开始清理的标记
+  shop.purge_started 的 event_at），它就是晚到或重推的旧事件，什么都不做（ignored）——旧的取消订购
+  不会删掉之后重新订购的店铺，旧的开通不会盖掉新令牌，也不会把取消之前（或清理到一半）的授权写回来。
+  取消订购不比开始清理的标记：清理没做完时平台重推的取消照样接着删。
+  比较和写入在同一次写方闸门里做（开通在 exclusive 里；取消订购在 revoke_shop 的闸门里
   判断、清理、写 shop.purged），期间插不进这家店的别的订购事件；
 - revoke：取消订购（AssistService.revoke_shop：删令牌、停止处理、删除该店铺在本单元的全部数据）
   + 系统事件 shop.purged（shop_id 为空，detail 只有店铺 ID、原因、各项删除条数和 event_at；清理之后
   还在，AuditLog.list_system_events 读）。event_at 是触发清理的平台事件时间；不是平台事件触发的
   （运维取消订购、过期清理）用删掉的那份授权的开通事件时间（只比平台时间和平台时间：挡住那次开通
-  和更早的重推，之后平台真有新的开通照样开通），不知道时用开始清理的时间；
-- purge_expired：授权过期超过 TenancyConfig.purge_after_expiry_days 的店铺 → revoke
-  （原因 expired；是否还过期在写方闸门里再确认）；dry_run 只列出、不删；
+  和更早的重推，之后平台真有新的开通照样开通）；令牌已经删了（接着做上一次没做完的清理）时沿用
+  那次开始清理的标记里的 event_at；都不知道时用开始清理的时间；
+- 开始清理的标记 shop.purge_started（系统事件，detail 只有店铺 ID、原因和 event_at）：在写方闸门里、
+  判断通过之后、删令牌之前写。之后没有这家店的 shop.purged、令牌也不在了，就是没做完的清理（中途
+  出错、进程被杀；令牌先删，purge_expired 再也列不出它）：unfinished_purges 列出，purge_expired
+  每轮先接着删完（原因、event_at 沿用标记里的；闸门里确认还没有授权，重新开通了的不删）。
+  标记的写入时间晚于这家店之前的标记和清理记录，清理记录不早于自己的标记：按写入时间就分得清
+  哪些做完了（做完的清理记录之前的标记都算做完）；
+- purge_expired：先接着做没做完的清理，再把授权过期超过 TenancyConfig.purge_after_expiry_days 的
+  店铺 → revoke（原因 expired；是否还过期在写方闸门里再确认）；dry_run 只列出过期的、不删；
 - refresh_tokens：令牌续期（rodit.app.token_lifecycle）。
 
 改店铺记录（开通、切换状态）在 exclusive(shop_id)（写方闸门，和取消订购同一把）里做：等在途处理
 做完，读改写之间不会插进同一进程里的其他修改。revoke 自己取写方闸门，不能在任何闸门里调。
-直接调 onboard（运维开通）不比较事件时间（照样记下 granted_at）。
+直接调 onboard（运维开通）不比较事件时间；ShopAuth.granted_at 只记调用方给的平台开通事件时间
+（onboard 的 granted_at，运维从服务市场的订单上抄），不知道时为空、不参与比较——不拿本单元的时钟
+冒充平台时间（否则在它之前发生、之后才送到的取消订购会被当成旧事件）。
 令牌不进日志、审计和异常消息（SecretStr）。
 """
 
@@ -87,6 +98,10 @@ _EVENT_CLOCK_SKEW = timedelta(days=1)
 """找清理记录时按写入时间（本单元的时钟）预先筛选的余量：清理记录的 event_at 是平台的事件时间，
 写入时间在它之后（清理做完才写），只有平台时钟比本单元快时才会早一点。"""
 
+_TICK = timedelta(microseconds=1)
+"""开始清理的标记不晚于这家店之前的标记、清理记录时（同一时刻、别的进程时钟快），标记往后挪的量
+（数据库时间精度是微秒）。"""
+
 STATUS_TRANSITIONS: dict[ShopStatus, frozenset[ShopStatus]] = {
     ShopStatus.TRIAL: frozenset({ShopStatus.ACTIVE, ShopStatus.SUSPENDED}),
     ShopStatus.ACTIVE: frozenset({ShopStatus.SUSPENDED}),
@@ -114,12 +129,27 @@ class SubscriptionOutcome:
 
 class PurgeIncomplete(RoditError):
     """过期清理有店铺没删完（令牌可能已删，数据还在）：purged 是删完的店铺 → 条数，
-    failed 是要用 revoke --shop-id 重试的店铺（purge_shop 是幂等的）。消息里只有店铺 ID。"""
+    failed 是没删完的店铺（下一轮 purge_expired 接着删；也可以用 revoke --shop-id 重试，
+    purge_shop 是幂等的）。消息里只有店铺 ID。"""
 
     def __init__(self, purged: dict[str, dict[str, int]], failed: list[str]) -> None:
         self.purged = purged
         self.failed = failed
-        super().__init__(f"过期清理没有完成的店铺：{', '.join(failed)}（请用 revoke 重试）")
+        super().__init__(
+            f"过期清理没有完成的店铺：{', '.join(failed)}（下一轮接着删，也可以用 revoke 重试）"
+        )
+
+
+@dataclass(frozen=True)
+class UnfinishedPurge:
+    """没做完的清理（见模块说明）：有开始清理的标记 shop.purge_started、之后没有这家店的
+    shop.purged，令牌也不在了。reason 是最近一次标记的原因，event_at 是这些标记里最晚的事件时间，
+    started_at 是最近一次开始清理的时间（写入时间）。"""
+
+    shop_id: str
+    reason: str
+    event_at: datetime
+    started_at: datetime
 
 
 class TenancyService:
@@ -147,18 +177,23 @@ class TenancyService:
         *,
         actor: str = SYSTEM_ACTOR,
         status: ShopStatus | None = None,
+        granted_at: datetime | None = None,
     ) -> Shop:
-        """订购开通 / 续订：写店铺和授权，返回店铺现状。
+        """订购开通 / 续订：写店铺和授权，返回店铺现状。不比较事件时间（运维开通）。
 
         status：新店铺的状态（默认 TRIAL）；已有店铺默认保留原状态，给了就按 STATUS_TRANSITIONS
         切换（不允许的切换抛 ActionNotAllowed）。只能是 TRIAL / ACTIVE。
+        granted_at：这份授权的平台开通 / 续订事件时间（记进 ShopAuth.granted_at，订购事件顺序的
+        高水位）；不知道时不给（为空，不参与比较，见模块说明）。
         平台不对、权限超出本阶段或缺 MVP 必需的权限、不是开通 / 续订事件都抛 ValueError，
         什么都不写。
         """
         actor = _require_actor(actor)
         self._check_grant(event, status)
         with self._exclusive(event.shop_id):
-            shop, created = self._onboard_locked(event, actor=actor, status=status)
+            shop, created = self._onboard_locked(
+                event, actor=actor, status=status, granted_at=granted_at
+            )
         _log_granted(event, created)
         return shop
 
@@ -171,10 +206,15 @@ class TenancyService:
             raise ValueError("开通时店铺状态只能是 trial 或 active")
 
     def _onboard_locked(
-        self, event: SubscriptionEvent, *, actor: str, status: ShopStatus | None
+        self,
+        event: SubscriptionEvent,
+        *,
+        actor: str,
+        status: ShopStatus | None,
+        granted_at: datetime | None,
     ) -> tuple[Shop, bool]:
         """写店铺和授权：调用方持有这家店的写方闸门，事件已经过 _check_grant。
-        返回 (店铺现状, 是否新建)。"""
+        granted_at 是记进授权的平台开通事件时间（可以为空）。返回 (店铺现状, 是否新建)。"""
         # 模型校验保证开通 / 续订事件带令牌和到期时间
         assert event.access_token is not None and event.expires_at is not None
         shop_id = event.shop_id
@@ -212,7 +252,7 @@ class TenancyService:
                 refresh_token=event.refresh_token,
                 refresh_expires_at=event.refresh_expires_at if has_refresh else None,
                 needs_reauth=False,
-                granted_at=event.at,  # 订购事件顺序的高水位
+                granted_at=granted_at,  # 订购事件顺序的高水位（平台事件时间，可以为空）
             )
         )
         if existing is not None and existing.status != shop.status:
@@ -307,7 +347,9 @@ class TenancyService:
                 if self._superseded(event):
                     _log_stale(event)
                     return SubscriptionOutcome(kind=event.kind, shop_id=shop_id, action="ignored")
-                shop, created = self._onboard_locked(event, actor=PLATFORM_ACTOR, status=None)
+                shop, created = self._onboard_locked(
+                    event, actor=PLATFORM_ACTOR, status=None, granted_at=event.at
+                )
             _log_granted(event, created)
             return SubscriptionOutcome(
                 kind=event.kind, shop_id=shop_id, action="granted", shop=shop
@@ -331,15 +373,23 @@ class TenancyService:
     def _superseded(self, event: SubscriptionEvent) -> bool:
         """这家店已经处理过不早于 event 的订购事件（event 是晚到或重推的旧事件）：现在这份授权的
         开通事件时间（ShopAuth.granted_at），或者清理记录 shop.purged 的 event_at（以前的记录没有，
-        按写入时间）不早于 event.at。只读时间，不解密令牌。调用方持有这家店的写方闸门。"""
+        按写入时间）不早于 event.at。开通 / 续订还要比开始清理的标记 shop.purge_started（做完没做完
+        都算）：清理中途出错、还没接着删完时，那份授权的开通推送晚到也不写回来。取消订购不比标记：
+        没做完的清理，平台重推的取消照样接着删（purge_shop 是幂等的）。
+        只读时间，不解密令牌。调用方持有这家店的写方闸门。"""
         shop_id, at = event.shop_id, event.at
         stamp = self._unit.repos.auth.stamp(shop_id)
         if stamp is not None and stamp.granted_at is not None and stamp.granted_at >= at:
             return True
-        purged = self._unit.repos.audit.list_system_events(
-            action=AuditAction.SHOP_PURGED, since=at - _EVENT_CLOCK_SKEW
+        actions = [AuditAction.SHOP_PURGED]
+        if event.kind in GRANT_KINDS:
+            actions.append(AuditAction.SHOP_PURGE_STARTED)
+        audit = self._unit.repos.audit
+        return any(
+            e.detail.get("shop_id") == shop_id and _purge_event_at(e) >= at
+            for action in actions
+            for e in audit.list_system_events(action=action, since=at - _EVENT_CLOCK_SKEW)
         )
-        return any(e.detail.get("shop_id") == shop_id and _purge_event_at(e) >= at for e in purged)
 
     # ================================================================ 取消订购 / 过期清理
 
@@ -347,7 +397,8 @@ class TenancyService:
         """取消订购：删令牌、停止处理、删除该店铺在本单元的全部数据（AssistService.revoke_shop），
         再写系统事件 shop.purged（清理之后还在；event_at 见模块说明）。返回各项删除条数。
 
-        清理失败时异常向外抛，不写 shop.purged（令牌可能已删；purge_shop 是幂等的，重试即可）。
+        清理失败时异常向外抛，不写 shop.purged（令牌可能已删；开始清理的标记已经写了，令牌删了的
+        下一轮 purge_expired 接着删；purge_shop 是幂等的，也可以直接重试）。
         不能在任何闸门里调（revoke_shop 自己取写方闸门）。"""
         counts = self._purge(shop_id, reason=reason, actor=actor)
         assert counts is not None  # 没有 guard：一定会删
@@ -363,49 +414,67 @@ class TenancyService:
         guard: Callable[[], bool] | None = None,
     ) -> dict[str, int] | None:
         """revoke 的实现。guard 在写方闸门里判断，返回 False 时什么都不删、返回 None；
+        判断通过之后、删令牌之前写开始清理的标记 shop.purge_started（没做完时下一轮接着删）；
         shop.purged 在删完之后、放开闸门之前写：等在闸门外的订购事件一定看得到它。
         event_at：触发清理的平台事件时间；没有时（运维、过期清理）在闸门里、删之前读删掉的那份
-        授权的开通事件时间，不知道时用开始清理的时间（见模块说明）。"""
+        授权的开通事件时间；令牌已经删了时沿用没做完的清理的 event_at；都不知道时用开始清理的时间
+        （见模块说明）。"""
         actor = _require_actor(actor)
         reason = (reason or "").strip()
         if not reason:
             raise ValueError("取消订购要写明原因")
         started = self._unit.clock.now()
-        marks: list[datetime] = []  # 这次清理记下的 event_at（在闸门里定）
+        marks: list[tuple[datetime, datetime]] = []  # (event_at, 标记的写入时间)，在闸门里定
 
         def checked() -> bool:
             if guard is not None and not guard():
                 return False
+            markers, purged = self._purge_history(shop_id)
+            last = max((e.created_at for e in purged), default=None)
             if event_at is not None:
-                marks.append(event_at)
+                mark = event_at
             else:
                 stamp = self._unit.repos.auth.stamp(shop_id)
-                granted = stamp.granted_at if stamp is not None else None
-                marks.append(granted or started)
+                if stamp is not None:
+                    mark = stamp.granted_at or started
+                else:  # 令牌已经删了：接着做没做完的清理，沿用它的事件时间
+                    pending = _unfinished(markers, last)
+                    mark = max((_purge_event_at(m) for m in pending), default=started)
+            # 写入时间晚于这家店之前所有的标记和清理记录（别的进程时钟快、同一时刻都不影响判断）
+            latest = max((e.created_at for e in (*markers, *purged)), default=None)
+            now = self._unit.clock.now()
+            marked_at = now if latest is None or now > latest else latest + _TICK
+            self._record_system(
+                AuditAction.SHOP_PURGE_STARTED,
+                actor,
+                marked_at,
+                {"shop_id": shop_id, "reason": reason, "event_at": mark.isoformat()},
+            )
+            marks.append((mark, marked_at))
+            # 删令牌之前留一行日志：清理中途进程被杀时，日志里也查得到是哪家店
+            logger.info("开始取消订购 / 清理店铺 %s（%s）", shop_id, reason)
             return True
 
         def record(counts: dict[str, int]) -> None:
-            effective_at = marks[-1] if marks else (event_at or started)
-            self._unit.repos.audit.record(
-                AuditEvent(
-                    shop_id=None,  # 系统事件：店铺的审计已经删了，这条要留下来
-                    actor=actor,
-                    action=AuditAction.SHOP_PURGED,
-                    detail={
-                        "shop_id": shop_id,
-                        "reason": reason,
-                        "counts": dict(counts),
-                        "event_at": effective_at.isoformat(),
-                    },
-                    created_at=self._unit.clock.now(),
-                )
+            mark, marked_at = marks[-1]  # revoke_shop 删之前一定调过 guard（checked）
+            self._record_system(
+                AuditAction.SHOP_PURGED,
+                actor,
+                max(self._unit.clock.now(), marked_at),  # 不早于自己的标记
+                {
+                    "shop_id": shop_id,
+                    "reason": reason,
+                    "counts": dict(counts),
+                    "event_at": mark.isoformat(),
+                },
             )
 
         try:
             result = self._revoke(shop_id, guard=checked, on_purged=record)
         except Exception as exc:
             logger.error(
-                "取消订购没有完成（%s）：店铺 %s，请重试（清理是幂等的）",
+                "取消订购没有完成（%s）：店铺 %s（令牌已删的下一轮过期清理接着删；也可以重试，"
+                "清理是幂等的）",
                 type(exc).__name__,
                 shop_id,
             )
@@ -427,22 +496,77 @@ class TenancyService:
             if expires_at < cutoff
         ]
 
+    def unfinished_purges(self) -> list[UnfinishedPurge]:
+        """没做完的清理（见模块说明），按店铺 ID 排序：开始清理的标记之后没有这家店的清理记录，
+        令牌也不在了。重新有了授权的店铺（重新开通、续订，或者令牌根本没删掉）不算：还过期的由
+        purge_expired 照常按过期清理。只读系统事件和授权的版本，不解密令牌。"""
+        audit = self._unit.repos.audit
+        markers = audit.list_system_events(action=AuditAction.SHOP_PURGE_STARTED)
+        if not markers:
+            return []
+        purged = audit.list_system_events(
+            action=AuditAction.SHOP_PURGED, since=markers[0].created_at
+        )
+        last: dict[str, datetime] = {}
+        for done in purged:
+            shop_id = done.detail.get("shop_id")
+            if isinstance(shop_id, str):
+                last[shop_id] = max(done.created_at, last.get(shop_id, done.created_at))
+        by_shop: dict[str, list[AuditEvent]] = {}
+        for marker in markers:
+            shop_id = marker.detail.get("shop_id")
+            if isinstance(shop_id, str):
+                by_shop.setdefault(shop_id, []).append(marker)
+        out: list[UnfinishedPurge] = []
+        for shop_id, shop_markers in sorted(by_shop.items()):
+            found = _unfinished(shop_markers, last.get(shop_id))
+            if not found or self._unit.repos.auth.stamp(shop_id) is not None:
+                continue
+            newest = found[-1]
+            out.append(
+                UnfinishedPurge(
+                    shop_id=shop_id,
+                    reason=str(newest.detail.get("reason") or PURGE_REASON_EXPIRED),
+                    event_at=max(_purge_event_at(m) for m in found),
+                    started_at=newest.created_at,
+                )
+            )
+        return out
+
     def purge_expired(
         self, *, now: datetime | None = None, dry_run: bool = False
     ) -> dict[str, dict[str, int]]:
-        """授权过期超过宽限期的店铺：取消订购并删除数据（原因 expired）。返回 店铺 → 各项删除条数
-        （dry_run 时只列出店铺，条数为空）。
+        """先接着做没做完的清理（unfinished_purges；原因、event_at 沿用标记里的），再把授权过期超过
+        宽限期的店铺取消订购并删除数据（原因 expired）。返回 店铺 → 各项删除条数
+        （dry_run 时只列出过期的店铺，条数为空，什么都不删）。
 
-        删之前逐店在写方闸门里再确认一次还过期（列出之后续期成功、重新授权了的不删；确认和删除
-        之间插不进同一进程里的开通）。有店铺没删完时其余照删，最后抛 PurgeIncomplete
-        （带上删完的和没删完的）。"""
+        删之前逐店在写方闸门里再确认一次：没做完的清理确认还没有授权（期间重新开通了的不删），
+        过期的确认还过期（列出之后续期成功、重新授权了的不删）；确认和删除之间插不进同一进程里的
+        开通。有店铺没删完时其余照删，最后抛 PurgeIncomplete（带上删完的和没删完的）。"""
         now = now or self._unit.clock.now()
-        due = self.expired_shops(now=now)
         if dry_run:
-            return {shop_id: {} for shop_id in due}
-        cutoff = self._purge_cutoff(now)
+            return {shop_id: {} for shop_id in self.expired_shops(now=now)}
         purged: dict[str, dict[str, int]] = {}
         failed: list[str] = []
+        for unfinished in self.unfinished_purges():
+            shop_id = unfinished.shop_id
+            try:
+                counts = self._purge(
+                    shop_id,
+                    reason=unfinished.reason,
+                    actor=SYSTEM_ACTOR,
+                    event_at=unfinished.event_at,
+                    guard=lambda s=shop_id: self._unit.repos.auth.stamp(s) is None,
+                )
+            except Exception:  # noqa: BLE001 — revoke 已记日志；其余店铺照删
+                failed.append(shop_id)
+                continue
+            if counts is None:
+                logger.info("接着清理：店铺 %s 又有授权了（重新开通），不删", shop_id)
+                continue
+            purged[shop_id] = counts
+        due = self.expired_shops(now=now)
+        cutoff = self._purge_cutoff(now)
         for shop_id in due:
             try:
                 counts = self._purge(
@@ -499,6 +623,23 @@ class TenancyService:
             AuditEvent(shop_id=shop_id, actor=actor, action=action, detail=detail, created_at=now)
         )
 
+    def _record_system(
+        self, action: AuditAction, actor: str, at: datetime, detail: dict[str, Any]
+    ) -> None:
+        """系统事件（shop_id 为空）：店铺的审计会被清理删掉，这些要留下来。"""
+        self._unit.repos.audit.record(
+            AuditEvent(shop_id=None, actor=actor, action=action, detail=detail, created_at=at)
+        )
+
+    def _purge_history(self, shop_id: str) -> tuple[list[AuditEvent], list[AuditEvent]]:
+        """这家店开始清理的标记和清理记录（按写入时间升序）。"""
+        audit = self._unit.repos.audit
+        markers, purged = (
+            [e for e in audit.list_system_events(action=a) if e.detail.get("shop_id") == shop_id]
+            for a in (AuditAction.SHOP_PURGE_STARTED, AuditAction.SHOP_PURGED)
+        )
+        return markers, purged
+
 
 def _purge_event_at(record: AuditEvent) -> datetime:
     """清理记录对应的事件时间：detail 里的 event_at；以前的记录没有，按写入时间。"""
@@ -509,6 +650,12 @@ def _purge_event_at(record: AuditEvent) -> datetime:
         except ValueError:
             pass
     return record.created_at
+
+
+def _unfinished(markers: list[AuditEvent], last_purged: datetime | None) -> list[AuditEvent]:
+    """一家店开始清理的标记里还没做完的：写入时间晚于这家店最近一条清理记录（清理记录不早于
+    自己的标记，新的标记晚于之前的标记和清理记录，见 _purge）。"""
+    return [m for m in markers if last_purged is None or m.created_at > last_purged]
 
 
 def _log_granted(event: SubscriptionEvent, created: bool) -> None:
@@ -550,4 +697,5 @@ __all__ = [
     "SubscriptionAction",
     "SubscriptionOutcome",
     "TenancyService",
+    "UnfinishedPurge",
 ]

@@ -137,6 +137,7 @@ def test_new_audit_actions_and_constants():
         "AUTH_REFRESH_FAILED": "auth.refresh_failed",
         "SHOP_STATUS_CHANGED": "shop.status_changed",
         "SHOP_PURGED": "shop.purged",
+        "SHOP_PURGE_STARTED": "shop.purge_started",
         "TENANT_VIOLATION": "tenant.violation",
         "ROLLOUT_INCIDENT": "shop.rollout_incident",
         "COMPLIANCE_FLAG": "compliance.flag",
@@ -146,7 +147,7 @@ def test_new_audit_actions_and_constants():
     for name, value in expected.items():
         assert AuditAction[name].value == value
     assert len({a.value for a in AuditAction}) == len(AuditAction)  # 取值不重复
-    assert SYSTEM_EVENT_ACTIONS == {"shop.purged", "eval.verdict"}
+    assert SYSTEM_EVENT_ACTIONS == {"shop.purged", "shop.purge_started", "eval.verdict"}
     assert (DEGRADED_TENANT_ISOLATION, DEGRADED_BUDGET, LATENCY_SINCE_RECEIVED) == (
         "tenant_isolation",
         "budget",
