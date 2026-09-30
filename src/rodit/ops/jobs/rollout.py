@@ -17,6 +17,9 @@
         扫描一周实际发出去的文字（默认上一个完整周；feedback.compliance），每家店写一条
         compliance.flag 审计：计数、规则名、推荐 / 消息 ID，没有文字。命中的是疑似违规（候选），
         由复核人员逐条确认或标记误报（POST rollout/compliance-reviews），确认的才算门槛不通过。
+        不拿租约、和 serve 同时跑：扫描开始之后开始清理（shop.purge_started）的店铺这次不写
+        （之后重新扫描这一周），写完才发现令牌不在了的删掉这次的写入，写完才发现开始清理、令牌
+        还在的打警告（清理完又重新开通时不能整家店删审计，请核对、重新扫描）。
 
 数据库：RODIT_DATABASE_DSN（应用角色，行级安全按店铺隔离；系统事件在不设店铺范围的事务里读写）；
 acceptance-report、compliance-scan 还要 RODIT_TOKEN_KEY（仓储组装需要，不解密任何令牌）。
@@ -33,7 +36,7 @@ import json
 import logging
 import sys
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -56,6 +59,10 @@ EXIT_BAD_INPUT = 2
 FAR_FUTURE = datetime(9999, 12, 31, tzinfo=UTC)
 """expiring_shop_ids 给一个很远的时间：本单元全部有授权的店铺。"""
 SYSTEM_ACTOR = "system"
+PURGE_CLOCK_MARGIN = timedelta(minutes=5)
+"""compliance-scan 找"扫描期间开始的清理"时往前放的余量：开始清理的标记 shop.purge_started 按 serve
+的时钟写，扫描开始的时间按本任务的时钟取，两台机器的时钟差在这之内（也盖住清理写了标记之后、
+删令牌之前等在途处理的最多 30 秒）。"""
 
 
 def _iso_time(text: str) -> datetime:
@@ -266,9 +273,22 @@ def compliance_command(
     if start >= now:
         raise ValueError(f"{period} 还没开始，不能扫描")
     until = min(end, now)
+    # 本任务不拿租约、和 serve 不共用闸门：扫描期间 serve 可能取消订购 / 清理某家店（清理先写开始
+    # 清理的标记，再删令牌、删数据），甚至清理完之后又重新开通。每家店写之前、写之后各确认一次
+    # 列出店铺之后（按开始扫描的时间，放时钟余量）有没有开始清理它。按整次扫描的开始时间、不按
+    # 轮到这家店的时间：一家大店的清理可能跑好几分钟，轮到它时还在删、读到的是删了一半的数据；
+    # 在这之前开始的清理，删令牌只要等在途处理（最多 30 秒），令牌删了就列不出这家店
+    watch_from = now - PURGE_CLOCK_MARGIN
     shops = _shops(repos)
     for shop in shops:
         weeks = compliance_weeks(repos, config, shop, since=start, until=until)
+        if weeks and _purge_started_since(repos, shop.id, watch_from):
+            # 读到的可能是清理之前的数据（清理完又重新开通时就混进了新订购）：这次不写
+            print(
+                f"{shop.id} 扫描期间开始了取消订购 / 清理：这次不写记录（之后重新扫描这一周）",
+                file=out,
+            )
+            continue
         for week in weeks:
             repos.audit.record(
                 AuditEvent(
@@ -286,15 +306,42 @@ def compliance_command(
                 + (f"（{rules}；等复核人员确认或标记误报）" if rules else ""),
                 file=out,
             )
-        if weeks and repos.auth.stamp(shop.id) is None:  # 不解密令牌
+        if not weeks:
+            continue
+        if repos.auth.stamp(shop.id) is None:  # 不解密令牌
             # 扫描期间 serve 取消订购 / 过期清理了这家店（本任务和 serve 不共用闸门）：清理先删
             # 令牌、后删审计，令牌不在了说明这里的写入可能晚于清理——再删一次这家店的审计，
             # 不留下迟到的记录（§8.4；purge_shop 是幂等的）
             repos.audit.purge_shop(shop.id)
             print(f"{shop.id} 扫描期间被取消订购，已删除这次写入的记录", file=out)
+        elif _purge_started_since(repos, shop.id, watch_from):
+            # 写之前的确认之后才开始清理（写之前、写之后两次确认之间的很小的窗口；serve 和
+            # 本任务的时钟差超过 PURGE_CLOCK_MARGIN 时也可能漏掉），令牌还在：要么清理还没删到
+            # 令牌（它之后删审计，连这次的写入一起删掉），要么已经清理完又重新开通——这次写的
+            # 记录可能来自已删除的数据，但不能整家店删审计（会删掉新订购的记录），只能提示
+            # 核对、重新扫描
+            print(
+                f"警告：{shop.id} 扫描期间开始了取消订购 / 清理（清理完又重新开通时，这次写入的 "
+                "compliance.flag 可能来自已删除的数据），请核对并重新扫描这一周",
+                file=out,
+            )
+            logger.warning(
+                "compliance-scan：店铺 %s 扫描期间开始了清理，这次的记录请核对、重新扫描",
+                shop.id,
+            )
     if not shops:
         print("本单元没有有授权的店铺", file=out)
     return 0
+
+
+def _purge_started_since(repos: Any, shop_id: str, since: datetime) -> bool:
+    """since 之后（写入时间）有没有开始清理这家店（系统事件 shop.purge_started）。"""
+    return any(
+        e.detail.get("shop_id") == shop_id
+        for e in repos.audit.list_system_events(
+            action=AuditAction.SHOP_PURGE_STARTED.value, since=since
+        )
+    )
 
 
 __all__ = [

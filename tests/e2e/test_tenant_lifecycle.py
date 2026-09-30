@@ -5,7 +5,8 @@
   403 → 续订恢复 → 平台代码在进程内推取消订购 → 数据删除、系统事件留下 → 重新开通；
 - 读者探针（502379f 时授权过期照样读平台、只读权限照样写售后）现在都在调平台之前停下；
 - @pytest.mark.pg：同样的生命周期跑在 PostgreSQL（行级安全、令牌加密、跨店只经
-  rodit_auth_expiring 列出到期店铺、清理之后系统事件还读得到）。
+  rodit_auth_expiring 列出到期店铺、清理之后系统事件还读得到）；清理到一半出错 / 进程被杀之后，
+  开始清理的标记让下一轮（重启之后也一样）接着删完，期间重新订购的店铺不删。
 全部是合成数据和合成令牌；平台接口、续期接口、订购推送都是 mock。
 """
 
@@ -29,12 +30,13 @@ from rodit.core.audit import AuditAction
 from rodit.core.config import EngineConfig
 from rodit.core.enums import AfterSaleAction, Platform, ReviewState, ShopStatus
 from rodit.core.errors import AuthExpired
-from rodit.core.models import ShopAuth
+from rodit.core.models import AuditEvent, ShopAuth
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.scopes import MVP_SCOPES
 from rodit.decision import RuleProvider
 from rodit.engine.engine import REASON_SHOP_INACTIVE
 from rodit.ops.bindings import LazySubscriptionHandler
+from rodit.ops.jobs.tenancy import ExpiredPurge
 from rodit.storage import BUSINESS_TABLES, Database
 from rodit.testing.fakes import (
     FakeActionPort,
@@ -255,7 +257,15 @@ def pg_service(e2e_pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AssistServic
         conn.execute(sql.SQL("TRUNCATE {} RESTART IDENTITY").format(tables))
     monkeypatch.setenv("RODIT_TOKEN_KEY", TOKEN_KEY)
     world = build_demo_world()
-    clock = FakeClock(world.now)
+    unit = _pg_unit(e2e_pg_dsn, FakeClock(world.now))
+    seed_unit(unit, world)  # 店铺 A、B
+    return AssistService(unit)
+
+
+def _pg_unit(dsn: str, clock: FakeClock):
+    """连 PostgreSQL 的平台单元（应用角色，受行级安全约束）。再调一次就是"重启"：新的仓储、
+    新的进程内状态，同一个库。"""
+    world = build_demo_world()
     hasher = BuyerRefHasher(TEST_SALT)
     tools = InMemoryToolGateway(world, Platform.TAOBAO)
     unit = build_unit(
@@ -263,7 +273,7 @@ def pg_service(e2e_pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AssistServic
         config=EngineConfig(),
         clock=clock,
         hasher=hasher,
-        repos=postgres_repos(Database(e2e_pg_dsn), clock=clock),  # 应用角色，受行级安全约束
+        repos=postgres_repos(Database(dsn), clock=clock),  # 应用角色，受行级安全约束
         llm=EvidenceEchoLLM(),
         tools=tools,
         adapters=[
@@ -281,8 +291,7 @@ def pg_service(e2e_pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AssistServic
         token_refresher=FakeTokenRefresher(Platform.TAOBAO, clock=clock),
         parse_subscription=FakeSubscriptionParser(Platform.TAOBAO),
     )
-    seed_unit(unit, world)  # 店铺 A、B
-    return AssistService(unit)
+    return unit
 
 
 def _rows(dsn: str, shop_id: str) -> dict[str, int]:
@@ -425,6 +434,120 @@ def test_replayed_cancel_after_resubscribe_on_postgres(pg_service: AssistService
     result = service.handle_event("B", taobao_event(FAQ_Q, msg_id="pg-r1", seller_id=NEW))
     assert result is not None and result.suggestions[0].text == FAQ_A
     assert len(unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)) == 1
+
+
+class _FailsOnce:
+    """第一次清理时出错（令牌已经删了、这一项之后的数据还在），之后正常。"""
+
+    def __init__(self) -> None:
+        self.failed = False
+
+    def purge_shop(self, shop_id: str) -> int:
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("语句超时（模拟）")
+        return 0
+
+
+def _expire_on_pg(service: AssistService, shop_id: str, days: float) -> None:
+    unit = service.unit
+    auth = unit.repos.auth.get(shop_id)
+    expired = unit.clock.now() - timedelta(days=days)
+    unit.repos.auth.save(auth.model_copy(update={"expires_at": expired}))
+
+
+@pytest.mark.pg
+def test_resubscribe_after_a_failed_expiry_purge_survives_the_next_round_on_postgres(
+    pg_service: AssistService, e2e_pg_dsn: str
+):
+    """PostgreSQL：过期清理删了令牌之后出错（每个仓储各自提交，令牌删除已经落库）；商家随后
+    重新订购（平台推送照常开通），下一轮过期清理不删新授权和新数据；被删的那份授权的开通推送
+    晚到，照样忽略。"""
+    service = pg_service
+    unit = service.unit
+    clock = unit.clock
+    handle = service.tenancy.handle_subscription
+    parse = unit.parse_subscription
+    grant = parse(subscription_push("subscribed", SHOP_A, at=clock.now(), access_token="tok-pg-t0"))
+    assert handle(grant).action == "granted"
+    _expire_on_pg(service, SHOP_A, 45)
+    unit.extra_purgers.append(_FailsOnce())
+    job = ExpiredPurge(service)
+    assert job() is False
+    assert unit.repos.auth.stamp(SHOP_A) is None
+    assert handle(grant).action == "ignored"  # 被删的那份授权的开通推送晚到
+    [pending] = service.tenancy.unfinished_purges()
+    assert (pending.shop_id, pending.reason, pending.event_at) == (SHOP_A, "expired", grant.at)
+
+    clock.advance(hours=1)
+    resub = parse(
+        subscription_push("subscribed", SHOP_A, at=clock.now(), access_token="tok-pg-resub")
+    )
+    assert handle(resub).action == "granted"
+    service.console.create_faq(SHOP_A, question=FAQ_Q, answer=FAQ_A, merchant=MERCHANT)
+    for _ in range(2):
+        clock.advance(hours=6)
+        assert job() is True
+    assert unit.auth.is_authorized(SHOP_A)
+    assert unit.repos.auth.get(SHOP_A).access_token.get_secret_value() == "tok-pg-resub"
+    assert _rows(e2e_pg_dsn, SHOP_A)["shop"] == 1
+    assert unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED) == []
+    assert service.tenancy.unfinished_purges() == []
+    result = service.handle_event("B", taobao_event(FAQ_Q, msg_id="pg-rs1", seller_id=SHOP_A))
+    assert result is not None and result.suggestions[0].text == FAQ_A
+
+
+@pytest.mark.pg
+def test_purge_interrupted_mid_shop_is_finished_after_a_restart_on_postgres(
+    pg_service: AssistService, e2e_pg_dsn: str
+):
+    """PostgreSQL：清理线程在一家店中间被打断（令牌、前几张表已删，后面的表还在，没有
+    shop.purged）；重启（新的单元和服务，同一个库）之后第一轮过期清理接着删完，写 shop.purged。"""
+    service = pg_service
+    unit = service.unit
+    _expire_on_pg(service, SHOP_A, 45)
+    unit.repos.audit.record(
+        AuditEvent(
+            shop_id=SHOP_A,
+            actor="kf_pg01",
+            action=AuditAction.FEEDBACK_SENT,
+            detail={},
+            created_at=unit.clock.now(),
+        )
+    )
+    before = _rows(e2e_pg_dsn, SHOP_A)
+    assert before["audit_log"] > 0
+
+    class Killed(BaseException):
+        """进程被杀（模拟）：之后的代码（记日志、写清理记录）一行都没跑。"""
+
+    real_purge = unit.repos.feedback.purge_shop
+
+    def killed(shop_id: str) -> int:
+        raise Killed
+
+    unit.repos.feedback.purge_shop = killed  # type: ignore[method-assign]
+    with pytest.raises(Killed):
+        ExpiredPurge(service)()
+    unit.repos.feedback.purge_shop = real_purge  # type: ignore[method-assign]
+    left = _rows(e2e_pg_dsn, SHOP_A)
+    assert left["shop_auth"] == 0 and left["shop"] == 0  # 令牌、店铺已删
+    assert left["audit_log"] == before["audit_log"]  # 审计还没删到
+    assert unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED) == []
+
+    restarted = AssistService(_pg_unit(e2e_pg_dsn, FakeClock(unit.clock.now())))
+    assert ExpiredPurge(restarted)() is True
+    assert sum(_rows(e2e_pg_dsn, SHOP_A).values()) == 0
+    [record] = restarted.unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+    assert record.shop_id is None and record.detail["shop_id"] == SHOP_A
+    assert record.detail["reason"] == "expired"
+    # 开始清理的标记：被打断的那次、重启之后接着删的那次各一条，事件时间相同
+    markers = restarted.unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGE_STARTED)
+    assert [m.detail["shop_id"] for m in markers] == [SHOP_A, SHOP_A]
+    assert markers[0].detail["event_at"] == markers[1].detail["event_at"]
+    assert record.detail["event_at"] == markers[0].detail["event_at"]
+    assert restarted.tenancy.unfinished_purges() == []
+    assert _rows(e2e_pg_dsn, SHOP_B)["shop"] == 1
 
 
 @pytest.mark.pg

@@ -688,6 +688,229 @@ def test_expired_shop_with_unreadable_token_is_still_purged(service: AssistServi
     assert list(purged) == [SHOP_A]
 
 
+# ================================================================ 开始清理的标记、没做完的清理
+
+
+class FailsOnce:
+    """第一次清理时抛错（模拟清理到一半失败：令牌已经删了，数据没删完），之后正常。"""
+
+    def __init__(self) -> None:
+        self.failed = False
+
+    def purge_shop(self, shop_id: str) -> int:
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("磁盘满了（模拟）")
+        return 0
+
+
+def _markers(service: AssistService) -> list:
+    return service.unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGE_STARTED)
+
+
+def _grant_a(service: AssistService, **kw) -> SubscriptionEvent:
+    """店铺 A 经平台推送开通（记下平台开通时间 granted_at）。"""
+    grant = _event(service, "subscribed", SHOP_A, **kw)
+    assert _handle(service, grant).action == "granted"
+    return grant
+
+
+def test_purge_writes_a_start_marker_before_deleting_the_token(service: AssistService):
+    """开始清理的标记（系统事件）在写方闸门里、删令牌之前写；做完之后清理记录不早于它。"""
+    unit = service.unit
+    seen: dict[str, object] = {}
+    real_delete = unit.repos.auth.delete
+
+    def delete(shop_id: str) -> bool:
+        seen["markers"] = [m.detail for m in _markers(service)]
+        return real_delete(shop_id)
+
+    unit.repos.auth.delete = delete  # type: ignore[method-assign]
+    cancel = _event(service, "cancelled", SHOP_A)
+    assert _handle(service, cancel).action == "revoked"
+    assert seen["markers"] == [
+        {"shop_id": SHOP_A, "reason": "cancelled", "event_at": cancel.at.isoformat()}
+    ]
+    [marker] = _markers(service)
+    assert marker.shop_id is None and marker.actor == PLATFORM_ACTOR
+    [record] = _purge_records(service)
+    assert record.created_at >= marker.created_at
+    assert service.tenancy.unfinished_purges() == []  # 做完了
+    assert unit.repos.audit.list_events(SHOP_A) == []  # 标记不属于店铺，清理不删它
+
+
+def test_failed_expiry_purge_is_finished_by_the_next_round(service: AssistService):
+    """过期清理删了令牌之后出错（没写 shop.purged，purge_expired 再也列不出它）：unfinished_purges
+    列出来，下一轮 purge_expired 接着删完，原因和 event_at（那份授权的开通时间）沿用。"""
+    unit = service.unit
+    grant = _grant_a(service)  # T0
+    _expire(service, SHOP_A, 40)
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(PurgeIncomplete):
+        service.tenancy.purge_expired()
+    assert unit.repos.auth.stamp(SHOP_A) is None and _purge_records(service) == []
+    assert service.tenancy.expired_shops() == []
+    [pending] = service.tenancy.unfinished_purges()
+    assert (pending.shop_id, pending.reason, pending.event_at) == (
+        SHOP_A,
+        PURGE_REASON_EXPIRED,
+        grant.at,
+    )
+    assert service.tenancy.purge_expired(dry_run=True) == {}  # dry_run 只列过期的，不删
+
+    unit.clock.advance(hours=6)  # R：下一轮
+    purged = service.tenancy.purge_expired()
+    assert list(purged) == [SHOP_A]
+    [record] = _purge_records(service)
+    assert record.detail["reason"] == PURGE_REASON_EXPIRED and record.actor == "system"
+    assert record.detail["event_at"] == grant.at.isoformat()  # 不是重试时的本机时间 R
+    assert service.tenancy.unfinished_purges() == []
+    assert service.tenancy.purge_expired() == {}  # 做完了，不再重试
+
+
+def test_retry_after_a_partial_purge_keeps_the_grant_time_as_event_at(service: AssistService):
+    """复现（修复前）：运维取消订购删了令牌之后出错；重试（revoke 或下一轮）时授权已经不在，
+    清理记录的 event_at 退回重试时的本机时间 R。商家在 T0 和 R 之间真的重新订购了、推送在重试
+    之后才到，就被当成旧事件忽略。现在沿用开始清理的标记里的 T0，照常开通。"""
+    unit = service.unit
+    grant = _grant_a(service)  # T0
+    unit.clock.advance(hours=1)
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(RuntimeError):
+        service.tenancy.revoke(SHOP_A, reason="ops", actor="ops")
+    unit.clock.advance(hours=2)
+    resub = _event(service, "subscribed", SHOP_A, access_token="tok-resub-between")  # P
+    unit.clock.advance(hours=3)
+    service.tenancy.revoke(SHOP_A, reason="ops", actor="ops")  # R：重试
+    [record] = _purge_records(service)
+    assert record.detail["event_at"] == grant.at.isoformat()
+
+    assert _handle(service, resub).action == "granted"  # T0 < P < R，推送在 R 之后才到
+    assert unit.auth.is_authorized(SHOP_A)
+
+
+def test_replayed_grant_between_a_failed_purge_and_its_retry_is_ignored(service: AssistService):
+    """清理删了令牌之后出错、还没接着删完：被删的那份授权（T0）的开通推送晚到，不写回来
+    （开始清理的标记的 event_at 挡住）。"""
+    unit = service.unit
+    grant = _grant_a(service, access_token="tok-before-purge")
+    unit.clock.advance(hours=1)
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(RuntimeError):
+        service.tenancy.revoke(SHOP_A, reason="ops", actor="ops")
+    assert _handle(service, grant).action == "ignored"
+    assert unit.repos.auth.stamp(SHOP_A) is None
+    [pending] = service.tenancy.unfinished_purges()
+    assert (pending.shop_id, pending.reason) == (SHOP_A, "ops")
+
+
+def test_replayed_cancel_after_a_failed_purge_finishes_it(service: AssistService):
+    """取消订购不拿开始清理的标记比：清理没做完时平台重推同一条取消，照常接着删完。"""
+    unit = service.unit
+    cancel = _event(service, "cancelled", SHOP_A)
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(RuntimeError):
+        _handle(service, cancel)
+    assert _handle(service, cancel).action == "revoked"
+    [record] = _purge_records(service)
+    assert record.detail["event_at"] == cancel.at.isoformat()
+    assert service.tenancy.unfinished_purges() == []
+    assert unit.repos.knowledge.get_shop(SHOP_A) is None
+
+
+def test_unfinished_purge_is_not_resumed_once_the_shop_subscribed_again(service: AssistService):
+    """清理没做完、商家随后重新订购：新授权、新数据都不删（列出时不算没做完；列出之后才重新
+    开通的，在写方闸门里确认还没有授权时也不删）。"""
+    unit = service.unit
+    _grant_a(service)
+    _expire(service, SHOP_A, 40)
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(PurgeIncomplete):
+        service.tenancy.purge_expired()
+    listed = service.tenancy.unfinished_purges()
+    assert [p.shop_id for p in listed] == [SHOP_A]
+
+    unit.clock.advance(hours=1)
+    resub = _event(service, "subscribed", SHOP_A, access_token="tok-resubscribed-a")
+    assert _handle(service, resub).action == "granted"  # 晚于那次清理的开通：照常开通
+    _add_faq(service, SHOP_A)
+    assert service.tenancy.unfinished_purges() == []
+
+    unit.clock.advance(hours=6)
+    tenancy = service.tenancy
+    tenancy.unfinished_purges = lambda: listed  # type: ignore[method-assign]  # 列出之后才重新开通
+    assert tenancy.purge_expired() == {}
+    assert unit.auth.is_authorized(SHOP_A)
+    assert unit.repos.auth.get(SHOP_A).access_token.get_secret_value() == "tok-resubscribed-a"
+    assert _purge_records(service) == []
+    assert _ask(service, FAQ_Q, msg_id="m1", shop_id=SHOP_A).suggestions[0].text == FAQ_A
+
+
+def test_marker_at_the_same_instant_as_the_previous_purge_still_counts(service: AssistService):
+    """上一次清理刚做完、同一时刻又清理这家店且失败：新的标记写在上一条清理记录之后，
+    照样算没做完（按写入时间判断，不会被上一条清理记录当成做完）。"""
+    unit = service.unit
+    service.tenancy.revoke(SHOP_A, reason="ops", actor="ops")
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(RuntimeError):
+        service.tenancy.revoke(SHOP_A, reason="again", actor="ops")  # 时钟没走
+    first, second = _markers(service)
+    [record] = _purge_records(service)
+    assert second.created_at > record.created_at >= first.created_at
+    [pending] = service.tenancy.unfinished_purges()
+    assert (pending.shop_id, pending.reason) == (SHOP_A, "again")
+    assert list(service.tenancy.purge_expired()) == [SHOP_A]
+    assert service.tenancy.unfinished_purges() == []
+
+
+def test_marker_from_a_process_with_a_faster_clock_is_closed_by_the_next_round(
+    service: AssistService,
+):
+    """没做完的那次清理是时钟快 10 秒的进程写的标记；接着删的进程时钟慢：它的标记、清理记录
+    照样排在那条标记之后，一轮就做完（不会因为写入时间倒挂一直重试）。"""
+    unit = service.unit
+    slow = unit.clock.now()
+    unit.clock.set(slow + timedelta(seconds=10))  # 时钟快的进程
+    unit.extra_purgers.append(FailsOnce())
+    with pytest.raises(RuntimeError):
+        service.tenancy.revoke(SHOP_A, reason="ops", actor="ops")
+    unit.clock.set(slow)  # 时钟慢的进程接着删
+    assert list(service.tenancy.purge_expired()) == [SHOP_A]
+    first, second = _markers(service)
+    [record] = _purge_records(service)
+    assert record.created_at >= second.created_at > first.created_at
+    assert service.tenancy.unfinished_purges() == []
+    assert service.tenancy.purge_expired() == {}
+
+
+# ================================================================ 运维开通的平台开通时间
+
+
+def test_ops_onboarding_does_not_stamp_local_time_as_the_grant_time(service: AssistService):
+    """复现（修复前）：直接调 onboard（运维开通）把本机时间 N 记成平台开通时间；商家在 N 之前
+    取消订购、推送在 N 之后才到，被当成旧事件忽略，数据留到过期清理（约 60 天）。现在不给
+    granted_at 时不记（不参与比较），这条取消照常删除；给了就按平台开通时间比。"""
+    unit = service.unit
+    service.tenancy.onboard(_event(service), actor="ops")  # N
+    assert unit.repos.auth.stamp(NEW).granted_at is None
+    early_cancel = _event(service, "cancelled", at=unit.clock.now() - timedelta(minutes=10))
+    assert _handle(service, early_cancel).action == "revoked"
+    assert unit.repos.auth.get(NEW) is None and unit.repos.knowledge.get_shop(NEW) is None
+
+    unit.clock.advance(hours=1)
+    p0 = unit.clock.now() - timedelta(minutes=30)  # 服务市场订单上的开通时间
+    service.tenancy.onboard(_event(service), actor="ops", granted_at=p0)
+    assert unit.repos.auth.stamp(NEW).granted_at == p0
+    older = _event(service, "cancelled", at=p0 - timedelta(seconds=1))
+    assert _handle(service, older).action == "ignored"
+    assert unit.auth.is_authorized(NEW)
+    # 平台推送的开通照旧记事件时间
+    unit.clock.advance(hours=1)
+    renewed = _event(service, "renewed")
+    assert _handle(service, renewed).action == "granted"
+    assert unit.repos.auth.stamp(NEW).granted_at == renewed.at
+
+
 def test_audit_never_contains_tokens(service: AssistService):
     service.tenancy.onboard(_event(service, refresh_token=REFRESH))
     service.tenancy.set_status(NEW, ShopStatus.ACTIVE, actor="ops")

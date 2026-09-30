@@ -23,11 +23,12 @@ import pytest
 from ops_support import FakeReadinessDb, FakeServeLease, TestClient, parse_exposition, sample
 from pydantic import SecretStr
 
+from rodit.app import AssistService
 from rodit.app.demo import seed_unit
 from rodit.app.unit import in_memory_repos
 from rodit.core.audit import AuditAction
 from rodit.core.enums import Platform
-from rodit.core.models import ShopAuth
+from rodit.core.models import AuditEvent, ShopAuth
 from rodit.core.scopes import MVP_SCOPES
 from rodit.ops import serve
 from rodit.ops.background import BackgroundRunner, PeriodicJob
@@ -37,7 +38,7 @@ from rodit.ops.jobs import tenancy as tenancy_jobs
 from rodit.ops.serve import build_server, main
 from rodit.ops.settings import ServerSettings
 from rodit.storage.db import MIGRATIONS
-from rodit.testing.fakes import FakeClock
+from rodit.testing.fakes import FakeClock, parse_subscription, subscription_push
 from rodit.testing.fixtures import SHOP_A, SHOP_B, build_demo_world
 
 ALL_VERSIONS = tuple(m.version for m in MIGRATIONS)
@@ -273,7 +274,8 @@ def test_purge_expired_runs_inside_serve_and_clears_serves_cache(local_server):
 
 
 def test_purge_job_retries_shops_that_were_not_fully_purged(local_server, caplog):
-    """没删完的店铺令牌已经删了，purge_expired 下一轮不会再列出：后台任务记着、下一轮重试。"""
+    """没删完的店铺令牌已经删了，过期清理再也列不出它：开始清理的标记还在（没有清理记录），
+    下一轮接着删完；删完之后不再重试。"""
     server, _, _, _, _, lease = local_server
     lease.acquire()
     unit = server.unit
@@ -298,6 +300,132 @@ def test_purge_job_retries_shops_that_were_not_fully_purged(local_server, caplog
     assert record.detail["shop_id"] == SHOP_A
     assert server.background.run_once("purge_expired") == "ok"  # 不再重试
     assert len(unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)) == 1
+
+
+class _Flaky:
+    """清理到一半出错（令牌已经删了），on 为 False 之后正常。"""
+
+    def __init__(self) -> None:
+        self.on = True
+
+    def purge_shop(self, shop_id: str) -> int:
+        if self.on:
+            raise RuntimeError("模拟清理失败")
+        return 0
+
+
+def _push(server: Any, kind: str, shop_id: str, **kw: Any) -> str:
+    """平台推订购事件（serve 的同一个 AssistService），返回 granted / revoked / ignored。"""
+    kw.setdefault("at", server.unit.clock.now())
+    if kind in ("subscribed", "renewed"):
+        kw.setdefault("access_token", "tok-bg-push-synthetic")
+    event = parse_subscription(subscription_push(kind, shop_id, **kw))
+    return server.service.tenancy.handle_subscription(event).action
+
+
+@pytest.mark.parametrize("fixed", [True, False], ids=["purger-fixed", "purger-still-broken"])
+def test_purge_job_does_not_wipe_a_shop_that_subscribed_again_after_a_failed_round(
+    local_server, fixed
+):
+    """复现（修复前）：过期清理删了令牌之后出错，后台任务记下店铺、下一轮不加判断地按取消订购重删；
+    期间商家重新订购（平台推送照常开通），下一轮把新授权和新数据一起删掉，清理记录的 event_at
+    还是新授权的开通时间，平台重推这次订购也被忽略。清理一直失败时每轮都删一次。
+    现在下一轮只接着删令牌还不在的店铺（写方闸门里确认），重新开通的不删。"""
+    server, _, _, clock, _, lease = local_server
+    lease.acquire()
+    unit = server.unit
+    _expire(server, SHOP_A, 45)
+    flaky = _Flaky()
+    unit.extra_purgers.append(flaky)
+    assert server.background.run_once("purge_expired") == "error"
+    assert unit.repos.auth.get(SHOP_A) is None  # 令牌已删
+
+    clock.advance(hours=1)
+    resub_at = clock.now()
+    assert _push(server, "subscribed", SHOP_A, access_token="tok-bg-resub-synthetic") == "granted"
+    flaky.on = not fixed
+    for _ in range(2):  # 之后的每一轮
+        clock.advance(hours=6)
+        assert server.background.run_once("purge_expired") == "ok"
+        assert unit.auth.is_authorized(SHOP_A)
+        assert unit.repos.knowledge.get_shop(SHOP_A) is not None
+    auth = unit.repos.auth.get(SHOP_A)
+    assert auth.access_token.get_secret_value() == "tok-bg-resub-synthetic"
+    assert auth.granted_at == resub_at
+    assert unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED) == []
+    assert server.service.tenancy.unfinished_purges() == []
+
+
+def test_purge_job_retry_keeps_the_grant_time_of_the_deleted_auth(local_server):
+    """复现（修复前）：下一轮重试时授权已经删了，清理记录的 event_at 退回重试时的本机时间 R；
+    商家在那之前（T0 之后）真的重新订购、推送在重试之后才到，被当成旧事件忽略。
+    现在沿用第一次开始清理时记下的 T0。"""
+    server, _, _, clock, _, lease = local_server
+    lease.acquire()
+    unit = server.unit
+    granted_at = clock.now()  # T0：平台开通
+    assert _push(server, "subscribed", SHOP_A, access_token="tok-bg-t0-synthetic") == "granted"
+    _expire(server, SHOP_A, 45)
+    flaky = _Flaky()
+    unit.extra_purgers.append(flaky)
+    assert server.background.run_once("purge_expired") == "error"
+    clock.advance(hours=5)
+    resub_at = clock.now()  # P：T0 < P < R
+    flaky.on = False
+    clock.advance(hours=1)
+    assert server.background.run_once("purge_expired") == "ok"  # R：重试
+    [record] = unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+    assert record.detail["shop_id"] == SHOP_A and record.detail["reason"] == "expired"
+    assert record.detail["event_at"] == granted_at.isoformat()
+    # P 的订购推送在重试之后才到：照常开通
+    assert _push(server, "subscribed", SHOP_A, at=resub_at) == "granted"
+    assert unit.auth.is_authorized(SHOP_A)
+
+
+def test_purge_killed_mid_shop_is_finished_after_a_restart(local_server):
+    """复现（修复前）：serve 停止时清理线程被杀在一家店中间（令牌已删、数据还在、没有清理记录），
+    后台任务的重试记录只在内存里，重启之后 purge_expired 再也列不出这家店，数据一直留着。
+    现在开始清理的标记在删令牌之前写进库，重启之后第一轮接着删完。"""
+    server, _, _, _, _, lease = local_server
+    lease.acquire()
+    unit = server.unit
+    _expire(server, SHOP_A, 45)
+    unit.repos.audit.record(
+        AuditEvent(
+            shop_id=SHOP_A,
+            actor="kf_bg01",
+            action=AuditAction.FEEDBACK_SENT,
+            detail={},
+            created_at=unit.clock.now(),
+        )
+    )
+
+    class Killed(BaseException):
+        """进程被杀（模拟）：清理线程没了，之后的代码（记日志、记重试）一行都没跑。"""
+
+    real_purge = unit.repos.feedback.purge_shop
+    killed: list[str] = []
+
+    def killed_once(shop_id: str) -> int:
+        if not killed:
+            killed.append(shop_id)
+            raise Killed
+        return real_purge(shop_id)
+
+    unit.repos.feedback.purge_shop = killed_once  # type: ignore[method-assign]
+    with pytest.raises(Killed):
+        tenancy_jobs.ExpiredPurge(server.service)()
+    assert unit.repos.auth.get(SHOP_A) is None  # 令牌已删
+    assert unit.repos.audit.list_events(SHOP_A)  # 审计还没删到
+
+    # 重启：新的 AssistService、新的后台任务（内存里什么都没有），同一份数据
+    restarted = AssistService(unit)
+    assert tenancy_jobs.ExpiredPurge(restarted)() is True
+    [record] = unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+    assert record.detail["shop_id"] == SHOP_A and record.detail["reason"] == "expired"
+    assert unit.repos.audit.list_events(SHOP_A) == []
+    assert unit.repos.knowledge.get_shop(SHOP_A) is None
+    assert restarted.tenancy.unfinished_purges() == []
 
 
 def test_refresh_tokens_runs_inside_serve(local_server, caplog):

@@ -16,18 +16,21 @@
 
     onboard-shop --shop-id ID --platform P --scopes a,b,c (--token-stdin | --token-file FILE)
                  [--category C] [--expires-at ISO | --expires-days N] [--refresh-expires-at ISO]
-                 [--status trial|active]
+                 [--status trial|active] [--granted-at ISO]
         开通店铺：核对平台是本单元的平台、权限不超出 tenancy.onboarding_phase、不缺 MVP 必需的权限，
         写店铺（新店铺默认 trial）和加密的授权，审计 auth.granted。
         令牌只从标准输入或文件读（第一行 access_token，可选的第二行是续期令牌），不进命令行参数、
         不回显、不进日志；--expires-at / --expires-days 是 access_token 的到期时间（默认 30 天后；
-        --expires-days 要在 (0, 3650] 之内）。
+        --expires-days 要在 (0, 3650] 之内）。--granted-at 是这份授权的平台开通 / 续订事件时间
+        （服务市场订单上的，不能晚于现在）：记进授权，之后比它早的订购推送算旧事件；不给时不记
+        （不拿本机时间冒充平台时间：在它之前发生、之后才送到的取消订购照常处理）。
     refresh-tokens
         给 tenancy.refresh_ahead_hours 之内到期的店铺续期（rodit.app.token_lifecycle），只打印各结果
         的店铺数。
     purge-expired [--dry-run]
-        授权过期超过 tenancy.purge_after_expiry_days 的店铺：取消订购、删除数据、留下系统事件
-        shop.purged。只打印店铺数和删除条数；--dry-run 只数、不删。
+        先接着删完上次没删完的店铺（开始清理的标记 shop.purge_started 之后没有 shop.purged、
+        令牌已删；重新开通了的不删），再清理授权过期超过 tenancy.purge_after_expiry_days 的店铺：
+        取消订购、删除数据、留下系统事件 shop.purged。只打印店铺数和删除条数；--dry-run 只数、不删。
     revoke --shop-id ID [--reason TEXT]
         取消订购（商家线下提出、平台推送丢了时用）：删令牌、删除该店铺在本单元的全部数据，
         留下 shop.purged（原因默认 ops）。令牌文件里这家店的访问令牌要另外删掉。
@@ -135,6 +138,11 @@ def register(subparsers: Any) -> None:
         "--status",
         choices=[ShopStatus.TRIAL.value, ShopStatus.ACTIVE.value],
         help="新店铺的状态（默认 trial）；已有店铺不给时保留原状态",
+    )
+    onboard.add_argument(
+        "--granted-at",
+        type=_iso_time,
+        help="这份授权的平台开通 / 续订事件时间（服务市场订单上的，ISO 8601）；不给时不记",
     )
     subparsers.add_parser("refresh-tokens", help="§8.4 给即将到期的店铺授权续期")
     purge = subparsers.add_parser("purge-expired", help="§8.4 删除授权过期超过宽限期的店铺数据")
@@ -254,11 +262,15 @@ def _onboard(
         expires_at = now + timedelta(days=days)  # 范围在 _check_args 里核对过
     if expires_at <= now:
         raise ValueError("access_token 的到期时间已经过了")
+    # 平台开通事件时间：只记运维给的（订单上的），不给时为空——本机时间不是平台时间
+    granted_at = args.granted_at
+    if granted_at is not None and granted_at > now:
+        raise ValueError("--granted-at 不能晚于现在（是平台已经发生的开通 / 续订事件的时间）")
     event = SubscriptionEvent(
         kind="subscribed",
         shop_id=args.shop_id,
         platform=Platform(args.platform),
-        at=now,
+        at=granted_at or now,
         scopes=_scopes(args.scopes),
         access_token=access_token,
         refresh_token=refresh_token,
@@ -267,7 +279,7 @@ def _onboard(
         category=args.category,
     )
     status = ShopStatus(args.status) if args.status else None
-    shop = service.tenancy.onboard(event, actor=OPS_ACTOR, status=status)
+    shop = service.tenancy.onboard(event, actor=OPS_ACTOR, status=status, granted_at=granted_at)
     print(
         f"已开通店铺 {shop.id}（{shop.platform.value}，状态 {shop.status.value}）："
         f"权限 {','.join(sorted(event.scopes))}；"
@@ -321,12 +333,19 @@ def _purge(service: Any, args: argparse.Namespace, out: TextIO) -> int:
         print(
             f"授权过期超过 {days} 天、待清理的店铺：{len(due)} 家（--dry-run，没有删除）", file=out
         )
+        unfinished = service.tenancy.unfinished_purges()
+        if unfinished:
+            print(f"上次没删完、要接着删的店铺：{len(unfinished)} 家", file=out)
         return 0
     try:
         purged = service.tenancy.purge_expired()
     except PurgeIncomplete as exc:
         _print_purged(out, days, exc.purged)
-        print(f"没有删完的店铺：{len(exc.failed)} 家（店铺 ID 见日志，用 revoke 重试）", file=out)
+        print(
+            f"没有删完的店铺：{len(exc.failed)} 家（店铺 ID 见日志；下次 purge-expired 或 serve 的"
+            "过期清理接着删）",
+            file=out,
+        )
         logger.error("过期清理没有删完的店铺：%s", ", ".join(exc.failed))
         return EXIT_FAILURE
     _print_purged(out, days, purged)
@@ -381,44 +400,30 @@ def refresh_tokens_once(service: Any) -> bool:
 class ExpiredPurge:
     """serve 后台任务：过期清理一轮（TenancyService.purge_expired）。
 
-    没删完的店铺令牌已经删了，purge_expired 下一轮不会再列出它们：这里记下来，下一轮先按
-    取消订购重试（清理是幂等的），删完为止；进程重启会丢掉这份记录，所以日志里写明店铺 ID。"""
+    没删完的店铺（令牌已删、数据还在）不在这里记：清理在删令牌之前写了开始清理的标记
+    shop.purge_started，purge_expired 每轮先接着删完这些（进程重启、清理中途被杀之后也一样），
+    已经重新开通的店铺不删（在写方闸门里确认）。"""
 
     def __init__(self, service: Any) -> None:
         self._service = service
-        self._retry: set[str] = set()
-
-    @property
-    def pending(self) -> frozenset[str]:
-        return frozenset(self._retry)
 
     def __call__(self) -> bool:
-        from rodit.app.tenancy import PURGE_REASON_EXPIRED, SYSTEM_ACTOR, PurgeIncomplete
+        from rodit.app.tenancy import PurgeIncomplete
 
-        tenancy = self._service.tenancy
-        purged: dict[str, Mapping[str, int]] = {}
-        for shop_id in sorted(self._retry):
-            try:
-                purged[shop_id] = tenancy.revoke(
-                    shop_id, reason=PURGE_REASON_EXPIRED, actor=SYSTEM_ACTOR
-                )
-            except Exception:  # noqa: BLE001 — revoke 已记日志；留到下一轮
-                continue
-            self._retry.discard(shop_id)
+        failed: list[str] = []
         try:
-            purged.update(tenancy.purge_expired())
+            purged: Mapping[str, Mapping[str, int]] = self._service.tenancy.purge_expired()
         except PurgeIncomplete as exc:
-            purged.update(exc.purged)
-            self._retry.update(exc.failed)
+            purged, failed = exc.purged, exc.failed
         if purged:
             total = sum(sum(c.values()) for c in purged.values())
             logger.info(
                 "过期清理（serve 后台任务）：%d 家店铺，共删除 %d 条记录", len(purged), total
             )
-        if self._retry:
+        if failed:
             logger.error(
-                "过期清理（serve 后台任务）没有删完的店铺：%s（下一轮重试）",
-                ", ".join(sorted(self._retry)),
+                "过期清理（serve 后台任务）没有删完的店铺：%s（下一轮接着删）",
+                ", ".join(sorted(failed)),
             )
             return False
         return True

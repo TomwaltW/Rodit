@@ -52,6 +52,11 @@ class AuditAction(StrEnum):
     # 系统事件（shop_id 为空）：取消订购 / 过期清理之后留下的记录，detail 只有店铺 ID、原因和
     # 删除条数；店铺的数据删掉了，这条记录还在（AuditLog.list_system_events 读）
     SHOP_PURGED = "shop.purged"
+    # 系统事件（shop_id 为空）：开始取消订购 / 清理（在写方闸门里、删令牌之前写），detail 只有
+    # 店铺 ID、原因和 event_at。之后没有 shop.purged 的就是没做完的清理（中途出错、进程被杀）：
+    # 下一轮过期清理接着删（TenancyService.unfinished_purges）；它的 event_at 也算这家店处理过的
+    # 订购事件时间
+    SHOP_PURGE_STARTED = "shop.purge_started"
     # 串店（§9.2、§12.4 串店检查）：只记在哪一步拦下的，不记任何数据
     TENANT_VIOLATION = "tenant.violation"
     # 上线节奏（§13.4）：复核人员登记的平台违规通知、买家投诉（周、条数，不记原文）
@@ -101,7 +106,11 @@ OPTIONAL_RESULT_DETAIL_KEYS: tuple[str, ...] = (RESULT_BUDGET_EXCEEDED,)
 """engine.result detail 里可能出现、但不是每次都有的键。"""
 
 SYSTEM_EVENT_ACTIONS: frozenset[str] = frozenset(
-    {AuditAction.SHOP_PURGED.value, AuditAction.EVAL_VERDICT.value}
+    {
+        AuditAction.SHOP_PURGED.value,
+        AuditAction.SHOP_PURGE_STARTED.value,
+        AuditAction.EVAL_VERDICT.value,
+    }
 )
 """只以系统事件（shop_id 为空）记录的动作：不属于任何店铺，清理店铺数据时不删。"""
 

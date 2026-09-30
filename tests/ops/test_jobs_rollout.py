@@ -8,11 +8,14 @@ from __future__ import annotations
 import io
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from rodit.app import AssistService
+from rodit.app import rollout as app_rollout
 from rodit.app.demo import build_demo_unit
 from rodit.core.audit import AuditAction, InMemoryAuditSink
 from rodit.core.clock import CST
@@ -29,7 +32,7 @@ from rodit.core.models import AuditEvent, QualityReview, QualityScores, Suggesti
 from rodit.eval.fingerprint import current_fingerprint, verdict_event, verdict_from_report
 from rodit.ops import serve
 from rodit.ops.jobs import rollout as rollout_jobs
-from rodit.testing.fakes import FakeClock, make_message
+from rodit.testing.fakes import FakeClock, make_message, parse_subscription, subscription_push
 from rodit.testing.fixtures import SHOP_A, SHOP_B
 
 NOW = datetime(2026, 9, 30, 12, 0, tzinfo=CST)  # W40 周三
@@ -344,6 +347,146 @@ def test_compliance_scan_removes_its_flags_when_the_shop_is_purged_meanwhile(rep
     assert repos.audit.list_events(SHOP_A, action=AuditAction.COMPLIANCE_FLAG.value) == []
     assert repos.audit.list_events(SHOP_B, action=AuditAction.COMPLIANCE_FLAG.value) != []
     assert f"{SHOP_A} 扫描期间被取消订购" in out.getvalue()
+
+
+def _scan_service() -> AssistService:
+    """serve 那一边：演示单元（店铺 A、B）的 AssistService，店铺 A 上周发出去一条疑似违规的消息。
+    扫描任务和它用同一个时钟（开始清理的标记按 serve 的时钟写）。"""
+    service = AssistService(build_demo_unit(Platform.TAOBAO))
+    unit = service.unit
+    at = unit.clock.now() - timedelta(days=6)  # 上一个完整周（W39）
+    unit.repos.conversations.add_message(
+        make_message("有优惠吗", at=at, conversation_id="conv_cs", msg_id="b_cs")
+    )
+    unit.repos.conversations.add_outgoing(
+        shop_id=SHOP_A,
+        conversation_id="conv_cs",
+        msg_id="out_cs",
+        role=Role.AGENT,
+        text="加我微信 abc123，给您最低价",
+        at=at + timedelta(minutes=1),
+    )
+    return service
+
+
+def _cancel_and_resubscribe(service: AssistService, shop_id: str) -> None:
+    """serve 处理平台推送：取消订购（删掉这家店的数据），马上又重新订购。"""
+    tenancy, clock = service.tenancy, service.unit.clock
+    cancel = parse_subscription(subscription_push("cancelled", shop_id, at=clock.now()))
+    assert tenancy.handle_subscription(cancel).action == "revoked"
+    clock.advance(seconds=1)
+    again = parse_subscription(
+        subscription_push("subscribed", shop_id, at=clock.now(), access_token="tok-scan-again")
+    )
+    assert tenancy.handle_subscription(again).action == "granted"
+
+
+def _scan(service: AssistService) -> tuple[int, str]:
+    out = io.StringIO()
+    unit = service.unit
+    code = rollout_jobs.run(
+        parse("compliance-scan"), {}, repos=unit.repos, clock=unit.clock, out=out
+    )
+    return code, out.getvalue()
+
+
+def test_compliance_scan_skips_a_shop_purged_and_resubscribed_while_it_read(monkeypatch):
+    """复现（修复前）：扫描读完店铺 A 的消息之后，serve 取消订购（删掉 out_cs）又重新开通；
+    扫描只看令牌还在，照样写下来自已删除数据的 compliance.flag（留进新订购的审计里）。
+    现在写之前看到扫描期间开始了清理，这家店这次不写。"""
+    service = _scan_service()
+    unit = service.unit
+    real_weeks = app_rollout.compliance_weeks
+
+    def weeks_then_purge(repos, config, shop, **kw):  # type: ignore[no-untyped-def]
+        found = real_weeks(repos, config, shop, **kw)
+        if shop.id == SHOP_A:
+            _cancel_and_resubscribe(service, SHOP_A)
+        return found
+
+    monkeypatch.setattr(app_rollout, "compliance_weeks", weeks_then_purge)
+    code, out = _scan(service)
+    assert code == 0
+    assert unit.auth.is_authorized(SHOP_A)  # 重新开通了
+    assert unit.repos.audit.list_events(SHOP_A, action=AuditAction.COMPLIANCE_FLAG.value) == []
+    assert unit.repos.audit.list_events(SHOP_B, action=AuditAction.COMPLIANCE_FLAG.value) != []
+    assert f"{SHOP_A} 扫描期间开始了取消订购 / 清理：这次不写记录" in out
+
+
+def test_compliance_scan_warns_when_the_purge_and_resubscribe_land_during_its_writes():
+    """剩下的窗口：写之前的确认之后才开始清理、写之后的确认之前又重新开通——这次写的记录可能
+    来自已删除的数据，又不能整家店删审计（会删掉新订购的记录）：提示这家店要核对、重新扫描。"""
+    service = _scan_service()
+    audit = service.unit.repos.audit
+    original = audit.record
+    fired: list[str] = []
+
+    def purge_then_record(event: AuditEvent) -> None:
+        if (
+            event.shop_id == SHOP_A
+            and event.action == AuditAction.COMPLIANCE_FLAG.value
+            and not fired
+        ):
+            fired.append(event.shop_id)
+            _cancel_and_resubscribe(service, SHOP_A)
+        original(event)
+
+    audit.record = purge_then_record  # type: ignore[method-assign]
+    code, out = _scan(service)
+    assert code == 0 and fired == [SHOP_A]
+    assert f"警告：{SHOP_A} 扫描期间开始了取消订购 / 清理" in out
+    # 重新开通的店铺：不整家店删审计（新订购的开通记录留着）
+    assert service.unit.auth.is_authorized(SHOP_A)
+    assert audit.list_events(SHOP_A, action=AuditAction.AUTH_GRANTED.value) != []
+    assert f"警告：{SHOP_B}" not in out
+
+
+def test_compliance_scan_skips_a_shop_whose_long_purge_began_before_its_turn(monkeypatch):
+    """一家大店的清理跑了好几分钟：扫描店铺 A 时 serve 开始清理店铺 B（写了标记、删了令牌，
+    还没删到消息），10 分钟后轮到 B 时还在删、读到的是删了一半的数据；读完之后清理做完、B 马上
+    重新开通。按轮到 B 的时间往前找标记会漏掉（标记早于它 10 分钟），按整次扫描的开始时间找
+    就不漏：B 这次不写。"""
+    service = _scan_service()
+    unit = service.unit
+    clock = unit.clock
+    knowledge = unit.repos.knowledge
+    real_purge = knowledge.purge_shop
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_purge(shop_id: str) -> int:
+        if shop_id == SHOP_B and not release.is_set():
+            entered.set()
+            assert release.wait(timeout=10)
+        return real_purge(shop_id)
+
+    knowledge.purge_shop = slow_purge  # type: ignore[method-assign]
+    cancel = parse_subscription(subscription_push("cancelled", SHOP_B, at=clock.now()))
+    purging = threading.Thread(target=service.tenancy.handle_subscription, args=(cancel,))
+    real_weeks = app_rollout.compliance_weeks
+
+    def weeks_while_purging(repos, config, shop, **kw):  # type: ignore[no-untyped-def]
+        if shop.id == SHOP_A:
+            purging.start()  # serve 开始清理 B：标记、删令牌，停在删知识库这一步
+            assert entered.wait(timeout=10)
+            clock.advance(minutes=10)
+            return real_weeks(repos, config, shop, **kw)
+        found = real_weeks(repos, config, shop, **kw)  # B 的消息还没删
+        release.set()
+        purging.join(timeout=10)
+        clock.advance(seconds=1)
+        again = parse_subscription(
+            subscription_push("subscribed", SHOP_B, at=clock.now(), access_token="tok-scan-b2")
+        )
+        assert service.tenancy.handle_subscription(again).action == "granted"
+        return found
+
+    monkeypatch.setattr(app_rollout, "compliance_weeks", weeks_while_purging)
+    code, out = _scan(service)
+    assert code == 0 and not purging.is_alive()
+    assert unit.auth.is_authorized(SHOP_B)  # 重新开通了
+    assert unit.repos.audit.list_events(SHOP_B, action=AuditAction.COMPLIANCE_FLAG.value) == []
+    assert unit.repos.audit.list_events(SHOP_A, action=AuditAction.COMPLIANCE_FLAG.value) != []
+    assert f"{SHOP_B} 扫描期间开始了取消订购 / 清理：这次不写记录" in out
 
 
 # ================================================================ PostgreSQL
