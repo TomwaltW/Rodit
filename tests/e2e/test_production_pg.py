@@ -28,6 +28,7 @@ from rodit.core.enums import (
 )
 from rodit.core.errors import AuthExpired
 from rodit.core.pii import BuyerRefHasher
+from rodit.core.scopes import PHASE2_SCOPES
 from rodit.decision import RuleProvider
 from rodit.storage import BUSINESS_TABLES, Database
 from rodit.testing.fakes import FakeActionPort, FakeClock, InMemoryToolGateway
@@ -115,6 +116,9 @@ def test_flows_on_postgres(pg_service: AssistService):
     review = service.review_aftersale(SHOP_A, "as_2001")
     assert review.matched_rules == ["R2"] and review.state == ReviewState.CONFIRM
     version = unit.tools.get_aftersale(SHOP_A, "as_2001").status_version
+    # 这家店申请了写售后权限（二期，§8.4）：客服确认后执行写操作要有 refund.write
+    auth = unit.repos.auth.get(SHOP_A)
+    unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(PHASE2_SCOPES)}))
     done = service.confirm_aftersale(
         SHOP_A,
         "as_2001",

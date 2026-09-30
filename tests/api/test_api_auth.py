@@ -24,6 +24,7 @@ from rodit.api import Principal, StaticTokenAuthenticator, bearer_token, create_
 from rodit.app.demo import taobao_event
 from rodit.core.audit import AuditAction
 from rodit.core.enums import SuggestionStatus
+from rodit.core.scopes import PHASE2_SCOPES
 from rodit.testing.fixtures import AGENT, MANAGER, SHOP_A, SHOP_B
 
 ROUTE_IDS = [r.name for r in SHOP_ROUTES]
@@ -276,6 +277,12 @@ def test_merchant_identity_fields_in_body_are_rejected(api: Api, path: str, body
     assert api.unit.repos.auth.get(SHOP_A) is not None  # 取消订购没有执行
 
 
+def _grant_refund_write(api: Api, shop_id: str = SHOP_A) -> None:
+    """这家店申请了写售后权限（二期，§8.4）：客服确认后执行售后写操作要有 refund.write。"""
+    auth = api.unit.repos.auth.get(shop_id)
+    api.unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(PHASE2_SCOPES)}))
+
+
 def _status_version(api: Api, aftersale_id: str) -> str:
     r = api.post(f"/v1/shops/{SHOP_A}/aftersales/{aftersale_id}/review", "agent_a")
     assert r.status_code == 200
@@ -284,6 +291,7 @@ def _status_version(api: Api, aftersale_id: str) -> str:
 
 def test_r6_confirm_requires_manager_role(api: Api):
     """§7.3.2 R6：金额超过上限必须店长确认。by_manager 只由店长角色推出。"""
+    _grant_refund_write(api)
     version = _status_version(api, "as_2005")
     body = {"action": "agree_return", "expected_status_version": version}
     url = f"/v1/shops/{SHOP_A}/aftersales/as_2005/confirm"
@@ -305,6 +313,7 @@ def test_r6_confirm_requires_manager_role(api: Api):
 
 def test_manager_role_alone_is_not_enough_for_r6(api: Api):
     """店长角色但不在店铺的 manager_ids 里：审核助手照样拒绝（409），不调用平台。"""
+    _grant_refund_write(api)
     version = _status_version(api, "as_2005")
     r = api.post(
         f"/v1/shops/{SHOP_A}/aftersales/as_2005/confirm",
@@ -317,6 +326,7 @@ def test_manager_role_alone_is_not_enough_for_r6(api: Api):
 
 
 def test_agent_confirm_records_the_agent_as_operator_without_manager_flag(api: Api):
+    _grant_refund_write(api)
     version = _status_version(api, "as_2001")  # R2：未发货仅退款，不需要店长
     r = api.post(
         f"/v1/shops/{SHOP_A}/aftersales/as_2001/confirm",

@@ -40,6 +40,7 @@ from rodit.core.enums import (
 from rodit.core.errors import ActionNotAllowed
 from rodit.core.models import aftersale_idempotency_key
 from rodit.core.questions import Q_GROUNDED, Q_PROMISE_RISK
+from rodit.core.scopes import PHASE2_SCOPES
 from rodit.testing.fakes import qa_answers
 from rodit.testing.fixtures import AGENT, SHOP_A
 
@@ -149,13 +150,21 @@ NR_ANSWER = (
 )
 
 
+def _grant_refund_write(service, shop_id: str = SHOP_A) -> None:
+    """这家店申请了写售后权限（二期，§8.4）：客服确认后执行售后写操作要有 refund.write。"""
+    auth = service.unit.repos.auth.get(shop_id)
+    service.unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(PHASE2_SCOPES)}))
+
+
 def _nr_service():
     llm = scripted_llm({"没收到": llm_answer(NR_ANSWER, "tool:logistics:o_1003")})
-    return demo_service(
+    service = demo_service(
         llm=llm,
         router=scripted_router([("没收到", route(Intent.NOT_RECEIVED, 0.93))]),
         qa=scripted_qa(),
     )
+    _grant_refund_write(service)  # 这些流程一直走到客服确认后执行写操作
+    return service
 
 
 def test_11_3_signed_not_received_pickup_guidance_then_r4_review_and_confirm():
@@ -308,6 +317,7 @@ def test_11_3_reread_race_status_version_changed():
 
 def test_r3_two_step_return_then_refund():
     service = demo_service()
+    _grant_refund_write(service)
     unit = service.unit
     review = service.review_aftersale(SHOP_A, "as_2002")
     assert review.matched_rules == ["R3"]
