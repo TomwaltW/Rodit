@@ -11,7 +11,11 @@
 规则和质检硬规则（rodit.qa.hard_rules）同一份词表、同样的规则名：站外引流（core.lexicon
 find_off_platform_in_answer；另外存下来的文字做过个人信息最小化时，遮住的手机号、联系方式、邮箱占位符
 也算）、绝对化用语（EngineConfig.qa_gate 的词表和例外）、店铺禁用词（生效配置的 banned_words）。
-没有依据原文，成分标注里的 100%（"桑蚕丝 100%"）这里也会命中——只是代理指标，由复核人员按 ID 核对。
+没有依据原文，成分标注里的 100%（"桑蚕丝 100%"）这里也会命中。
+
+所以命中只是"疑似违规"——候选，由复核人员按 ID 逐条确认（compliance.reviewed 审计，
+ComplianceReviewEntry）：confirmed（确实违规）算门槛不通过；dismissed（误报）不计；还没确认的列为
+"待确认"，门槛上是 unchecked（写明几条、哪些 ID），不算不通过。同一条再标记以最后一次为准。
 
 同一次发送的两份记录只算一次（记在推荐上）：写回会话的那条（msg_id "agent:{推荐 id}"），或同一会话
 里文字相同的一条消息（平台回声；比较前 NFKC 归一、遮个人信息、去掉空白），每条推荐最多配一条。
@@ -26,14 +30,28 @@ import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
-from typing import Literal
+from enum import StrEnum
+from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 from rodit.core.config import QAGateConfig
 from rodit.core.enums import Role, SuggestionStatus
 from rodit.core.lexicon import find_absolute_terms, find_off_platform_in_answer
-from rodit.core.models import ShopConfig, StoredMessage, SuggestionRecord, strip_control_chars
+from rodit.core.models import (
+    AuditEvent,
+    ShopConfig,
+    StoredMessage,
+    SuggestionRecord,
+    strip_control_chars,
+)
 from rodit.core.pii import CONTACT_MASK, EMAIL_MASK, PHONE_MASK, mask_pii
 from rodit.feedback.review import iso_period, week_start
 
@@ -46,6 +64,11 @@ COMPLIANCE_RULES: tuple[str, ...] = (RULE_OFF_PLATFORM, RULE_ABSOLUTE, RULE_BANN
 OUTGOING_ROLES: tuple[Role, ...] = (Role.AGENT, Role.BOT)
 MAX_LISTED_IDS = 100
 """汇总里最多列出多少个推荐 ID / 消息 ID（计数不受影响）。"""
+
+MAX_MSG_ID_CHARS = 200
+
+COMPLIANCE_REVIEWED = "compliance.reviewed"
+"""复核人员确认 / 标记误报一条疑似违规的审计动作（shop_id 是店铺；detail 见 review_detail）。"""
 
 _CONTACT_PLACEHOLDERS = (PHONE_MASK, CONTACT_MASK, EMAIL_MASK)
 _WRITE_BACK_PREFIX = "agent:"  # 反馈写回会话的消息 ID：agent:{推荐 id}（rodit.app.service）
@@ -235,45 +258,226 @@ def scan_sent(
     return weeks
 
 
+# ================================================================ 复核人员的确认（违规 / 误报）
+
+
+class ComplianceDecision(StrEnum):
+    CONFIRMED = "confirmed"  # 确实违规：门槛不通过
+    DISMISSED = "dismissed"  # 误报（如依据里原样有的"桑蚕丝 100%"）：不计
+
+
+FlagKey = tuple[str, str]
+"""一条疑似违规的标识：("suggestion", 推荐 id) 或 ("message", 消息 ID)。"""
+
+
+def flag_key(flag: ComplianceFlag) -> FlagKey:
+    if flag.source == "edited_suggestion":
+        return ("suggestion", str(flag.suggestion_id))
+    return ("message", flag.msg_id or "")
+
+
+def check_flag_ref(suggestion_id: Any, msg_id: Any) -> tuple[int | None, str | None]:
+    """复核人员指定的一条疑似违规：推荐 ID（编辑后发送的推荐）和消息 ID 给且只给一个。"""
+    if (suggestion_id is None) == (msg_id is None):
+        raise ValueError("suggestion_id 和 msg_id 要给且只给一个")
+    if suggestion_id is not None:
+        if isinstance(suggestion_id, bool) or not isinstance(suggestion_id, int):
+            raise ValueError("suggestion_id 要是整数")
+        if suggestion_id < 1:
+            raise ValueError("suggestion_id 要是正整数")
+        return suggestion_id, None
+    if not isinstance(msg_id, str):
+        raise ValueError("msg_id 要是字符串")
+    cleaned = strip_control_chars(msg_id).strip()
+    if not cleaned or len(cleaned) > MAX_MSG_ID_CHARS:
+        raise ValueError(f"msg_id 不能为空，最多 {MAX_MSG_ID_CHARS} 个字符")
+    return None, cleaned
+
+
+class ComplianceReviewEntry(_Model):
+    """复核人员对一条疑似违规的结论（compliance.reviewed 审计事件）。没有文字，只有 ID 和备注
+    （备注已做个人信息最小化）。"""
+
+    shop_id: str
+    suggestion_id: int | None = None
+    msg_id: str | None = None
+    decision: ComplianceDecision
+    rules: list[str] = Field(default_factory=list)  # 扫描命中的规则名（登记时的）
+    note: str | None = None
+    reviewer: str
+    recorded_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _one_ref(self) -> ComplianceReviewEntry:
+        check_flag_ref(self.suggestion_id, self.msg_id)
+        return self
+
+    @property
+    def key(self) -> FlagKey:
+        if self.suggestion_id is not None:
+            return ("suggestion", str(self.suggestion_id))
+        return ("message", self.msg_id or "")
+
+
+def review_detail(entry: ComplianceReviewEntry) -> dict[str, Any]:
+    """写进 compliance.reviewed 的 detail（复核人取 actor，时间取 created_at）。"""
+    return {
+        "suggestion_id": entry.suggestion_id,
+        "msg_id": entry.msg_id,
+        "decision": entry.decision.value,
+        "rules": list(entry.rules),
+        "note": entry.note,
+    }
+
+
+def parse_reviews(events: Iterable[AuditEvent], *, shop_id: str) -> list[ComplianceReviewEntry]:
+    """审计事件 → 复核结论（按时间升序）。别的店铺、别的动作、字段不对的事件跳过。"""
+    out: list[ComplianceReviewEntry] = []
+    for e in events:
+        if e.shop_id != shop_id or e.action != COMPLIANCE_REVIEWED:
+            continue
+        d = e.detail
+        note = d.get("note")
+        rules = d.get("rules")
+        try:
+            out.append(
+                ComplianceReviewEntry(
+                    shop_id=shop_id,
+                    suggestion_id=d.get("suggestion_id"),
+                    msg_id=d.get("msg_id"),
+                    decision=d.get("decision"),
+                    rules=[r for r in rules if isinstance(r, str)]
+                    if isinstance(rules, list)
+                    else [],
+                    note=note if isinstance(note, str) else None,
+                    reviewer=e.actor,
+                    recorded_at=e.created_at,
+                )
+            )
+        except (ValidationError, ValueError):
+            continue
+    return sorted(out, key=lambda x: x.recorded_at)
+
+
+def current_reviews(
+    entries: Iterable[ComplianceReviewEntry],
+) -> dict[FlagKey, ComplianceReviewEntry]:
+    """每条疑似违规以最后一次结论为准。"""
+    latest: dict[FlagKey, ComplianceReviewEntry] = {}
+    for e in sorted(entries, key=lambda x: x.recorded_at):
+        latest[e.key] = e
+    return latest
+
+
+def find_flag(
+    weeks: Iterable[ComplianceWeek], *, suggestion_id: int | None, msg_id: str | None
+) -> ComplianceFlag | None:
+    """扫描结果里对应的那条疑似违规（没有返回 None）。"""
+    wanted: FlagKey = (
+        ("suggestion", str(suggestion_id))
+        if suggestion_id is not None
+        else ("message", msg_id or "")
+    )
+    for week in weeks:
+        for flag in week.flags:
+            if flag_key(flag) == wanted:
+                return flag
+    return None
+
+
 # ================================================================ 汇总
 
 
 class ComplianceSummary(_Model):
-    """一段窗口的扫描汇总（上线状态、验收报告用）：计数和 ID，没有文字。"""
+    """一段窗口的扫描汇总（上线状态、验收报告用）：计数和 ID，没有文字。
+
+    flagged = confirmed + dismissed + pending：扫描命中的都是候选，复核人员确认的（confirmed）
+    才算违规，误报（dismissed）不计，没确认的（pending）等复核人员看。构造时没给 pending 就是
+    flagged 里除去确认、误报的那些（没复核过的都算待确认）。"""
 
     since: AwareDatetime
     until: AwareDatetime
     scanned_suggestions: int = 0
     scanned_messages: int = 0
-    flagged: int = 0  # 疑似违规的发送条数（代理指标，门槛要求为 0）
+    flagged: int = 0  # 疑似违规的发送条数（扫描命中，候选）
+    confirmed: int = 0  # 其中复核人员确认是违规的（门槛要求为 0）
+    dismissed: int = 0  # 其中复核人员标记为误报的
+    pending: int = 0  # 其中还没确认的（门槛上是 unchecked）
     rule_counts: dict[str, int] = Field(default_factory=dict)
     by_period: dict[str, int] = Field(default_factory=dict)  # 各周疑似违规条数
     suggestion_ids: list[int] = Field(default_factory=list)
     message_ids: list[str] = Field(default_factory=list)
+    pending_suggestion_ids: list[int] = Field(default_factory=list)  # 待确认的（给复核人员核对）
+    pending_message_ids: list[str] = Field(default_factory=list)
     ids_truncated: bool = False  # ID 超过 MAX_LISTED_IDS 条时只列前面的
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_pending(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "pending" not in data:
+            counts = [data.get(k, 0) for k in ("flagged", "confirmed", "dismissed")]
+            if all(isinstance(n, int) and not isinstance(n, bool) for n in counts):
+                flagged, confirmed, dismissed = counts
+                data = {**data, "pending": max(flagged - confirmed - dismissed, 0)}
+        return data
+
+    @model_validator(mode="after")
+    def _counts_add_up(self) -> ComplianceSummary:
+        if self.confirmed + self.dismissed + self.pending != self.flagged:
+            raise ValueError("确认、误报、待确认的条数加起来要等于疑似违规条数")
+        return self
 
 
 def summarize_scan(
-    weeks: Sequence[ComplianceWeek], *, max_ids: int = MAX_LISTED_IDS
+    weeks: Sequence[ComplianceWeek],
+    *,
+    reviews: Iterable[ComplianceReviewEntry] = (),
+    max_ids: int = MAX_LISTED_IDS,
 ) -> ComplianceSummary:
-    """按周的扫描结果 → 窗口汇总（weeks 时间升序，至少一周）。"""
+    """按周的扫描结果 + 复核人员的结论 → 窗口汇总（weeks 时间升序，至少一周）。"""
     if not weeks:
         raise ValueError("没有扫描结果")
+    decided = {k: e.decision for k, e in current_reviews(reviews).items()}
     flags = [f for w in weeks for f in w.flags]
     counts = Counter(rule for f in flags for rule in f.rules)
     suggestion_ids = [f.suggestion_id for f in flags if f.suggestion_id is not None]
     message_ids = [f.msg_id for f in flags if f.msg_id is not None]
+    outcome = [decided.get(flag_key(f)) for f in flags]
+    pending = [f for f, d in zip(flags, outcome, strict=True) if d is None]
+    pending_suggestions = [f.suggestion_id for f in pending if f.suggestion_id is not None]
+    pending_messages = [f.msg_id for f in pending if f.suggestion_id is None and f.msg_id]
     return ComplianceSummary(
         since=weeks[0].since,
         until=weeks[-1].until,
         scanned_suggestions=sum(w.scanned_suggestions for w in weeks),
         scanned_messages=sum(w.scanned_messages for w in weeks),
-        flagged=sum(w.flagged for w in weeks),
+        flagged=len(flags),
+        confirmed=sum(1 for d in outcome if d == ComplianceDecision.CONFIRMED),
+        dismissed=sum(1 for d in outcome if d == ComplianceDecision.DISMISSED),
+        pending=len(pending),
         rule_counts={r: counts[r] for r in COMPLIANCE_RULES if counts[r]},
         by_period={w.period: w.flagged for w in weeks},
         suggestion_ids=suggestion_ids[:max_ids],
         message_ids=message_ids[:max_ids],
+        pending_suggestion_ids=pending_suggestions[:max_ids],
+        pending_message_ids=pending_messages[:max_ids],
         ids_truncated=len(suggestion_ids) > max_ids or len(message_ids) > max_ids,
+    )
+
+
+def pending_reason(summary: ComplianceSummary) -> str | None:
+    """待确认的疑似违规的说明（门槛 unchecked 的原因）：几条、哪些 ID、怎么处理。没有返回 None。"""
+    if summary.pending <= 0:
+        return None
+    ids = []
+    if summary.pending_suggestion_ids:
+        ids.append("编辑后发送的推荐 " + "、".join(str(i) for i in summary.pending_suggestion_ids))
+    if summary.pending_message_ids:
+        ids.append("消息 " + "、".join(summary.pending_message_ids))
+    listed = f"（{'；'.join(ids)}）" if ids else ""
+    return (
+        f"合规扫描有 {summary.pending} 条疑似违规等复核人员确认{listed}：确实违规的标记 confirmed"
+        "（算不通过），误报标记 dismissed（不计）——POST rollout/compliance-reviews"
     )
 
 
@@ -303,17 +507,29 @@ def flag_detail(week: ComplianceWeek) -> dict[str, object]:
 
 
 __all__ = [
+    "COMPLIANCE_REVIEWED",
     "COMPLIANCE_RULES",
     "MAX_LISTED_IDS",
+    "MAX_MSG_ID_CHARS",
     "OUTGOING_ROLES",
     "RULE_ABSOLUTE",
     "RULE_BANNED",
     "RULE_OFF_PLATFORM",
+    "ComplianceDecision",
     "ComplianceFlag",
+    "ComplianceReviewEntry",
     "ComplianceRules",
     "ComplianceSummary",
     "ComplianceWeek",
+    "FlagKey",
+    "check_flag_ref",
+    "current_reviews",
+    "find_flag",
     "flag_detail",
+    "flag_key",
+    "parse_reviews",
+    "pending_reason",
+    "review_detail",
     "scan_sent",
     "scan_text",
     "summarize_scan",

@@ -13,8 +13,10 @@ acceptance-report 收集（rodit.ops.jobs.rollout）。
   （engine.result 的 latency_ms.since_received——含排队和会话锁等待；没有时用 total）的
   P95 ≤ 5000 毫秒（§1.3、§12.1）；
 - platform_violations：复核人员按周登记的平台违规（shop.rollout_incident），窗口里每个完整周都要
-  登记，合计为 0；
-- compliance_scan：窗口里实际发出去的文字的合规扫描（feedback.compliance，代理指标），疑似违规为 0；
+  登记（0 要在那一周结束后登记才算，见 feedback.rollout.incident_total），合计为 0；
+- compliance_scan：窗口里实际发出去的文字的合规扫描（feedback.compliance，代理指标）：扫描命中的
+  疑似违规由复核人员逐条确认，确认是违规的为 0；有没确认的（且没有确认的违规）是 unchecked，
+  写明几条、哪些 ID；误报标记后不计；
 - weekly_review：窗口里每周人工复核（§13.5）已打分的样本合在一起，事实正确、合规满分率都 ≥ 95%
   （§13.2），至少 DEFAULT_MIN_SCORED 条。
 
@@ -34,7 +36,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from rodit.core.audit import LATENCY_SINCE_RECEIVED, RESULT_BUDGET_EXCEEDED, AuditAction, ResultKey
 from rodit.core.clock import CST
 from rodit.core.models import AuditEvent, QualityReview, SuggestionRecord
-from rodit.feedback.compliance import COMPLIANCE_RULES, ComplianceSummary
+from rodit.feedback.compliance import COMPLIANCE_RULES, ComplianceSummary, pending_reason
 from rodit.feedback.metrics import E2E_P95_TARGET_MS, percentile
 from rodit.feedback.review import (
     DEFAULT_MIN_SCORED,
@@ -70,7 +72,7 @@ CRITERION_LABELS: dict[str, str] = {
     "adoption": "采纳率 ≥ 60%（最近 2 个完整周，按推荐组）",
     "latency_p95": "推荐出现 P95 ≤ 5 秒",
     "platform_violations": "平台违规为 0（复核人员按周登记）",
-    "compliance_scan": "发出去的文字没有疑似违规（合规扫描，代理指标）",
+    "compliance_scan": "发出去的文字没有违规（合规扫描命中后由复核人员确认，代理指标）",
     "weekly_review": "每周复核事实正确、合规满分率 ≥ 95%（§13.5）",
 }
 """条件名 → 中文说明，也是报告里条件的顺序。"""
@@ -249,18 +251,23 @@ def violations_criterion(total: IncidentTotal) -> Criterion:
 
 
 def scan_criterion(summary: ComplianceSummary) -> Criterion:
+    """复核人员确认的违规 > 0 → 没通过；否则有没确认的疑似违规 → 缺数据（等复核人员确认或标记
+    误报）；都复核过（或没有命中）→ 通过。扫描命中本身不算不通过（只是候选）。"""
     rules = "、".join(f"{r} {n}" for r, n in summary.rule_counts.items()) or "没有命中"
-    status = CriterionStatus.PASSED if summary.flagged == 0 else CriterionStatus.FAILED
-    return _criterion(
-        "compliance_scan",
-        status,
-        value=summary.flagged,
-        threshold=0,
-        detail=(
-            f"扫描编辑后发送的推荐 {summary.scanned_suggestions} 条、发出的消息 "
-            f"{summary.scanned_messages} 条，疑似违规 {summary.flagged} 条（{rules}）"
-        ),
+    detail = (
+        f"扫描编辑后发送的推荐 {summary.scanned_suggestions} 条、发出的消息 "
+        f"{summary.scanned_messages} 条，疑似违规 {summary.flagged} 条（{rules}）；"
+        f"复核人员确认违规 {summary.confirmed}、误报 {summary.dismissed}、待确认 {summary.pending}"
     )
+    if summary.confirmed > 0:
+        status = CriterionStatus.FAILED
+    elif summary.pending > 0:
+        status = CriterionStatus.UNCHECKED
+        detail += f"。{pending_reason(summary)}"
+    else:
+        status = CriterionStatus.PASSED
+    value = None if status == CriterionStatus.UNCHECKED else summary.confirmed
+    return _criterion("compliance_scan", status, value=value, threshold=0, detail=detail)
 
 
 def review_criterion(reviews: Sequence[QualityReview]) -> Criterion:
@@ -330,6 +337,7 @@ def pool_incidents(totals: Sequence[tuple[str, IncidentTotal]]) -> IncidentTotal
         weeks=list(first.weeks),
         by_week=by_week,
         missing=sorted({w for _, t in missing for w in t.missing}),
+        provisional=sorted({w for _, t in missing for w in t.provisional}),
         known=known,
         count=count,
         reason=reason,
@@ -352,6 +360,9 @@ def pool_scans(summaries: Sequence[ComplianceSummary]) -> ComplianceSummary | No
         scanned_suggestions=sum(s.scanned_suggestions for s in summaries),
         scanned_messages=sum(s.scanned_messages for s in summaries),
         flagged=sum(s.flagged for s in summaries),
+        confirmed=sum(s.confirmed for s in summaries),
+        dismissed=sum(s.dismissed for s in summaries),
+        pending=sum(s.pending for s in summaries),
         rule_counts={r: counts[r] for r in COMPLIANCE_RULES if counts.get(r)},
         by_period=dict(sorted(by_period.items())),
     )

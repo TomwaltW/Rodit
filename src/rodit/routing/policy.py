@@ -3,7 +3,9 @@
 按顺序判断，命中就停，rule 记下命中的规则序号：
 
 1. P(off_platform) ≥ off_platform → 平台规则标准话术（优先级最高；即使店铺关了这一类也照样给；
-                                    投票制判断层的追问里提到站外交易也算，按"被问到"的占比）；
+                                    投票制判断层的追问里提到站外交易也算，按"被问到"的占比；
+                                    只因追问命中时，主要问题在规则 2–4 会给的提醒——要人工、
+                                    情绪激动、投诉——照样带上，高风险标记也按主要问题）；
 2. need_human ≥ need_human       → 辅助 / 影子：提醒客服优先处理；自动：转人工；
                                     自动模式另看关键词规则的"要求人工"信号（§5.7 兜底）；
 3. emotion ≥ emotion_escalate    → 辅助 / 影子：安抚话术并标红；自动：转人工；
@@ -167,19 +169,25 @@ class RoutingPolicy:
 
         # 规则 1：站外交易请求（优先级最高，防止违规）。买家把站外交易当成第二个问题提时
         # （投票制判断层的追问 second_intent）也算：按"被问到"的占比取大的，不让它变成分条里的一条
-        p_off = max(
-            probs.get(Intent.OFF_PLATFORM, 0.0),
-            self._mentioned(answers, probs).get(Intent.OFF_PLATFORM, 0.0),
-        )
+        p_primary = probs.get(Intent.OFF_PLATFORM, 0.0)
         if intent == Intent.OFF_PLATFORM:
-            p_off = max(p_off, confidence)
+            p_primary = max(p_primary, confidence)
+        p_off = max(p_primary, self._mentioned(answers, probs).get(Intent.OFF_PLATFORM, 0.0))
         if _ge(p_off, cfg.off_platform):
+            extra: dict[str, object] = {"high_risk": False}
+            if not _ge(p_primary, cfg.off_platform):
+                # 只因追问提到站外交易才命中：主要问题的要人工 / 情绪 / 投诉提醒（规则 2–4）照样给，
+                # 不让顺带的一句"加个微信"盖掉"我要投诉，找人工"（§5.7 投诉一律提醒人工）
+                extra = {
+                    "high_risk": base["high_risk"],
+                    "alerts": self._escalation_alerts(intent, wants_human, emotion),
+                }
             return decide(
                 RouteAction.OFF_PLATFORM_SCRIPT,
                 1,
                 intent=Intent.OFF_PLATFORM,
                 intent_confidence=p_off,
-                high_risk=False,
+                **extra,
             )
 
         # 规则 2：要求人工 / 投诉
@@ -259,6 +267,18 @@ class RoutingPolicy:
         return decide(RouteAction.NO_SUGGESTION, 8, alerts=pending_alerts)
 
     # ---------------------------------------------------------------- 工具
+
+    def _escalation_alerts(self, intent: Intent, wants_human: bool, emotion: float) -> list[str]:
+        """规则 2–4 会给的提醒（规则 1 因追问命中时带上）：要人工、情绪激动、投诉。
+        "要人工"的提醒已经写了"投诉"，同时是投诉时不重复加投诉提醒（和规则 2 一致）。"""
+        alerts: list[str] = []
+        if wants_human:
+            alerts.append(ALERT_NEED_HUMAN)
+        if _ge(emotion, self.config.emotion_escalate):
+            alerts.append(ALERT_EMOTION)
+        if intent == Intent.COMPLAINT and not wants_human:
+            alerts.append(ALERT_COMPLAINT)
+        return alerts
 
     @staticmethod
     def _noul(answers: DecisionResponse, key: str) -> float:

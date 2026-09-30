@@ -30,7 +30,12 @@ from rodit.eval.fingerprint import (
 )
 
 T0 = datetime(2026, 9, 25, 10, 0, tzinfo=CST)
-RUNNING = current_fingerprint(EngineConfig())
+# 线上的大模型（合成的地址和模型名）：线上的指纹要知道用的是哪个模型
+LLM_ENV = {
+    "RODIT_LLM_BASE_URL": "https://llm.example.invalid/v1",
+    "RODIT_LLM_MODEL": "synthetic-model",
+}
+RUNNING = current_fingerprint(EngineConfig(), environ=LLM_ENV)
 
 
 def other_config() -> EngineConfig:
@@ -43,12 +48,12 @@ def other_config() -> EngineConfig:
 
 
 def test_fingerprint_names_the_config_and_question_versions():
-    fp = current_fingerprint(EngineConfig())
+    fp = current_fingerprint(EngineConfig(), environ=LLM_ENV)
     assert fp.config_fingerprint == config_fingerprint(EngineConfig())
     assert fp.router_questions_ver == ROUTER_QUESTIONS_VER
     assert fp.qa_questions_ver == QA_QUESTIONS_VER
     assert fp.git_sha is None and fp.classifier_sha256 is None  # 不查代码版本时不填
-    changed = current_fingerprint(other_config())
+    changed = current_fingerprint(other_config(), environ=LLM_ENV)
     assert changed.config_fingerprint != fp.config_fingerprint
     assert not same_setup(changed, fp)
     assert same_setup(fp, fp.model_copy(update={"git_sha": "abc", "git_dirty": True}))

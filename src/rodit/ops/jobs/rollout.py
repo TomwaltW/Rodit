@@ -4,8 +4,10 @@
     record-eval --report 报告.json [--config YAML]
         把 python -m rodit.eval --json 的完整评测报告记成 eval.verdict 系统事件（§13.5；
         rodit.eval.fingerprint）。部分评测（--intent / --limit）、没有测试集判定、没有配置指纹的
-        报告不收（退出码 2，什么都不写）。顺带说明报告的配置指纹和部署配置（--config，其次
-        RODIT_CONFIG，都没有时是内置默认值）一致不一致：上线状态只认一致的、真实大模型跑的结论。
+        报告不收（退出码 2，什么都不写）。顺带说明报告的指纹和线上（部署配置：--config，其次
+        RODIT_CONFIG，都没有时是内置默认值；大模型、分类器按部署规则取配置和环境变量
+        RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_CLASSIFIER_PATH）一致不一致、哪几项不一致：
+        上线状态只认一致的、真实大模型跑的结论。
     acceptance-report --since ISO [--until ISO] [--json] [--config YAML]
         Phase 1 验收报告（feedback.acceptance，§15）：每家店一份 + 合在一起一份。店铺来自
         ShopAuthRepository.expiring_shop_ids(很远的将来)——本单元有授权的店铺（只有 ID 和到期时间，
@@ -13,10 +15,14 @@
         退出码：0 合在一起的条件都通过；1 有条件没通过或缺数据（文本最后一行写明哪几条和取值）。
     compliance-scan [--week 2026-W39] [--config YAML]
         扫描一周实际发出去的文字（默认上一个完整周；feedback.compliance），每家店写一条
-        compliance.flag 审计：计数、规则名、推荐 / 消息 ID，没有文字。
+        compliance.flag 审计：计数、规则名、推荐 / 消息 ID，没有文字。命中的是疑似违规（候选），
+        由复核人员逐条确认或标记误报（POST rollout/compliance-reviews），确认的才算门槛不通过。
 
 数据库：RODIT_DATABASE_DSN（应用角色，行级安全按店铺隔离；系统事件在不设店铺范围的事务里读写）；
 acceptance-report、compliance-scan 还要 RODIT_TOKEN_KEY（仓储组装需要，不解密任何令牌）。
+record-eval、acceptance-report 判断测试集依据时要和线上服务同样的大模型、分类器环境变量
+（RODIT_LLM_BASE_URL / RODIT_LLM_MODEL，配置里没写 llm.base_url 和 llm.model 时；
+decision.provider 是 classifier 时 RODIT_CLASSIFIER_PATH）：不知道线上用的是什么，结论就对不上。
 配置、报告文件、参数不对时退出码 2（日志写明原因）；数据库错误按 rodit.ops.jobs 的约定。
 """
 
@@ -125,10 +131,14 @@ def run(
         config, source = _config(args, environ)
         if command == RECORD_EVAL:
             log = audit or (repos.audit if repos is not None else _pg_audit())
-            return record_eval(args, out, audit=log, clock=clock, config=config, source=source)
+            return record_eval(
+                args, out, audit=log, clock=clock, config=config, source=source, environ=environ
+            )
         repos = repos if repos is not None else _pg_repos(clock)
         if command == ACCEPTANCE_REPORT:
-            return acceptance_command(args, out, repos=repos, clock=clock, config=config)
+            return acceptance_command(
+                args, out, repos=repos, clock=clock, config=config, environ=environ
+            )
         return compliance_command(args, out, repos=repos, clock=clock, config=config)
     except (ValueError, OSError, yaml.YAMLError) as exc:
         logger.error("%s 没有完成：%s", command, exc)
@@ -146,11 +156,12 @@ def record_eval(
     clock: Clock,
     config: EngineConfig,
     source: str,
+    environ: Mapping[str, str] | None = None,
 ) -> int:
     from rodit.eval.fingerprint import (
         current_fingerprint,
         describe_verdict,
-        same_setup,
+        differences,
         verdict_event,
         verdict_from_report,
     )
@@ -170,20 +181,24 @@ def record_eval(
     fp = verdict.fingerprint
     code = fp.git_sha[:12] if fp.git_sha else "未知"
     print(f"已记录评测结论（eval.verdict）：{describe_verdict(at, verdict)}", file=out)
+    model = fp.llm_model or "未知"
     print(
         f"配置指纹 {fp.config_fingerprint[:12]}，路由问题 {fp.router_questions_ver}，"
-        f"质检问题 {fp.qa_questions_ver}，代码 {code}",
+        f"质检问题 {fp.qa_questions_ver}，生成环节 {fp.generation_ver or '未知'}，"
+        f"判断层 {fp.decision_provider or '未知'}，大模型 {model}，代码 {code}",
         file=out,
     )
-    if not same_setup(fp, current_fingerprint(config)):
+    diffs = differences(fp, current_fingerprint(config, environ=environ))
+    if verdict.llm_mode != "env":
+        print("离线替身跑的评测只作回归基线，上线状态不会用它判断测试集门槛", file=out)
+    elif diffs:
         print(
-            f"注意：和部署配置（{source}）的指纹不一致，上线状态不会用这次结论判断测试集门槛",
+            f"注意：和线上（部署配置 {source}）不一致（{'、'.join(diffs)}），"
+            "上线状态不会用这次结论判断测试集门槛",
             file=out,
         )
-    elif verdict.llm_mode != "env":
-        print("离线替身跑的评测只作回归基线，上线状态不会用它判断测试集门槛", file=out)
     else:
-        print(f"和部署配置（{source}）一致：上线状态用这次结论判断测试集门槛", file=out)
+        print(f"和线上（部署配置 {source}）一致：上线状态用这次结论判断测试集门槛", file=out)
     return 0
 
 
@@ -201,7 +216,13 @@ def _shops(repos: Any) -> list[Any]:
 
 
 def acceptance_command(
-    args: argparse.Namespace, out: TextIO, *, repos: Any, clock: Clock, config: EngineConfig
+    args: argparse.Namespace,
+    out: TextIO,
+    *,
+    repos: Any,
+    clock: Clock,
+    config: EngineConfig,
+    environ: Mapping[str, str] | None = None,
 ) -> int:
     from rodit.app.rollout import acceptance_input, eval_evidence
     from rodit.feedback.acceptance import acceptance_report, render_text
@@ -216,7 +237,7 @@ def acceptance_command(
     ]
     report = acceptance_report(
         inputs,
-        test_set=eval_evidence(repos.audit, config),
+        test_set=eval_evidence(repos.audit, config, environ=environ),
         since=since,
         until=until,
         now=now,
@@ -262,7 +283,7 @@ def compliance_command(
             print(
                 f"{shop.id} {week.period}：编辑后发送的推荐 {week.scanned_suggestions} 条、"
                 f"发出的消息 {week.scanned_messages} 条，疑似违规 {week.flagged} 条"
-                + (f"（{rules}）" if rules else ""),
+                + (f"（{rules}；等复核人员确认或标记误报）" if rules else ""),
                 file=out,
             )
     if not shops:

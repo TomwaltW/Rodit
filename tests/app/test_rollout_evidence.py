@@ -34,6 +34,19 @@ W39_START = datetime(2026, 9, 21, tzinfo=CST)
 FULL = {"factual": 2, "relevance": 2, "compliance": 2, "expression": 2}
 
 
+LLM_ENV = {
+    "RODIT_LLM_BASE_URL": "https://llm.example.invalid/v1",
+    "RODIT_LLM_MODEL": "synthetic-model",
+}
+
+
+@pytest.fixture(autouse=True)
+def running_llm(monkeypatch):
+    """线上的大模型（合成的地址和模型名，从环境变量读）：测试集依据要知道线上用的是哪个模型。"""
+    for name, value in LLM_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
 @pytest.fixture
 def service() -> AssistService:
     return AssistService(build_demo_unit(Platform.TAOBAO))
@@ -100,6 +113,27 @@ def test_the_running_config_fingerprint_decides_which_verdict_counts(service: As
     record_verdict(service, report(service), minutes_ago=10)
     ev = eval_evidence(service.unit.repos.audit, service.unit.config)
     assert ev.passed is True and ev.reason is None
+
+
+def test_a_model_swap_through_the_environment_needs_a_new_verdict(
+    service: AssistService, monkeypatch
+):
+    """只改环境变量 RODIT_LLM_MODEL 换模型（配置没写 llm.model）：旧结论不再算测试集依据
+    （§13.5 换大模型之前先跑回归）。"""
+    ro = service.rollout
+    ro.set_stage(SHOP_A, "shadow", operator=REVIEWER)
+    shadow_ready(service)
+    record_verdict(service, report(service))
+    status = ro.status(SHOP_A)
+    assert status.advice == RolloutAdvice.READY_FOR_ASSIST and status.unchecked == []
+    monkeypatch.setenv("RODIT_LLM_MODEL", "synthetic-model-2")
+    ev = eval_evidence(service.unit.repos.audit, service.unit.config)
+    assert ev.passed is None and "大模型" in (ev.reason or "")
+    assert "synthetic-model-2" in (ev.reason or "")
+    status = ro.status(SHOP_A)
+    [unchecked] = status.unchecked
+    assert unchecked.name == "test_set" and "大模型" in (unchecked.reason or "")
+    assert [c.name for c in status.shadow_gate.checks if c.name == "test_set"] == []
 
 
 def test_shadow_switch_follows_the_test_set_verdict(service: AssistService):
@@ -205,5 +239,12 @@ def test_an_edited_send_is_counted_once_even_with_its_write_back(service: Assist
     assert flag.rules == ["off_platform"]
     status = service.rollout.status(SHOP_A)
     assert status.evidence is not None and status.evidence.compliance.flagged == 1
-    assert "compliance_scan" in status.blocking
+    # 没确认之前只是候选（unchecked），复核人员确认是违规后才算没通过
+    assert "compliance_scan" not in status.blocking
+    assert "compliance_scan" in [u.name for u in status.unchecked]
+    service.rollout.review_compliance(
+        SHOP_A, suggestion_id=sid, decision="confirmed", reviewer=REVIEWER
+    )
+    status = service.rollout.status(SHOP_A)
+    assert status.evidence.compliance.confirmed == 1 and "compliance_scan" in status.blocking
     assert "abc123" not in status.model_dump_json() and "微信" not in status.model_dump_json()
