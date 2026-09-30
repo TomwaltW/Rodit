@@ -1,0 +1,193 @@
+# Rodit 平台单元的 Prometheus 告警规则（方案 §8.4 授权、§9.2 串店、§12.1 性能、§12.2 降级、
+# §12.4 可观测性、§16 三个平台云的运维负担：统一监控）。
+#
+# 和 recording.yml 一起加载（这里引用的 rodit:* 都在那边定义）。一个平台单元一个抓取目标，
+# 告警按 job、instance 分开。抓取任务的 job_name 要叫 rodit（RoditScrapeDown 按它找目标）。
+# severity：critical = 马上处理（串店、授权已过期、服务不就绪、抓不到指标）；
+# warning = 当天处理。阈值是建议值【待上线后按实际数据校准】。
+# 标签和注释里只有店铺 ID、问题类型、工具名这类代码，没有买家数据（指标本身就没有）。
+# tests/ops/test_alert_rules.py 核对：必需的告警都在、引用的指标都已登记、promtool（有的话）检查通过。
+
+groups:
+  - name: rodit.alerts
+    rules:
+      # ================================================================ 店铺授权（§8.4、§12.4）
+      - alert: RoditShopAuthExpiring
+        expr: (rodit_auth_expiring_shops - rodit_auth_expired_shops) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：{{ $value }} 家店铺的授权即将到期"
+          description: >
+            授权在告警窗口（RODIT_AUTH_EXPIRY_WARN_DAYS，默认 7 天）内到期。serve 的后台任务
+            refresh_tokens（RODIT_TOKEN_REFRESH_INTERVAL_S）会在到期前续期；续不了的要提醒商家
+            重新授权。哪几家店：rodit_shop_auth_expiring{instance="{{ $labels.instance }}"}。
+      - alert: RoditShopAuthExpired
+        expr: rodit_auth_expired_shops > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}：{{ $value }} 家店铺授权已过期或需要重新授权，已停止处理"
+          description: >
+            这些店铺的消息不再处理（§8.4），客服看不到推荐。请商家重新授权；过期超过宽限期的由 serve
+            的后台任务 purge_expired 按约定清理数据。清理过（shop.purged）、没有再开通的店铺不再计入，
+            告警随之消失；令牌文件里这些店铺的访问令牌也要删掉。清理中途被打断的店铺（进程重启、
+            数据库出错），serve 下一轮 purge_expired 会自动接着删完，不用手动处理；一直删不完时
+            RoditBackgroundTaskFailing{task="purge_expired"} 会报。店铺列表见 rodit_shop_auth_expiring。
+      - alert: RoditAuthCheckErrors
+        expr: increase(rodit_auth_expiry_check_errors_total[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：授权过期检查失败"
+          description: >
+            serve 后台的授权检查（auth_expiry，RODIT_AUTH_EXPIRY_CHECK_S）出错（多半是数据库故障），
+            授权告警用的是上一次的结果。查应用日志"授权过期检查失败"。
+      - alert: RoditAuthCheckStale
+        expr: time() - rodit_auth_expiry_last_check_timestamp_seconds > 3600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：授权过期检查超过 1 小时没有成功"
+          description: 授权告警的数据已经过时，先处理 RoditAuthCheckErrors。
+
+      # ================================================================ 串店（§9.2、§12.4 串店检查）
+      - alert: RoditTenantIsolationBreach
+        expr: >
+          rodit:tenant_isolation:increase15m{stage!="http"} > 0
+          or sum by (job, instance) (increase(rodit_degradations_total{kind="tenant_isolation"}[15m])) > 0
+          or sum by (job, instance, tool) (increase(rodit_tool_cache_tenant_violations_total[15m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}：处理中拦下了跨店铺的数据（串店）"
+          description: >
+            引擎、平台工具或接口处理中拿到了别家店铺的数据，已拦下、没有推荐 / 没有返回（§9.2）。
+            这不该发生：查平台云代码的只读工具、适配器和知识仓储。引擎拦下的看审计 tenant.violation
+            （记了在哪一步）；stage="server" 是接口处理中发现的（如售后审核读到别家店铺的售后单），
+            看应用日志"接口处理中发现串店"里的路由和店铺。必要时暂停该单元。
+      - alert: RoditTenantIsolationRejected
+        expr: rodit:tenant_isolation:increase15m{stage="http"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：有令牌访问了别家店铺的接口（已拒绝）"
+          description: >
+            接口层按调用方身份拦下（令牌不是这家店铺的，403 tenant_isolation）。可能是网页工具或平台
+            对接配错了令牌，也可能是有人在试探。看 rodit_http_errors_total{code="tenant_isolation"}
+            的路由（服务端发现的串店记 stage="server"，走 critical 的 RoditTenantIsolationBreach）。
+
+      # ================================================================ 性能（§12.1 端到端 P95 ≤ 5 秒）
+      - alert: RoditEndToEndLatencyHigh
+        expr: >
+          max by (job, instance) (rodit:engine_latency_seconds:p95_5m{stage=~"total|since_received"}) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：推荐出现的 P95 {{ $value | humanizeDuration }}，超过 5 秒"
+          description: >
+            §12.1 目标：推荐出现（端到端）P95 ≤ 5 秒（since_received 从平台收到消息算起）。
+            各环节见 rodit:engine_latency_seconds:p95_5m 的 stage；大模型慢时看 rodit_llm_latency_seconds。
+
+      # ================================================================ 平台接口（§12.2、§12.4 失败率、额度）
+      - alert: RoditPlatformToolFailureRateHigh
+        expr: >
+          rodit:platform_tool_failure_ratio:rate10m > 0.2
+          and on (job, instance, tool) rodit:platform_tool_calls:rate10m > 0.02
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：平台接口 {{ $labels.tool }} 失败率 {{ $value | humanizePercentage }}"
+          description: >
+            平台接口故障、限流或超时（outcome 见 rodit_platform_tool_calls_total）。问答按 §12.2 降级：
+            有缓存用缓存并注明时间，没有就推荐"我帮您查一下"。
+      - alert: RoditPlatformToolThrottled
+        expr: >
+          rodit:platform_tool_throttled_ratio:rate10m > 0.05
+          and on (job, instance, tool) rodit:platform_tool_calls:rate10m > 0.02
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：平台接口 {{ $labels.tool }} 被限流（{{ $value | humanizePercentage }}）"
+          description: >
+            平台接口额度不够用了（§12.1 平台接口有额度）。找平台调额度，或调长缓存
+            （logistics.cache_ttl_s）；缓存兜底次数见 rodit:tool_cache_stale_served:rate10m。
+
+      # ================================================================ 大模型（§12.2）
+      - alert: RoditLLMFailureRateHigh
+        expr: >
+          rodit:llm_failure_ratio:rate10m > 0.2
+          and on (job, instance, purpose) rodit:llm_calls:rate10m > 0.02
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：大模型调用（{{ $labels.purpose }}）失败率 {{ $value | humanizePercentage }}"
+          description: >
+            大模型超时或报错时退回 FAQ / 模板（§12.2），推荐变少。异常类型见
+            rodit_llm_calls_total 的 outcome；密钥缺失时 /readyz 报 missing_api_key。
+
+      # ================================================================ 降级（§12.2）
+      - alert: RoditDegradationSpike
+        expr: >
+          rodit:degradations_per_message:rate10m > 0.3
+          and on (job, instance) rodit:engine_messages:rate10m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：降级（{{ $labels.kind }}）激增，每条消息 {{ $value }} 次"
+          description: >
+            降级类型：llm 大模型、decision 判断层、tool:* 平台接口、budget 超过时间预算、
+            tenant_isolation 串店（另有 critical 告警）。客服照常工作，只是推荐变少（§12.2）。
+
+      # ================================================================ 就绪、抓取（§12.2）
+      - alert: RoditNotReady
+        expr: rodit_ready == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}：服务不就绪，已摘流量"
+          description: >
+            /readyz 不通过：数据库、迁移版本、大模型配置或单副本租约（lease）有问题，
+            哪一项见 rodit_readiness_check_ok 和 /readyz 的原因代码。lease 是 held_elsewhere 时
+            说明另一个进程拿走了这个平台单元的租约（一个单元只能跑一个进程）。/metrics 只输出后台
+            刷新的上次结果：rodit_readiness_age_seconds 很大说明检查本身卡住了（数据库网络不通时
+            一次检查要十几秒），结果太旧也按不就绪报。
+      - alert: RoditScrapeDown
+        expr: up{job="rodit"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}：抓不到 Rodit 的指标"
+          description: >
+            进程没在运行、一直重启（数据库连不上退出码 1、单副本租约被占退出码 2），或者 /metrics
+            超时。/metrics 抓取时不查库、不占业务接口的工作线程，但数据库连不通时每个业务请求都要等
+            连接超时，工作线程排满、请求越积越多，进程忙不过来时抓取照样可能超时。这时其他告警都看不到
+            数据。看容器日志：有"启动失败"是起不来；一直在刷"接口错误 StorageUnavailable"是数据库
+            不可用，查数据库连通性（网络策略、连接串、数据库本身）。
+            抓取任务的 job_name 要是 rodit，否则这条告警找不到目标。
+
+      # ================================================================ serve 的后台任务（§8.4、§12.4）
+      - alert: RoditBackgroundTaskFailing
+        expr: >
+          sum by (job, instance, task)
+            (increase(rodit_background_task_runs_total{outcome="error"}[6h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}：后台任务 {{ $labels.task }} 出错"
+          description: >
+            serve 里按间隔跑的续期（refresh_tokens）、过期清理（purge_expired）或授权检查
+            （auth_expiry）这一轮出错或没做完，下一轮会重试。查应用日志"后台任务"、
+            "令牌续期（serve 后台任务）"、"过期清理（serve 后台任务）没有删完的店铺"、
+            "授权过期检查失败"。就绪检查（readiness）每轮都能做完，检查结果是不就绪时报的是
+            RoditNotReady，不在这条里。

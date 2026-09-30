@@ -13,7 +13,7 @@
 - 会话上下文：本地记录买家消息、客服回声、发出的消息和最近的商品 / 订单卡片，供 get_context；
   客服回声和撤回也由 on_event 交给应用层，写进会话仓储（§5.3 最近几轮对话）；
 - 推荐展示：show_suggestions 把推荐卡片放进该会话的"侧边栏"（模式 B；模式 A 的辅助、模式 C 的
-  网页工具同理），新的一批替换旧的。
+  网页工具同理），连同标红提醒（alerts）和没有推荐时的原因（notice），新的一批替换旧的。
 
 所有状态按 shop_id 分开保存（§9.2）；线程安全（一把锁）。这是模拟实现：
 真实适配器部署在对应平台云内（§9.1），发送、转人工调用平台接口。
@@ -24,7 +24,7 @@ from __future__ import annotations
 import itertools
 import threading
 from collections import OrderedDict, deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar, Literal, get_args
@@ -208,6 +208,8 @@ class _Conversation:
     item: ItemRef | None = None
     order: OrderRef | None = None
     cards: list[SuggestionCard] = field(default_factory=list)
+    alerts: list[str] = field(default_factory=list)  # 标红提醒客服（EngineResult.alerts）
+    notice: str | None = None  # 没有推荐时的原因（EngineResult.no_suggestion_reason）
     transferred: bool = False
 
 
@@ -354,16 +356,26 @@ class BaseMockAdapter:
             )
 
     def show_suggestions(
-        self, shop_id: str, conversation_id: str, cards: list[SuggestionCard]
+        self,
+        shop_id: str,
+        conversation_id: str,
+        cards: list[SuggestionCard],
+        *,
+        alerts: Sequence[str] = (),
+        notice: str | None = None,
     ) -> None:
         """把推荐卡片放进该会话的侧边栏，替换上一批（§5.6、§8.2）；空列表表示清空。
 
+        alerts（标红提醒客服）和 notice（没有推荐时的原因）和卡片一起替换：不传就清掉上一批的。
+        它们不含买家原文；万一带了个人信息也先做最小化再展示。
         没收到过这个店铺这个会话的消息时不展示（插件只能在当前会话里展示）。
         """
         with self._lock:
             conv = self._conversation(shop_id, conversation_id)
             if conv is not None:
                 conv.cards = [c.model_copy(deep=True) for c in cards]
+                conv.alerts = [minimize(a) for a in alerts if isinstance(a, str) and a.strip()]
+                conv.notice = minimize(notice) if notice and notice.strip() else None
 
     def send(self, shop_id: str, conversation_id: str, text: str) -> SendResult:
         """只有模式 A 且开了全自动时可用（text 已由引擎加好 AI 标识前缀，§12.3），其他情况抛
@@ -437,6 +449,18 @@ class BaseMockAdapter:
         with self._lock:
             conv = self._conversation(shop_id, conversation_id)
             return [c.model_copy(deep=True) for c in conv.cards] if conv else []
+
+    def sidebar_alerts(self, shop_id: str, conversation_id: str) -> list[str]:
+        """当前展示在该会话侧边栏里的标红提醒。"""
+        with self._lock:
+            conv = self._conversation(shop_id, conversation_id)
+            return list(conv.alerts) if conv else []
+
+    def sidebar_notice(self, shop_id: str, conversation_id: str) -> str | None:
+        """当前展示在该会话侧边栏里的"没有推荐"的原因。"""
+        with self._lock:
+            conv = self._conversation(shop_id, conversation_id)
+            return conv.notice if conv else None
 
     def sent_messages(self, shop_id: str) -> list[OutgoingMessage]:
         with self._lock:

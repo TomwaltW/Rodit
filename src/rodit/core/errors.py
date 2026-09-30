@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Literal, get_args
+
+ToolFailureReason = Literal["unavailable", "throttled", "timeout"]
+"""平台接口失败的原因（ToolUnavailable.reason）：故障、限流、超时。指标按它分开统计（§12.4）。"""
+
+TOOL_FAILURE_REASONS: tuple[ToolFailureReason, ...] = get_args(ToolFailureReason)
+
 
 class RoditError(Exception):
     """所有业务异常的基类。"""
@@ -24,7 +31,17 @@ class ToolError(RoditError):
 
 
 class ToolUnavailable(ToolError):
-    """平台接口限流或故障。有缓存用缓存并注明时间，没有就推荐"我帮您查一下"（§12.2）。"""
+    """平台接口限流或故障。有缓存用缓存并注明时间，没有就推荐"我帮您查一下"（§12.2）。
+
+    reason 区分故障（unavailable，默认）、限流（throttled）、超时（timeout），降级处理一样，
+    只是指标分开统计；不认识的取值抛 ValueError。消息里不放令牌和买家信息。
+    """
+
+    def __init__(self, msg: str = "", *, reason: ToolFailureReason = "unavailable") -> None:
+        if reason not in TOOL_FAILURE_REASONS:
+            raise ValueError(f"未知的平台接口失败原因：{reason!r}")
+        super().__init__(msg)
+        self.reason: ToolFailureReason = reason
 
 
 class KnowledgeUnavailable(RoditError):

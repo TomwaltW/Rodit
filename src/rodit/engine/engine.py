@@ -29,6 +29,10 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
      route.model_copy(update={"intent": 该条, "parts": [], "action": HIGH_RISK_ANSWER 或 ANSWER})
      单独检索、生成、质检，每条最多一张卡片（其余路由结果最多 ShopConfig.suggestion_count 张）；
      投诉类的分条不生成，改为提醒人工；
+   - 并行（§12.1，engine.concurrency）：各条的"找 → 写 → 判"并行跑，同一条的几份草稿并行质检；
+     结果按原顺序收回，输出和顺序执行一致。工作线程只把要写的审计、降级记在这一条自己的记录里，
+     审计、推荐记录、缺失知识都在调用方线程、收回结果之后按原顺序写。
+     质检按"还差几张卡片就先判几份"分批：判哪些草稿和顺序执行时一样，不多调判断层；
    - HUMAN_PRIORITY / NO_SUGGESTION：不推荐，只给提醒；TRANSFER_HUMAN：transfer_to_human=True；
    - 店铺在 ShopConfig.disabled_intents 里关闭的问题类型，回答类路由（含分条）不推荐。
 6. 推荐卡片（engine.cards，§5.6）写 SuggestionRecord（SHOWN；影子模式 SHADOW），
@@ -47,6 +51,23 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    店铺或配置读不出来（知识库故障等，不是已知停用）而消息是 AUTO 时，生效模式无从判断：
    按全自动的兜底处理，transfer_to_human=True（§12.2 全自动模式下任何故障 → 客服接管）。
 
+时间预算（§12.1、§12.2，core.budget）：每条消息在 deadline_scope(latency.message_budget_s,
+min_llm_remaining_s=latency.min_llm_remaining_s) 里处理（EngineConfig.latency）。
+- 生成器、质检自己判断还能不能调大模型（core.budget.llm_allowed），来不及就退回 FAQ / 模板；
+- 截止时间过了：不再检索、生成、重写；没做完的大模型草稿丢掉（生成器不再等它，引擎也不判它；
+  截止之后才判完的大模型草稿同样丢掉），已经通过质检的 FAQ / 模板卡片保留；
+  剩余时间不够再调一次大模型时，同样不重写、不送判断层质检；
+- 引擎最多等到截止时间 + concurrency.JOIN_GRACE_S；还没做完的分条整条丢掉。它的线程会在后台
+  跑完，引擎和质检自己的记录都不在后台写：handle() 返回之后没有迟到的审计、推荐记录、
+  decision_log（质检截止之后不写）。后台线程调用的平台工具、大模型照常留下副作用：工具结果写进
+  缓存、大模型用量计量（llm.MeteredLLMClient 的 llm.usage，调用确实发生了，成本要算到店铺上，
+  §12.4）。handle 里提交到线程池的任务（分条、质检、生成器并行生成的几份草稿、路由投票）都经
+  core.budget.submit_in_context 记在引擎的 BackgroundWork 里（按店铺，handle 里的
+  background_scope）：取消订购删数据之前 AssistService.revoke_shop 用 wait_background 等它们
+  做完，迟到的写入一并删掉（§8.4）；
+- 以上任何一种"时间不够、丢了东西"都记降级 "budget"，engine.result 另加
+  budget_exceeded=True（core.audit.RESULT_BUDGET_EXCEEDED）。
+
 降级（§12.2）：每个环节单独兜住，handle() 对合法消息永不抛错。降级标记（EngineResult.degraded）：
 - "storage"      会话 / 推荐 / 缺失知识记录读写失败（仍然出推荐，缺 suggestion_id）
 - "knowledge"    知识库不可用（KnowledgeUnavailable）→ 不推荐
@@ -54,9 +75,13 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
 - "router"       Router 意外抛错（正常情况下 Router 自己降级、不抛）→ 不推荐
 - "decision"     判断层不可用，路由退回关键词规则（RouteDecision.degraded）
 - "decision:qa"  判断层质检不可用，只跑了硬规则（QAResult.degraded）
-- "retriever"    检索意外抛错（非 KnowledgeUnavailable）→ 该条不推荐
+- "retriever"    检索意外抛错（非 KnowledgeUnavailable、非串店）→ 该条不推荐
+- "tenant_isolation" 会话理解或检索发现串店（TenantIsolationError，§9.2、§12.4 串店检查）→ 不推荐
+                 （检索时是该条不推荐），另记一条 tenant.violation 审计，detail 只有 stage
+                 （understand / retrieve），不记任何数据
 - "generator"    生成抛错 → 保留已通过的草稿
 - "qa"           质检抛错 → 该草稿不推荐（没有验证过的文字不能推荐），保留已通过的
+- "budget"       时间预算不够，有步骤没做或草稿被丢掉（见上）
 - "tool:<kind>"  平台工具不可用：会话理解查订单（tool:order），或 EvidenceBundle.unavailable
 - "audit"        审计写入失败
 - "engine"       其他意外异常 → 不推荐
@@ -81,23 +106,37 @@ UNDERSTAND、ROUTE 各一条；RETRIEVE、GENERATE、QA 每次调用 / 每条分
 - "missing"     list[str]   同 EngineResult.missing_knowledge
 另有 "no_suggestion_reason"、"qa_checked"、"qa_reasons"、"transfer_to_human"；
 键的完整定义见 core.audit.ResultKey（常量 RESULT_DETAIL_KEYS，报表按同一份读）。
+超过时间预算时另加可选键 "budget_exceeded"（True，core.audit.OPTIONAL_RESULT_DETAIL_KEYS）。
 
 耗时（EngineResult.latency_ms，§12.1、§12.4）：键固定为 understand / route / retrieve / generate /
-qa / total，毫秒整数，没跑的环节为 0；分条推荐时同一环节累加。用 time.perf_counter 量墙钟耗时
+qa / total / since_received（LATENCY_KEYS），毫秒整数，没跑的环节为 0。分条并行时同一环节取各条里
+最长的（墙钟口径，和 total 对得上）；同一条里重写的几轮累加。各环节用 time.perf_counter 量墙钟耗时
 （单调时钟），不用注入的 Clock——Clock 只管业务时间戳（记录的 created_at 等）。
-understand 含店铺检查和会话理解；total 是整条消息从进入 handle 到出结果。
+understand 含店铺检查和会话理解；total 是整条消息从进入 handle 到出结果；since_received
+（core.audit.LATENCY_SINCE_RECEIVED）是从平台收到消息（交给 handle 的那条消息的 received_at）到
+出结果：Clock.now() − received_at，含排队、会话锁等待；时钟精度不够或两边时间对不齐时不小于 total。
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
+from functools import partial
 from typing import Any
 
 from rodit.core import audit as _audit
-from rodit.core.audit import AuditAction, ResultKey
+from rodit.core import budget
+from rodit.core.audit import (
+    DEGRADED_BUDGET,
+    DEGRADED_TENANT_ISOLATION,
+    LATENCY_SINCE_RECEIVED,
+    RESULT_BUDGET_EXCEEDED,
+    AuditAction,
+    ResultKey,
+)
 from rodit.core.clock import Clock
 from rodit.core.config import EngineConfig
 from rodit.core.context import shop_scope
@@ -111,7 +150,7 @@ from rodit.core.enums import (
     RouteAction,
     SuggestionStatus,
 )
-from rodit.core.errors import ConcurrencyConflict, KnowledgeUnavailable
+from rodit.core.errors import ConcurrencyConflict, KnowledgeUnavailable, TenantIsolationError
 from rodit.core.evidence import LLM_FREE_INTENTS, MISSING_ITEM, MISSING_ORDER, missing_any
 from rodit.core.models import (
     AuditEvent,
@@ -151,6 +190,14 @@ from rodit.engine.cards import (
     dedupe,
     dropped_draft_alert,
 )
+from rodit.engine.concurrency import (
+    NESTED_GRACE_S,
+    BackgroundWork,
+    Outcome,
+    background_scope,
+    run_inline,
+    run_ordered,
+)
 from rodit.engine.understanding import ConversationBuilder, ShopInactive, effective_mode
 
 logger = logging.getLogger(__name__)
@@ -170,10 +217,16 @@ DEGRADED_GENERATOR = "generator"
 DEGRADED_QA = "qa"
 DEGRADED_AUDIT = "audit"
 DEGRADED_ENGINE = "engine"
+# DEGRADED_TENANT_ISOLATION（"tenant_isolation"）、DEGRADED_BUDGET（"budget"）定义在 core.audit
 
 
 RESULT_DETAIL_KEYS = _audit.RESULT_DETAIL_KEYS  # 定义在 core.audit.ResultKey
-LATENCY_KEYS = ("understand", "route", "retrieve", "generate", "qa", "total")
+_STAGES = ("understand", "route", "retrieve", "generate", "qa")
+LATENCY_KEYS = (*_STAGES, "total", LATENCY_SINCE_RECEIVED)
+
+# 串店审计（tenant.violation）的 stage：只记在哪一步拦下的，不记任何数据（§9.2、§12.4）
+TENANT_STAGE_UNDERSTAND = "understand"
+TENANT_STAGE_RETRIEVE = "retrieve"
 
 # ---------------------------------------------------------------- 给客服看的原因与提醒
 
@@ -193,6 +246,8 @@ REASON_NO_SUGGESTION_DEGRADED = "判断层暂不可用，本条不推荐，请�
 REASON_TRANSFER = "已转人工（§5.7）"
 REASON_DISABLED = "店铺关闭了这类问题的推荐"
 REASON_ENGINE = "问答引擎内部错误，本条不推荐，请客服自行处理（§12.2）"
+REASON_TENANT = "检测到跨店铺数据，本条不推荐，请客服自行处理（§9.2）"
+REASON_BUDGET = "处理超时，本条不推荐，请客服自行处理（§12.1）"
 
 ALERT_HUMAN_PRIORITY = "买家要求人工或在投诉，请优先处理"
 ALERT_COMPLAINT_PART = "买家消息里有投诉，请人工优先处理"
@@ -203,6 +258,16 @@ _CONTEXT_MISSING = frozenset({MISSING_ORDER, MISSING_ITEM})
 _LATE_CHECK_LIMIT = 20  # 判断乱序时读的最近消息条数
 
 
+class _NotInTime:
+    """质检结果的占位：这份大模型草稿来不及判（时间预算），丢掉，不算质检不通过。"""
+
+    def __repr__(self) -> str:
+        return "<not in time>"
+
+
+_NOT_IN_TIME: Any = _NotInTime()
+
+
 def missing_for_intent(intent: Intent) -> str:
     """没有依据、也说不清缺哪条时的缺失标记（core.evidence.missing_any）。"""
     return missing_any(intent)
@@ -211,9 +276,17 @@ def missing_for_intent(intent: Intent) -> str:
 # ---------------------------------------------------------------- 一条消息的处理状态
 
 
+_Op = tuple[str, Any]  # ("degrade", 代码) / ("audit", (AuditAction, detail))
+
+
 @dataclass
 class _Unit:
-    """一次"找 → 写 → 判"：一个路由结果，或多问题消息里的一条（§6.6 规则 5）。"""
+    """一次"找 → 写 → 判"：一个路由结果，或多问题消息里的一条（§6.6 规则 5）。
+
+    在工作线程里跑（concurrency.run_ordered），只改自己：要记的降级、要写的审计按发生顺序记在
+    ops 里，耗时、质检计数也记在这里；主线程收回之后按原顺序并入 _Run（_merge_unit），
+    所以审计的先后和顺序执行时一样。没按时做完的分条，主线程不再读它（换成一个空的替身）。
+    """
 
     route: RouteDecision
     intent_confidence: float
@@ -223,18 +296,46 @@ class _Unit:
     missing: list[str] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     reason: str | None = None
+    ops: list[_Op] = field(default_factory=list)
+    latency: dict[str, float] = field(default_factory=lambda: dict.fromkeys(_STAGES, 0.0))
+    hard_hits: list[str] = field(default_factory=list)
+    qa_checked: int = 0
+    qa_failed: int = 0
+    qa_reasons: list[str] = field(default_factory=list)
+    budget_cut: bool = False  # 时间预算不够，有步骤没做或草稿被丢掉
 
     @property
     def intent(self) -> Intent:
         return self.route.intent
 
+    def degrade(self, code: str) -> None:
+        self.ops.append(("degrade", code))
+
+    def audit(self, action: AuditAction, detail: dict[str, Any]) -> None:
+        self.ops.append(("audit", (action, detail)))
+
+    def add_latency(self, stage: str, since: float) -> None:
+        self.latency[stage] += time.perf_counter() - since
+
+    def cut(self) -> None:
+        """时间预算不够：记 budget 降级（每条只记一次）。"""
+        if not self.budget_cut:
+            self.budget_cut = True
+            self.degrade(DEGRADED_BUDGET)
+
+    def placeholder(self, reason: str) -> _Unit:
+        """同一条的空替身（原来的对象还在工作线程里跑，主线程不能再读它）。"""
+        return _Unit(self.route, self.intent_confidence, self.limit, reason=reason)
+
 
 @dataclass
 class _Run:
-    """一条消息的处理状态。每次 handle 新建一个，引擎本身无状态，可以并发调用。"""
+    """一条消息的处理状态。每次 handle 新建一个，引擎本身无状态，可以并发调用。
+    只在调用方线程里读写（分条的工作线程不碰它）。"""
 
     msg: StandardMessage
     started: float
+    received_at: datetime | None = None  # 交给 handle 的那条消息（乱序时 msg 会换成最新那条）
     mode: Mode = Mode.ASSIST
     # 消息是 AUTO、但店铺 / 配置读不出来、生效模式无从判断：按全自动兜底转人工（§12.2）
     auto_unverified: bool = False
@@ -244,7 +345,7 @@ class _Run:
     route: RouteDecision | None = None
     degraded: list[str] = field(default_factory=list)
     context_notes: list[str] = field(default_factory=list)  # 影响所有卡片的降级（理解、路由）
-    latency: dict[str, float] = field(default_factory=lambda: dict.fromkeys(LATENCY_KEYS, 0.0))
+    latency: dict[str, float] = field(default_factory=lambda: dict.fromkeys(_STAGES, 0.0))
     alerts: list[str] = field(default_factory=list)
     hard_hits: list[str] = field(default_factory=list)
     qa_checked: int = 0
@@ -262,9 +363,15 @@ class _Run:
     def elapsed_ms(self) -> int:
         return round((time.perf_counter() - self.started) * 1000)
 
-    def latency_ms(self) -> dict[str, int]:
+    def latency_ms(self, now: datetime | None = None) -> dict[str, int]:
+        """各环节耗时 + total + since_received（now 是 Clock.now()；拿不到时按 total 算）。"""
         out = {k: round(v * 1000) for k, v in self.latency.items()}
-        out["total"] = self.elapsed_ms()
+        total = self.elapsed_ms()
+        out["total"] = total
+        since = total
+        if now is not None and self.received_at is not None:
+            since = max(total, round((now - self.received_at).total_seconds() * 1000))
+        out[LATENCY_SINCE_RECEIVED] = since
         return out
 
 
@@ -276,6 +383,9 @@ class AssistEngine:
 
     各步骤只通过 core.ports 的协议注入；引擎不直接读平台写接口（问答链路只读，§7）。
     gaps 为空时不记知识缺失提醒（结果里仍有 missing_knowledge）。
+    monotonic：时间预算用的单调时钟（秒，core.budget.Deadline 的 now），测试可以注入假的；
+    外层已经有截止时间时（调用方设的）要用同一个时钟。
+    交给线程池的任务按店铺记在 BackgroundWork 里，wait_background 等某家店的全部做完（取消订购用）。
     """
 
     def __init__(
@@ -293,8 +403,10 @@ class AssistEngine:
         audit: AuditSink,
         clock: Clock,
         gaps: FeedbackRepository | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
+        self._monotonic = monotonic
         self._conversations = conversations
         self._suggestions = suggestions
         self._router = router
@@ -305,17 +417,35 @@ class AssistEngine:
         self._clock = clock
         self._gaps = gaps
         self._builder = ConversationBuilder(knowledge, conversations, tools, config, clock)
+        self._background = BackgroundWork()
 
     @property
     def builder(self) -> ConversationBuilder:
         return self._builder
 
+    def wait_background(self, shop_id: str, timeout: float | None = None) -> bool:
+        """等这家店留在后台的任务（到截止时间被丢下、还在跑的分条和质检）全部做完；
+        timeout 秒之内做完（或本来就没有）返回 True。取消订购删数据之前调
+        （AssistService.revoke_shop），调用方要保证期间不会有这家店的新消息（持有写方闸门）。"""
+        return self._background.wait_idle(shop_id, timeout)
+
     # ------------------------------------------------------------ 入口
 
     def handle(self, msg: StandardMessage) -> EngineResult | None:
-        """处理一条买家消息。重复消息（或非买家消息）返回 None；对合法消息永不抛错（§12.2）。"""
-        run = _Run(msg=msg, started=time.perf_counter())
-        with shop_scope(msg.shop_id):
+        """处理一条买家消息。重复消息（或非买家消息）返回 None；对合法消息永不抛错（§12.2）。
+
+        整条消息在时间预算（EngineConfig.latency）里处理，见模块说明。"""
+        run = _Run(msg=msg, started=time.perf_counter(), received_at=msg.received_at)
+        latency = self._config.latency
+        with (
+            shop_scope(msg.shop_id),
+            background_scope(self._background, msg.shop_id),
+            budget.deadline_scope(
+                latency.message_budget_s,
+                min_llm_remaining_s=latency.min_llm_remaining_s,
+                now=self._monotonic,
+            ),
+        ):
             try:
                 return self._handle(run)
             except Exception as exc:  # noqa: BLE001 — 最后一道兜底
@@ -389,6 +519,11 @@ class AssistEngine:
         except KnowledgeUnavailable:
             run.degrade(DEGRADED_KNOWLEDGE)
             reason = REASON_KNOWLEDGE
+        except TenantIsolationError as exc:  # 串店（§9.2）：不推荐，只记在哪一步拦下的
+            self._warn("understand", exc)
+            run.degrade(DEGRADED_TENANT_ISOLATION)
+            self._audit(run, AuditAction.TENANT_VIOLATION, _tenant_detail(TENANT_STAGE_UNDERSTAND))
+            reason = REASON_TENANT
         except Exception as exc:  # noqa: BLE001
             self._warn("understand", exc)
             run.degrade(DEGRADED_UNDERSTANDING)
@@ -432,8 +567,7 @@ class AssistEngine:
                 auto_reply=soothe[1] if soothe else None,
             )
         units, plan_reason = self._plan_units(run, ctx, route, plan)
-        for unit in units:
-            self._run_unit(run, ctx, unit, plan)
+        units = self._run_units(run, ctx, units, plan)
         self._record_gaps(run, ctx, units)
 
         scored = self._cards(run, units)
@@ -608,7 +742,59 @@ class AssistEngine:
             units.append(_Unit(part_route, confidence, 1))
         return units, reason
 
-    def _run_unit(self, run: _Run, ctx: ConversationContext, unit: _Unit, plan: ActionPlan) -> None:
+    def _run_units(
+        self, run: _Run, ctx: ConversationContext, units: list[_Unit], plan: ActionPlan
+    ) -> list[_Unit]:
+        """各条并行跑"找 → 写 → 判"，按原顺序收回并入 run（§12.1）。
+
+        到"截止时间 + 宽限"还没做完的分条换成空的替身（该条不推荐，记 budget）；工作线程
+        不写引擎自己的记录，丢掉的分条不会在 handle() 返回之后留下审计、推荐记录；它调用的平台
+        工具、大模型迟到的缓存、用量写入由 BackgroundWork 兜住（取消订购等它们做完再删）。
+        某一条意外抛错时和顺序执行一样：前面各条已经并入，这个异常交给 handle 的兜底，后面各条丢掉。
+        """
+        tasks = [partial(self._run_unit, ctx, unit, plan) for unit in units]
+        outcomes: list[Outcome[_Unit]] = run_ordered(tasks)
+        done: list[_Unit] = []
+        for unit, outcome in zip(units, outcomes, strict=True):
+            if not outcome.finished:
+                logger.warning("问答引擎降级：分条超过时间预算，丢弃（%s）", unit.intent)
+                late = unit.placeholder(REASON_BUDGET)
+                late.budget_cut = True
+                run.degrade(DEGRADED_BUDGET)
+                done.append(late)
+                continue
+            if outcome.error is not None:
+                # 这一条已经跑完（抛错结束），可以读它：抛错之前记下的照常并入，和顺序执行一样
+                self._merge_unit(run, unit)
+                self._merge_latency(run, [*done, unit])
+                raise outcome.error
+            assert outcome.value is not None
+            self._merge_unit(run, outcome.value)
+            done.append(outcome.value)
+        self._merge_latency(run, done)
+        return done
+
+    def _merge_unit(self, run: _Run, unit: _Unit) -> None:
+        """把一条的记录按发生顺序并入 run：降级、审计（在调用方线程写）、质检计数。"""
+        for kind, value in unit.ops:
+            if kind == "degrade":
+                run.degrade(value)
+            else:
+                action, detail = value
+                self._audit(run, action, detail)
+        run.hard_hits.extend(unit.hard_hits)
+        run.qa_checked += unit.qa_checked
+        run.qa_failed += unit.qa_failed
+        run.qa_reasons.extend(r for r in unit.qa_reasons if r not in run.qa_reasons)
+
+    @staticmethod
+    def _merge_latency(run: _Run, units: list[_Unit]) -> None:
+        """分条并行：每个环节取各条里最长的（墙钟口径）。"""
+        for stage in ("retrieve", "generate", "qa"):
+            run.latency[stage] += max((u.latency[stage] for u in units), default=0.0)
+
+    def _run_unit(self, ctx: ConversationContext, unit: _Unit, plan: ActionPlan) -> _Unit:
+        """一条的"找 → 写 → 判"（工作线程里跑，只改 unit，见 _Unit）。"""
         route = unit.route
         # 规则 3 不附回答时（关闭的类型、投诉、降级时的高风险类型）只出安抚话术：不检索，
         # 不调平台工具，也不给关闭的类型记知识缺失
@@ -616,29 +802,40 @@ class AssistEngine:
             route, ctx.config.disabled_intents
         )
         if plan.retrieve and not soothe_only:
+            if budget.expired():  # 截止时间已过：不再检索
+                unit.cut()
+                unit.reason = REASON_BUDGET
+                return unit
             t = time.perf_counter()
             bundle: EvidenceBundle | None = None
             try:
                 bundle = self._retriever.retrieve(ctx, route)
             except KnowledgeUnavailable:
-                run.degrade(DEGRADED_KNOWLEDGE)
+                unit.degrade(DEGRADED_KNOWLEDGE)
                 unit.reason = REASON_KNOWLEDGE
+            except TenantIsolationError as exc:  # 串店（§9.2）：该条不推荐，只记在哪一步拦下的
+                self._warn("retrieve", exc)
+                unit.degrade(DEGRADED_TENANT_ISOLATION)
+                unit.audit(AuditAction.TENANT_VIOLATION, _tenant_detail(TENANT_STAGE_RETRIEVE))
+                unit.reason = REASON_TENANT
+                unit.add_latency("retrieve", t)
+                return unit
             except Exception as exc:  # noqa: BLE001
                 self._warn("retrieve", exc)
-                run.degrade(DEGRADED_RETRIEVER)
+                unit.degrade(DEGRADED_RETRIEVER)
                 unit.reason = REASON_RETRIEVER
-            run.add_latency("retrieve", t)
+            unit.add_latency("retrieve", t)
             if bundle is None:
                 if route.action != RouteAction.OFF_PLATFORM_SCRIPT:
-                    return
+                    return unit
                 # 站外交易标准话术不依赖依据（§11.4）：检索失败照常出话术，只是不带依据
                 bundle, unit.reason = EvidenceBundle(), None
             else:
-                self._audit(run, AuditAction.RETRIEVE, _retrieve_detail(route, bundle))
+                unit.audit(AuditAction.RETRIEVE, _retrieve_detail(route, bundle))
             unit.bundle = bundle
         bundle = unit.bundle
         for code in bundle.unavailable:
-            run.degrade(code)
+            unit.degrade(code)
         unit.missing = list(bundle.missing)
         if (
             route.action in _ANSWER_ACTIONS
@@ -649,11 +846,15 @@ class AssistEngine:
         ):
             unit.reason = REASON_NO_EVIDENCE
             unit.missing = unit.missing or [missing_for_intent(route.intent)]
-            return
-        self._generate_and_check(run, ctx, unit)
+            return unit
+        self._generate_and_check(ctx, unit)
+        return unit
 
-    def _generate_and_check(self, run: _Run, ctx: ConversationContext, unit: _Unit) -> None:
-        """生成 → 质检 → 大模型草稿不通过带原因重写（§5.5、§11.5）。"""
+    def _generate_and_check(self, ctx: ConversationContext, unit: _Unit) -> None:
+        """生成 → 质检 → 大模型草稿不通过带原因重写（§5.5、§11.5），受时间预算约束（§12.2）。
+
+        质检分批：还差 n 张卡片就先判接下来的 n 份草稿（并行），判哪些草稿和顺序执行一样。
+        """
         route, bundle = unit.route, unit.bundle
         max_regen = self._config.qa_gate.max_regenerations
         checked_texts: set[str] = set()
@@ -663,60 +864,68 @@ class AssistEngine:
         regenerations = 0
         generator_error = qa_error = False
         while True:
+            if budget.expired():  # 截止时间已过：不再生成、重写
+                unit.cut()
+                break
             t = time.perf_counter()
             drafts: list[Draft] | None = None
             try:
                 drafts = list(self._generator.generate(ctx, route, bundle, retry_feedback=feedback))
             except Exception as exc:  # noqa: BLE001 — 生成失败：保留已通过的（§12.2）
                 self._warn("generate", exc)
-            run.add_latency("generate", t)
+            unit.add_latency("generate", t)
             if drafts is None:
-                run.degrade(DEGRADED_GENERATOR)
+                unit.degrade(DEGRADED_GENERATOR)
                 generator_error = True
                 break
-            self._audit(run, AuditAction.GENERATE, _generate_detail(route, drafts, regenerations))
+            unit.audit(AuditAction.GENERATE, _generate_detail(route, drafts, regenerations))
+            if budget.expired():  # 生成器到截止时间才返回：没做完的大模型草稿已经丢掉
+                unit.cut()
 
             llm_failed: list[QAResult] = []
-            for draft in drafts:
-                if len(unit.passed) >= unit.limit:
-                    break
-                if draft.text in checked_texts:
-                    continue  # 同样的文字已经判过（重写时生成器又给了一遍 FAQ / 模板）
-                checked_texts.add(draft.text)
-                t = time.perf_counter()
-                qa: QAResult | None = None
-                try:
-                    qa = self._gate.check(ctx, route, draft, bundle)
-                except Exception as exc:  # noqa: BLE001 — 没验证过的文字不推荐
-                    self._warn("qa", exc)
-                run.add_latency("qa", t)
-                if qa is None:
-                    run.degrade(DEGRADED_QA)
-                    qa_error = True
-                    continue
-                results.append(qa)
-                run.qa_checked += 1
-                run.hard_hits.extend(h.rule for h in qa.hard_hits)
-                if qa.degraded:
-                    run.degrade(DEGRADED_DECISION_QA)
-                if qa.passed:
-                    unit.passed.append((draft, qa))
-                    continue
-                run.qa_failed += 1
-                why = _qa_reasons(qa)
-                failed_reasons.extend(why)
-                run.qa_reasons.extend(r for r in why if r not in run.qa_reasons)
-                if draft.kind == DraftKind.LLM:
-                    llm_failed.append(qa)
-                else:  # FAQ / 模板：标准回答本身有问题，重写没用
-                    unit.alerts.append(dropped_draft_alert(draft, qa))
+            queue = list(drafts)
+            while queue and len(unit.passed) < unit.limit:
+                wave: list[Draft] = []
+                while queue and len(wave) < unit.limit - len(unit.passed):
+                    draft = queue.pop(0)
+                    if draft.text in checked_texts:
+                        continue  # 同样的文字已经判过（重写时生成器又给了一遍 FAQ / 模板）
+                    checked_texts.add(draft.text)
+                    wave.append(draft)
+                for draft, qa in zip(wave, self._check_wave(ctx, unit, wave), strict=True):
+                    if qa is _NOT_IN_TIME:  # 来不及判的大模型草稿：丢掉，不算质检不通过
+                        unit.cut()
+                        continue
+                    if qa is None:
+                        unit.degrade(DEGRADED_QA)
+                        qa_error = True
+                        continue
+                    results.append(qa)
+                    unit.qa_checked += 1
+                    unit.hard_hits.extend(h.rule for h in qa.hard_hits)
+                    if qa.degraded:
+                        unit.degrade(DEGRADED_DECISION_QA)
+                    if qa.passed:
+                        unit.passed.append((draft, qa))
+                        continue
+                    unit.qa_failed += 1
+                    why = _qa_reasons(qa)
+                    failed_reasons.extend(why)
+                    unit.qa_reasons.extend(r for r in why if r not in unit.qa_reasons)
+                    if draft.kind == DraftKind.LLM:
+                        llm_failed.append(qa)
+                    else:  # FAQ / 模板：标准回答本身有问题，重写没用
+                        unit.alerts.append(dropped_draft_alert(draft, qa))
             if len(unit.passed) >= unit.limit or not llm_failed or regenerations >= max_regen:
+                break
+            if not budget.llm_allowed():  # 来不及再调一次大模型：不重写，保留已通过的
+                unit.cut()
                 break
             regenerations += 1
             feedback = dedupe(r for qa in llm_failed for r in _qa_reasons(qa))
 
         if results or qa_error:
-            self._audit(run, AuditAction.QA, _qa_detail(route, results, unit, regenerations))
+            unit.audit(AuditAction.QA, _qa_detail(route, results, unit, regenerations))
         if unit.passed:
             return
         if failed_reasons:
@@ -725,8 +934,52 @@ class AssistEngine:
             unit.reason = REASON_QA_ERROR
         elif generator_error:
             unit.reason = REASON_GENERATOR
+        elif unit.budget_cut:
+            unit.reason = REASON_BUDGET
         else:
             unit.reason = REASON_NO_DRAFT
+
+    def _check_wave(self, ctx: ConversationContext, unit: _Unit, wave: list[Draft]) -> list[Any]:
+        """并行质检一批草稿，按原顺序返回：QAResult；None = 质检抛错；_NOT_IN_TIME = 大模型
+        草稿来不及判（剩余时间不够调判断层、到点没判完，或截止之后才判完——结论不用）。
+
+        FAQ / 模板只跑硬规则（§5.5，毫秒级），截止时间过了也照常判完。要调判断层的大模型草稿
+        有两份以上时一起并行判；只有一份时按原顺序逐份判（没有可并行的，调用顺序和顺序执行一样），
+        大模型草稿仍在单独的线程里判，到点不再等它。
+        """
+        if not wave:
+            return []
+        t = time.perf_counter()
+        out: list[Any] = [None] * len(wave)
+        pending: list[int] = []
+        for i, draft in enumerate(wave):
+            if draft.kind == DraftKind.LLM and not budget.llm_allowed():
+                out[i] = _NOT_IN_TIME  # 不送判断层（§12.2 来不及调大模型）
+            else:
+                pending.append(i)
+        judged = [i for i in pending if wave[i].kind == DraftKind.LLM]
+        batches = [pending] if len(judged) >= 2 else [[i] for i in pending]
+        check = partial(self._gate.check, ctx, unit.route)
+        for batch in batches:
+            tasks = [partial(check, wave[i], unit.bundle) for i in batch]
+            if len(batch) == 1 and wave[batch[0]].kind != DraftKind.LLM:
+                outcomes = [run_inline(tasks[0])]  # 只跑硬规则：直接判
+            else:
+                outcomes = run_ordered(tasks, grace_s=NESTED_GRACE_S, name="rodit-qa")
+            for i, outcome in zip(batch, outcomes, strict=True):
+                out[i] = self._wave_result(wave[i], outcome)
+        unit.add_latency("qa", t)
+        return out
+
+    def _wave_result(self, draft: Draft, outcome: Outcome[QAResult]) -> Any:
+        if not outcome.finished:
+            return _NOT_IN_TIME
+        if outcome.error is not None:
+            self._warn("qa", outcome.error)  # 没验证过的文字不推荐
+            return None
+        if draft.kind == DraftKind.LLM and budget.expired():
+            return _NOT_IN_TIME  # 截止之后才判完：引擎已经不等它了
+        return outcome.value
 
     # ------------------------------------------------------------ 缺失知识（§5.7、§5.8）
 
@@ -994,7 +1247,7 @@ class AssistEngine:
             auto_reply=None if shadow else auto_reply,
             transfer_to_human=transfer,
             degraded=list(run.degraded),
-            latency_ms=run.latency_ms(),
+            latency_ms=run.latency_ms(self._clock.now()),
         )
         run.result = result
         self._write_result(run, result)
@@ -1008,6 +1261,10 @@ class AssistEngine:
             self._warn("finish", exc)
         if run.result is not None:
             return run.result
+        try:
+            now: datetime | None = self._clock.now()
+        except Exception:  # noqa: BLE001 — 时钟都读不出来：since_received 按 total 算
+            now = None
         result = EngineResult(
             shop_id=run.msg.shop_id,
             conversation_id=run.msg.conversation_id,
@@ -1016,7 +1273,7 @@ class AssistEngine:
             no_suggestion_reason=REASON_ENGINE,
             transfer_to_human=run.mode == Mode.AUTO or run.auto_unverified,
             degraded=list(run.degraded),
-            latency_ms=run.latency_ms(),
+            latency_ms=run.latency_ms(now),
         )
         run.result = result
         self._write_result(run, result)
@@ -1040,6 +1297,8 @@ class AssistEngine:
             ResultKey.MISSING: list(result.missing_knowledge),
         }
         detail = {str(k): v for k, v in detail.items()}
+        if DEGRADED_BUDGET in result.degraded:  # 可选键：只在超过时间预算时写
+            detail[RESULT_BUDGET_EXCEEDED] = True
         self._audit(run, AuditAction.RESULT, detail)
 
     # ------------------------------------------------------------ 留痕
@@ -1075,6 +1334,11 @@ def _with_ai_prefix(prefix: str, text: str) -> str:
 
 
 # ---------------------------------------------------------------- 审计 detail（不放买家原文）
+
+
+def _tenant_detail(stage: str) -> dict[str, Any]:
+    """串店审计：只记在哪一步拦下的，不记店铺、订单或任何数据（§9.2、§12.4）。"""
+    return {"stage": stage}
 
 
 def _qa_reasons(qa: QAResult) -> list[str]:

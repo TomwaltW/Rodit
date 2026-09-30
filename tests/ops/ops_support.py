@@ -58,6 +58,10 @@ OPS_ENV_NAMES: tuple[str, ...] = (
     "RODIT_AUTH_EXPIRY_WARN_DAYS",
     "RODIT_AUTH_EXPIRY_CHECK_S",
     "RODIT_READINESS_CACHE_S",
+    "RODIT_READINESS_REFRESH_S",
+    "RODIT_TOKEN_REFRESH_INTERVAL_S",
+    "RODIT_PURGE_EXPIRED_INTERVAL_S",
+    "RODIT_CLASSIFIER_PATH",
     "RODIT_DATABASE_DSN",
     "RODIT_MIGRATE_DSN",
     "RODIT_TOKEN_KEY",
@@ -106,6 +110,29 @@ class FakeReadinessDb:
         if self.query_error is not None:
             raise self.query_error
         return _Result([{"version": v} for v in self.versions])
+
+
+# ================================================================ 单副本租约的替身
+
+
+class FakeServeLease:
+    """serve 的单副本租约替身（rodit.ops.lease.Lease）：不连数据库，只记录调用。
+    main(["serve"], lease_factory=FakeServeLease) 用它；真的锁在 test_lease.py 里测。"""
+
+    def __init__(self, settings: Any = None) -> None:
+        self.events: list[str] = []
+
+    def acquire(self) -> FakeServeLease:
+        self.events.append("acquire")
+        return self
+
+    def release(self) -> None:
+        self.events.append("release")
+
+    def probe(self) -> dict[str, Any]:
+        from rodit.ops.health import CheckResult
+
+        return {"lease": CheckResult("acquire" in self.events and "release" not in self.events)}
 
 
 # ================================================================ "平台云代码"的绑定

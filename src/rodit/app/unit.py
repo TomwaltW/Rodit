@@ -10,11 +10,12 @@ build_unit 只接收"已经造好"的外部依赖（仓储、大模型、平台�
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Any
 
-from rodit.adapters import AdapterRegistry, AuthGuard
+from rodit.adapters import AdapterRegistry, AuthGuard, AuthGuardTokenProvider
 from rodit.aftersale import DefaultAfterSaleAdvisor, ReviewAssistant
 from rodit.core.audit import InMemoryAuditSink
 from rodit.core.clock import Clock
@@ -22,7 +23,7 @@ from rodit.core.config import EngineConfig, effective_shop_config
 from rodit.core.decision import DecisionProvider
 from rodit.core.enums import Platform
 from rodit.core.errors import ShopInactive
-from rodit.core.models import KnowledgeItem, ShopConfig
+from rodit.core.models import KnowledgeItem, ShopConfig, SubscriptionEvent
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import (
     AfterSaleActionPort,
@@ -40,6 +41,8 @@ from rodit.core.ports import (
     QualityReviewRepository,
     ShopAuthRepository,
     SuggestionRepository,
+    TokenProvider,
+    TokenRefreshPort,
     ToolGateway,
 )
 from rodit.decision import RuleProvider, build_decision_provider
@@ -61,6 +64,9 @@ from rodit.knowledge import FaqSearcher, KnowledgeRetriever
 from rodit.qa import DefaultQualityGate
 from rodit.routing import DecisionRouter, RoutingPolicy
 from rodit.tools import CachingToolGateway, DefaultLogisticsAdvisor, DefaultToolEvidenceProvider
+
+SubscriptionParser = Callable[[dict[str, Any]], SubscriptionEvent | None]
+"""平台订购推送（原始 dict）→ SubscriptionEvent；不认识的推送返回 None（§8.4）。"""
 
 TOOL_CACHE_MAX_STALE_S = 3600
 """平台接口故障时最多用 1 小时内的缓存兜底（§12.2 用缓存数据并注明时间）；更旧的订单、售后、
@@ -135,6 +141,16 @@ class Unit:
     catalog: ItemCatalog | None = None
     ocr: ImageTextExtractor | None = None
     extra_purgers: list[object] = field(default_factory=list)
+    # 给平台云代码取店铺令牌（§8.4，core.ports.TokenProvider）；不给时用基于 auth 的默认实现
+    tokens: TokenProvider | None = None
+    # 平台云代码注入的令牌续期接口和订购推送解析（PlatformBindings 的同名字段，§8.4）：
+    # 店铺生命周期（续期任务、平台推送订购事件的接口）从这里取；没注入时对应功能不可用
+    token_refresher: TokenRefreshPort | None = None
+    parse_subscription: SubscriptionParser | None = None
+
+    def __post_init__(self) -> None:
+        if self.tokens is None:
+            self.tokens = AuthGuardTokenProvider(self.auth)
 
     def shop_config(self, shop_id: str) -> ShopConfig:
         """店铺的生效配置（平台默认 → 类目默认 → 店铺覆盖，§9.3）。"""
@@ -161,6 +177,8 @@ def build_unit(
     qa_provider: DecisionProvider | None = None,
     catalog: ItemCatalog | None = None,
     ocr: ImageTextExtractor | None = None,
+    token_refresher: TokenRefreshPort | None = None,
+    parse_subscription: SubscriptionParser | None = None,
 ) -> Unit:
     """把各模块接成一个平台单元。
 
@@ -169,9 +187,15 @@ def build_unit(
       路由的兜底永远是关键词规则（§12.2 判断层不可用 → 关键词路由）。
     - action_port 为空表示没有申请写售后权限（MVP，§8.4 最小权限）：审核助手只给建议。
     - catalog / ocr：平台商品接口和详情图 OCR（§5.2.3），为空时商品同步不可用。
+    - token_refresher / parse_subscription：平台的令牌续期接口、订购推送解析（§8.4），
+      为空时续期、平台推送订购事件不可用。
     """
     if catalog is not None and catalog.platform != platform:
         raise ValueError(f"商品接口属于 {catalog.platform}，单元是 {platform}（§9.1 数据不跨云）")
+    if token_refresher is not None and token_refresher.platform != platform:
+        raise ValueError(
+            f"令牌续期接口属于 {token_refresher.platform}，单元是 {platform}（§9.1 数据不跨云）"
+        )
     if tools.platform != platform:
         raise ValueError(f"平台工具属于 {tools.platform}，单元是 {platform}（§9.1 数据不跨云）")
     cache = cache or InMemoryCache(clock)
@@ -278,4 +302,6 @@ def build_unit(
         action_port=action_port,
         catalog=catalog,
         ocr=ocr,
+        token_refresher=token_refresher,
+        parse_subscription=parse_subscription,
     )

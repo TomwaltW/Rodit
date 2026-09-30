@@ -33,6 +33,7 @@ from rodit.core.models import (
     KnowledgeItem,
     Turn,
 )
+from rodit.core.scopes import MVP_SCOPES
 from rodit.knowledge.admin import (
     FaqChange,
     FaqChanges,
@@ -58,7 +59,8 @@ class ConsoleService:
 
     出错时抛业务异常，由接口层映射：KeyError（不存在）、ValueError（取值不合法）、
     ActionNotAllowed（状态不对 / 不开放的配置项）、ShopInactive（店铺已删除或停用）、
-    ItemSyncUnavailable（没接商品接口）、ToolUnavailable（商品接口故障）。
+    ItemSyncUnavailable（没接商品接口）、ToolUnavailable（商品接口故障）、
+    AuthExpired（商品同步时店铺授权无效）。
     """
 
     def __init__(self, unit: Unit, processing: ShopGate) -> None:
@@ -147,7 +149,10 @@ class ConsoleService:
 
     def sync_items(self, shop_id: str, *, item_id: str | None = None, merchant: str) -> SyncReport:
         """平台商品同步（§5.2.3）：item_id 为空时同步整个店铺。没有接入商品接口或 OCR 时抛
-        ItemSyncUnavailable；商品接口故障抛 ToolUnavailable。"""
+        ItemSyncUnavailable；商品接口故障抛 ToolUnavailable。
+
+        调平台商品接口前先查店铺授权（§8.4 授权过期时停止处理）：没有授权、过期、缺读商品权限、
+        需要重新授权都抛 AuthExpired，商品接口一次都不调。"""
         actor = require_human(merchant, "商家")
         sync = ItemSync(
             self.unit.repos.knowledge,
@@ -160,6 +165,7 @@ class ConsoleService:
         )
         with self._processing(shop_id):
             require_shop(self.unit.repos.knowledge, shop_id)
+            self.unit.auth.require(shop_id, MVP_SCOPES)
             if item_id is None:
                 return sync.sync_shop(shop_id, operator=actor)
             return sync.sync_item(shop_id, item_id, operator=actor)

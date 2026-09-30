@@ -164,12 +164,16 @@ class StubRetriever:
 class StubGenerator:
     """script 里的每一项按调用顺序依次返回（列表或异常）；用完后按默认规则生成。
 
+    多问题分条并行生成（各条调用的先后不固定）：按问题类型写脚本用 script_for[intent]，
+    同一类型内按调用顺序依次返回，优先于 script。
+
     默认：澄清问题 / 站外话术 / 安抚 / 查不到时"我帮您查一下"用模板，
     其余用"大模型"根据第一条依据写。
     """
 
     def __init__(self) -> None:
         self.script: list[list[Draft] | Exception] = []
+        self.script_for: dict[Intent, list[list[Draft] | Exception]] = {}
         self.calls: list[dict[str, Any]] = []
 
     def generate(
@@ -188,6 +192,12 @@ class StubGenerator:
                 "evidence_ids": evidence.ids(),
             }
         )
+        scripted = self.script_for.get(route.intent)
+        if scripted:
+            item = scripted.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
         if self.script:
             item = self.script.pop(0)
             if isinstance(item, Exception):

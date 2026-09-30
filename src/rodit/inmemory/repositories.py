@@ -40,7 +40,7 @@ from rodit.core.models import (
     SuggestionRecord,
     merge_overrides,
 )
-from rodit.core.ports import RECALL_TOMBSTONE_TTL
+from rodit.core.ports import RECALL_TOMBSTONE_TTL, GrantStamp
 from rodit.inmemory.embedding import cosine
 
 
@@ -273,6 +273,10 @@ class InMemoryConversationRepository:
         self._conversations: dict[tuple[str, str], Conversation] = {}
         self._messages: dict[tuple[str, str], list[StoredMessage]] = {}
         self._msg_ids: set[tuple[str, str]] = set()
+        # (店铺, msg_id) → 写入序号：跨会话按时间排序时，同一时间按写入顺序
+        # （和 PostgreSQL 的自增 id 一致）
+        self._write_seq: dict[tuple[str, str], int] = {}
+        self._seq = itertools.count(1)
         # 店铺 → (会话, msg_id) → 过期时间；按写入顺序（有效期相同，也就是按过期顺序）
         self._tombstones: dict[str, OrderedDict[tuple[str, str], datetime]] = {}
 
@@ -312,6 +316,7 @@ class InMemoryConversationRepository:
     def _append(self, key: tuple[str, str], msg: StoredMessage) -> None:
         msgs = self._messages[key]
         msgs.append(msg)
+        self._write_seq[(msg.shop_id, msg.msg_id)] = next(self._seq)
         # 按时间升序；同一时间保持写入顺序（sort 是稳定的）
         msgs.sort(key=lambda m: m.created_at)
 
@@ -385,6 +390,26 @@ class InMemoryConversationRepository:
             msgs = self._messages.get((shop_id, conversation_id), [])
             return [m.model_copy() for m in msgs[-limit:]] if limit > 0 else []
 
+    def list_outgoing(
+        self,
+        shop_id: str,
+        *,
+        since: datetime,
+        until: datetime,
+        roles: Sequence[Role] = (Role.AGENT, Role.BOT),
+    ) -> list[StoredMessage]:
+        wanted = frozenset(roles)
+        with self._lock:
+            found = [
+                m
+                for (shop, _), msgs in self._messages.items()
+                if shop == shop_id
+                for m in msgs
+                if m.role in wanted and since <= m.created_at < until
+            ]
+            found.sort(key=lambda m: (m.created_at, self._write_seq.get((shop_id, m.msg_id), 0)))
+            return [m.model_copy() for m in found]
+
     def recall_message(self, shop_id: str, conversation_id: str, msg_id: str) -> bool:
         # 撤回：消息整条删掉（原文不留），msg_id 留在 _msg_ids 里继续去重
         with self._lock:
@@ -392,6 +417,7 @@ class InMemoryConversationRepository:
             kept = [m for m in msgs if m.msg_id != msg_id]
             if len(kept) != len(msgs):
                 self._messages[(shop_id, conversation_id)] = kept
+                self._write_seq.pop((shop_id, msg_id), None)
                 return True
             if (shop_id, msg_id) not in self._msg_ids:
                 self._remember_recall(shop_id, conversation_id, msg_id)  # 撤回先到（§8.3）
@@ -404,6 +430,7 @@ class InMemoryConversationRepository:
                 n += 1 + len(self._messages.pop(key, []))
                 del self._conversations[key]
             self._msg_ids = {k for k in self._msg_ids if k[0] != shop_id}
+            self._write_seq = {k: v for k, v in self._write_seq.items() if k[0] != shop_id}
             n += len(self._tombstones.pop(shop_id, {}))
             return n
 
@@ -656,11 +683,13 @@ class InMemoryAfterSaleReviewRepository:
 
 
 class InMemoryShopAuthRepository:
-    """实现 core.ports.ShopAuthRepository（内存里不加密；PostgreSQL 实现加密落库）。"""
+    """实现 core.ports.ShopAuthRepository（内存里不加密；PostgreSQL 实现加密落库）。
+    版本是这个仓储里递增的序号（删掉再建也不重复）；比较并交换都在锁里做。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._auth: dict[str, ShopAuth] = {}
+        self._versions = itertools.count(1)
 
     def get(self, shop_id: str) -> ShopAuth | None:
         with self._lock:
@@ -669,8 +698,41 @@ class InMemoryShopAuthRepository:
 
     def save(self, auth: ShopAuth) -> None:
         with self._lock:
-            self._auth[auth.shop_id] = auth.model_copy()
+            self._auth[auth.shop_id] = auth.model_copy(update={"version": next(self._versions)})
+
+    def replace(self, auth: ShopAuth, *, expected_version: int) -> bool:
+        with self._lock:
+            current = self._auth.get(auth.shop_id)
+            if current is None or current.version != expected_version:
+                return False
+            self._auth[auth.shop_id] = auth.model_copy(update={"version": next(self._versions)})
+            return True
+
+    def stamp(self, shop_id: str) -> GrantStamp | None:
+        with self._lock:
+            a = self._auth.get(shop_id)
+            if a is None or a.version is None:
+                return None
+            return GrantStamp(version=a.version, granted_at=a.granted_at)
 
     def delete(self, shop_id: str) -> bool:
         with self._lock:
             return self._auth.pop(shop_id, None) is not None
+
+    def expiring_shop_ids(self, before: datetime) -> list[tuple[str, datetime]]:
+        # 只交出店铺 ID 和到期时间（和 PostgreSQL 实现的 rodit_auth_expiring 一样，不碰令牌）
+        with self._lock:
+            found = [
+                (a.shop_id, a.expires_at) for a in self._auth.values() if a.expires_at <= before
+            ]
+        return sorted(found, key=lambda pair: (pair[1], pair[0]))
+
+    def mark_needs_reauth(self, shop_id: str, *, expected_version: int | None = None) -> bool:
+        with self._lock:
+            auth = self._auth.get(shop_id)
+            if auth is None:
+                return False
+            if expected_version is not None and auth.version != expected_version:
+                return False  # 被拒的那一份已经被换掉了
+            self._auth[shop_id] = auth.model_copy(update={"needs_reauth": True})
+            return True

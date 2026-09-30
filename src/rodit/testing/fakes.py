@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from pydantic import SecretStr, ValidationError
+
+from rodit.core.clock import Clock
 from rodit.core.config import EngineConfig, effective_shop_config
 from rodit.core.decision import (
     Answer,
@@ -43,13 +47,16 @@ from rodit.core.models import (
     OrderRef,
     PlatformItem,
     PriceInfo,
+    RefreshedToken,
     StandardMessage,
     StockInfo,
+    SubscriptionEvent,
     Turn,
 )
 from rodit.core.pii import mask_pii
 from rodit.core.ports import LLMRequest, LLMResponse
 from rodit.core.questions import (
+    NO_SECOND_INTENT,
     Q_ANSWERS_QUESTION,
     Q_EMOTION,
     Q_GROUNDED,
@@ -58,8 +65,10 @@ from rodit.core.questions import (
     Q_NEED_HUMAN,
     Q_PLATFORM_VIOLATION,
     Q_PROMISE_RISK,
+    Q_SECOND_INTENT,
     Q_TONE,
 )
+from rodit.core.scopes import MVP_SCOPES
 from rodit.testing.fixtures import AGENT, BUYER, CONV, DEFAULT_NOW, SHOP_A, DemoWorld
 
 # ================================================================ 时间
@@ -220,6 +229,292 @@ class FakeDecisionProvider:
         return response
 
 
+# ---------------------------------------------------------------- 判断层走大模型时的脚本
+
+_JUDGE_STATE = re.compile(r"## 状态（state）\n(?P<state>.*?)\n\n## 问题", re.S)
+_JUDGE_QUESTION = re.compile(r"^### (?P<key>\S+)（(?P<type>是否题|单选题|打分题)）", re.M)
+_JUDGE_TYPES = {"是否题": "noul", "单选题": "choice", "打分题": "score"}
+
+JUDGE_DEFAULT_ANSWERS: dict[str, dict[str, Any]] = {
+    # 路由（§6.5）：不要人工、情绪平稳、只问了一件事
+    Q_NEED_HUMAN: {"answer": "否", "p": 0.02},
+    Q_EMOTION: {"score": 0},
+    Q_MULTI_INTENT: {"answer": "否", "p": 0.05},
+    Q_SECOND_INTENT: {"choice": NO_SECOND_INTENT},  # 投票制判断层的追问：没有第二个问题
+    # 质检（§5.5）：全部通过
+    Q_GROUNDED: {"answer": "是", "p": 0.95},
+    Q_ANSWERS_QUESTION: {"answer": "是", "p": 0.95},
+    Q_PROMISE_RISK: {"answer": "否", "p": 0.05},
+    Q_PLATFORM_VIOLATION: {"answer": "否", "p": 0.02},
+    Q_TONE: {"score": 3},
+}
+"""判断层提示词里的问题没有写进脚本时的默认作答（大模型输出格式，见 decision.llm）。"""
+
+
+def judge_questions(request: LLMRequest) -> dict[str, str]:
+    """判断层提示词（decision.llm.build_judge_messages）里问到的问题：
+    问题名 → noul / choice / score。"""
+    text = "\n".join(m.content for m in request.messages)
+    return {m["key"]: _JUDGE_TYPES[m["type"]] for m in _JUDGE_QUESTION.finditer(text)}
+
+
+def judge_state(request: LLMRequest) -> dict[str, Any]:
+    """判断层提示词里的 state（已脱敏的 JSON）。不是判断层提示词时返回空 dict。"""
+    m = _JUDGE_STATE.search("\n".join(m.content for m in request.messages))
+    return json.loads(m.group("state")) if m else {}
+
+
+def judge_buyer_text(request: LLMRequest) -> str:
+    """路由 state 里的当前买家消息（最后一条买家消息，已脱敏）；质检 state 里的买家问题。"""
+    state = judge_state(request)
+    for message in reversed(state.get("messages") or []):
+        if isinstance(message, dict) and message.get("role") == Role.BUYER.value:
+            return str(message.get("text") or "")
+    return str(state.get("question") or "")
+
+
+JudgeAnswers = Mapping[str, Mapping[str, Any]]
+JudgeScript = Sequence[tuple[str, JudgeAnswers]] | Callable[[LLMRequest], JudgeAnswers]
+
+
+def _judge_answers(script: JudgeScript | JudgeAnswers | None, request: LLMRequest) -> JudgeAnswers:
+    if script is None:
+        return {}
+    if callable(script):
+        return script(request)
+    if isinstance(script, Mapping):
+        return script
+    text = judge_buyer_text(request)
+    for keyword, answers in script:
+        if keyword in text:
+            return answers
+    raise AssertionError(f"判断层脚本里没有这条消息：{text}")
+
+
+def judge_output(
+    request: LLMRequest,
+    answers: JudgeAnswers,
+    *,
+    defaults: JudgeAnswers = JUDGE_DEFAULT_ANSWERS,
+) -> dict[str, Any]:
+    """按提示词问到的问题逐题作答（一次请求答全部问题，§6.4 一次投票一个请求）：脚本里有的用脚本，
+    没有的用 defaults；是否题 / 打分题再没有就答"否" / 0；单选题必须写进脚本。
+    脚本里有、提示词没问的问题丢掉（路由问题增减时脚本不用跟着改）。"""
+    asked = judge_questions(request)
+    if not asked:
+        raise AssertionError("不是判断层提示词：没有找到问题")
+    out: dict[str, Any] = {}
+    for key, kind in asked.items():
+        if key in answers:
+            out[key] = dict(answers[key])
+        elif key in defaults:
+            out[key] = dict(defaults[key])
+        elif kind == "noul":
+            out[key] = {"answer": "否", "p": 0.05}
+        elif kind == "score":
+            out[key] = {"score": 0}
+        else:
+            raise AssertionError(f"判断层脚本里没有单选题 {key} 的答案")
+    return out
+
+
+def scripted_judge_llm(
+    *,
+    route: JudgeScript | JudgeAnswers | None = None,
+    qa: JudgeScript | JudgeAnswers | None = None,
+    generate: Callable[[LLMRequest], Any] | None = None,
+    defaults: JudgeAnswers = JUDGE_DEFAULT_ANSWERS,
+    model: str = "fake-judge-llm",
+) -> FakeLLMClient:
+    """路由、质检（、生成）共用一个假大模型，判断层按提示词里的问题逐题作答（多个问题一次答完）：
+
+    - route：[(买家消息里的关键词, 答案)] 按当前买家消息查表，或 dict（每次都一样），
+      或 callable(request) → 答案；答案的格式同大模型输出，如
+      {"intent": {"choice": "size_advice"}, "multi_intent": {"answer": "是", "p": 0.9}}；
+    - qa：同上（默认全部通过）；generate：生成请求的 handler（默认抛 AssertionError）。
+    投票时每一票都是一次请求，调用次数 = 投票次数（FakeLLMClient.calls_for("route")）。
+    """
+
+    def handler(request: LLMRequest) -> Any:
+        if request.purpose in ("route", "qa"):
+            script = route if request.purpose == "route" else qa
+            try:
+                answers = _judge_answers(script, request)
+                return judge_output(request, answers, defaults=defaults)
+            except AssertionError as exc:
+                return exc
+        if generate is None:
+            return AssertionError(f"这个假大模型不处理 {request.purpose} 请求")
+        return generate(request)
+
+    return FakeLLMClient(handler, model=model)
+
+
+# ================================================================ 店铺授权（§8.4）
+
+
+class FakeTokenRefresher:
+    """实现 core.ports.TokenRefreshPort 的假实现（平台续期接口在平台云内，沙箱里一律 mock）。
+
+    - 默认每次续期成功：新令牌 tok-refreshed-{店铺}-{序号}（合成的），有效期 = 现在 + ttl；
+      rotate_refresh=True 时同时换一个续期令牌（有效期 refresh_ttl），否则 refresh_token 为空；
+    - script(shop_id, *results)：这家店接下来几次的结果（RefreshedToken 或异常，按顺序用完为止）；
+      always(shop_id, result)：这家店之后每次都是这个结果（如 AuthExpired、ToolUnavailable）；
+    - calls：[(店铺, 传入的续期令牌)]（SecretStr，repr 里看不到原文）。线程安全。
+    """
+
+    def __init__(
+        self,
+        platform: Platform = Platform.TAOBAO,
+        *,
+        clock: Clock | None = None,
+        ttl: timedelta = timedelta(days=30),
+        refresh_ttl: timedelta = timedelta(days=90),
+        rotate_refresh: bool = True,
+    ) -> None:
+        self.platform = Platform(platform)
+        self._clock: Clock = clock or FakeClock()
+        self._ttl = ttl
+        self._refresh_ttl = refresh_ttl
+        self._rotate = rotate_refresh
+        self._lock = threading.Lock()
+        self._seq = itertools.count(1)
+        self._queued: dict[str, list[RefreshedToken | Exception]] = {}
+        self._always: dict[str, RefreshedToken | Exception] = {}
+        self.calls: list[tuple[str, SecretStr]] = []
+
+    def script(self, shop_id: str, *results: RefreshedToken | Exception) -> None:
+        with self._lock:
+            self._queued.setdefault(shop_id, []).extend(results)
+
+    def always(self, shop_id: str, result: RefreshedToken | Exception | None) -> None:
+        """result=None 表示恢复默认（续期成功）。"""
+        with self._lock:
+            if result is None:
+                self._always.pop(shop_id, None)
+            else:
+                self._always[shop_id] = result
+
+    def calls_for(self, shop_id: str) -> int:
+        with self._lock:
+            return sum(1 for shop, _ in self.calls if shop == shop_id)
+
+    def refresh(self, shop_id: str, refresh_token: SecretStr) -> RefreshedToken:
+        with self._lock:
+            self.calls.append((shop_id, refresh_token))
+            queued = self._queued.get(shop_id)
+            if queued:
+                result: RefreshedToken | Exception | None = queued.pop(0)
+            else:
+                result = self._always.get(shop_id)
+            n = next(self._seq)
+        if isinstance(result, Exception):
+            raise result
+        if result is not None:
+            return result.model_copy()
+        now = self._clock.now()
+        return RefreshedToken(
+            access_token=SecretStr(f"tok-refreshed-{shop_id}-{n:03d}"),
+            expires_at=now + self._ttl,
+            refresh_token=SecretStr(f"tok-refresh-{shop_id}-{n:03d}") if self._rotate else None,
+            refresh_expires_at=now + self._refresh_ttl if self._rotate else None,
+        )
+
+
+SUBSCRIPTION_EVENT_TYPE = "subscription"
+"""合成的订购推送里的 type（模拟平台服务市场的消息；真实格式由平台云代码解析）。"""
+
+
+def subscription_push(
+    kind: str,
+    shop_id: str,
+    *,
+    platform: Platform = Platform.TAOBAO,
+    at: datetime | None = None,
+    scopes: Iterable[str] | None = None,
+    access_token: str | None = None,
+    refresh_token: str | None = None,
+    expires_at: datetime | None = None,
+    refresh_expires_at: datetime | None = None,
+    category: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """构造一条合成的订购推送（平台原始格式的模拟，全部是假数据）。
+
+    subscribed / renewed 没给令牌时自动造一个合成令牌、权限默认 MVP 只读、有效期 30 天；
+    extra 里的字段原样放进去（如 buyer_nick 之类，用来测试解析时丢弃不认识的字段）。
+    """
+    at = at or DEFAULT_NOW
+    raw: dict[str, Any] = {
+        "type": SUBSCRIPTION_EVENT_TYPE,
+        "event": kind,
+        "shop_id": shop_id,
+        "platform": Platform(platform).value,
+        "at": at.isoformat(),
+    }
+    if kind in ("subscribed", "renewed"):  # 开通 / 续订带令牌：没给就造合成的
+        scopes = MVP_SCOPES if scopes is None else scopes
+        access_token = access_token or f"tok-sub-{shop_id}-synthetic"
+        expires_at = expires_at or at + timedelta(days=30)
+    for key, value in (
+        ("scopes", sorted(scopes) if scopes is not None else None),
+        ("access_token", access_token),
+        ("expires_at", expires_at.isoformat() if expires_at else None),
+        ("refresh_token", refresh_token),
+        ("refresh_expires_at", refresh_expires_at.isoformat() if refresh_expires_at else None),
+        ("category", category),
+    ):
+        if value is not None:
+            raw[key] = value
+    return {**raw, **extra}
+
+
+_SUBSCRIPTION_FIELDS = (
+    "shop_id",
+    "platform",
+    "at",
+    "scopes",
+    "access_token",
+    "refresh_token",
+    "expires_at",
+    "refresh_expires_at",
+    "category",
+)
+
+
+def parse_subscription(raw: Mapping[str, Any]) -> SubscriptionEvent | None:
+    """合成订购推送 → SubscriptionEvent（PlatformBindings.parse_subscription 的假实现）。
+
+    不是订购推送、字段不合法时返回 None（和适配器的 on_event 一样，无法识别的事件不处理）；
+    只读认识的字段，其余（昵称之类）一律丢弃。scopes 可以是列表或逗号分隔的字符串。
+    """
+    if not isinstance(raw, Mapping) or raw.get("type") != SUBSCRIPTION_EVENT_TYPE:
+        return None
+    data: dict[str, Any] = {k: raw[k] for k in _SUBSCRIPTION_FIELDS if raw.get(k) is not None}
+    data["kind"] = raw.get("event")
+    scopes = data.get("scopes")
+    if isinstance(scopes, str):
+        data["scopes"] = [s.strip() for s in scopes.split(",") if s.strip()]
+    try:
+        return SubscriptionEvent.model_validate(data)
+    except ValidationError:
+        return None
+
+
+class FakeSubscriptionParser:
+    """按平台解析合成订购推送（模拟适配器那一侧）：别的平台的推送返回 None（§9.1 数据不跨云）。
+    是 rodit.testing 的类，生产模式的绑定检查会拒绝它。"""
+
+    def __init__(self, platform: Platform) -> None:
+        self.platform = Platform(platform)
+
+    def __call__(self, raw: Mapping[str, Any]) -> SubscriptionEvent | None:
+        event = parse_subscription(raw)
+        if event is None or event.platform != self.platform:
+            return None
+        return event
+
+
 # ================================================================ 平台工具（只读）
 
 
@@ -239,7 +534,7 @@ class InMemoryToolGateway:
     def _enter(self, name: str, shop_id: str, *args: Any) -> None:
         self.calls.append((name, shop_id, args))
         if name in self.fail_on:
-            raise ToolUnavailable(f"{name} 限流（模拟）")
+            raise ToolUnavailable(f"{name} 限流（模拟）", reason="throttled")
 
     def get_order(self, shop_id: str, order_id: str) -> OrderInfo | None:
         self._enter("get_order", shop_id, order_id)
@@ -385,7 +680,7 @@ class InMemoryItemCatalog:
     def _enter(self, name: str, shop_id: str) -> None:
         self.calls.append((name, shop_id))
         if name in self.fail_on:
-            raise ToolUnavailable(f"{name} 限流（模拟）")
+            raise ToolUnavailable(f"{name} 限流（模拟）", reason="throttled")
 
     def list_items(self, shop_id: str) -> list[PlatformItem]:
         self._enter("list_items", shop_id)

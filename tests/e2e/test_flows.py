@@ -40,6 +40,7 @@ from rodit.core.enums import (
 from rodit.core.errors import ActionNotAllowed
 from rodit.core.models import aftersale_idempotency_key
 from rodit.core.questions import Q_GROUNDED, Q_PROMISE_RISK
+from rodit.core.scopes import PHASE2_SCOPES
 from rodit.testing.fakes import qa_answers
 from rodit.testing.fixtures import AGENT, SHOP_A
 
@@ -149,13 +150,21 @@ NR_ANSWER = (
 )
 
 
+def _grant_refund_write(service, shop_id: str = SHOP_A) -> None:
+    """这家店申请了写售后权限（二期，§8.4）：客服确认后执行售后写操作要有 refund.write。"""
+    auth = service.unit.repos.auth.get(shop_id)
+    service.unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(PHASE2_SCOPES)}))
+
+
 def _nr_service():
     llm = scripted_llm({"没收到": llm_answer(NR_ANSWER, "tool:logistics:o_1003")})
-    return demo_service(
+    service = demo_service(
         llm=llm,
         router=scripted_router([("没收到", route(Intent.NOT_RECEIVED, 0.93))]),
         qa=scripted_qa(),
     )
+    _grant_refund_write(service)  # 这些流程一直走到客服确认后执行写操作
+    return service
 
 
 def test_11_3_signed_not_received_pickup_guidance_then_r4_review_and_confirm():
@@ -166,10 +175,19 @@ def test_11_3_signed_not_received_pickup_guidance_then_r4_review_and_confirm():
     result = Chat(service, "c_11_3").say("显示签收了但我根本没收到", order_id="o_1003")
     assert result.route.intent == Intent.NOT_RECEIVED
     assert result.route.action == RouteAction.HIGH_RISK_ANSWER and result.route.rule == 4
-    [card] = result.suggestions
-    assert "菜鸟驿站" in card.text
-    assert [e.id for e in card.evidence] == ["tool:logistics:o_1003"]
+    # 第一条是确定性模板：签收细分状态 + 驿站取件指引 + 没找到就在订单页申请售后（§7.3.1）；
+    # 第二条是大模型的回答
+    card, llm_card = result.suggestions
+    assert card.kind == DraftKind.TEMPLATE
+    assert "菜鸟驿站" in card.text and "请凭取件码取件" in card.text and "申请售后" in card.text
+    assert [e.id for e in card.evidence] == [
+        "tool:logistics:o_1003",
+        "platform:taobao:apply_aftersale",
+    ]
     assert "请核查物流签收细分状态" in card.risk_hints
+    assert llm_card.kind == DraftKind.LLM and llm_card.text == NR_ANSWER
+    assert [e.id for e in llm_card.evidence] == ["tool:logistics:o_1003"]
+    assert "请核查物流签收细分状态" in llm_card.risk_hints
     service.feedback_sent(SHOP_A, card.suggestion_id, agent_id=AGENT)  # 客服发送取件指引
 
     # 买家没找到，在订单页申请仅退款（as_2003）→ 审核助手命中 R4，进入签收核查
@@ -308,6 +326,7 @@ def test_11_3_reread_race_status_version_changed():
 
 def test_r3_two_step_return_then_refund():
     service = demo_service()
+    _grant_refund_write(service)
     unit = service.unit
     review = service.review_aftersale(SHOP_A, "as_2002")
     assert review.matched_rules == ["R3"]

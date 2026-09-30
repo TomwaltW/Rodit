@@ -9,9 +9,12 @@ import pytest
 from api_support import EVENTS_PATH, MERCHANT_A, Api
 
 from rodit.app.demo import taobao_event
+from rodit.app.tenancy import PURGE_REASON_MERCHANT
+from rodit.core.audit import AuditAction
 from rodit.core.enums import AfterSaleStatus, KnowledgeStatus, SuggestionStatus
 from rodit.core.errors import ToolUnavailable
 from rodit.core.pii import BuyerRefHasher
+from rodit.core.scopes import PHASE2_SCOPES
 from rodit.testing.fixtures import RAW_BUYERS, SHOP_A, SHOP_B, SHOP_D, TEST_SALT
 
 A = f"/v1/shops/{SHOP_A}"
@@ -370,7 +373,14 @@ def test_reports_adoption_and_qa(api: Api):
 # ================================================================ 售后审核（§7.3.2）
 
 
+def _grant_refund_write(api: Api, shop_id: str = SHOP_A) -> None:
+    """这家店申请了写售后权限（二期，§8.4）：客服确认后执行售后写操作要有 refund.write。"""
+    auth = api.unit.repos.auth.get(shop_id)
+    api.unit.repos.auth.save(auth.model_copy(update={"scopes": sorted(PHASE2_SCOPES)}))
+
+
 def test_aftersale_review_negotiate_and_confirm(api: Api):
+    _grant_refund_write(api)
     url = f"{A}/aftersales/as_2002"
     r = api.post(f"{url}/review", "agent_a")
     assert r.status_code == 200, r.text
@@ -411,6 +421,7 @@ def test_aftersale_review_negotiate_and_confirm(api: Api):
 
 def test_aftersale_changed_during_negotiation_needs_refresh(api: Api):
     """协商期间平台上的售后单变了：视图提示先刷新；按新版本直接确认也会被拒（建议可能过期）。"""
+    _grant_refund_write(api)
     url = f"{A}/aftersales/as_2002"
     view = api.post(f"{url}/review", "agent_a").json()
     assert view["platform_status_version"] == view["platform"]["status_version"]
@@ -442,6 +453,7 @@ def test_aftersale_review_hides_buyer_note_and_ref(api: Api):
 
 
 def test_aftersale_errors_map_to_409(api: Api):
+    _grant_refund_write(api)
     r = api.post(
         f"{A}/aftersales/as_2007/confirm",
         "agent_a",
@@ -506,6 +518,10 @@ def test_revoke_purges_shop_and_blocks_later_requests(api: Api):
     counts = r.json()["counts"]
     assert counts["auth"] == 1 and r.json()["total"] == sum(counts.values()) > 5
     assert api.unit.repos.knowledge.get_shop(SHOP_A) is None
+    # 写系统事件 shop.purged（操作人是商家账号），迟到的旧订购事件按它判断先后
+    [purged] = api.unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+    assert purged.detail["shop_id"] == SHOP_A and purged.actor == MERCHANT_A
+    assert purged.detail["reason"] == PURGE_REASON_MERCHANT
 
     # 之后店铺 A 的一切请求都是 403（§8.4 停止处理）
     r = _event(api, "在吗", "v2")

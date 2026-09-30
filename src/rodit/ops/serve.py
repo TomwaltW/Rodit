@@ -6,24 +6,47 @@
     python -m rodit.ops.serve local-init  本地试用：迁移 + 写入合成演示数据 + 生成令牌文件
     python -m rodit.ops.serve recalibrate 每月用采纳反馈重算阈值（§13.5，只输出建议）
     python -m rodit.ops.serve train-classifier --out FILE  训练路由分类器（§6.4 Phase 2）
+    其余子命令由 rodit.ops.jobs 注册表里的任务模块提供（店铺生命周期、上线节奏）。
 
-serve 的组装：
+serve 的组装（顺序：平台绑定 → 平台单元 → 接上 ctx.tokens → 应用服务 → 接上 ctx.on_subscription）：
     rodit.app.production.build_production_unit（PostgreSQL、境内大模型，审计套上指标采集）
-    + 平台绑定（平台云代码注入，见 rodit.ops.bindings；或 RODIT_MODE_C_ONLY=1 只部署模式 C）
+    + 平台绑定（平台云代码注入，见 rodit.ops.bindings；或 RODIT_MODE_C_ONLY=1 只部署模式 C）；
+      工厂拿到的 ctx.tokens / ctx.on_subscription 是代理，单元和服务组装好之后才接上
     + rodit.api.create_app（鉴权用 TokenFileAuthenticator，令牌哈希来自挂载的密钥文件）
     + 运维接口 /healthz、/readyz、/metrics（rodit.ops.router）+ JSON 日志（rodit.ops.logconfig）。
 
 生产模式（RODIT_ENV=production，默认）下拒绝启动的情况：没有平台绑定又没有明确只部署模式 C；
 绑定里有模拟实现（合成数据）；缺少必需的环境变量（只报变量名）；令牌文件读不出来；
-/metrics 既没有抓取令牌也没有明确允许公开。
+/metrics 既没有抓取令牌也没有明确允许公开；配置要求公示大模型（llm.require_disclosure）却没填
+llm.public_name / llm.filing_no（§12.3 生成式人工智能服务要公示所用模型的名称和备案号）。
 本地试用（RODIT_ENV=local）允许合成数据的平台绑定，没配大模型时用离线替身（rodit.app.offline）。
+平台绑定给了 llm_transport（平台要求经它报备的通道调用大模型）时，大模型客户端经它发请求，
+计量（llm.usage）和密钥缺失时的就绪语义不变。
 
 decision.provider 是 classifier 时，serve 从 RODIT_CLASSIFIER_PATH 加载路由分类器的模型文件
 （train-classifier 生成）当路由判断层，质检仍用大模型（§6.4）；没设、文件不存在或校验不过都
 拒绝启动（退出码 2），日志里写明原因。
 
 一个进程一个平台单元，单进程运行：会话串行锁、适配器的去重记录、短时缓存都在进程内
-（CLAUDE.md 选型记录：多实例部署时再换 Redis）。
+（CLAUDE.md 选型记录：多实例部署时再换 Redis）。serve 用单副本租约强制执行（rodit.ops.lease：
+PostgreSQL 会话级 advisory lock，按平台单元取键）：组装好服务、通过启动前检查之后抢租约，另一个
+进程占着就拒绝启动（退出码 2，日志写明占用者），连不上数据库退出码 1；RODIT_MIGRATE_ON_START 的
+迁移在拿到租约之后跑；服务退出（包括异常退出）时释放。就绪检查多一项 lease（连接断了会重连再抢，
+被别的进程抢走就一直不就绪）。改数据的运维任务（onboard-shop、refresh-tokens、purge-expired、
+revoke、set-status）拿同一个租约，serve 在跑时拒绝执行（见 rodit.ops.jobs.tenancy）。
+
+serve 的后台任务（rodit.ops.background，拿到租约之后启动、退出时停下）：
+    readiness     每 RODIT_READINESS_REFRESH_S 秒真的跑一遍就绪检查（不用 /readyz 的缓存；/metrics
+                  只输出上次的结果和年龄，抓取时不查库；结果超过 max(60, 3 × 间隔) 秒没更新就记成
+                  不就绪。间隔为 0 时只由 /readyz 刷新，/readyz 在缓存期内拿缓存的结果，所以再加上
+                  RODIT_READINESS_CACHE_S，见 readiness_stale_after_s）；
+    auth_expiry   每 RODIT_AUTH_EXPIRY_CHECK_S 秒检查授权即将过期 / 已过期的店铺（取消订购清理过、
+                  没有再开通的店铺不算，令牌文件里还有它也一样）；
+    refresh_tokens / purge_expired
+                  每 RODIT_TOKEN_REFRESH_INTERVAL_S / RODIT_PURGE_EXPIRED_INTERVAL_S 秒续期、
+                  过期清理（和平台推送、接口用同一个 AssistService：同一把取消订购的闸门、
+                  同一份缓存）；每轮之前确认租约还在本进程，不在就跳过。
+出错只记日志（异常类型）和 rodit_background_task_runs_total{task,outcome}，不影响服务。
 
 离线任务（在平台单元内跑，不需要 RODIT_PLATFORM；结果都由人确认后才上线）：
 
@@ -51,9 +74,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -63,16 +87,18 @@ import psycopg
 import yaml
 from fastapi import FastAPI
 
+import rodit.ops.jobs as jobs
 from rodit.adapters import NullToolGateway
 from rodit.api import create_app
 from rodit.api.auth import PrincipalRole
 from rodit.app.production import build_production_unit, migrate, production_database
 from rodit.app.service import AssistService
 from rodit.app.unit import Repos, Unit, build_unit
+from rodit.core.audit import AuditAction
 from rodit.core.clock import CST, Clock, SystemClock
-from rodit.core.config import EngineConfig, load_config
+from rodit.core.config import LLM_ENV_PREFIX, EngineConfig, llm_endpoint, load_config
 from rodit.core.enums import ProviderName
-from rodit.core.errors import StorageUnavailable
+from rodit.core.errors import StorageUnavailable, TokenDecryptionError
 from rodit.core.models import LabeledSample
 from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import AuditLog, ToolGateway
@@ -81,11 +107,13 @@ from rodit.decision import ClassifierArtifactError, ClassifierProvider, RuleProv
 from rodit.eval.recalibrate import DEFAULT_MIN_SUPPORT
 from rodit.eval.train import DEFAULT_MIN_SAMPLES
 from rodit.llm import MeteredLLMClient
+from rodit.ops.background import BackgroundRunner, PeriodicJob
 from rodit.ops.bindings import (
     BindingContext,
     BindingError,
     BindingsFactory,
     PlatformBindings,
+    bind_context,
     demo_bindings,
     load_factory,
     mode_c_bindings,
@@ -93,18 +121,22 @@ from rodit.ops.bindings import (
 )
 from rodit.ops.health import (
     CheckResult,
-    ReadinessChecker,
+    Probe,
     SessionDatabase,
     database_probe,
     llm_probe,
     static_probe,
 )
 from rodit.ops.instrument import (
+    DEFAULT_READINESS_STALE_S,
     AuthExpiryMonitor,
     MeteredToolGateway,
     ObservedAuditLog,
+    ObservedReadinessChecker,
     RoditMetrics,
+    mark_server_tenant_isolation,
 )
+from rodit.ops.lease import Lease, LeaseError, serve_lease
 from rodit.ops.logconfig import configure_logging
 from rodit.ops.router import MetricsGuard, install_ops
 from rodit.ops.settings import ServerSettings, SettingsError
@@ -124,7 +156,6 @@ from rodit.storage import APP_ROLE, Database, PgFeedbackRepository
 
 logger = logging.getLogger("rodit.ops")
 
-LLM_ENV_PREFIX = "RODIT_LLM_"
 MIGRATE_DSN_ENV = "RODIT_MIGRATE_DSN"
 DATABASE_DSN_ENV = "RODIT_DATABASE_DSN"
 TOKEN_KEY_ENV = "RODIT_TOKEN_KEY"
@@ -147,6 +178,10 @@ class StartupError(RuntimeError):
     """启动前检查不通过。消息里只有变量名、文件路径和原因，没有任何值。"""
 
 
+LeaseFactory = Callable[[ServerSettings], Lease]
+"""设置 → 单副本租约（默认 rodit.ops.lease.serve_lease；测试注入假的）。"""
+
+
 @dataclass
 class Server:
     """组装好的服务。app 交给 uvicorn；其余字段给测试和运维命令用。"""
@@ -157,25 +192,28 @@ class Server:
     unit: Unit
     bindings: PlatformBindings
     metrics: RoditMetrics
-    readiness: ReadinessChecker
+    readiness: ObservedReadinessChecker
     authenticator: TokenFileAuthenticator
     auth_monitor: AuthExpiryMonitor | None
+    background: BackgroundRunner  # main 拿到租约之后 start、退出时 stop；测试可以 run_once
 
 
 # ================================================================ 启动前检查
 
 
 def _llm_configured(config: EngineConfig, env: Mapping[str, str]) -> bool:
-    base_url = config.llm.base_url or env.get(f"{LLM_ENV_PREFIX}BASE_URL", "")
-    model = config.llm.model or env.get(f"{LLM_ENV_PREFIX}MODEL", "")
-    return bool(base_url.strip() and model.strip())
+    base_url, model, _ = llm_endpoint(config.llm, env, prefix=LLM_ENV_PREFIX)
+    return bool(base_url and model)
 
 
 def preflight(
     settings: ServerSettings, config: EngineConfig, environ: Mapping[str, str] | None = None
 ) -> None:
     """必需的环境变量都有值（只看有没有，报错只列变量名）。大模型密钥缺失不在这里拦：
-    /readyz 报 missing_api_key，进程不接流量，日志里看得到原因。"""
+    /readyz 报 missing_api_key，进程不接流量，日志里看得到原因。
+
+    生产模式下配置要求公示大模型（llm.require_disclosure）时，公示名称和备案号都要填
+    （§12.3 生成式人工智能服务登记：公示所用模型的名称和备案号 / 上线编号）。"""
     env = os.environ if environ is None else environ
     required = [DATABASE_DSN_ENV, TOKEN_KEY_ENV, config.privacy.buyer_salt_env]
     missing = [name for name in required if not env.get(name, "").strip()]
@@ -183,6 +221,18 @@ def preflight(
         missing.append(f"{LLM_ENV_PREFIX}BASE_URL / {LLM_ENV_PREFIX}MODEL（或配置文件 llm 段）")
     if missing:
         raise StartupError("缺少必需的环境变量：" + "、".join(missing))
+    if settings.is_production and config.llm.require_disclosure:
+        blank = [
+            f"llm.{name}"
+            for name in ("public_name", "filing_no")
+            if not (getattr(config.llm, name) or "").strip()
+        ]
+        if blank:
+            raise StartupError(
+                "配置 llm.require_disclosure 为 true，缺少 "
+                + "、".join(blank)
+                + "（§12.3 要公示所用大模型的名称和备案号，D5 选定后填进部署配置）"
+            )
 
 
 def resolve_bindings(
@@ -237,11 +287,13 @@ def load_route_classifier(
     meta = classifier.meta
     assert meta is not None
     logger.info(
-        "路由分类器已加载：训练时间 %s，训练样本 %d 条，问题类型 %d 个，sha256 %s",
+        "路由分类器已加载：训练时间 %s，训练样本 %d 条，问题类型 %d 个，sha256 %s，文件 sha256 %s"
+        "（上线状态、评测指纹按文件的比）",
         meta.trained_at.astimezone(CST).isoformat(timespec="minutes"),
         meta.samples,
         len(classifier.classes),
         classifier.artifact_sha256,
+        classifier.file_sha256,
     )
     if meta.questions_version != ROUTER_QUESTIONS_VER:
         logger.warning(
@@ -262,6 +314,7 @@ class _Composed:
     bindings: PlatformBindings
     metrics: RoditMetrics
     llm_probe: Callable[[], Mapping[str, CheckResult]]
+    ctx: BindingContext | None = None  # 交给绑定工厂的上下文（服务组装好后接上 on_subscription）
 
 
 def compose_unit(
@@ -275,7 +328,11 @@ def compose_unit(
     """平台单元 + 指标采集（不含 HTTP 应用）。
 
     repos 只在本地试用、没配大模型（离线替身）时生效（测试用内存仓储）；
-    其他情况一律 PostgreSQL（build_production_unit）。"""
+    其他情况一律 PostgreSQL（build_production_unit）。
+
+    顺序：先调绑定工厂（它拿到的 ctx.tokens / ctx.on_subscription 是代理），再组装平台单元，
+    把绑定里的 token_refresher / parse_subscription 挂到单元上，然后把 ctx.tokens 接到
+    Unit.tokens；ctx.on_subscription 由 build_server 在服务组装好之后接上。"""
     env = os.environ if environ is None else environ
     config = load_config(settings.config_path or None)
     preflight(settings, config, env)
@@ -307,14 +364,22 @@ def compose_unit(
             catalog=bindings.catalog,
             ocr=bindings.ocr,
             route_provider=classifier,
+            llm_transport=bindings.llm_transport,  # 平台可报备的通道（§9.1、§12.3），没给用默认出口
         )
         probe = llm_probe(config.llm, environ=env, env_prefix=LLM_ENV_PREFIX)
     else:
+        if bindings.llm_transport is not None:
+            logger.warning("本地试用没有配置大模型（离线替身）：平台绑定的 llm_transport 用不到")
         unit = _offline_unit(
             settings, config, clock, hasher, bindings, tools, observe, repos, classifier
         )
         probe = static_probe("llm", CheckResult(True, {"offline": True}))
-    return _Composed(unit=unit, bindings=bindings, metrics=metrics, llm_probe=probe)
+    # 平台云代码的续期接口、订购推送解析挂到单元上：店铺生命周期（续期任务、平台推送订购事件的
+    # 接口）经 Unit / AssistService 取用
+    unit.token_refresher = bindings.token_refresher
+    unit.parse_subscription = bindings.parse_subscription
+    bind_context(ctx, tokens=unit.tokens)  # 单元组装好了：平台云代码可以取店铺令牌了
+    return _Composed(unit=unit, bindings=bindings, metrics=metrics, llm_probe=probe, ctx=ctx)
 
 
 def _offline_unit(
@@ -357,6 +422,20 @@ def _offline_unit(
     )
 
 
+def readiness_stale_after_s(settings: ServerSettings) -> float:
+    """/metrics 输出的就绪结果最多多旧（秒），再旧就记成不就绪（刷新卡住了）。
+
+    后台刷新（RODIT_READINESS_REFRESH_S > 0）每轮都真的跑探针，正常情况下结果最多旧一个间隔
+    （加上检查本身的耗时），阈值留足余量：max(60, 3 × 间隔)。间隔为 0 时只由 /readyz 刷新：
+    /readyz 在缓存期（RODIT_READINESS_CACHE_S）内拿缓存的结果（年龄从真的检查那一刻算），
+    结果最多旧"缓存期 + 探针间隔"，所以阈值再加上缓存期，不然缓存期一长，健康的服务也按
+    不就绪报。"""
+    stale = max(DEFAULT_READINESS_STALE_S, 3 * settings.readiness_refresh_s)
+    if settings.readiness_refresh_s <= 0:
+        stale += settings.readiness_cache_s
+    return stale
+
+
 def _metrics_guard(settings: ServerSettings, auth: TokenFileAuthenticator) -> MetricsGuard | None:
     if settings.metrics_public:
         return None
@@ -378,8 +457,14 @@ def build_server(
     repos: Repos | None = None,
     database: SessionDatabase | None = None,
     environ: Mapping[str, str] | None = None,
+    lease: Lease | None = None,
 ) -> Server:
-    """组装完整的服务（见模块说明）。database 覆盖就绪检查用的数据库（测试用）。"""
+    """组装完整的服务（见模块说明）。database 覆盖就绪检查用的数据库（测试用）。
+
+    lease：单副本租约（main 在组装之后、跑服务之前 acquire），给了就在就绪检查里加一项 lease，
+    续期、过期清理每轮之前也先确认它。后台任务在这里组装好、不启动（main 启动）。
+    /metrics 渲染前只做内存里的事：输出上次的就绪结果和年龄、缓存层的统计（缓存命中、过期兜底、
+    串店），不查库。"""
     composed = compose_unit(
         settings, bindings_factory=bindings_factory, clock=clock, repos=repos, environ=environ
     )
@@ -388,34 +473,60 @@ def build_server(
         settings.tokens_file, reload_interval_s=settings.tokens_reload_s, clock=unit.clock
     )
     guard = _metrics_guard(settings, authenticator)
-    readiness = ReadinessChecker(
-        {
-            "database": database_probe(database or production_database()),
-            "llm": composed.llm_probe,
-        },
+    probes: dict[str, Probe] = {
+        "database": database_probe(database or production_database()),
+        "llm": composed.llm_probe,
+    }
+    if lease is not None:
+        probes["lease"] = lease.probe
+    readiness = ObservedReadinessChecker(
+        probes,
+        metrics,
         cache_s=settings.readiness_cache_s,
+        stale_after_s=readiness_stale_after_s(settings),
     )
+    # 抓取时不跑探针：数据库网络不通时一次检查要十几秒，超过抓取超时，反而一个样本都没有
+    metrics.registry.before_render(readiness.publish)
+    gateway = unit.gateway
+    metrics.registry.before_render(lambda: metrics.observe_tool_cache(gateway.totals()))
+    service = AssistService(unit)
+    # 后台刷新每轮都真的跑探针（fresh）：缓存只给 /readyz 省查询。用缓存的话，缓存期
+    # （RODIT_READINESS_CACHE_S）比过期阈值长时，后台拿到的一直是旧结果，抓取按"太旧"记成不就绪
+    periodic: list[PeriodicJob] = [
+        PeriodicJob("readiness", lambda: readiness.check(fresh=True), settings.readiness_refresh_s)
+    ]
     monitor: AuthExpiryMonitor | None = None
     if not composed.bindings.mode_c_only:  # 模式 C 不需要平台授权（§8.1），不告警
-        platform_shops = composed.bindings.shop_ids
-
-        def shop_ids() -> list[str]:
-            shops = set(authenticator.shop_ids())
-            if platform_shops is not None:
-                shops.update(platform_shops())
-            return sorted(shops)
-
         monitor = AuthExpiryMonitor(
             unit.auth,
-            shop_ids,
+            monitored_shop_ids(unit, authenticator, composed.bindings.shop_ids),
             metrics,
             within=timedelta(days=settings.auth_expiry_warn_days),
             refresh_s=settings.auth_expiry_check_s,
             clock=unit.clock,
         )
-        metrics.registry.before_render(monitor.refresh)
-    service = AssistService(unit)
+        refresh_auth = monitor.refresh
+        periodic.append(
+            PeriodicJob(
+                "auth_expiry", lambda: refresh_auth(force=True), settings.auth_expiry_check_s
+            )
+        )
+    from rodit.ops.jobs.tenancy import serve_jobs  # 任务模块用到时才导入（rodit.ops.jobs）
+
+    periodic.extend(
+        serve_jobs(
+            service,
+            refresh_interval_s=settings.token_refresh_interval_s,
+            purge_interval_s=settings.purge_expired_interval_s,
+            guard=_lease_guard(lease),
+        )
+    )
+    background = BackgroundRunner(periodic, on_result=metrics.observe_background)
+    metrics.register_background(background.jobs)
+    if composed.ctx is not None:  # 服务组装好了：平台推送的订购事件交给店铺生命周期处理
+        bind_context(composed.ctx, on_subscription=service.tenancy.handle_subscription)
     app = create_app(service, authenticator=authenticator)
+    mark_server_tenant_isolation(app)  # 服务端发现的串店记 stage="server"（critical 告警）
     install_ops(app, readiness=readiness, metrics=metrics, metrics_guard=guard)
     if not settings.is_production:
         logger.warning("本地试用模式（RODIT_ENV=local）：合成数据、模拟适配器，不能用于生产")
@@ -436,7 +547,49 @@ def build_server(
         readiness=readiness,
         authenticator=authenticator,
         auth_monitor=monitor,
+        background=background,
     )
+
+
+def monitored_shop_ids(
+    unit: Unit,
+    authenticator: TokenFileAuthenticator,
+    platform_shops: Callable[[], Iterable[str]] | None,
+) -> Callable[[], list[str]]:
+    """授权过期检查覆盖的店铺：令牌文件里的店铺 + 平台云代码提供的订购列表，去掉取消订购清理过
+    （系统事件 shop.purged）、之后没有再开通（没有授权记录）的店铺。
+
+    取消订购只删库里的数据，挂载的令牌文件还留着这家店的令牌；不去掉的话它永远算"授权已过期"，
+    critical 告警按说明处理完（purge-expired / revoke）也消不掉。再开通会写授权记录，
+    自动回到检查里。"""
+
+    def shop_ids() -> list[str]:
+        shops = set(authenticator.shop_ids())
+        if platform_shops is not None:
+            shops.update(platform_shops())
+        purged = {
+            e.detail.get("shop_id")
+            for e in unit.repos.audit.list_system_events(action=AuditAction.SHOP_PURGED)
+        }
+        return sorted(s for s in shops if s not in purged or _has_auth(unit, s))
+
+    return shop_ids
+
+
+def _has_auth(unit: Unit, shop_id: str) -> bool:
+    """有没有授权记录（不关心是否有效）。令牌读不出来也算有：让授权检查按过期报出来。"""
+    try:
+        return unit.repos.auth.get(shop_id) is not None
+    except TokenDecryptionError:
+        return True
+
+
+def _lease_guard(lease: Lease | None) -> Callable[[], bool] | None:
+    """续期、过期清理每轮之前确认单副本租约还在本进程（连接断了会重连再抢）。"""
+    if lease is None:
+        return None
+    probe = lease.probe
+    return lambda: all(result.ok for result in probe().values())
 
 
 # ================================================================ 迁移
@@ -733,7 +886,12 @@ def _parser() -> argparse.ArgumentParser:
     issue.add_argument("--role", choices=sorted(get_args(PrincipalRole)))
     issue.add_argument("--metrics", action="store_true", help="签发 /metrics 的抓取令牌")
     issue.add_argument("--name", help="抓取令牌的名字（--metrics 时）")
-    issue.add_argument("--expires-days", type=float, default=0, help="有效天数（0 = 不过期）")
+    issue.add_argument(
+        "--expires-days",
+        type=_token_days,
+        default=0,
+        help=f"有效天数（0 = 不过期，最多 {MAX_TOKEN_DAYS:g}）",
+    )
     issue.add_argument("--append", metavar="FILE", help="直接写进这个令牌文件（没有就新建）")
     config_help = "对照的部署配置（默认 RODIT_CONFIG，都没有时用内置默认值）"
     recal = sub.add_parser("recalibrate", help="§13.5 用采纳反馈重算阈值（只输出建议）")
@@ -766,7 +924,23 @@ def _parser() -> argparse.ArgumentParser:
         help=f"留出集上预测为该类型的样本少于这个数就不校准（默认 {DEFAULT_MIN_SUPPORT}）",
     )
     train.add_argument("--config", metavar="YAML", help=config_help)
+    jobs.register_all(sub)  # 任务模块的子命令（rodit.ops.jobs）
     return parser
+
+
+MAX_TOKEN_DAYS = 3650.0
+
+
+def _token_days(text: str) -> float:
+    """issue-token 的有效天数：0（不过期）到 MAX_TOKEN_DAYS 之间的有限数。负数签出来就是过期的，
+    inf / 1e12 换成到期时间会溢出（没有说明的崩溃）。"""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("必须是数字") from None
+    if not (math.isfinite(value) and 0 <= value <= MAX_TOKEN_DAYS):
+        raise argparse.ArgumentTypeError(f"必须在 0（不过期）到 {MAX_TOKEN_DAYS:g} 之间")
+    return value
 
 
 def _positive_int(text: str) -> int:
@@ -799,6 +973,20 @@ def _early_logging(environ: Mapping[str, str]) -> None:
     configure_logging(level, fmt if fmt in {"json", "text"} else "json")
 
 
+def _default_lease(settings: ServerSettings) -> Lease:
+    return serve_lease(settings.platform)
+
+
+def _release(lease: Lease | None) -> None:
+    """放租约（没拿到、已经放过都可以调用）。放不掉只记日志：进程退出时连接断开，锁照样释放。"""
+    if lease is None:
+        return
+    try:
+        lease.release()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("释放单副本租约失败：%s", type(exc).__name__)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -806,11 +994,16 @@ def main(
     out: TextIO | None = None,
     label_source: LabelSource | None = None,
     clock: Clock | None = None,
+    lease_factory: LeaseFactory | None = None,
 ) -> int:
     """命令行入口。run 默认是 uvicorn.run（测试注入假的）。返回进程退出码。
 
     label_source / clock 只给离线任务（recalibrate、train-classifier）用：默认从 PostgreSQL 读
-    标注（trainer_label_source）、用系统时间；测试注入假的，不连数据库。"""
+    标注（trainer_label_source）、用系统时间；测试注入假的，不连数据库。
+    lease_factory 只给 serve 用：默认是 PostgreSQL 的单副本租约（rodit.ops.lease）。
+
+    serve 的顺序：设置 → 组装服务（启动前检查，不连库）→ 抢租约 → 按需迁移 → 启动后台任务
+    → 跑服务 → 停后台任务 → 放租约。"""
     out = out or sys.stdout
     args = _parser().parse_args(list(argv) if argv is not None else None)
     command = args.command or "serve"
@@ -819,7 +1012,12 @@ def main(
     _early_logging(os.environ)
     if command in ("recalibrate", "train-classifier"):
         return _run_job(command, args, out, label_source=label_source, clock=clock)
+    lease: Lease | None = None
     try:
+        # 任务模块认领的命令（rodit.ops.jobs）：抛出的异常和内置命令一样按下面映射退出码
+        code = jobs.dispatch(args, os.environ)
+        if code is not None:
+            return code
         if command == "issue-token":
             return issue_token_command(args, out)
         if command == "migrate":
@@ -829,33 +1027,49 @@ def main(
         configure_logging(settings.log_level, settings.log_format)
         if command == "local-init":
             return local_init(settings, out)
+        candidate = (lease_factory or _default_lease)(settings)
+        server = build_server(settings, lease=candidate)
+        lease = candidate  # 从这里起失败都要放租约（没拿到时放也没关系）
+        lease.acquire()  # 另一个进程占着 → LeaseHeld：启动失败，退出码 2
         if settings.migrate_on_start:
             migrate_database()
-        server = build_server(settings)
-    except (SettingsError, StartupError, BindingError, TokenFileError) as exc:
+    except (SettingsError, StartupError, BindingError, TokenFileError, LeaseError) as exc:
+        _release(lease)
         logger.error("启动失败：%s", exc)
         return EXIT_STARTUP
     except RuntimeError as exc:  # 其他模块缺环境变量时的报错（只含变量名）
+        _release(lease)
         logger.error("启动失败：%s", exc)
         return EXIT_STARTUP
     except (StorageUnavailable, psycopg.Error) as exc:  # 只记类型：说明里可能有主机名、账号
+        _release(lease)
         logger.error("数据库不可用：%s", type(exc).__name__)
         return EXIT_FAILURE
-    except (ValueError, OSError) as exc:  # 配置值不对（超时不是正整数、配置文件不存在……）
+    # 配置值不对（超时不是正整数、配置文件不存在、YAML 写错……）
+    except (ValueError, OSError, yaml.YAMLError) as exc:
+        _release(lease)
         logger.error("启动失败：%s", exc)
         return EXIT_STARTUP
+    except BaseException:
+        _release(lease)
+        raise
     if run is None:
         import uvicorn
 
         run = uvicorn.run
-    run(
-        server.app,
-        host=settings.host,
-        port=settings.port,
-        log_config=None,  # 用 configure_logging 的 JSON 日志和过滤
-        server_header=False,
-        timeout_graceful_shutdown=20,
-    )
+    try:
+        server.background.start()  # 拿到租约之后才跑续期、过期清理
+        run(
+            server.app,
+            host=settings.host,
+            port=settings.port,
+            log_config=None,  # 用 configure_logging 的 JSON 日志和过滤
+            server_header=False,
+            timeout_graceful_shutdown=20,
+        )
+    finally:
+        server.background.stop()  # 先停后台任务（等手上这一轮做完，有上限），再放租约
+        _release(lease)  # 正常退出、异常退出都放租约（被杀时连接断开，数据库自动释放）
     return 0
 
 

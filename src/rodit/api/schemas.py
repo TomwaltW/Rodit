@@ -425,13 +425,24 @@ class HealthView(_View):
 # ================================================================ 模式 C 网页工具（§8.1）
 
 
+class LLMDisclosureView(_View):
+    """对外公示的大模型信息（§12.3 生成式人工智能服务：公示所用模型的名称和备案号 / 上线编号）。
+    来自部署配置的 llm.public_name / llm.filing_no；没填的项不返回。没有接口地址、模型 ID、密钥。"""
+
+    public_name: str | None = None
+    filing_no: str | None = None
+
+
 class MeView(_View):
-    """当前令牌对应的身份（网页工具登录用）。只有调用方自己的信息，没有令牌、没有店铺数据。"""
+    """当前令牌对应的身份（网页工具登录用）。只有调用方自己的信息，没有令牌、没有店铺数据。
+
+    llm：配置了公示信息时才有（网页工具页脚显示）；没配置时响应里没有这个字段。"""
 
     shop_id: str
     user_id: str
     role: PrincipalRole
     platform: Platform  # 本平台单元（§9.1）
+    llm: LLMDisclosureView | None = None
 
 
 class ItemSummaryView(_View):
@@ -455,6 +466,7 @@ __all__ = [
     "HealthView",
     "ItemSummaryView",
     "KnowledgeView",
+    "LLMDisclosureView",
     "MeView",
     "NegotiateRequest",
     "NegotiationDoneRequest",

@@ -40,6 +40,7 @@ from rodit.core.errors import (  # noqa: F401  (re-export)
     KnowledgeUnavailable,
     RoditError,
     ShopInactive,
+    TenantIsolationError,
 )
 from rodit.core.models import (
     ConversationContext,
@@ -369,6 +370,8 @@ class ConversationBuilder:
             orders = self._tools.list_recent_orders(
                 msg.shop_id, msg.buyer_ref, limit=self._recent_order_limit
             )
+        except TenantIsolationError:
+            raise  # 串店（§9.2）不是"工具不可用"：交给引擎记串店、不推荐
         except Exception:  # noqa: BLE001 — ToolUnavailable 及其他故障一律降级（§12.2）
             notes.add(DEGRADED_TOOL_ORDER)
             return []
@@ -389,6 +392,8 @@ class ConversationBuilder:
             return hit
         try:
             order = self._tools.get_order(msg.shop_id, order_id)
+        except TenantIsolationError:
+            raise  # 串店（§9.2）不是"工具不可用"：交给引擎记串店、不推荐
         except Exception:  # noqa: BLE001
             notes.add(DEGRADED_TOOL_ORDER)
             return None

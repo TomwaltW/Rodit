@@ -4,9 +4,10 @@
 请求模型一律 extra="forbid"：复核人、操作人只取自调用方身份（Principal），请求体里带 reviewer /
 operator / shop_id 等字段直接 422（§4.1 原则 3）。
 
-响应里的上线状态、影子对比、复核报表只有计数、分数和推荐 ID，没有文字；只有复核列表
-（复核人员专用，每次返回都留访问记录，§9.2）带推荐文字和买家问题（已做个人信息最小化）。
-影子对比明细不返回平台消息 ID。
+响应里的上线状态、影子对比、复核报表、平台违规 / 投诉登记只有计数、分数和推荐 / 消息 ID
+（登记另有复核人员的备注），没有文字；只有复核列表（复核人员专用，每次返回都留访问记录，§9.2）
+带推荐文字和买家问题（已做个人信息最小化）。影子对比明细不返回平台消息 ID；上线状态里合规扫描
+列出的消息 ID 是客服 / 机器人发出的消息的 ID（给复核人员核对），不是买家消息的。
 """
 
 from __future__ import annotations
@@ -18,8 +19,10 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from rodit.app.rollout import MAX_NOTE_CHARS, ShadowComparison
 from rodit.core.enums import Intent, QualityReviewStatus
 from rodit.core.models import QUALITY_PERIOD_PATTERN, QualityReview, QualityScores
+from rodit.feedback.compliance import MAX_MSG_ID_CHARS
 from rodit.feedback.metrics import ShadowIntentStats
 from rodit.feedback.review import DEFAULT_SAMPLE_SIZE, MAX_SAMPLE_SIZE
+from rodit.feedback.rollout import MAX_INCIDENT_COUNT
 
 
 class _Request(BaseModel):
@@ -47,6 +50,35 @@ class SampleRequest(_Request):
 
     period: str | None = Field(default=None, pattern=QUALITY_PERIOD_PATTERN)
     size: int = Field(default=DEFAULT_SAMPLE_SIZE, ge=1, le=MAX_SAMPLE_SIZE)
+
+
+class IncidentRequest(_Request):
+    """复核人员登记某一周平台下发的违规通知（violation）或买家投诉（complaint）的总数（§13.4）。
+    没有也登记 0，门槛才算检查过；同一类、同一周再登记以最后一次为准。备注会做个人信息最小化，
+    不要贴通知或投诉的原文。复核人取自调用方身份。"""
+
+    kind: Literal["violation", "complaint"]
+    week: str = Field(pattern=QUALITY_PERIOD_PATTERN)
+    count: int = Field(ge=0, le=MAX_INCIDENT_COUNT, strict=True)
+    note: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
+
+
+class ComplianceReviewRequest(_Request):
+    """复核人员确认合规扫描的一条疑似违规（confirmed：确实违规，门槛不通过）或标记误报
+    （dismissed：不计入，如依据里原样有的"桑蚕丝 100%"）。suggestion_id（编辑后发送的推荐）和
+    msg_id（客服 / 机器人发出的消息）给且只给一个——上线状态里合规扫描列出的 ID。备注会做个人信息
+    最小化，不要贴原文。复核人取自调用方身份。"""
+
+    suggestion_id: int | None = Field(default=None, ge=1, strict=True)
+    msg_id: str | None = Field(default=None, min_length=1, max_length=MAX_MSG_ID_CHARS)
+    decision: Literal["confirmed", "dismissed"]
+    note: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
+
+    @model_validator(mode="after")
+    def _one_ref(self) -> ComplianceReviewRequest:
+        if (self.suggestion_id is None) == (self.msg_id is None):
+            raise ValueError("suggestion_id 和 msg_id 要给且只给一个")
+        return self
 
 
 class ScoreRequest(_Request):
@@ -147,6 +179,8 @@ class QualityReviewView(_View):
 
 
 __all__ = [
+    "ComplianceReviewRequest",
+    "IncidentRequest",
     "QualityReviewView",
     "SampleRequest",
     "ScoreRequest",

@@ -166,6 +166,28 @@ def test_from_env(monkeypatch):
         OpenAICompatibleClient.from_env()
 
 
+def test_from_env_strips_whitespace_like_llm_endpoint(monkeypatch, api_key):
+    """从密钥文件注入的值常带换行、空格：和 core.config.llm_endpoint 一样去掉首尾空白。
+    否则就绪检查说配好了、启动时却因为地址前面有空格崩掉；模型名多一个换行，请求里的
+    model 和评测指纹记下的都跟线上算出来的对不上。"""
+    from rodit.core.config import LLMConfig, llm_endpoint
+
+    monkeypatch.setenv("RODIT_LLM_BASE_URL", f" {BASE}\n")
+    monkeypatch.setenv("RODIT_LLM_MODEL", "qwen-synthetic \n")
+    monkeypatch.setenv("RODIT_LLM_TIMEOUT_S", " 3.5\n")
+    transport = FakeTransport()
+    c = OpenAICompatibleClient.from_env(transport=transport)
+    assert (c.base_url, c.model, c.timeout_s) == (BASE, "qwen-synthetic", 3.5)
+    assert llm_endpoint(LLMConfig())[:2] == (c.base_url, c.model)
+    c.complete(req())
+    url, _, body, _ = transport.calls[0]
+    assert url == f"{BASE}/chat/completions" and body["model"] == "qwen-synthetic"
+
+    monkeypatch.setenv("RODIT_LLM_MODEL", " \n")  # 只有空白：和没设一样
+    with pytest.raises(RuntimeError, match="RODIT_LLM_MODEL"):
+        OpenAICompatibleClient.from_env()
+
+
 # ---------------------------------------------------------------- 响应
 
 

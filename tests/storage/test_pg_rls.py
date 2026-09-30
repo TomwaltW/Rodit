@@ -219,16 +219,29 @@ def test_repositories_cannot_read_other_shop_even_by_id(db, seeded):
     assert PgSuggestionRepository(db).get(SHOP_A, b_id) is None
 
 
-def test_system_audit_events_are_write_only_for_the_app(db, admin_db, truncate):
+def test_system_audit_events_are_readable_only_without_shop_scope(db, admin_db, truncate):
+    """迁移版本 5 的 system_event_select：不设店铺范围时应用能读 shop_id 为空的系统事件
+    （取消订购的清理记录、评测结论），读不到任何店铺的事件；设了店铺范围时读不到系统事件。"""
     audit = PgAuditLog(db)
     audit.record(AuditEvent(shop_id=None, actor="system", action="llm.usage", created_at=NOW))
     audit.record(AuditEvent(shop_id=SHOP_A, actor="system", action="llm.usage", created_at=NOW))
+    audit.record(AuditEvent(shop_id=SHOP_B, actor="system", action="llm.usage", created_at=NOW))
     with admin_db.session(None) as conn:
         shops = sorted((r["shop_id"] or "") for r in conn.execute("SELECT shop_id FROM audit_log"))
-    assert shops == ["", SHOP_A]
+    assert shops == ["", SHOP_A, SHOP_B]
     assert [e.shop_id for e in audit.list_events(SHOP_A)] == [SHOP_A]
+    assert [e.shop_id for e in audit.list_system_events()] == [None]
+    with db.session(None) as conn:  # 不设店铺：只有系统事件
+        rows = conn.execute("SELECT shop_id FROM audit_log").fetchall()
+        assert [r["shop_id"] for r in rows] == [None]
+    with db.session(SHOP_A) as conn:  # 设了店铺：只有本店的，没有系统事件
+        rows = conn.execute("SELECT shop_id FROM audit_log").fetchall()
+        assert [r["shop_id"] for r in rows] == [SHOP_A]
+    # 读得到也改不了、删不掉（只有 SELECT 策略放行系统事件）
     with db.session(None) as conn:
-        assert conn.execute("SELECT count(*) AS n FROM audit_log").fetchone()["n"] == 0
+        assert conn.execute("UPDATE audit_log SET actor = 'x'").rowcount == 0
+        assert conn.execute("DELETE FROM audit_log").rowcount == 0
+    assert len(audit.list_system_events()) == 1
     # 设置了店铺范围时不能写无店铺事件（防止借无店铺事件绕过隔离）
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         with db.session(SHOP_A) as conn:
@@ -320,4 +333,108 @@ def test_non_superuser_owner_can_migrate_and_is_still_bound_by_rls(pg_admin_dsn)
             admin.execute(
                 sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(dbname))
             )
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(owner)))
+
+
+# ================================================================ 迁移版本 5：跨店列出快到期的店铺
+
+
+def test_auth_expiring_function_is_locked_down(db, admin_db, truncate, token_key):
+    """rodit_auth_expiring：SECURITY DEFINER、固定 search_path、属于表的属主、
+    只有 rodit_app 能执行、只返回店铺 ID 和到期时间；应用角色自己仍然不能跨店读 shop_auth。"""
+    with admin_db.session(None) as conn:
+        fn = conn.execute(
+            "SELECT p.prosecdef, p.proconfig, pg_get_userbyid(p.proowner) AS owner,"
+            " (SELECT tableowner FROM pg_tables WHERE tablename = 'shop_auth') AS table_owner,"
+            " has_function_privilege('rodit_app', p.oid, 'EXECUTE') AS app,"
+            " has_function_privilege('rodit_trainer', p.oid, 'EXECUTE') AS trainer,"
+            " p.proacl IS NOT NULL AS has_acl,"
+            " EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0) AS public,"
+            " pg_get_function_result(p.oid) AS result"
+            " FROM pg_proc p WHERE p.proname = 'rodit_auth_expiring'"
+        ).fetchall()
+    assert len(fn) == 1
+    (row,) = fn
+    assert row["prosecdef"] is True
+    assert "search_path=pg_catalog, pg_temp" in row["proconfig"]
+    assert row["owner"] == row["table_owner"]
+    assert row["app"] is True and row["trainer"] is False
+    # PUBLIC 没有执行权限（proacl 为空表示默认权限，也就是授给了 PUBLIC）
+    assert row["has_acl"] is True and row["public"] is False
+    assert row["result"] == "TABLE(shop_id text, expires_at timestamp with time zone)"
+
+    auth = PgShopAuthRepository(db, encryption_key=token_key)
+    for shop, days in ((SHOP_A, 1), (SHOP_B, 2)):
+        auth.save(
+            ShopAuth(
+                shop_id=shop,
+                access_token=SecretStr(f"tok-{shop}-synthetic"),
+                scopes=["order.read"],
+                expires_at=NOW + timedelta(days=days),
+                refresh_token=SecretStr(f"tok-{shop}-refresh"),
+            )
+        )
+    with db.session(None) as conn:
+        rows = conn.execute("SELECT * FROM rodit_auth_expiring(%s)", (NOW + timedelta(3),))
+        got = [dict(r) for r in rows]
+        assert [set(r) for r in got] == [{"shop_id", "expires_at"}] * 2
+        assert [r["shop_id"] for r in got] == [SHOP_A, SHOP_B]
+        # 应用角色自己打开函数的开关也读不到别的店铺（那条策略只给属主）
+        conn.execute("SELECT set_config('rodit.auth_expiring_scan', 'on', true)")
+        assert conn.execute("SELECT count(*) AS n FROM shop_auth").fetchone()["n"] == 0
+    with db.session(SHOP_A) as conn:
+        assert [r["shop_id"] for r in conn.execute("SELECT shop_id FROM shop_auth")] == [SHOP_A]
+    # 设了店铺范围的事务（商家请求等）不能借它列出别的店铺
+    with pytest.raises(psycopg.errors.InsufficientPrivilege, match="不设店铺范围"):
+        with db.session(SHOP_A) as conn:
+            conn.execute("SELECT * FROM rodit_auth_expiring(%s)", (NOW + timedelta(3),))
+    # 训练导出角色不能调用
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with db.session(None, trainer=True) as conn:
+            conn.execute("SELECT * FROM rodit_auth_expiring(now())")
+
+
+def test_auth_expiring_works_for_non_superuser_owner(pg_admin_dsn):
+    """生产上迁移账号（函数属主）不是超级用户、受 FORCE 行级安全约束：函数照样能跨店列出，
+    属主在函数外仍然读不到别的店铺的授权。"""
+    suffix = uuid.uuid4().hex[:10]
+    owner, dbname = f"rodit_test_owner_{suffix}", f"rodit_test_auth_{suffix}"
+    with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(owner)))
+        admin.execute(
+            sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                sql.Identifier(dbname), sql.Identifier(owner)
+            )
+        )
+    dsn = make_conninfo(pg_admin_dsn, dbname=dbname)
+    try:
+        with psycopg.connect(dsn) as conn:
+            conn.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(owner)))
+            for migration in MIGRATIONS:
+                conn.execute(migration.sql())
+            for shop, days in ((SHOP_A, 1), (SHOP_B, 5)):
+                conn.execute("SELECT set_config('rodit.shop_id', %s, false)", (shop,))
+                conn.execute(
+                    "INSERT INTO shop_auth (shop_id, access_token, scopes, expires_at)"
+                    " VALUES (%s, 'x'::bytea, '{order.read}', %s)",
+                    (shop, NOW + timedelta(days=days)),
+                )
+            conn.execute("SELECT set_config('rodit.shop_id', '', false)")
+            # 属主在函数外：FORCE 行级安全照旧
+            assert conn.execute("SELECT count(*) FROM shop_auth").fetchone()[0] == 0
+            conn.commit()
+        db = Database(dsn)  # 应用视角：SET LOCAL ROLE rodit_app
+        with db.session(None) as conn:
+            rows = conn.execute(
+                "SELECT shop_id FROM rodit_auth_expiring(%s)", (NOW + timedelta(days=2),)
+            ).fetchall()
+        assert [r["shop_id"] for r in rows] == [SHOP_A]
+        with db.session(None) as conn:
+            assert conn.execute("SELECT count(*) AS n FROM shop_auth").fetchone()["n"] == 0
+    finally:
+        with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(dbname))
+            )
+            admin.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(owner)))
             admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(owner)))

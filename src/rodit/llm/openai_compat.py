@@ -194,14 +194,18 @@ class OpenAICompatibleClient:
     @classmethod
     def from_env(cls, *, prefix: str = "RODIT_LLM_", **kwargs: Any) -> OpenAICompatibleClient:
         """从环境变量构造：{prefix}BASE_URL、{prefix}MODEL（必填），{prefix}TIMEOUT_S（可选）；
-        密钥仍在每次调用时从 {prefix}API_KEY 读。"""
-        base_url = os.environ.get(f"{prefix}BASE_URL", "")
-        model = os.environ.get(f"{prefix}MODEL", "")
+        密钥仍在每次调用时从 {prefix}API_KEY 读。
+
+        值去掉首尾空白（从密钥文件、挂载文件注入时常带换行），和 core.config.llm_endpoint 同一条
+        规则：启动前检查、就绪检查、评测指纹描述的就是这里造出来的客户端（模型名多一个空格，
+        评测记下的和线上算出来的就对不上）。"""
+        base_url = os.environ.get(f"{prefix}BASE_URL", "").strip()
+        model = os.environ.get(f"{prefix}MODEL", "").strip()
         if not base_url or not model:
             raise RuntimeError(
                 f"环境变量 {prefix}BASE_URL 和 {prefix}MODEL 必须设置（D5 所选模型）"
             )
-        timeout = os.environ.get(f"{prefix}TIMEOUT_S")
+        timeout = os.environ.get(f"{prefix}TIMEOUT_S", "").strip()
         if timeout:
             kwargs.setdefault("timeout_s", float(timeout))
         kwargs.setdefault("api_key_env", f"{prefix}API_KEY")

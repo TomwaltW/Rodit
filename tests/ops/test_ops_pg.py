@@ -73,6 +73,7 @@ def test_local_init_then_serve_on_postgres(local_env):
     assert ask.status_code == 200, ask.text
     assert ask.json()["suggestions"]
 
+    assert server.background.run_once("auth_expiry") == "ok"  # 授权检查在 serve 的后台线程里跑
     metrics = client.get(
         "/metrics", headers={"Authorization": f"Bearer {tokens[('metrics', 'local')]}"}
     )

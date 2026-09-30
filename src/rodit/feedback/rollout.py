@@ -7,16 +7,27 @@
 - 影子 → 智能辅助（§13.4 "测试集和影子对比都达到 13.2 的门槛"）：
   影子对比部分 = 窗口内影子推荐的人工复核样本（每周抽样里状态为 SHADOW 的推荐）按 §13.2 打分，
   事实正确、合规满分率都 ≥ 95%，且已打分的样本不少于 min_scored 条；
-  测试集部分在离线评测（rodit.eval）里跑，没有传入结果时列为 unchecked（需要复核人员确认）；
+  测试集部分来自离线评测（rodit.eval）的结论：python -m rodit.ops record-eval 把评测报告记成
+  eval.verdict 系统事件，只有配置指纹和线上配置一致、用真实大模型跑的结论才算
+  （rodit.eval.fingerprint 的 test_set_evidence）；没有这样的结论时列为 unchecked，并写明原因；
   字符重合度（shadow_report 的 match_rate）只是参考，帮复核人员挑差异大的样本，不作为门槛。
   窗口默认是最近两个完整 ISO 周加本周（§13.4 影子模式 1–2 周）。
 - 智能辅助 → 下一阶段（§13.4 "连续 2 周采纳率 ≥ 60%，平台违规为 0"）：截至上一个完整周的
-  最近 2 周，phase_gate(min_periods=2)，每周至少 ASSIST_MIN_GROUPS 个推荐组；平台违规暂无数据来源，
-  列为 unchecked。
+  最近 2 周，phase_gate(min_periods=2)，每周至少 ASSIST_MIN_GROUPS 个推荐组（全自动发出去的推荐
+  不算，见 feedback.metrics）。平台违规分两条报告：
+  platform_violations = 复核人员按周登记的平台违规通知（shop.rollout_incident，见 incident_total：
+  这 2 周都登记过、或登记的条数已经大于 0 才算检查过，否则 unchecked 并写明缺哪几周）；
+  compliance_scan = 实际发出去的文字的合规扫描（feedback.compliance，代理指标，同一窗口到现在）：
+  扫描命中只是候选，复核人员逐条确认——确认是违规的条数要为 0；还有没确认的（且没有确认的违规）时
+  这一条是 unchecked，写明几条、哪些 ID；误报标记后不计。
 - 全自动（按类型，§13.4 "该类型连续 4 周原样采纳率 ≥ 90%，且没有因此产生的投诉"）：
   config.routing.auto_threshold 列出的类型各跑 intent_gate(min_periods=4)，每周至少
-  AUTO_MIN_GROUPS 个推荐组；投诉暂无数据来源，列为 unchecked。开不开由平台准入和人工决定，
-  这里只报告。
+  AUTO_MIN_GROUPS 个推荐组；投诉 = 复核人员按周登记的投诉（最近 4 周，口径同平台违规），
+  没登记全时列为 unchecked。开不开由平台准入和人工决定，这里只报告。
+- 复核人员的登记（shop.rollout_incident）：每条是某一周的总数，同一类型、同一周再登记以最后一次为准
+  （改错用）；没有也要登记 0，门槛才算检查过。0 要在那一周结束之后登记（或结束后再登记一次确认）
+  才算：周中登记的 0 只说明到登记时还没有，平台通知常常滞后（provisional_zero）。本周的登记
+  （不是完整周）有大于 0 的也计入。
 - GateResult.passed 只看已检查的条件；unchecked 的条件由复核人员确认（切换时写进审计）。
 """
 
@@ -25,12 +36,22 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
+from rodit.core.audit import AuditAction
 from rodit.core.config import RoutingConfig
 from rodit.core.enums import Intent, QualityReviewStatus, SuggestionStatus
-from rodit.core.models import QualityReview, ShopConfig, StoredMessage, SuggestionRecord
+from rodit.core.models import (
+    QUALITY_PERIOD_PATTERN,
+    AuditEvent,
+    QualityReview,
+    ShopConfig,
+    StoredMessage,
+    SuggestionRecord,
+)
+from rodit.feedback.compliance import ComplianceSummary, pending_reason
 from rodit.feedback.metrics import (
     AdoptionReport,
     GateCheck,
@@ -50,6 +71,7 @@ from rodit.feedback.review import (
     QualityReport,
     iso_period,
     launch_gate,
+    period_range,
     week_start,
 )
 
@@ -105,12 +127,21 @@ ADVICE_TEXT: dict[RolloutAdvice, str] = {
 }
 
 UNCHECKED_LABELS: dict[str, str] = {
-    "test_set": "测试集评分（§13.1、§13.2，离线评测 rodit.eval 的结果）",
-    "platform_violations": "平台违规为 0（§13.4，暂无数据来源）",
-    "complaints": "没有因自动回复产生的投诉（§13.4，暂无数据来源）",
+    "test_set": (
+        "测试集评分（§13.1、§13.2：离线评测 rodit.eval 的结论，"
+        "python -m rodit.ops record-eval 记录）"
+    ),
+    "platform_violations": "平台违规为 0（§13.4：复核人员按周登记平台下发的违规通知）",
+    "complaints": "没有因自动回复产生的投诉（§13.4：复核人员按周登记）",
+    "compliance_scan": (
+        "发出去的文字没有违规（合规扫描命中的疑似违规由复核人员逐条确认，误报标记后不计）"
+    ),
     "consecutive": "统计周期首尾相接",
 }
 """没有数据、需要人工确认的条件（GateResult.unchecked 的名字 → 说明）。"""
+
+COMPLIANCE_SCAN_CHECK = "compliance_scan"
+"""智能辅助门槛里合规扫描（代理指标）的条件名。"""
 
 
 def stage_of(config: ShopConfig) -> RolloutStage:
@@ -120,6 +151,194 @@ def stage_of(config: ShopConfig) -> RolloutStage:
     if config.auto_reply_enabled:
         return RolloutStage.AUTO
     return RolloutStage.ASSIST
+
+
+# ================================================================ 复核人员登记的违规、投诉（§13.4）
+
+
+class IncidentKind(StrEnum):
+    VIOLATION = "violation"  # 平台下发的违规通知（话术违规、站外引流等）
+    COMPLAINT = "complaint"  # 买家投诉（全自动门槛：因自动回复产生的投诉）
+
+
+INCIDENT_KIND_LABELS: dict[IncidentKind, str] = {
+    IncidentKind.VIOLATION: "平台违规",
+    IncidentKind.COMPLAINT: "投诉",
+}
+
+INCIDENT_GATE_CHECKS: dict[IncidentKind, str] = {
+    IncidentKind.VIOLATION: "platform_violations",
+    IncidentKind.COMPLAINT: "complaints",
+}
+"""登记的类型 → 门槛里的条件名。"""
+
+MAX_INCIDENT_COUNT = 10_000
+
+
+class IncidentEntry(_Model):
+    """复核人员的一条登记（shop.rollout_incident 审计事件）：某一周某类事件的总数。没有原文。"""
+
+    shop_id: str
+    kind: IncidentKind
+    week: str = Field(pattern=QUALITY_PERIOD_PATTERN)
+    count: int = Field(ge=0, le=MAX_INCIDENT_COUNT)
+    note: str | None = None  # 复核人员的备注（已做个人信息最小化）
+    reviewer: str
+    recorded_at: AwareDatetime
+
+
+def incident_detail(entry: IncidentEntry) -> dict[str, Any]:
+    """写进 shop.rollout_incident 的 detail（复核人取 actor，时间取 created_at）。"""
+    return {"kind": entry.kind.value, "week": entry.week, "count": entry.count, "note": entry.note}
+
+
+def parse_incidents(events: Iterable[AuditEvent], *, shop_id: str) -> list[IncidentEntry]:
+    """审计事件 → 登记（按时间升序）。别的店铺、别的动作、字段不对的事件跳过。"""
+    out: list[IncidentEntry] = []
+    for e in events:
+        if e.shop_id != shop_id or e.action != AuditAction.ROLLOUT_INCIDENT.value:
+            continue
+        d = e.detail
+        note = d.get("note")
+        try:
+            out.append(
+                IncidentEntry(
+                    shop_id=shop_id,
+                    kind=d.get("kind"),
+                    week=d.get("week"),
+                    count=d.get("count"),
+                    note=note if isinstance(note, str) else None,
+                    reviewer=e.actor,
+                    recorded_at=e.created_at,
+                )
+            )
+        except ValidationError:
+            continue
+    return sorted(out, key=lambda x: x.recorded_at)
+
+
+def current_entries(
+    entries: Iterable[IncidentEntry],
+) -> dict[tuple[IncidentKind, str], IncidentEntry]:
+    """每个（类型、周）以最后一次登记为准。"""
+    latest: dict[tuple[IncidentKind, str], IncidentEntry] = {}
+    for e in sorted(entries, key=lambda x: x.recorded_at):
+        latest[(e.kind, e.week)] = e
+    return latest
+
+
+class IncidentTotal(_Model):
+    """一段窗口里某类登记的合计（门槛用）。count 为 None 表示没法判断（缺登记，见 reason）。"""
+
+    kind: IncidentKind
+    weeks: list[str]  # 必须登记的周（完整周）
+    by_week: dict[str, int] = Field(default_factory=dict)  # 已登记的周（含本周）→ 条数
+    missing: list[str] = Field(default_factory=list)  # 还要登记（或结束后再确认）的周
+    provisional: list[str] = Field(default_factory=list)  # 其中登记了 0、但是在那一周结束前登记的
+    known: int = 0  # 已登记的条数合计
+    count: int | None = None
+    reason: str | None = None
+
+
+def provisional_zero(entry: IncidentEntry, *, as_of: datetime | None = None) -> bool:
+    """这条登记是不是"暂定的 0"：条数为 0、登记时那一周还没结束——它只说明到登记时为止没有，
+    不能代表整周（通知常常滞后）。as_of 给了、那一周到 as_of 还没结束时不算暂定（那一周本来就只能
+    看到现在为止，如不到一周的验收窗口）。"""
+    if entry.count > 0:
+        return False
+    end = period_range(entry.week)[1]
+    if as_of is not None and end > as_of:
+        return False
+    return entry.recorded_at < end
+
+
+def incident_total(
+    entries: Iterable[IncidentEntry],
+    kind: IncidentKind,
+    weeks: Sequence[str],
+    *,
+    extra_weeks: Sequence[str] = (),
+    as_of: datetime | None = None,
+) -> IncidentTotal:
+    """weeks 是必须登记的周，extra_weeks（如本周）有登记就计入。as_of：按哪个时间点判断
+    （上线状态用现在，验收报告用窗口终点）。
+
+    必须登记的周里，登记的 0 要在那一周结束之后登记（或结束后再登记一次确认）才算检查过：
+    周一早上登记的 0 不能代表整周（provisional_zero），这一周仍算缺登记，reason 写明要在结束后确认。
+    大于 0 的登记什么时候登记都算。
+
+    登记的条数大于 0 → count = 合计（门槛不通过，不管缺不缺登记）；都登记了且合计为 0 → count = 0；
+    否则 count = None，reason 写明缺哪几周。"""
+    latest = current_entries(e for e in entries if e.kind == kind)
+    wanted = list(dict.fromkeys([*weeks, *extra_weeks]))
+    required = set(weeks)
+    provisional = [
+        w for w in weeks if (kind, w) in latest and provisional_zero(latest[(kind, w)], as_of=as_of)
+    ]
+    by_week = {
+        w: latest[(kind, w)].count
+        for w in wanted
+        if (kind, w) in latest and not (w in required and w in provisional)
+    }
+    missing = [w for w in weeks if w not in by_week]
+    known = sum(by_week.values())
+    label = INCIDENT_KIND_LABELS[kind]
+    count: int | None
+    reason: str | None = None
+    if known > 0:
+        count = known
+    elif not missing:
+        count = 0
+    else:
+        count = None
+        parts = []
+        unregistered = [w for w in missing if w not in provisional]
+        if unregistered:
+            parts.append(
+                f"还没登记 {'、'.join(unregistered)} 的{label}"
+                "（复核人员按周登记平台下发的通知，没有也要登记 0）"
+            )
+        if provisional:
+            parts.append(
+                f"{'、'.join(provisional)} 的{label}登记 0 是在那一周结束前登记的，"
+                "只能说明登记时还没有：那一周结束后再登记一次确认"
+            )
+        reason = "；".join(parts)
+    return IncidentTotal(
+        kind=kind,
+        weeks=list(weeks),
+        by_week=by_week,
+        missing=missing,
+        provisional=provisional,
+        known=known,
+        count=count,
+        reason=reason,
+    )
+
+
+class TestSetEvidence(_Model):
+    """测试集门槛（§13.1、§13.2）的依据：离线评测的结论（eval.verdict）。
+
+    passed 为 None 表示没有能用的结论（reason 写明原因）；否则 detail 描述用的是哪一次评测。
+    由 rodit.eval.fingerprint.test_set_evidence 按配置指纹挑选。"""
+
+    __test__ = False  # 不是 pytest 的测试类
+
+    passed: bool | None = None
+    reason: str | None = None
+    detail: str = ""
+    verdict_at: AwareDatetime | None = None
+    config_fingerprint: str | None = None  # 那次评测的配置指纹
+    running_fingerprint: str | None = None  # 线上配置的指纹
+
+
+class RolloutEvidence(_Model):
+    """门槛里原来没有数据来源的条件现在的依据（§13.4）。"""
+
+    test_set: TestSetEvidence
+    platform_violations: IncidentTotal  # 智能辅助门槛的 2 周（+ 本周）
+    complaints: IncidentTotal  # 全自动门槛的 4 周（+ 本周）
+    compliance: ComplianceSummary  # 智能辅助门槛的 2 周到现在
 
 
 # ================================================================ 采纳率周报（§13.4）
@@ -181,15 +400,40 @@ def assist_gate(
     weekly: Sequence[AdoptionReport],
     *,
     platform_violations: int | None = None,
+    potential_violations: int | None = None,
+    unreviewed_violations: int = 0,
     min_groups: int = ASSIST_MIN_GROUPS,
 ) -> GateResult:
-    """智能辅助 → 下一阶段：最近 2 周（weekly 的最后两份）推荐组采纳率都 ≥ 60%，平台违规为 0。"""
-    return phase_gate(
+    """智能辅助 → 下一阶段：最近 2 周（weekly 的最后两份）推荐组采纳率都 ≥ 60%，平台违规为 0。
+
+    platform_violations：复核人员登记的平台违规（None → unchecked）；
+    potential_violations：合规扫描命中、复核人员确认是违规的条数（代理指标，单独一条
+    compliance_scan；None 时不加这一条）；
+    unreviewed_violations：扫描命中、复核人员还没确认的条数——只是候选，不算不通过：没有确认的
+    违规、又有没确认的时，compliance_scan 列为 unchecked（由复核人员确认或标记误报）。"""
+    gate = phase_gate(
         list(weekly)[-ASSIST_PERIODS:],
         min_adoption=ASSIST_MIN_ADOPTION,
         min_periods=ASSIST_PERIODS,
         min_samples=min_groups,
         platform_violations=platform_violations,
+    )
+    if potential_violations is None:
+        return gate
+    if potential_violations == 0 and unreviewed_violations > 0:
+        return gate.model_copy(update={"unchecked": [*gate.unchecked, COMPLIANCE_SCAN_CHECK]})
+    checks = [
+        *gate.checks,
+        GateCheck(
+            name=COMPLIANCE_SCAN_CHECK,
+            passed=potential_violations == 0,
+            value=potential_violations,
+            threshold=0,
+            detail=("实际发出去的文字里复核人员确认的违规条数（合规扫描命中后逐条确认，代理指标）"),
+        ),
+    ]
+    return gate.model_copy(
+        update={"checks": checks, "passed": bool(weekly) and all(c.passed for c in checks)}
     )
 
 
@@ -314,8 +558,11 @@ def _review_rank(q: QualityReview) -> tuple[int, datetime]:
     return (1 if done else 0, q.reviewed_at or q.sampled_at)
 
 
-def shadow_gate(quality: LaunchGate, *, test_set_passed: bool | None = None) -> GateResult:
-    """影子 → 智能辅助：影子推荐的人工复核达到 §13.2 门槛；测试集结果没传时列为 unchecked。"""
+def shadow_gate(
+    quality: LaunchGate, *, test_set_passed: bool | None = None, test_set_detail: str | None = None
+) -> GateResult:
+    """影子 → 智能辅助：影子推荐的人工复核达到 §13.2 门槛；测试集结果没传时列为 unchecked。
+    test_set_detail：测试集依据的说明（哪一次评测、各项满分率）。"""
     checks = [
         GateCheck(
             name="shadow_review.scored",
@@ -344,7 +591,11 @@ def shadow_gate(quality: LaunchGate, *, test_set_passed: bool | None = None) -> 
         unchecked.append("test_set")
     else:
         checks.append(
-            GateCheck(name="test_set", passed=bool(test_set_passed), detail="离线测试集（§13.1）")
+            GateCheck(
+                name="test_set",
+                passed=bool(test_set_passed),
+                detail=test_set_detail or "离线测试集（§13.1）",
+            )
         )
     return GateResult(
         stage=RolloutStage.SHADOW.value,
@@ -371,6 +622,7 @@ def gate_summary(gate: GateResult) -> dict[str, object]:
 class UncheckedCondition(_Model):
     name: str
     description: str
+    reason: str | None = None  # 为什么没法检查（缺哪几周的登记、评测结论的指纹对不上……）
 
 
 class RolloutStatus(_Model):
@@ -395,14 +647,21 @@ class RolloutStatus(_Model):
     assist_gate: GateResult
     intent_gates: dict[Intent, GateResult] = Field(default_factory=dict)
     latest_quality: QualityReport | None = None  # 最近一个有样本的周期的复核报表
+    evidence: RolloutEvidence | None = None  # 测试集、平台违规、投诉、合规扫描的依据（没有文字）
 
 
-def _unchecked(names: Iterable[str]) -> list[UncheckedCondition]:
+def _unchecked(
+    names: Iterable[str], reasons: Mapping[str, str | None] | None = None
+) -> list[UncheckedCondition]:
     seen: list[str] = []
     for n in names:
         if n not in seen:
             seen.append(n)
-    return [UncheckedCondition(name=n, description=UNCHECKED_LABELS.get(n, n)) for n in seen]
+    reasons = reasons or {}
+    return [
+        UncheckedCondition(name=n, description=UNCHECKED_LABELS.get(n, n), reason=reasons.get(n))
+        for n in seen
+    ]
 
 
 def rollout_status(
@@ -419,21 +678,47 @@ def rollout_status(
     test_set_passed: bool | None = None,
     platform_violations: int | None = None,
     complaints: int | None = None,
+    evidence: RolloutEvidence | None = None,
     min_scored: int = DEFAULT_MIN_SCORED,
     assist_min_groups: int = ASSIST_MIN_GROUPS,
     auto_min_groups: int = AUTO_MIN_GROUPS,
 ) -> RolloutStatus:
     """汇总上线状态。records 要覆盖最近 4 个完整周和影子窗口（shadow_since 起、不设上限）；
-    shadow 是影子窗口内的对比（shadow_comparison）；reviews 是影子窗口涉及周期的复核样本。"""
+    shadow 是影子窗口内的对比（shadow_comparison）；reviews 是影子窗口涉及周期的复核样本。
+
+    evidence 给了时，测试集、平台违规、投诉取自它（覆盖 test_set_passed / platform_violations /
+    complaints），并加上合规扫描一条（复核人员确认的违规；只有没确认的疑似违规时是 unchecked）；
+    没法检查的条件带上原因。"""
     stage = stage_of(config)
+    reasons: dict[str, str | None] = {}
+    test_set_detail: str | None = None
+    potential: int | None = None
+    unreviewed = 0
+    if evidence is not None:
+        test_set_passed = evidence.test_set.passed
+        test_set_detail = evidence.test_set.detail or None
+        platform_violations = evidence.platform_violations.count
+        complaints = evidence.complaints.count
+        potential = evidence.compliance.confirmed
+        unreviewed = evidence.compliance.pending
+        reasons = {
+            "test_set": evidence.test_set.reason,
+            "platform_violations": evidence.platform_violations.reason,
+            "complaints": evidence.complaints.reason,
+            "compliance_scan": pending_reason(evidence.compliance),
+        }
     by_id = {r.id: r for r in records if r.id is not None and r.shop_id == shop_id}
     in_shadow = shadow_reviews(reviews, by_id, shop_id=shop_id, since=shadow_since)
     quality = launch_gate(in_shadow, min_scored=min_scored, min_full_rate=LAUNCH_MIN_FULL_RATE)
-    s_gate = shadow_gate(quality, test_set_passed=test_set_passed)
+    s_gate = shadow_gate(quality, test_set_passed=test_set_passed, test_set_detail=test_set_detail)
     own = [r for r in records if r.shop_id == shop_id]
     weekly = weekly_adoption(own, now, weeks=AUTO_PERIODS)
     a_gate = assist_gate(
-        weekly, platform_violations=platform_violations, min_groups=assist_min_groups
+        weekly,
+        platform_violations=platform_violations,
+        potential_violations=potential,
+        unreviewed_violations=unreviewed,
+        min_groups=assist_min_groups,
     )
     i_gates = auto_intent_gates(
         weekly, routing.auto_threshold, complaints=complaints, min_groups=auto_min_groups
@@ -459,7 +744,7 @@ def rollout_status(
         advice=advice,
         advice_text=ADVICE_TEXT[advice],
         blocking=blocking,
-        unchecked=_unchecked(n for gate in gates for n in gate.unchecked),
+        unchecked=_unchecked((n for gate in gates for n in gate.unchecked), reasons),
         shadow=summarize_shadow(shadow, since=shadow_since, until=now),
         shadow_quality=quality,
         shadow_gate=s_gate,
@@ -467,6 +752,7 @@ def rollout_status(
         assist_gate=a_gate,
         intent_gates=i_gates,
         latest_quality=latest_quality,
+        evidence=evidence,
     )
 
 
@@ -474,21 +760,35 @@ __all__ = [
     "ADVICE_TEXT",
     "ASSIST_MIN_GROUPS",
     "AUTO_MIN_GROUPS",
+    "COMPLIANCE_SCAN_CHECK",
+    "INCIDENT_GATE_CHECKS",
+    "INCIDENT_KIND_LABELS",
+    "MAX_INCIDENT_COUNT",
     "SHADOW_CONTEXT_MESSAGES",
     "SHADOW_MATCH_THRESHOLD",
     "SHADOW_WEEKS",
     "STAGE_LABELS",
     "SWITCHABLE_STAGES",
     "UNCHECKED_LABELS",
+    "IncidentEntry",
+    "IncidentKind",
+    "IncidentTotal",
     "RolloutAdvice",
+    "RolloutEvidence",
     "RolloutStage",
     "RolloutStatus",
     "ShadowSummary",
+    "TestSetEvidence",
     "UncheckedCondition",
     "WeeklyAdoption",
     "assist_gate",
     "auto_intent_gates",
+    "current_entries",
     "gate_summary",
+    "incident_detail",
+    "incident_total",
+    "parse_incidents",
+    "provisional_zero",
     "rollout_status",
     "shadow_comparison",
     "shadow_gate",

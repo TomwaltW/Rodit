@@ -9,7 +9,7 @@ from engine_support import Kit, build_kit
 
 from rodit.core.config import EngineConfig
 from rodit.core.enums import Mode, Platform, Role, ShopStatus
-from rodit.core.errors import KnowledgeUnavailable, ToolUnavailable
+from rodit.core.errors import KnowledgeUnavailable, TenantIsolationError, ToolUnavailable
 from rodit.core.models import ConversationContext, StandardMessage
 from rodit.engine import (
     DEGRADED_TOOL_ORDER,
@@ -370,6 +370,22 @@ def test_recent_orders_failure_only(kit: Kit) -> None:
     und = understand(kit, msg)
     assert und.context.order is not None and und.context.order.order_id == "o_1002"
     assert und.degraded == [DEGRADED_TOOL_ORDER]
+
+
+@pytest.mark.parametrize("method", ["list_recent_orders", "get_order"])
+def test_cross_shop_order_is_not_reported_as_a_tool_outage(
+    kit: Kit, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """平台工具返回了别的店铺的订单（网关抛 TenantIsolationError）：不是"工具不可用"，要往外抛，
+    由引擎记串店、不推荐（§9.2、§12.4 串店检查）。"""
+
+    def cross_shop(*a: Any, **kw: Any) -> Any:
+        raise TenantIsolationError("订单属于别的店铺")
+
+    monkeypatch.setattr(kit.tools, method, cross_shop)
+    msg = say(kit, "订单 o_1099 发货了吗")  # 不在最近订单里：会单独查订单
+    with pytest.raises(TenantIsolationError):
+        understand(kit, msg)
 
 
 def test_tool_unavailable_type_is_what_gateway_raises(kit: Kit) -> None:

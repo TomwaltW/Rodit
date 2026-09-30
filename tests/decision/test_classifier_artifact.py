@@ -31,7 +31,9 @@ from rodit.decision.classifier import (
     artifact_digest,
     dump_artifact,
     feature_key,
+    read_artifact_with_digest,
 )
+from rodit.eval.fingerprint import file_sha256
 from rodit.testing.fakes import FakeLLMClient
 from rodit.testing.fixtures import DEFAULT_NOW
 
@@ -106,6 +108,28 @@ def test_loaded_provider_carries_metadata(synthetic_intent_samples, tmp_path):
     # 重新训练就是新模型：不再挂着旧模型文件的 metadata
     loaded.fit(synthetic_intent_samples)
     assert loaded.meta is None and loaded.artifact_sha256 is None
+
+
+def test_the_loaded_file_hash_stays_with_the_instance(synthetic_intent_samples, tmp_path):
+    """加载时记下读到的字节的 SHA-256（和评测指纹的 file_sha256 同一个值）；同一路径之后被换成
+    别的模型文件（train-classifier --overwrite 是原子改名），已加载的实例照旧是原来的那个。"""
+    path = tmp_path / "classifier.json"
+    a = _trained(synthetic_intent_samples)
+    a.save(path, trained_at=DEFAULT_NOW)
+    sha_a = file_sha256(path)
+    assert a.file_sha256 == sha_a  # 写入的字节
+    data, digest = read_artifact_with_digest(path)
+    assert digest == sha_a and data == read_artifact(path)
+    loaded = ClassifierProvider.load(path, fallback=RuleProvider())
+    assert loaded.file_sha256 == sha_a
+    b = _trained(synthetic_intent_samples[:-3])
+    b.save(path, trained_at=DEFAULT_NOW + timedelta(days=1))
+    assert file_sha256(path) == b.file_sha256 != sha_a
+    assert loaded.file_sha256 == sha_a
+    # 从内容重建、重新训练的实例不对应任何文件
+    assert ClassifierProvider.from_artifact(data, fallback=RuleProvider()).file_sha256 is None
+    loaded.fit(synthetic_intent_samples)
+    assert loaded.file_sha256 is None
 
 
 def test_artifact_is_plain_json_with_integer_counts(artifact):

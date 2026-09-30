@@ -1,0 +1,83 @@
+# Rodit 平台单元的 Prometheus 记录规则（方案 §12.1 性能、§12.2 可用性与降级、§12.4 可观测性）。
+#
+# 指标由 /metrics 输出（rodit.ops.instrument.RoditMetrics，标签里没有买家数据）。一个平台单元一个
+# 抓取目标（§9.1 每个平台云各一套监控），所以聚合时都保留 job、instance：告警按单元分开。
+# 规则名按 Prometheus 的约定 level:metric:operations。告警在 alerts.yml，两个文件一起加载：
+#
+#   rule_files:
+#     - /etc/prometheus/rodit/recording.yml
+#     - /etc/prometheus/rodit/alerts.yml
+#
+# 改指标名或标签时同步改这里；tests/ops/test_alert_rules.py 核对这里引用的每个指标都已登记。
+
+groups:
+  - name: rodit.recording
+    interval: 30s
+    rules:
+      # ---------------------------------------------------------------- 耗时（§12.1）
+      # stage=total：引擎内的端到端；stage=since_received：从平台收到消息算起（含排队、会话锁等待），
+      # 更接近"推荐出现（端到端）P95 ≤ 5 秒"的口径
+      - record: rodit:engine_latency_seconds:p95_5m
+        expr: >
+          histogram_quantile(0.95,
+            sum by (job, instance, stage, le) (rate(rodit_engine_latency_seconds_bucket[5m])))
+      - record: rodit:engine_latency_seconds:p50_5m
+        expr: >
+          histogram_quantile(0.5,
+            sum by (job, instance, stage, le) (rate(rodit_engine_latency_seconds_bucket[5m])))
+
+      # ---------------------------------------------------------------- 消息量、降级（§12.2）
+      - record: rodit:engine_messages:rate10m
+        expr: sum by (job, instance) (rate(rodit_engine_messages_total[10m]))
+      # 每条消息的降级次数，按降级类型（一条消息可以有几种降级）
+      - record: rodit:degradations_per_message:rate10m
+        expr: >
+          sum by (job, instance, kind) (rate(rodit_degradations_total[10m]))
+          / on (job, instance) group_left
+          sum by (job, instance) (rate(rodit_engine_messages_total[10m]))
+
+      # ---------------------------------------------------------------- 平台接口（§12.4 调用量、失败率、额度）
+      - record: rodit:platform_tool_calls:rate10m
+        expr: sum by (job, instance, tool) (rate(rodit_platform_tool_calls_total[10m]))
+      # 失败 = 故障、限流、超时（ToolUnavailable.reason）和其他异常
+      - record: rodit:platform_tool_failure_ratio:rate10m
+        expr: >
+          sum by (job, instance, tool)
+            (rate(rodit_platform_tool_calls_total{outcome=~"unavailable|throttled|timeout|error"}[10m]))
+          / sum by (job, instance, tool) (rate(rodit_platform_tool_calls_total[10m]))
+      # 限流单独看：额度用完要找平台调额度或加长缓存，不是平台故障
+      - record: rodit:platform_tool_throttled_ratio:rate10m
+        expr: >
+          sum by (job, instance, tool) (rate(rodit_platform_tool_calls_total{outcome="throttled"}[10m]))
+          / sum by (job, instance, tool) (rate(rodit_platform_tool_calls_total[10m]))
+      # 缓存层：命中率、过期兜底（§12.1 平台接口有额度要做缓存、§12.2 用缓存数据并注明时间）
+      - record: rodit:tool_cache_hit_ratio:rate10m
+        expr: >
+          sum by (job, instance, tool) (rate(rodit_tool_cache_hits_total[10m]))
+          / sum by (job, instance, tool) (rate(rodit_tool_cache_requests_total[10m]))
+      - record: rodit:tool_cache_stale_served:rate10m
+        expr: sum by (job, instance, tool) (rate(rodit_tool_cache_stale_served_total[10m]))
+
+      # ---------------------------------------------------------------- 大模型（§12.2、§12.4）
+      - record: rodit:llm_calls:rate10m
+        expr: sum by (job, instance, purpose) (rate(rodit_llm_calls_total[10m]))
+      - record: rodit:llm_failure_ratio:rate10m
+        expr: >
+          sum by (job, instance, purpose) (rate(rodit_llm_calls_total{outcome!="ok"}[10m]))
+          / sum by (job, instance, purpose) (rate(rodit_llm_calls_total[10m]))
+
+      # ---------------------------------------------------------------- 串店（§9.2、§12.4 串店检查）
+      # 近 15 分钟有拦截的 stage（只输出大于 0 的）。stage 的取值事先不知道（引擎在哪一步发现），
+      # 序列第一次出现时就是 1，increase() 看不到从无到 1：前半段用"现在 − 15 分钟前（那时没有就当 0）"
+      # 补上，后半段的 increase() 处理进程重启后计数归零
+      - record: rodit:tenant_isolation:increase15m
+        expr: >
+          (
+            sum by (job, instance, stage) (rodit_tenant_isolation_total)
+            - (
+              sum by (job, instance, stage) (rodit_tenant_isolation_total offset 15m)
+              or sum by (job, instance, stage) (rodit_tenant_isolation_total) * 0
+            )
+          ) > 0
+          or
+          sum by (job, instance, stage) (increase(rodit_tenant_isolation_total[15m])) > 0

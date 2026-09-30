@@ -1,0 +1,248 @@
+# deploy/prometheus 的告警单元测试（promtool test rules；test_alert_rules.py 在有 promtool 时跑）。
+# 输入全是合成的指标序列（店铺 ID 是合成演示数据里的），每 30 秒一个点。
+# 每个场景在某个时刻查 ALERTS{alertstate="firing"}：正好是期望的那几条告警，别的都没有。
+
+rule_files:
+  - ../../deploy/prometheus/recording.yml
+  - ../../deploy/prometheus/alerts.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ---------------------------------------------------------------- 串店：第一次出现就告警，15 分钟后恢复
+  - interval: 30s
+    input_series:
+      # 引擎第 5 分钟第一次拦下（序列从无到 1）
+      - series: 'rodit_tenant_isolation_total{job="rodit",instance="tb",stage="retrieve"}'
+        values: '_x10 1x60'
+      # 接口层的 0 值序列一开始就有，第 5 分钟拦下一次
+      - series: 'rodit_tenant_isolation_total{job="rodit",instance="tb",stage="http"}'
+        values: '0x10 1x60'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditTenantIsolationBreach",alertstate="firing",severity="critical",job="rodit",instance="tb",stage="retrieve"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditTenantIsolationRejected",alertstate="firing",severity="warning",job="rodit",instance="tb",stage="http"}'
+            value: 1
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 30m
+        exp_samples: []
+
+  # ---------------------------------------------------------------- 串店：接口处理中服务端发现的（stage="server"）是 critical
+  - interval: 30s
+    input_series:
+      # 0 值序列一开始就有（RoditMetrics 预先建好），第 5 分钟售后审核读到了别家店铺的售后单
+      - series: 'rodit_tenant_isolation_total{job="rodit",instance="tb",stage="server"}'
+        values: '0x10 1x60'
+      - series: 'rodit_tenant_isolation_total{job="rodit",instance="tb",stage="http"}'
+        values: '0x70'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditTenantIsolationBreach",alertstate="firing",severity="critical",job="rodit",instance="tb",stage="server"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 串店：降级类型、缓存层拦下
+  - interval: 30s
+    input_series:
+      - series: 'rodit_degradations_total{job="rodit",instance="tb",kind="tenant_isolation"}'
+        values: '0x10 1x30'
+      - series: 'rodit_tool_cache_tenant_violations_total{job="rodit",instance="tb",tool="get_order"}'
+        values: '0x10 2x30'
+      - series: 'rodit_engine_messages_total{job="rodit",instance="tb",shop_id="s_1001",outcome="no_suggestion"}'
+        values: '0+10x40'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing",alertname="RoditTenantIsolationBreach"}
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditTenantIsolationBreach",alertstate="firing",severity="critical",job="rodit",instance="tb"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditTenantIsolationBreach",alertstate="firing",severity="critical",job="rodit",instance="tb",tool="get_order"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 授权：即将过期、已过期、检查出错、检查过时
+  - interval: 30s
+    input_series:
+      - series: 'rodit_auth_expiring_shops{job="rodit",instance="tb"}'
+        values: '3x160'
+      - series: 'rodit_auth_expired_shops{job="rodit",instance="tb"}'
+        values: '1x160'
+      - series: 'rodit_auth_expiry_check_errors_total{job="rodit",instance="tb"}'
+        values: '0x100 1x60'
+      - series: 'rodit_auth_expiry_last_check_timestamp_seconds{job="rodit",instance="tb"}'
+        values: '0x160'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditShopAuthExpiring",alertstate="firing",severity="warning",job="rodit",instance="tb"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditShopAuthExpired",alertstate="firing",severity="critical",job="rodit",instance="tb"}'
+            value: 1
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 75m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditShopAuthExpiring",alertstate="firing",severity="warning",job="rodit",instance="tb"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditShopAuthExpired",alertstate="firing",severity="critical",job="rodit",instance="tb"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditAuthCheckErrors",alertstate="firing",severity="warning",job="rodit",instance="tb"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditAuthCheckStale",alertstate="firing",severity="warning",job="rodit",instance="tb"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 端到端 P95 > 5 秒（从收到消息算起）
+  - interval: 30s
+    input_series:
+      # since_received：90% 的消息在 5–7.5 秒之间
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="since_received",le="1"}'
+        values: '0x60'
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="since_received",le="5"}'
+        values: '0+1x60'
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="since_received",le="7.5"}'
+        values: '0+10x60'
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="since_received",le="+Inf"}'
+        values: '0+10x60'
+      # 引擎内的 total 都在 1 秒内（快）：按两者里慢的算
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="total",le="1"}'
+        values: '0+10x60'
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="total",le="+Inf"}'
+        values: '0+10x60'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditEndToEndLatencyHigh",alertstate="firing",severity="warning",job="rodit",instance="tb"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 平台接口失败率、限流
+  - interval: 30s
+    input_series:
+      - series: 'rodit_platform_tool_calls_total{job="rodit",instance="tb",tool="get_order",outcome="ok"}'
+        values: '0+5x80'
+      - series: 'rodit_platform_tool_calls_total{job="rodit",instance="tb",tool="get_order",outcome="throttled"}'
+        values: '0+5x80'
+      - series: 'rodit_platform_tool_calls_total{job="rodit",instance="tb",tool="get_price",outcome="ok"}'
+        values: '0+5x80'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditPlatformToolFailureRateHigh",alertstate="firing",severity="warning",job="rodit",instance="tb",tool="get_order"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditPlatformToolThrottled",alertstate="firing",severity="warning",job="rodit",instance="tb",tool="get_order"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 大模型失败率、降级激增
+  - interval: 30s
+    input_series:
+      - series: 'rodit_llm_calls_total{job="rodit",instance="tb",purpose="generate",outcome="ok"}'
+        values: '0+3x60'
+      - series: 'rodit_llm_calls_total{job="rodit",instance="tb",purpose="generate",outcome="LLMTimeout"}'
+        values: '0+3x60'
+      - series: 'rodit_llm_calls_total{job="rodit",instance="tb",purpose="route",outcome="ok"}'
+        values: '0+6x60'
+      - series: 'rodit_degradations_total{job="rodit",instance="tb",kind="llm"}'
+        values: '0+5x60'
+      - series: 'rodit_degradations_total{job="rodit",instance="tb",kind="decision"}'
+        values: '0+1x60'
+      - series: 'rodit_engine_messages_total{job="rodit",instance="tb",shop_id="s_1001",outcome="suggested"}'
+        values: '0+10x60'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditLLMFailureRateHigh",alertstate="firing",severity="warning",job="rodit",instance="tb",purpose="generate"}'
+            value: 1
+          - labels: 'ALERTS{alertname="RoditDegradationSpike",alertstate="firing",severity="warning",job="rodit",instance="tb",kind="llm"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 不就绪
+  - interval: 30s
+    input_series:
+      - series: 'rodit_ready{job="rodit",instance="tb"}'
+        values: '1x4 0x30'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 5m
+        exp_samples: []
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditNotReady",alertstate="firing",severity="critical",job="rodit",instance="tb"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 抓不到指标（进程一直重启、/metrics 超时）
+  - interval: 30s
+    input_series:
+      - series: 'up{job="rodit",instance="tb"}'
+        values: '1x4 0x30'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 5m
+        exp_samples: []
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditScrapeDown",alertstate="firing",severity="critical",job="rodit",instance="tb"}'
+            value: 1
+
+  # ---------------------------------------------------------------- serve 的后台任务出错（error 的 0 值序列预先建好）
+  - interval: 30s
+    input_series:
+      - series: 'rodit_background_task_runs_total{job="rodit",instance="tb",task="purge_expired",outcome="error"}'
+        values: '0x20 1x40'
+      - series: 'rodit_background_task_runs_total{job="rodit",instance="tb",task="refresh_tokens",outcome="error"}'
+        values: '0x60'
+      - series: 'rodit_background_task_runs_total{job="rodit",instance="tb",task="refresh_tokens",outcome="ok"}'
+        values: '0+1x60'
+    promql_expr_test:
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 5m
+        exp_samples: []
+      - expr: ALERTS{alertstate="firing"}
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RoditBackgroundTaskFailing",alertstate="firing",severity="warning",job="rodit",instance="tb",task="purge_expired"}'
+            value: 1
+
+  # ---------------------------------------------------------------- 一切正常：没有告警
+  - interval: 30s
+    input_series:
+      - series: 'rodit_ready{job="rodit",instance="tb"}'
+        values: '1x80'
+      - series: 'up{job="rodit",instance="tb"}'
+        values: '1x80'
+      - series: 'rodit_tenant_isolation_total{job="rodit",instance="tb",stage="http"}'
+        values: '0x80'
+      - series: 'rodit_tenant_isolation_total{job="rodit",instance="tb",stage="server"}'
+        values: '0x80'
+      - series: 'rodit_background_task_runs_total{job="rodit",instance="tb",task="purge_expired",outcome="error"}'
+        values: '0x80'
+      - series: 'rodit_degradations_total{job="rodit",instance="tb",kind="tenant_isolation"}'
+        values: '0x80'
+      - series: 'rodit_auth_expiring_shops{job="rodit",instance="tb"}'
+        values: '0x80'
+      - series: 'rodit_auth_expired_shops{job="rodit",instance="tb"}'
+        values: '0x80'
+      - series: 'rodit_auth_expiry_check_errors_total{job="rodit",instance="tb"}'
+        values: '0x80'
+      - series: 'rodit_auth_expiry_last_check_timestamp_seconds{job="rodit",instance="tb"}'
+        values: '0+30x80'
+      - series: 'rodit_platform_tool_calls_total{job="rodit",instance="tb",tool="get_order",outcome="ok"}'
+        values: '0+5x80'
+      - series: 'rodit_llm_calls_total{job="rodit",instance="tb",purpose="generate",outcome="ok"}'
+        values: '0+3x80'
+      - series: 'rodit_engine_messages_total{job="rodit",instance="tb",shop_id="s_1001",outcome="suggested"}'
+        values: '0+10x80'
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="since_received",le="2.5"}'
+        values: '0+10x80'
+      - series: 'rodit_engine_latency_seconds_bucket{job="rodit",instance="tb",stage="since_received",le="+Inf"}'
+        values: '0+10x80'
+    promql_expr_test:
+      - expr: ALERTS
+        eval_time: 35m
+        exp_samples: []

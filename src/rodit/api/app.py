@@ -6,7 +6,8 @@ create_app 是应用工厂：一个 AssistService（一个平台单元，§9.1�
 适配器注册表、商品卡片）做鉴权前置检查和展示。
 
 模式 C 网页工具（rodit.api.web）：GET / 和 /assist 是自带的静态页面，页面本身不含数据、不需要鉴权；
-页面脚本用 /v1/me 登录（令牌 → 身份），用 /v1/shops/{shop_id}/items 选商品，其余都是下面的接口。
+页面脚本用 /v1/me 登录（令牌 → 身份；部署配置了大模型公示信息时一并返回，页脚显示，§12.3），
+用 /v1/shops/{shop_id}/items 选商品，其余都是下面的接口。
 
 鉴权顺序（每个店铺范围的路由都一样，§9.2 串店测试覆盖全部路由）：
     令牌 → Principal（401）→ 路径 shop_id 与 principal.shop_id 一致（403 tenant_isolation）
@@ -24,7 +25,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, FastAPI, Path, Response
 
-from rodit.api import routes_console, routes_rollout
+from rodit.api import routes_console, routes_rollout, routes_tenancy
 from rodit.api.auth import PERSON_ROLES, Authenticator, Principal
 from rodit.api.deps import (
     MSG_FORBIDDEN_ROLE,
@@ -53,6 +54,7 @@ from rodit.api.schemas import (
     HealthView,
     ItemSummaryView,
     KnowledgeView,
+    LLMDisclosureView,
     MeView,
     NegotiateRequest,
     NegotiationDoneRequest,
@@ -64,6 +66,7 @@ from rodit.api.schemas import (
 )
 from rodit.api.web import build_web_router
 from rodit.app.service import AssistService
+from rodit.app.tenancy import PURGE_REASON_MERCHANT
 from rodit.core.enums import ReviewState
 from rodit.core.errors import RoditError, TenantIsolationError
 from rodit.core.models import AfterSaleReview, EngineResult
@@ -146,15 +149,29 @@ router = APIRouter()
 
 
 @router.get("/healthz", response_model=HealthView, tags=["运维"])
-def healthz() -> HealthView:
-    """存活检查（不需要鉴权，不返回任何店铺信息）。"""
+async def healthz() -> HealthView:
+    """存活检查（不需要鉴权，不返回任何店铺信息）。
+
+    async：在事件循环上直接回答，不排在线程池里的业务请求后面（数据库网络不通时业务请求
+    都在等连接超时，线程池排满；同步的存活检查跟着超时，容器被判不健康。见 rodit.ops.router）。"""
     return HealthView()
 
 
-@router.get("/v1/me", response_model=MeView, tags=["模式 C"])
+def _disclosure(service: AssistService) -> LLMDisclosureView | None:
+    """部署配置里对外公示的大模型名称、备案号（§12.3）；都没填时为 None（响应里不出现）。"""
+    llm = service.unit.config.llm
+    public_name = (llm.public_name or "").strip() or None
+    filing_no = (llm.filing_no or "").strip() or None
+    if public_name is None and filing_no is None:
+        return None
+    return LLMDisclosureView(public_name=public_name, filing_no=filing_no)
+
+
+@router.get("/v1/me", response_model=MeView, response_model_exclude_none=True, tags=["模式 C"])
 def whoami(principal: PrincipalDep, service: ServiceDep) -> MeView:
     """当前令牌对应的身份（网页工具登录用：模式 C 话术助手、商家控制台）：
-    店铺、账号、角色、平台单元。
+    店铺、账号、角色、平台单元；部署配置了大模型公示信息时另带 llm（公示名称、备案号，§12.3），
+    网页工具在页脚显示。
 
     具体的人（PERSON_ROLES：客服、店长、商家、复核人员）都能用；平台对接的令牌不是人，
     不能登录网页工具（403 forbidden_role）。各页面按角色决定显示什么：复核人员在话术助手页只看到
@@ -168,6 +185,7 @@ def whoami(principal: PrincipalDep, service: ServiceDep) -> MeView:
         user_id=principal.user_id,
         role=principal.role,
         platform=service.unit.platform,
+        llm=_disclosure(service),
     )
 
 
@@ -478,9 +496,13 @@ def aftersale_confirm(
 def revoke(principal: RevokeDep, service: ServiceDep, body: EmptyBody = None) -> RevokeView:
     """取消订购 / 授权过期：删令牌、停止处理，删除该店铺在本单元的全部数据（§8.4）。
 
-    可以重试（各存储的删除是幂等的）；之后该店铺的所有请求都是 403。
+    走 TenancyService.revoke：删完写系统事件 shop.purged（操作人是商家账号），之后迟到的旧订购
+    事件按它判断先后（见 rodit.app.tenancy）。可以重试（各存储的删除是幂等的）；之后该店铺的
+    所有请求都是 403。
     """
-    counts = service.revoke_shop(principal.shop_id)
+    counts = service.tenancy.revoke(
+        principal.shop_id, reason=PURGE_REASON_MERCHANT, actor=principal.user_id
+    )
     return RevokeView(counts=dict(counts), total=sum(counts.values()))
 
 
@@ -510,6 +532,7 @@ def create_app(
     app.include_router(router)
     app.include_router(routes_console.router)  # 商家控制台：知识编辑、店铺配置、商品同步（§9.1）
     app.include_router(routes_rollout.router)  # 上线节奏与每周复核（§13.4、§13.5）
+    app.include_router(routes_tenancy.router)  # 店铺生命周期：开通、订购事件（§8.4）
     if web_page:
         app.include_router(build_web_router(service.unit.platform))
     return app

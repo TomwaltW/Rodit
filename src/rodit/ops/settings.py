@@ -18,9 +18,16 @@
 | RODIT_LOG_LEVEL / RODIT_LOG_FORMAT | INFO / json | 日志级别、格式（json / text） |
 | RODIT_MIGRATE_ON_START | false | serve 启动前先迁移（需要属主权限，一般用单独的 migrate 命令） |
 | RODIT_AUTH_EXPIRY_WARN_DAYS | 7 | 授权在这么多天内到期就告警（§12.4） |
-| RODIT_AUTH_EXPIRY_CHECK_S | 300 | 授权检查的最短间隔（秒） |
-| RODIT_READINESS_CACHE_S | 2 | /readyz 结果缓存（秒） |
+| RODIT_AUTH_EXPIRY_CHECK_S | 300 | 授权过期检查的间隔（秒，serve 的后台线程；0 = 不检查） |
+| RODIT_READINESS_CACHE_S | 2 | /readyz 结果缓存（秒；后台刷新不用缓存） |
+| RODIT_READINESS_REFRESH_S | 10 | 后台就绪检查的间隔（秒，每轮都真的检查；0 = 只由 /readyz 刷新） |
+| RODIT_TOKEN_REFRESH_INTERVAL_S | 3600 | serve 里令牌续期的间隔（秒，§8.4；0 = 不跑） |
+| RODIT_PURGE_EXPIRED_INTERVAL_S | 21600 | serve 里过期清理的间隔（秒，§8.4；0 = 不跑） |
 | RODIT_CLASSIFIER_PATH | | 路由分类器模型文件（provider 是 classifier 时必填） |
+
+数字一律要有限的非负数（inf、nan 拒绝：后面要换成时间间隔，溢出会变成没有说明的崩溃）。
+/metrics 输出的就绪结果超过多久算太旧（记成不就绪）由两项就绪设置算出来，见
+rodit.ops.serve.readiness_stale_after_s（间隔为 0 时加上缓存期）。
 
 离线任务 recalibrate / train-classifier 不用 ServerSettings（不需要 RODIT_PLATFORM），标注从
 RODIT_TRAINER_DSN 读（只属于 rodit_trainer 的登录账号，见 rodit.ops.serve）。
@@ -28,18 +35,25 @@ RODIT_TRAINER_DSN 读（只属于 rodit_trainer 的登录账号，见 rodit.ops.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rodit.core.enums import Platform
 
 DEFAULT_TOKENS_FILE = "/run/secrets/rodit_tokens.json"
+MAX_WARN_DAYS = 3650.0  # 授权告警窗口的上限（天）：再大换成时间间隔会溢出
+MAX_INTERVAL_S = 30 * 86400.0  # 后台任务间隔的上限（秒）：线程等待有上限，也没有更长的必要
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
+
+
+Interval = Annotated[float, Field(ge=0, le=MAX_INTERVAL_S, allow_inf_nan=False)]
+"""后台任务的间隔（秒）：0 = 不跑。"""
 
 
 class SettingsError(RuntimeError):
@@ -66,6 +80,8 @@ def _number(env: Mapping[str, str], name: str, default: float, *, integer: bool 
         value = int(raw) if integer else float(raw)
     except ValueError:
         raise SettingsError(f"环境变量 {name} 必须是数字，现在是 {raw!r}") from None
+    if not math.isfinite(value):
+        raise SettingsError(f"环境变量 {name} 必须是有限的数字，现在是 {raw!r}")
     if value < 0:
         raise SettingsError(f"环境变量 {name} 不能为负，现在是 {raw!r}")
     return value
@@ -89,9 +105,12 @@ class ServerSettings(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_format: Literal["json", "text"] = "json"
     migrate_on_start: bool = False
-    auth_expiry_warn_days: float = Field(default=7.0, gt=0)
-    auth_expiry_check_s: float = Field(default=300.0, ge=0)
-    readiness_cache_s: float = Field(default=2.0, ge=0)
+    auth_expiry_warn_days: float = Field(default=7.0, gt=0, le=MAX_WARN_DAYS, allow_inf_nan=False)
+    auth_expiry_check_s: Interval = 300.0
+    readiness_cache_s: float = Field(default=2.0, ge=0, allow_inf_nan=False)
+    readiness_refresh_s: Interval = 10.0
+    token_refresh_interval_s: Interval = 3600.0
+    purge_expired_interval_s: Interval = 21600.0
     classifier_path: str = ""  # 路由分类器模型文件；只在 decision.provider: classifier 时加载
 
     @property
@@ -129,6 +148,9 @@ class ServerSettings(BaseModel):
                 auth_expiry_warn_days=_number(env, "RODIT_AUTH_EXPIRY_WARN_DAYS", 7.0),
                 auth_expiry_check_s=_number(env, "RODIT_AUTH_EXPIRY_CHECK_S", 300.0),
                 readiness_cache_s=_number(env, "RODIT_READINESS_CACHE_S", 2.0),
+                readiness_refresh_s=_number(env, "RODIT_READINESS_REFRESH_S", 10.0),
+                token_refresh_interval_s=_number(env, "RODIT_TOKEN_REFRESH_INTERVAL_S", 3600.0),
+                purge_expired_interval_s=_number(env, "RODIT_PURGE_EXPIRED_INTERVAL_S", 21600.0),
                 classifier_path=env.get("RODIT_CLASSIFIER_PATH", "").strip(),
             )
         except ValidationError as e:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from rodit.core.audit import InMemoryAuditSink
 from rodit.inmemory import (
     HashingEmbedder,
     InMemoryAfterSaleReviewRepository,
@@ -46,6 +47,34 @@ def test_shop_auth_repository_contract():
     contracts.check_shop_auth_repository(InMemoryShopAuthRepository)
 
 
+def test_shop_auth_refresh_fields_contract():
+    contracts.check_shop_auth_refresh_fields(InMemoryShopAuthRepository)
+
+
+def test_mark_needs_reauth_contract():
+    contracts.check_mark_needs_reauth(InMemoryShopAuthRepository)
+
+
+def test_mark_needs_reauth_compare_and_set_contract():
+    contracts.check_mark_needs_reauth_compare_and_set(InMemoryShopAuthRepository)
+
+
+def test_shop_auth_versions_contract():
+    contracts.check_shop_auth_versions(InMemoryShopAuthRepository)
+
+
+def test_expiring_shop_ids_contract():
+    contracts.check_expiring_shop_ids(InMemoryShopAuthRepository)
+
+
+def test_list_outgoing_contract():
+    contracts.check_list_outgoing(InMemoryConversationRepository)
+
+
+def test_system_events_contract():
+    contracts.check_system_events(InMemoryAuditSink)
+
+
 def test_cross_shop_isolation():
     contracts.check_cross_shop_isolation(
         lambda: contracts.RepoSet(
@@ -56,6 +85,7 @@ def test_cross_shop_isolation():
             reviews=InMemoryAfterSaleReviewRepository(),
             auth=InMemoryShopAuthRepository(),
             quality_reviews=InMemoryQualityReviewRepository(),
+            audit=InMemoryAuditSink(),
         )
     )
 

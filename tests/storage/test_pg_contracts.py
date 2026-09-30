@@ -10,6 +10,7 @@ import pytest
 from rodit.storage import (
     Database,
     PgAfterSaleReviewRepository,
+    PgAuditLog,
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
@@ -69,6 +70,44 @@ def test_shop_auth_repository_contract(db, truncate, token_key):
     )
 
 
+def test_shop_auth_refresh_fields_contract(db, truncate, token_key):
+    contracts.check_shop_auth_refresh_fields(
+        fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))
+    )
+
+
+def test_mark_needs_reauth_contract(db, truncate, token_key):
+    contracts.check_mark_needs_reauth(
+        fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))
+    )
+
+
+def test_mark_needs_reauth_compare_and_set_contract(db, truncate, token_key):
+    contracts.check_mark_needs_reauth_compare_and_set(
+        fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))
+    )
+
+
+def test_shop_auth_versions_contract(db, truncate, token_key):
+    contracts.check_shop_auth_versions(
+        fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))
+    )
+
+
+def test_expiring_shop_ids_contract(db, truncate, token_key):
+    contracts.check_expiring_shop_ids(
+        fresh(truncate, lambda: PgShopAuthRepository(db, encryption_key=token_key))
+    )
+
+
+def test_list_outgoing_contract(db, truncate):
+    contracts.check_list_outgoing(fresh(truncate, lambda: PgConversationRepository(db)))
+
+
+def test_system_events_contract(db, truncate):
+    contracts.check_system_events(fresh(truncate, lambda: PgAuditLog(db)))
+
+
 def test_cross_shop_isolation(db, truncate, token_key):
     contracts.check_cross_shop_isolation(
         fresh(
@@ -81,6 +120,7 @@ def test_cross_shop_isolation(db, truncate, token_key):
                 reviews=PgAfterSaleReviewRepository(db),
                 auth=PgShopAuthRepository(db, encryption_key=token_key),
                 quality_reviews=PgQualityReviewRepository(db),
+                audit=PgAuditLog(db),
             ),
         )
     )

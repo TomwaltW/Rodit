@@ -33,7 +33,7 @@ uv run pytest          # 跑测试
 uv run ruff check .    # lint
 ```
 
-基线：`uv run pytest` → 见最近一次交付报告（Phase 1 运营闭环和复审修复合并后为 `3073 passed`，其中 PostgreSQL 测试 95 条、浏览器冒烟测试 3 条）。
+基线：`uv run pytest` → 见最近一次交付报告（Phase 1 上线就绪和两轮复审修复合并后为 `3680 passed, 2 skipped`，其中 PostgreSQL 测试 125 条、浏览器冒烟测试 4 条；跳过的 2 条是镜像里没有 promtool 时的告警规则检查）。
 
 云端镜像自带 PostgreSQL 16 和 Redis 7，但默认不启动。PostgreSQL 用 `bash scripts/dev-pg.sh`
 （启动服务并给当前用户建角色，之后 psql / psycopg 直接连）；Redis 用 `service redis-server start`。
