@@ -335,6 +335,9 @@ def test_served_metrics_include_tenant_quota_cache_and_readiness(local_server):
         headers=tokens.auth("agent_a"),
     )
     assert r.status_code == 403
+    # 就绪、授权过期检查由 serve 的后台任务（就绪也可以由 /readyz）刷新，抓取时只输出上次的结果
+    assert server.background.run_once("readiness") == "ok"
+    assert server.background.run_once("auth_expiry") == "ok"
     text = client.get("/metrics", headers=tokens.auth("metrics")).text
     s = parse_exposition(text)
     assert sample(s, "rodit_tenant_isolation_total", stage="retrieve") == 1
@@ -346,3 +349,54 @@ def test_served_metrics_include_tenant_quota_cache_and_readiness(local_server):
     assert sample(s, "rodit_auth_expired_shops") == 0
     for leaked in ("13812345678", "建国路", "web_1"):
         assert leaked not in text
+
+
+def test_server_side_tenant_isolation_is_not_counted_as_a_caller_mismatch(
+    local_server, monkeypatch, caplog
+):
+    """接口处理中服务端发现的串店（平台工具给店铺 A 返回了店铺 B 的售后单）和调用方令牌不对是
+    同一个 403 tenant_isolation，但前者是真的拿到了别家店铺的数据：记 stage="server"
+    （critical 告警），不能混进 stage="http"（warning，"配错了令牌"）。"""
+    server, client, tokens = local_server
+    gateway = server.unit.reviews._gateway  # 售后审核读平台原始接口（不经缓存层）
+    real = gateway.get_aftersale
+
+    def leaky(shop_id: str, aftersale_id: str) -> Any:
+        info = real(shop_id, aftersale_id)
+        return info.model_copy(update={"shop_id": SHOP_B}) if info else info
+
+    monkeypatch.setattr(gateway, "get_aftersale", leaky)
+    with caplog.at_level("ERROR"):
+        r = client.post(
+            f"/v1/shops/{SHOP_A}/aftersales/as_2001/review", headers=tokens.auth("agent_a")
+        )
+    assert r.status_code == 403 and r.json()["error"] == "tenant_isolation"
+    assert SHOP_B not in r.text  # 响应不透露别的店铺
+    s = parse_exposition(client.get("/metrics", headers=tokens.auth("metrics")).text)
+    assert sample(s, "rodit_tenant_isolation_total", stage="server") == 1
+    assert sample(s, "rodit_tenant_isolation_total", stage="http") == 0
+    route = "/v1/shops/{shop_id}/aftersales/{aftersale_id}/review"
+    assert sample(s, "rodit_http_errors_total", route=route, code="tenant_isolation") == 1
+    # 日志里有路由和本店铺 ID，运维照着查（不记异常说明）
+    assert "接口处理中发现串店" in caplog.text and SHOP_A in caplog.text
+
+    # 调用方令牌不是这家店的：仍然是 stage="http"
+    r = client.post(
+        f"/v1/shops/{SHOP_B}/standalone/ask",
+        json={"session_id": "web_1", "question": "能开发票吗"},
+        headers=tokens.auth("agent_a"),
+    )
+    assert r.status_code == 403
+    s = parse_exposition(client.get("/metrics", headers=tokens.auth("metrics")).text)
+    assert sample(s, "rodit_tenant_isolation_total", stage="http") == 1
+    assert sample(s, "rodit_tenant_isolation_total", stage="server") == 1
+
+
+def test_server_stage_zero_series_exists_from_the_start(metrics):
+    s = _samples(metrics)
+    assert sample(s, "rodit_tenant_isolation_total", stage="server") == 0
+    metrics.observe_http("/x", "GET", 403, 0.01, "tenant_isolation", tenant_stage="server")
+    metrics.observe_http("/x", "GET", 403, 0.01, "tenant_isolation", tenant_stage="不是代码")
+    s = _samples(metrics)
+    assert sample(s, "rodit_tenant_isolation_total", stage="server") == 1
+    assert sample(s, "rodit_tenant_isolation_total", stage="http") == 1  # 标记不合法：按 http

@@ -22,6 +22,12 @@
 
 滚动发布：先停旧进程（它退出时释放租约），新进程再起来；新进程先起的话会以退出码 2 退出，由编排系统
 重启重试，直到旧进程退出。
+
+改数据的运维任务（onboard-shop、refresh-tokens、purge-expired、revoke、set-status，
+rodit.ops.jobs.tenancy）也拿同一个租约（job_lease，application_name 以 rodit-job/ 开头）：取消订购的
+闸门、缓存都在 serve 进程内，另起一个进程改同一家店铺的数据和 serve 互不相知。serve 在跑时这些任务
+拒绝执行（退出码 2，说明改用哪个接口或 serve 里的哪个定时任务）；任务在跑时 serve 起不来（退出码 2，
+任务做完释放后编排系统重启即可）。
 """
 
 from __future__ import annotations
@@ -50,6 +56,8 @@ LEASE_NAMESPACE = 0x526F6469
 DSN_ENV = "RODIT_DATABASE_DSN"
 DEFAULT_CONNECT_TIMEOUT_S = 5
 APPLICATION_NAME_PREFIX = "rodit-serve"
+JOB_APPLICATION_NAME_PREFIX = "rodit-job"
+"""运维任务拿租约时的 application_name 前缀（占用者一看就知道是任务，不是另一个 serve）。"""
 
 CLIENT_KEEPALIVE: Mapping[str, int] = {
     "keepalives": 1,
@@ -105,11 +113,23 @@ class LeaseHeld(LeaseError):
         self.platform = Platform(platform)
         self.holder = holder
         who = f"（占用者：{holder}）" if holder else ""
-        super().__init__(
-            f"平台单元 {self.platform.value} 已有一个 serve 进程在运行{who}：一个平台单元只能跑"
-            "一个进程（会话串行锁、去重记录、短时缓存都在进程内，§9.1）。确认旧进程已经退出后再启动；"
-            "旧进程退出时数据库自动释放租约"
-        )
+        if self.held_by_job:
+            message = (
+                f"平台单元 {self.platform.value} 的单副本租约正被运维任务占用{who}："
+                "任务做完就释放，之后再启动（编排系统按退出码 2 重启重试即可）"
+            )
+        else:
+            message = (
+                f"平台单元 {self.platform.value} 已有一个 serve 进程在运行{who}：一个平台单元只能跑"
+                "一个进程（会话串行锁、去重记录、短时缓存都在进程内，§9.1）。确认旧进程已经退出后再"
+                "启动；旧进程退出时数据库自动释放租约"
+            )
+        super().__init__(message)
+
+    @property
+    def held_by_job(self) -> bool:
+        """占用者是运维任务（job_lease），不是 serve。"""
+        return bool(self.holder) and str(self.holder).startswith(JOB_APPLICATION_NAME_PREFIX + "/")
 
 
 class Lease(Protocol):
@@ -122,10 +142,20 @@ class Lease(Protocol):
     def probe(self) -> Mapping[str, CheckResult]: ...
 
 
+def _host() -> str:
+    return "".join(c for c in socket.gethostname() if c.isascii() and c.isprintable())[:32] or "?"
+
+
 def default_application_name(platform: Platform | str) -> str:
     """rodit-serve/平台/主机名/进程号（PostgreSQL 只保留前 63 个字节）。不含任何密钥。"""
-    host = "".join(c for c in socket.gethostname() if c.isascii() and c.isprintable())[:32]
-    return f"{APPLICATION_NAME_PREFIX}/{Platform(platform).value}/{host or '?'}/{os.getpid()}"[:63]
+    return f"{APPLICATION_NAME_PREFIX}/{Platform(platform).value}/{_host()}/{os.getpid()}"[:63]
+
+
+def job_application_name(platform: Platform | str, command: str) -> str:
+    """rodit-job/平台/命令/主机名/进程号（前 63 个字节；命令名放在主机名前面，截断时也留得住）。"""
+    name = "".join(c for c in command if c.isascii() and (c.isalnum() or c in "-_"))[:24] or "?"
+    value = Platform(platform).value
+    return f"{JOB_APPLICATION_NAME_PREFIX}/{value}/{name}/{_host()}/{os.getpid()}"[:63]
 
 
 class ServeLease:
@@ -293,14 +323,30 @@ def serve_lease(platform: Platform | str) -> ServeLease:
     return ServeLease(platform)
 
 
+def job_lease(
+    platform: Platform | str, command: str, *, environ: Mapping[str, str] | None = None
+) -> ServeLease:
+    """改数据的运维任务用的租约：和 serve 同一个键，application_name 标明是哪个任务。
+    连接串从 environ（默认 os.environ）的 RODIT_DATABASE_DSN 读；构造时不连库。"""
+    env = os.environ if environ is None else environ
+    return ServeLease(
+        platform,
+        dsn=env.get(DSN_ENV, ""),
+        application_name=job_application_name(platform, command),
+    )
+
+
 __all__ = [
     "APPLICATION_NAME_PREFIX",
+    "JOB_APPLICATION_NAME_PREFIX",
     "LEASE_NAMESPACE",
     "Lease",
     "LeaseError",
     "LeaseHeld",
     "ServeLease",
     "default_application_name",
+    "job_application_name",
+    "job_lease",
     "lease_key",
     "serve_lease",
 ]

@@ -96,6 +96,13 @@ def test_settings_from_env(ops_env, monkeypatch):
         ("RODIT_PORT", "70000", "port"),
         ("RODIT_READINESS_CACHE_S", "-1", "RODIT_READINESS_CACHE_S"),
         ("RODIT_LOG_FORMAT", "xml", "log_format"),
+        # 不是有限数：换成时间间隔会溢出（原来是没有说明的崩溃、退出码 1）
+        ("RODIT_AUTH_EXPIRY_WARN_DAYS", "inf", "RODIT_AUTH_EXPIRY_WARN_DAYS"),
+        ("RODIT_AUTH_EXPIRY_WARN_DAYS", "1e12", "auth_expiry_warn_days"),
+        ("RODIT_READINESS_CACHE_S", "nan", "RODIT_READINESS_CACHE_S"),
+        ("RODIT_PURGE_EXPIRED_INTERVAL_S", "1e12", "purge_expired_interval_s"),
+        ("RODIT_TOKEN_REFRESH_INTERVAL_S", "-5", "RODIT_TOKEN_REFRESH_INTERVAL_S"),
+        ("RODIT_READINESS_REFRESH_S", "inf", "RODIT_READINESS_REFRESH_S"),
     ],
 )
 def test_bad_settings(ops_env, monkeypatch, name, value, match):
@@ -422,15 +429,20 @@ def test_metrics_labels_contain_no_buyer_data(local_server):
         "mode",
         "version",
         "check",  # 就绪检查的项名（database / migrations / llm / lease）
+        "task",  # serve 的后台任务名（readiness / auth_expiry / refresh_tokens / purge_expired）
     }
+    assert "job" not in label_names  # job 是 Prometheus 抓取目标的标签，重名会被改成 exported_job
 
 
 def test_auth_expiring_gauge(local_server):
-    _, client, tokens, clock = local_server
+    server, client, tokens, clock = local_server
+    # 授权检查在 serve 的后台线程里按间隔跑（抓取 /metrics 时不查库），这里手动跑一轮
+    assert server.background.run_once("auth_expiry") == "ok"
     s = parse_exposition(client.get("/metrics", headers=tokens.auth("metrics")).text)
     assert sample(s, "rodit_auth_expiring_shops") == 0
     assert sample(s, "rodit_auth_checked_shops") == 2  # 令牌文件和合成订购列表里的店铺 A、B
     clock.advance(days=25)  # 演示授权 30 天后到期，进入 7 天告警窗口
+    assert server.background.run_once("auth_expiry") == "ok"
     s = parse_exposition(client.get("/metrics", headers=tokens.auth("metrics")).text)
     assert sample(s, "rodit_auth_expiring_shops") == 2
     assert sample(s, "rodit_shop_auth_expiring", shop_id=SHOP_A) == 1
@@ -591,6 +603,20 @@ def test_issue_token_with_expiry(tmp_path):
     assert main([*args, "--expires-days", "30", "--append", str(path)], out=out) == 0
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     assert data["principals"][0]["expires_at"]
+
+
+@pytest.mark.parametrize("days", ["inf", "nan", "1e12", "-1", "3651", "abc"])
+def test_issue_token_rejects_bad_expiry_before_issuing(tmp_path, capsys, days):
+    """inf / 1e12 换成到期时间会溢出（原来是没有说明的崩溃）；负数签出来就是过期的令牌。
+    参数不对：退出码 2，不签发、不写文件。"""
+    out = io.StringIO()
+    path = tmp_path / "tokens.json"
+    args = ["issue-token", "--shop-id", SHOP_A, "--user-id", "kf_09", "--role", "agent"]
+    with pytest.raises(SystemExit) as err:
+        main([*args, f"--expires-days={days}", "--append", str(path)], out=out)
+    assert err.value.code == 2
+    assert "--expires-days" in capsys.readouterr().err
+    assert "Bearer" not in out.getvalue() and not path.exists()
 
 
 class _Resp:

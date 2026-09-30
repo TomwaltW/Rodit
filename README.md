@@ -102,7 +102,7 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `healthcheck` | 镜像 HEALTHCHECK 用：请求本机 `/healthz` |
 | `recalibrate [--since …] [--until …] [--min-support N] [--out 文件] [--config YAML]` | §13.5 每月按采纳反馈重算阈值：只输出建议（中文摘要 + 只含改动的 YAML 片段），不改任何配置 |
 | `train-classifier --out 文件 [--min-samples N] [--force] [--overwrite] [--config YAML]` | §6.4 用反馈标注训练路由分类器：报告留出集和评测集上对比关键词规则的效果，原子写入模型文件（JSON） |
-| `onboard-shop --shop-id … (--token-stdin \| --token-file 文件) …` / `refresh-tokens` / `purge-expired [--dry-run]` / `revoke --shop-id …` / `set-status --shop-id … --status …` | §8.4 店铺生命周期（见下文"上线就绪"） |
+| `onboard-shop --shop-id … (--token-stdin \| --token-file 文件) …` / `refresh-tokens` / `purge-expired [--dry-run]` / `revoke --shop-id …` / `set-status --shop-id … --status …` | §8.4 店铺生命周期（见下文"上线就绪"）。除了 `--dry-run` 都要拿单副本租约：`serve` 在跑时拒绝执行（退出码 2），日志写明改用哪个接口或 `serve` 里的哪个定时任务 |
 | `record-eval --report 结果.json` / `acceptance-report --since … [--json]` / `compliance-scan [--week …]` | §13.2、§13.4、§15 上线门槛的数据和 Phase 1 验收报告 |
 
 `recalibrate` 和 `train-classifier` 是离线任务，标注从 `RODIT_TRAINER_DSN` 读（这个登录账号要能
@@ -138,8 +138,10 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `RODIT_HOST` / `RODIT_PORT` | 镜像里 `0.0.0.0` / `8000` | 监听地址 |
 | `RODIT_LOG_LEVEL` / `RODIT_LOG_FORMAT` | `INFO` / `json` | 日志 |
 | `RODIT_MIGRATE_ON_START` | `false` | `serve` 前先迁移（服务进程需要属主权限，不推荐） |
-| `RODIT_AUTH_EXPIRY_WARN_DAYS` / `RODIT_AUTH_EXPIRY_CHECK_S` | 7 / 300 | 授权即将过期告警的窗口、检查间隔 |
+| `RODIT_AUTH_EXPIRY_WARN_DAYS` / `RODIT_AUTH_EXPIRY_CHECK_S` | 7 / 300 | 授权即将过期告警的窗口、检查间隔（`serve` 的后台线程；0 = 不检查） |
 | `RODIT_READINESS_CACHE_S` | 2 | `/readyz` 结果缓存 |
+| `RODIT_READINESS_REFRESH_S` | 10 | 后台刷新就绪检查的间隔（0 = 只由 `/readyz` 刷新）；`/metrics` 只输出上次的结果 |
+| `RODIT_TOKEN_REFRESH_INTERVAL_S` / `RODIT_PURGE_EXPIRED_INTERVAL_S` | 3600 / 21600 | `serve` 里令牌续期、过期清理的间隔（0 = 不跑），见"上线就绪" |
 | `RODIT_CLASSIFIER_PATH` | | `decision.provider: classifier` 时必填：`train-classifier` 输出的模型文件；缺失或校验不过拒绝启动 |
 | `RODIT_TRAINER_DSN` | | 只给离线任务（`recalibrate`、`train-classifier`）：能 `SET ROLE rodit_trainer` 的登录账号，不给服务进程 |
 
@@ -168,7 +170,9 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 - `/healthz`：存活，不查依赖；
 - `/readyz`：就绪 = 数据库能用应用角色连上 + 迁移到最新（库里有更新版本的迁移也算就绪）+ 大模型已配置（有密钥，不真调用）；
   503 时 `checks` 里有原因代码（`unreachable` / `timeout` / `not_migrated` / `behind` / `no_privilege` / `missing_api_key`…），没有任何连接串或店铺数据；
-- `/metrics`（Prometheus 文本格式，要抓取令牌）：`rodit_engine_latency_seconds{stage}`（端到端 `total` 和各环节，
+- `/metrics`（Prometheus 文本格式，要抓取令牌）：抓取时不查库（数据库网络不通时一次检查要十几秒，会超过抓取超时），
+  就绪结果和授权过期检查由 `serve` 的后台线程刷新，输出上次的结果和 `rodit_readiness_age_seconds`（太旧按不就绪报）；
+  `rodit_engine_latency_seconds{stage}`（端到端 `total` 和各环节，
   P50 / P95 用 `histogram_quantile`）、`rodit_engine_messages_total{shop_id,outcome}`、`rodit_suggestions_total`、
   `rodit_qa_checks_total` / `rodit_qa_failures_total`、`rodit_qa_hard_rule_hits_total{rule,blocking}`、
   `rodit_degradations_total{kind}`、`rodit_llm_tokens_total{shop_id,purpose,direction}`、
@@ -202,11 +206,21 @@ sessionStorage）按角色显示知识、政策、商品、设置、上线、复
 - 开通：平台订购 / 授权推送 → `POST /v1/platform/{access}/subscription`（平台对接身份，只能推自己店铺的），
   或平台云代码进程内调用 `BindingContext.on_subscription`，或运维命令 `onboard-shop`（令牌只从标准输入或文件读，
   不进命令行参数）。开通时权限按 `tenancy.onboarding_phase` 核对（1 = MVP 只读；写售后要到二期）。
-- 续期：`refresh-tokens` 给 `tenancy.refresh_ahead_hours` 内到期、有续期令牌的店铺续期；续不了的标记"要重新授权"，
+- 续期：给 `tenancy.refresh_ahead_hours` 内到期、有续期令牌的店铺续期；续不了的标记"要重新授权"，
   之后的处理一律拒绝。续期令牌同样应用内加密（附加认证数据和访问令牌不同）。
 - 取消订购 / 授权过期：取消推送立即删除该店铺在本单元的数据；过期超过 `tenancy.purge_after_expiry_days`
-  （默认 30 天，【待定：委托处理协议】）的由 `purge-expired [--dry-run]` 删除。删除后留一条不带店铺数据的系统事件
-  `shop.purged`（只有店铺 ID、原因和各类数据的条数）。`revoke --shop-id` 手动取消，`set-status` 切换试用 / 正式 / 停用。
+  （默认 30 天，【待定：委托处理协议】）的按约定删除。删除后留一条不带店铺数据的系统事件
+  `shop.purged`（只有店铺 ID、原因和各类数据的条数）。令牌文件里这家店的访问令牌要另外删掉（清理过、没有再开通的
+  店铺不再计入授权过期告警）。`revoke --shop-id` 手动取消，`set-status` 切换试用 / 正式 / 停用。
+- 续期和过期清理在 `serve` 进程里按间隔跑（`RODIT_TOKEN_REFRESH_INTERVAL_S` 默认 1 小时、
+  `RODIT_PURGE_EXPIRED_INTERVAL_S` 默认 6 小时，起来 1 分钟后跑第一轮），不用另外排定时任务：取消订购的闸门
+  （等在途处理做完再删）、工具缓存、适配器去重记录都在 `serve` 进程内，另起一个进程删数据时 `serve` 手上的消息
+  照样把推荐和审计写进来、再也没有人删。没删完的店铺下一轮重试；出错只记日志和
+  `rodit_background_task_runs_total{task,outcome}`（告警 `RoditBackgroundTaskFailing`）。
+- 命令行里改数据的店铺生命周期命令（`onboard-shop`、`refresh-tokens`、`purge-expired`、`revoke`、`set-status`）
+  和 `serve` 拿同一个单副本租约：`serve` 在跑时拒绝执行（退出码 2），改用 `POST /v1/platform/{access}/subscription`
+  （开通 / 续订 / 取消订购）、商家令牌 `POST /v1/shops/{shop_id}/revoke`，或者 `serve` 里的定时任务；
+  `set-status` 没有对应接口，停服务窗口里跑。`purge-expired --dry-run` 只读，可以和 `serve` 同时跑。
 - 售后审核（拉单、协商、确认）和商品同步也先检查授权；确认执行同意退款 / 退货 / 拒绝还要有 `refund.write`。
 
 **5 秒预算（§12.1）**：每条消息一个截止时间（`latency.message_budget_s`，默认 4.5 秒）；多问题分条、两种话术、
@@ -231,14 +245,17 @@ FAQ / 模板；超时的只留已经通过质检的 FAQ / 模板卡片，降级�
 **运维加固（§9.1、§12.3、§12.4）**：
 - 单副本租约：`serve` 启动时在 PostgreSQL 上拿按平台的会话级咨询锁，已有进程持有时拒绝启动（退出码 2，日志写明
   持有者）；`/readyz` 多一项 `lease`。会话锁、取消订购的闸门都在进程内，Phase 1 一个平台单元只跑一个副本；
+  改数据的运维命令也拿这个租约（见上），运维命令在跑时 `serve` 起不来（退出码 2，命令做完后编排系统重启即可）；
   连接串要直连或走会话模式的连接池（事务模式的连接池拿不住会话锁）。
 - 大模型出口可注入：平台绑定的 `llm_transport`（和 OpenAI 兼容客户端的 transport 同签名）给奇门 / EGW 等报备通道用，
   计量和就绪检查照旧。
 - 模型公示：配置 `llm.public_name` / `llm.filing_no`（【待定：D5】），`/v1/me` 返回、`/assist` 页脚显示；
   `llm.require_disclosure: true` 时生产部署缺了拒绝启动。
-- 指标：`rodit_tenant_isolation_total{stage}`（串店拦截）、平台工具按 `unavailable / throttled / timeout` 分开、
-  工具缓存命中 / 过期兜底、`rodit_ready` 和各项就绪检查；告警和预计算规则在 `deploy/prometheus/`
-  （授权即将过期 / 已过期、任何串店、端到端 P95 > 5 秒、工具和大模型失败率、降级突增、就绪失败）。
+- 指标：`rodit_tenant_isolation_total{stage}`（串店拦截：`http` 是调用方令牌不是这家店的，`server` 是接口处理中
+  服务端发现的，其余是引擎在哪一步拦下的）、平台工具按 `unavailable / throttled / timeout` 分开、
+  工具缓存命中 / 过期兜底、`rodit_ready` 和各项就绪检查、后台任务每一轮的结果；告警和预计算规则在 `deploy/prometheus/`
+  （授权即将过期 / 已过期、任何串店、端到端 P95 > 5 秒、工具和大模型失败率、降级突增、就绪失败、抓不到指标、
+  后台任务出错）。Prometheus 抓取任务的 `job_name` 要叫 `rodit`（`RoditScrapeDown` 按它找目标）。
 
 ## 一条买家消息怎么走（方案 §4.2）
 

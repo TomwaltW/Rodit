@@ -22,6 +22,7 @@ from rodit.ops.lease import (
     LeaseError,
     LeaseHeld,
     ServeLease,
+    job_application_name,
     lease_key,
 )
 from rodit.ops.serve import build_server, main
@@ -51,6 +52,18 @@ def test_lease_held_message_is_clear():
     assert "只能" in text and "进程" in text  # 说清楚为什么不能再起一个
     assert isinstance(err, LeaseError) and isinstance(err, RuntimeError)
     assert "占用者" not in str(LeaseHeld(Platform.PDD, holder=None))
+
+
+def test_lease_held_by_a_job_says_so():
+    """运维任务占着租约时 serve 起不来：说明是任务占着、做完再启动（不是"另一个 serve"）。"""
+    holder = job_application_name(Platform.TAOBAO, "purge-expired")
+    assert holder.startswith("rodit-job/taobao/purge-expired/") and len(holder.encode()) <= 63
+    err = LeaseHeld(Platform.TAOBAO, holder=f"{holder}，自 2026-09-30 08:00:00 起")
+    assert err.held_by_job and "运维任务" in str(err) and "serve 进程在运行" not in str(err)
+    assert not LeaseHeld(Platform.TAOBAO, holder="rodit-serve/taobao/h/1").held_by_job
+    assert not LeaseHeld(Platform.TAOBAO, holder=None).held_by_job
+    # 命令名放在主机名前面，截断时也留得住；奇怪的字符去掉
+    assert job_application_name(Platform.PDD, "re voke;--x").startswith("rodit-job/pdd/revoke--x/")
 
 
 def test_lease_without_dsn_refuses_to_acquire(monkeypatch):

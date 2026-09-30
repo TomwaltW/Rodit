@@ -40,7 +40,9 @@ REQUIRED_ALERTS = {
     "RoditLLMFailureRateHigh",  # 大模型失败率
     "RoditDegradationSpike",  # 降级激增
     "RoditNotReady",  # 就绪失败
+    "RoditScrapeDown",  # 抓不到指标（进程一直重启、/metrics 超时）
     "RoditAuthCheckErrors",  # 授权检查出错
+    "RoditBackgroundTaskFailing",  # serve 的后台任务（续期、过期清理……）出错
 }
 
 PROMQL_FUNCTIONS = {
@@ -59,6 +61,7 @@ SELECTOR = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{([^}]*)\}")
 MATCHER = re.compile(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|!=|=)\s*"((?:[^"\\]|\\.)*)"\s*,?')
 IDENT = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 TARGET_LABELS = {"job", "instance"}  # Prometheus 抓取时加的目标标签
+TARGET_METRICS = {"up"}  # Prometheus 自己给每个抓取目标生成的序列（只有目标标签）
 
 
 def _load(path: Path) -> list[dict[str, Any]]:
@@ -124,6 +127,9 @@ def _check_expr(
             assert name in registered, f"{where}：{name} 没有登记"
             unknown = set(matchers) - set(registered[name])
             assert not unknown, f"{where}：{name} 没有标签 {sorted(unknown)}"
+        elif name in TARGET_METRICS:
+            unknown = set(matchers) - TARGET_LABELS
+            assert not unknown, f"{where}：{name} 没有标签 {sorted(unknown)}"
         else:
             assert name in records, f"{where}：{name} 不是登记的指标，也不是记录规则"
     for ident in idents:
@@ -138,6 +144,8 @@ def _check_expr(
         if ident.startswith("rodit_"):
             assert ident in registered, f"{where}：{ident} 没有登记"
             used.add(ident)
+        elif ident in TARGET_METRICS:
+            continue
         elif ident.startswith("rodit:"):
             assert ident in records, f"{where}：记录规则 {ident} 没有定义"
         else:
@@ -165,7 +173,12 @@ def test_required_alerts_exist_with_severity_and_description(alerts):
         if "for" in rule:
             assert re.fullmatch(r"\d+[smh]", rule["for"]), rule["alert"]
     critical = {r["alert"] for r in alerts if r["labels"]["severity"] == "critical"}
-    assert {"RoditTenantIsolationBreach", "RoditShopAuthExpired", "RoditNotReady"} <= critical
+    assert {
+        "RoditTenantIsolationBreach",
+        "RoditShopAuthExpired",
+        "RoditNotReady",
+        "RoditScrapeDown",
+    } <= critical
 
 
 def test_recording_rule_names_follow_the_convention(recordings):
@@ -199,6 +212,7 @@ def test_every_referenced_metric_is_registered(alerts, recordings, registered):
         "rodit_llm_calls_total",
         "rodit_degradations_total",
         "rodit_auth_expiry_check_errors_total",
+        "rodit_background_task_runs_total",
     ):
         assert name in used, name
 
