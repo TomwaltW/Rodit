@@ -7,7 +7,8 @@ CachingToolGateway 包在任意 ToolGateway 外面，本身也是 ToolGateway（
   数据里的 fetched_at 保持原来的获取时间，回答据此写"截至"（§12.2 "用缓存数据并注明时间"）；
   没有缓存就把 ToolUnavailable 抛给调用方（推荐"我帮您查一下"）；
 - 防御性串店检查：内层返回的任何对象 shop_id 与请求的不一致 → TenantIsolationError，不缓存（§9.2）；
-- 按店铺、方法统计调用量、缓存命中、平台调用、失败次数，供额度监控（§12.4），见 stats()。
+- 按店铺、方法统计调用量、缓存命中、平台调用、失败次数，供额度监控（§12.4），见 stats()；
+  totals() 是各店相加的按方法累计，部署入口抓取 /metrics 时导出（rodit.ops.instrument）。
 
 注意：
 - Cache 的写入时间由缓存实现自己的时钟给出，缓存和网关要注入同一个 Clock，TTL 才准。
@@ -113,6 +114,19 @@ class CachingToolGateway:
                 for s, methods in self._stats.items()
                 if shop_id is None or s == shop_id
             }
+
+    def totals(self) -> dict[str, ToolCallStats]:
+        """{方法名: ToolCallStats}：各店铺相加的累计统计（运行指标按工具导出，不按店铺：
+        店铺数 × 方法数的序列太多，§12.4 看的是平台接口整体的调用量、命中、兜底和串店）。
+        只增不减：取消订购的店铺也不从里面减掉（计数器不能往回走）。"""
+        out: dict[str, ToolCallStats] = {}
+        with self._lock:
+            for methods in self._stats.values():
+                for method, st in methods.items():
+                    total = out.setdefault(method, ToolCallStats())
+                    for field in ToolCallStats.model_fields:
+                        setattr(total, field, getattr(total, field) + getattr(st, field))
+        return out
 
     def _bump(self, shop_id: str, method: str, field: str) -> None:
         with self._lock:

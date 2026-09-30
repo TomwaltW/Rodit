@@ -6,7 +6,8 @@ create_app 是应用工厂：一个 AssistService（一个平台单元，§9.1�
 适配器注册表、商品卡片）做鉴权前置检查和展示。
 
 模式 C 网页工具（rodit.api.web）：GET / 和 /assist 是自带的静态页面，页面本身不含数据、不需要鉴权；
-页面脚本用 /v1/me 登录（令牌 → 身份），用 /v1/shops/{shop_id}/items 选商品，其余都是下面的接口。
+页面脚本用 /v1/me 登录（令牌 → 身份；部署配置了大模型公示信息时一并返回，页脚显示，§12.3），
+用 /v1/shops/{shop_id}/items 选商品，其余都是下面的接口。
 
 鉴权顺序（每个店铺范围的路由都一样，§9.2 串店测试覆盖全部路由）：
     令牌 → Principal（401）→ 路径 shop_id 与 principal.shop_id 一致（403 tenant_isolation）
@@ -53,6 +54,7 @@ from rodit.api.schemas import (
     HealthView,
     ItemSummaryView,
     KnowledgeView,
+    LLMDisclosureView,
     MeView,
     NegotiateRequest,
     NegotiationDoneRequest,
@@ -151,10 +153,21 @@ def healthz() -> HealthView:
     return HealthView()
 
 
-@router.get("/v1/me", response_model=MeView, tags=["模式 C"])
+def _disclosure(service: AssistService) -> LLMDisclosureView | None:
+    """部署配置里对外公示的大模型名称、备案号（§12.3）；都没填时为 None（响应里不出现）。"""
+    llm = service.unit.config.llm
+    public_name = (llm.public_name or "").strip() or None
+    filing_no = (llm.filing_no or "").strip() or None
+    if public_name is None and filing_no is None:
+        return None
+    return LLMDisclosureView(public_name=public_name, filing_no=filing_no)
+
+
+@router.get("/v1/me", response_model=MeView, response_model_exclude_none=True, tags=["模式 C"])
 def whoami(principal: PrincipalDep, service: ServiceDep) -> MeView:
     """当前令牌对应的身份（网页工具登录用：模式 C 话术助手、商家控制台）：
-    店铺、账号、角色、平台单元。
+    店铺、账号、角色、平台单元；部署配置了大模型公示信息时另带 llm（公示名称、备案号，§12.3），
+    网页工具在页脚显示。
 
     具体的人（PERSON_ROLES：客服、店长、商家、复核人员）都能用；平台对接的令牌不是人，
     不能登录网页工具（403 forbidden_role）。各页面按角色决定显示什么：复核人员在话术助手页只看到
@@ -168,6 +181,7 @@ def whoami(principal: PrincipalDep, service: ServiceDep) -> MeView:
         user_id=principal.user_id,
         role=principal.role,
         platform=service.unit.platform,
+        llm=_disclosure(service),
     )
 
 

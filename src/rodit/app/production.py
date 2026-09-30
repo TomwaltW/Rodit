@@ -5,7 +5,8 @@
 - 大模型：境内已备案模型（D5），OpenAI 兼容接口，按店铺计量用量（§12.4）；
 - buyer_ref 的盐、令牌加密密钥、数据库连接串、大模型密钥都只从环境变量读，仓库里没有真实值；
 - 平台只读工具（订单 / 物流 / 售后接口）、接入适配器、售后写接口必须在平台云内实现并注入：
-  沙箱里调不通开放平台接口（CLAUDE.md：平台接口一律 mock），本仓库只有模拟实现。
+  沙箱里调不通开放平台接口（CLAUDE.md：平台接口一律 mock），本仓库只有模拟实现；
+- 平台要求大模型调用经它可报备的通道出去时（附录 A.3），平台云代码注入 llm_transport。
 
 环境变量：RODIT_DATABASE_DSN、RODIT_TOKEN_KEY、RODIT_BUYER_SALT、
 RODIT_LLM_BASE_URL、RODIT_LLM_MODEL、RODIT_LLM_API_KEY、RODIT_LLM_TIMEOUT_S（可选）、
@@ -33,6 +34,7 @@ from rodit.core.ports import (
     ToolGateway,
 )
 from rodit.llm import MeteredLLMClient, OpenAICompatibleClient
+from rodit.llm.openai_compat import Transport
 from rodit.storage import (
     Database,
     PgAfterSaleReviewRepository,
@@ -111,6 +113,7 @@ def build_production_unit(
     catalog: ItemCatalog | None = None,
     ocr: ImageTextExtractor | None = None,
     route_provider: DecisionProvider | None = None,
+    llm_transport: Transport | None = None,
 ) -> Unit:
     """生产单元：tools / adapters / action_port 由平台云里的实现注入（见模块说明）。
 
@@ -120,6 +123,9 @@ def build_production_unit(
     route_provider：路由用的判断层，为空时按 config.decision 组装；decision.provider 是
     classifier 时由部署入口从模型文件加载好传进来（§6.4 Phase 2）。质检仍按 config.decision
     组装（classifier / rules 时质检用大模型，§6.4 "质检用硬规则 + 大模型"）。
+    llm_transport：大模型的出口（签名同 rodit.llm.openai_compat.Transport），平台要求经它报备的
+    通道调用时由平台云代码注入（附录 A.3、§9.1、§12.3）；为空时用默认的 urllib 出口。
+    只换出口：请求内容、密钥读取（每次调用时读环境变量）、超时、错误映射、用量计量都不变。
     """
     clock = clock or SystemClock()
     db = production_database()
@@ -132,9 +138,12 @@ def build_production_unit(
             model=config.llm.model,
             api_key_env=config.llm.api_key_env,
             timeout_s=config.llm.timeout_s,
+            transport=llm_transport,
         )
     else:
-        client = OpenAICompatibleClient.from_env(api_key_env=config.llm.api_key_env)
+        client = OpenAICompatibleClient.from_env(
+            api_key_env=config.llm.api_key_env, transport=llm_transport
+        )
     llm = MeteredLLMClient(client, repos.audit, clock)
     return build_unit(
         platform=platform,

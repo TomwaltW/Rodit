@@ -7,6 +7,8 @@
 - 每个指标的序列数有上限（max_series）：超出后新的标签组合记到 "_overflow" 序列，
   标签值再多也不会把内存和 Prometheus 撑爆。
 - forget(label, value)：删除某个标签值的全部序列（取消订购后删掉该店铺的指标，§8.4）。
+- Counter.set_totals：抓取时用别的组件自己累计的总数整体替换（如缓存层的统计）。
+- sample_names()：输出里会出现的样本名和标签名，告警 / 记录规则（deploy/prometheus）按它核对。
 - 登记表可以挂渲染前的钩子（before_render），抓取时刷新按需计算的量（如授权即将过期的店铺数）；
   钩子出错只记日志，不影响其余指标输出。
 """
@@ -178,6 +180,21 @@ class Counter(_Metric):
             box = self._series.get(key)
             return box[0] if box else 0.0
 
+    def set_totals(self, values: Iterable[tuple[Mapping[str, object], float]]) -> None:
+        """用别处累计的总数整体替换（抓取时导出其他组件自己记的累计计数，如缓存层的统计）。
+        同一组标签（清洗后相同）的值相加；不能为负。调用方保证总数只增不减。"""
+        fresh: dict[LabelKey, list[float]] = {}
+        for labels, value in values:
+            amount = float(value)
+            if amount < 0 or math.isnan(amount):
+                raise ValueError("计数不能为负")
+            key = self._key(labels)
+            if key not in fresh and len(fresh) >= self._max_series:
+                key = (OVERFLOW,) * len(self.labelnames)
+            fresh.setdefault(key, [0.0])[0] += amount
+        with self._lock:
+            self._series = dict(fresh)
+
     def _lines(self) -> list[str]:
         with self._lock:
             items = sorted(self._series.items())
@@ -340,6 +357,26 @@ class MetricsRegistry:
     def get(self, name: str) -> _Metric | None:
         with self._lock:
             return self._metrics.get(name)
+
+    def names(self) -> list[str]:
+        """登记的指标名（按登记顺序）。"""
+        with self._lock:
+            return list(self._metrics)
+
+    def sample_names(self) -> dict[str, tuple[str, ...]]:
+        """输出里会出现的样本名 → 标签名（直方图是 _bucket（多一个 le）、_sum、_count）。
+        告警、记录规则引用的指标名和标签按这个核对（deploy/prometheus）。"""
+        with self._lock:
+            metrics = list(self._metrics.values())
+        out: dict[str, tuple[str, ...]] = {}
+        for m in metrics:
+            if isinstance(m, Histogram):
+                out[f"{m.name}_bucket"] = (*m.labelnames, "le")
+                out[f"{m.name}_sum"] = m.labelnames
+                out[f"{m.name}_count"] = m.labelnames
+            else:
+                out[m.name] = m.labelnames
+        return out
 
     def before_render(self, hook: Callable[[], None]) -> None:
         """登记渲染前的钩子（抓取时刷新按需计算的指标）。"""
