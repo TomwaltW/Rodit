@@ -1809,11 +1809,16 @@
         : h('p', { className: 'status ok' }, '当前阶段已检查的条件都达到了。'),
       unchecked.length
         ? h('div', { className: 'unchecked' }, [
-            h('p', null, '需要人工确认的条件（没有数据来源，切换时由复核人员确认）：'),
-            h('ul', null, unchecked.map((u) => h('li', null, u.description || u.name))),
+            h('p', null, '需要人工确认的条件（缺数据，切换时由复核人员确认）：'),
+            h(
+              'ul',
+              null,
+              unchecked.map((u) => h('li', null, u.reason ? `${u.description || u.name}：${u.reason}` : u.description || u.name)),
+            ),
           ])
         : null,
       currentGates(s).map((g) => (g.gate ? gateTable(g.gate, g.title) : null)),
+      evidenceSection(s.evidence),
     ];
 
     const sh = s.shadow || {};
@@ -1873,6 +1878,47 @@
       nodes.push(h('p', { className: 'muted' }, '最近几周没有复核样本。'));
     }
     put($('rollout'), nodes);
+  }
+
+  /** 登记的周 → 条数；必须登记而没登记的周写"未登记"（§13.4，复核人员按周登记）。 */
+  function incidentText(t) {
+    if (!t) return '—';
+    const byWeek = t.by_week || {};
+    const weeks = Array.isArray(t.weeks) ? t.weeks : [];
+    const extra = Object.keys(byWeek).filter((w) => !weeks.includes(w));
+    const parts = [...weeks, ...extra].map((w) => `${w} ${has(byWeek, w) ? num(byWeek[w]) : '未登记'}`);
+    const total = t.count === null || t.count === undefined ? '缺登记' : `合计 ${num(t.count)}`;
+    return `${total}（${parts.join('、') || '—'}）`;
+  }
+
+  /** 合规扫描汇总：计数和推荐 / 消息编号，没有文字。 */
+  function scanText(c) {
+    if (!c) return '—';
+    const ids = [
+      ...(Array.isArray(c.suggestion_ids) ? c.suggestion_ids.map((id) => `推荐 #${id}`) : []),
+      ...(Array.isArray(c.message_ids) ? c.message_ids.map((id) => `消息 ${id}`) : []),
+    ];
+    const listed = ids.length ? `：${ids.join('、')}${c.ids_truncated ? ' …' : ''}` : '';
+    return (
+      `${fmtRange(c.since, c.until)} 编辑后发送的推荐 ${num(c.scanned_suggestions)} 条、发出的消息 ${num(c.scanned_messages)} 条，` +
+      `疑似违规 ${num(c.flagged)} 条${listed}`
+    );
+  }
+
+  /** 门槛里原来没有数据来源的条件现在的依据：测试集结论、平台违规 / 投诉登记、合规扫描。 */
+  function evidenceSection(ev) {
+    if (!ev) return null;
+    const t = ev.test_set || {};
+    const testSet = t.passed === null || t.passed === undefined ? t.reason || '没有能用的评测结论' : t.detail || (t.passed ? '达标' : '没达标');
+    return [
+      h('h3', null, '门槛依据'),
+      h('dl', { className: 'stats' }, [
+        statRow('测试集（评测结论）', testSet),
+        statRow('平台违规（复核人员登记）', incidentText(ev.platform_violations)),
+        statRow('投诉（复核人员登记）', incidentText(ev.complaints)),
+        statRow('合规扫描（代理指标）', scanText(ev.compliance)),
+      ]),
+    ];
   }
 
   async function loadShadowDetail(box) {
@@ -2372,7 +2418,7 @@
 
   function renderAdoption(report) {
     const o = report && report.overall;
-    if (!o || !o.total) {
+    if (!o || (!o.total && !(report.auto && report.auto.sent))) {
       put($('adoption'), h('p', { className: 'muted' }, '这段时间还没有推荐记录。'));
       return;
     }
@@ -2392,6 +2438,9 @@
         statRow('不合适', `${o.rejected}（${pct(o.reject_rate)}）`),
         statRow('已过期 / 未操作', `${o.expired} / ${o.shown}`),
         statRow('弃用原因', reasonSummary(o)),
+        report.auto && report.auto.sent
+          ? statRow('全自动发送（不计入采纳率）', `${num(report.auto.sent)} 条 / ${num(report.auto.groups)} 组消息`)
+          : null,
       ]),
       byIntent.length
         ? table(

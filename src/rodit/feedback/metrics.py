@@ -2,7 +2,9 @@
 
 口径（报表里的每个数都能按这里复算）：
 
-- 推荐条数：SuggestionRecord 的条数，不含 SHADOW（影子模式没有展示，单独用 shadow_report）。
+- 推荐条数：SuggestionRecord 的条数，不含 SHADOW（影子模式没有展示，单独用 shadow_report），
+  也不含全自动发出去的（agent_id="bot"，见 is_auto_sent）：采纳率是客服原样 / 小改后发送的比例
+  （§1.3），全自动的回复单独列在 AdoptionReport.auto；有一张卡片被全自动发出去的推荐组整组算全自动。
   adoption_rate =（原样发送 + 编辑后发送）/ 推荐条数；as_is_rate = 原样发送 / 推荐条数；
   还没操作的（SHOWN）和被刷新掉的（EXPIRED）都算在分母里。
 - 推荐组：同一条买家消息、同一个问题类型的推荐卡片（引擎一次给 1–3 条，客服最多发一条）。
@@ -41,6 +43,10 @@ REJECT_REASON_LABELS: dict[RejectReason, str] = {
 """弃用原因的中文名（§5.8、§12.4 弃用原因分布）。"""
 
 E2E_P95_TARGET_MS = 5000  # 推荐出现（端到端）P95 ≤ 5 秒（§1.3、§12.1）
+
+AUTO_AGENT_ID = Role.BOT.value
+"""全自动发送成功的推荐记录的 agent_id：rodit.app.service 发送成功后把推荐记为 SENT、
+agent_id="bot"。"""
 
 _ADOPTED = frozenset({SuggestionStatus.SENT, SuggestionStatus.EDITED_SENT})
 
@@ -129,10 +135,20 @@ class IntentStats(_Model):
     latency_ms: LatencyStats = Field(default_factory=LatencyStats)
 
 
+class AutoReplyStats(_Model):
+    """全自动发出去的回复（agent_id="bot"）：不算进采纳率，单独一行（§13.4 全自动按类型监控）。"""
+
+    sent: int = 0  # 全自动发出去的推荐条数
+    groups: int = 0  # 涉及的推荐组数（整组算全自动）
+    by_intent: dict[Intent, int] = Field(default_factory=dict)  # 各类型的推荐组数
+    latency_ms: LatencyStats = Field(default_factory=LatencyStats)  # 按买家消息去重
+
+
 class AdoptionReport(_Model):
     """推荐采纳率报表（§12.4 给商家看的业务指标）。
 
-    by_intent 按 Intent 定义顺序，只含有数据的类型。
+    overall / by_intent 只含客服看到的推荐（不含影子模式、不含全自动发出去的推荐组）；
+    by_intent 按 Intent 定义顺序，只含有数据的类型。全自动发出去的在 auto。
     """
 
     since: AwareDatetime | None = None
@@ -141,10 +157,26 @@ class AdoptionReport(_Model):
     shadow_excluded: int = 0
     overall: IntentStats
     by_intent: dict[Intent, IntentStats] = Field(default_factory=dict)
+    auto: AutoReplyStats = Field(default_factory=AutoReplyStats)
 
 
 def _group_key(r: SuggestionRecord) -> tuple[str, str, str, str]:
     return (r.shop_id, r.conversation_id, r.msg_id or f"#{r.id}", r.intent.value)
+
+
+def is_auto_sent(r: SuggestionRecord) -> bool:
+    """全自动发出去的推荐：SENT 且 agent_id 是 "bot"。全自动没发出去的仍是 SHOWN（留给客服）。"""
+    return r.status == SuggestionStatus.SENT and r.agent_id == AUTO_AGENT_ID
+
+
+def _message_latency(records: Iterable[SuggestionRecord]) -> list[float]:
+    """按买家消息去重的耗时（多问题分条的几组共用一次处理耗时，取最大）。"""
+    by_message: dict[tuple[str, str, str], list[int]] = {}
+    for r in records:
+        if r.latency_ms is not None:
+            key = (r.shop_id, r.conversation_id, r.msg_id or f"#{r.id}")
+            by_message.setdefault(key, []).append(r.latency_ms)
+    return [float(max(v)) for v in by_message.values()]
 
 
 def _stats(
@@ -213,27 +245,33 @@ def adoption_report(
         for r in records
         if (since is None or r.created_at >= since) and (until is None or r.created_at < until)
     ]
-    shown = [r for r in picked if r.status != SuggestionStatus.SHADOW]
+    visible = [r for r in picked if r.status != SuggestionStatus.SHADOW]
+    # 全自动发出去的推荐组整组拿出来（组里其余卡片客服没看到，不压低客服的采纳率）
+    auto_keys = {_group_key(r) for r in visible if is_auto_sent(r)}
+    auto = [r for r in visible if _group_key(r) in auto_keys]
+    shown = [r for r in visible if _group_key(r) not in auto_keys]
     all_groups = len({_group_key(r) for r in shown})
     # 整体耗时按买家消息去重：多问题分条（规则 5）的几组共用一次处理耗时
-    by_message: dict[tuple[str, str, str], list[int]] = {}
-    for r in shown:
-        if r.latency_ms is not None:
-            key = (r.shop_id, r.conversation_id, r.msg_id or f"#{r.id}")
-            by_message.setdefault(key, []).append(r.latency_ms)
-    overall = _stats(None, shown, all_groups, [float(max(v)) for v in by_message.values()])
+    overall = _stats(None, shown, all_groups, _message_latency(shown))
     by_intent: dict[Intent, IntentStats] = {}
     for intent in Intent:
         subset = [r for r in shown if r.intent == intent]
         if subset:
             by_intent[intent] = _stats(intent, subset, all_groups)
+    auto_by_intent = Counter(key[3] for key in auto_keys)
     return AdoptionReport(
         since=since,
         until=until,
         shop_ids=sorted({r.shop_id for r in picked}),
-        shadow_excluded=len(picked) - len(shown),
+        shadow_excluded=len(picked) - len(visible),
         overall=overall,
         by_intent=by_intent,
+        auto=AutoReplyStats(
+            sent=sum(1 for r in auto if is_auto_sent(r)),
+            groups=len(auto_keys),
+            by_intent={i: auto_by_intent[i.value] for i in Intent if auto_by_intent[i.value]},
+            latency_ms=LatencyStats.of(_message_latency(r for r in auto if is_auto_sent(r))),
+        ),
     )
 
 
