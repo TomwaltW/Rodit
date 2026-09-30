@@ -5,6 +5,8 @@
   "亲" 开头用"亲，"，"您" 开头用"您好，"；语气亲切时句末带"哦"，专业、简洁不带。
 - 事实一律来自证据，模板只负责措辞；返回的 Draft 带上用到的证据 ID，质检照常跑硬规则。
 - 物流：始终写"截至 {时间}"；驿站 / 快递柜给取件指引；只有接口给出预计送达时间才提到货时间（§7.2）。
+- 签收未收到（§7.3.1、§11.3）：物流进度（签收细分状态）+ 驿站 / 快递柜取件指引 + 已签收时
+  "还是没找到就在订单页申请售后"（有平台申请售后规则的证据时，引用它）。
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from datetime import datetime
 from typing import Literal
 
 from rodit.core.clock import CST, fmt_time
-from rodit.core.enums import INTENT_LABELS, DraftKind, Intent
+from rodit.core.enums import INTENT_LABELS, DraftKind, Intent, LogisticsStatus
 from rodit.core.evidence import PlatformRuleKey
 from rodit.core.models import (
     ConversationContext,
@@ -40,8 +42,12 @@ CLARIFY = "clarify"  # 证据包给出的其他澄清问题
 SOOTHE = "soothe"
 TOOL_UNAVAILABLE = "tool_unavailable"
 LOGISTICS = "logistics"
+NOT_RECEIVED = "not_received"
 REFUND_PROGRESS = "refund_progress"
 APPLY_AFTERSALE = "apply_aftersale"
+
+NOT_FOUND_APPLY = "如果还是没找到，您可以在订单页申请售后"
+"""签收未收到的最后一步（§7.3.1 没找到就引导申请售后；平台只允许买家在订单页发起）。"""
 
 Variant = Literal["direct", "with_followup", "clarify", "soothe", "script"]
 
@@ -232,6 +238,25 @@ def logistics(ctx: ConversationContext, ev: Evidence, analysis: LogisticsAnalysi
     if analysis.eta is not None:
         text += f"平台显示预计 {fmt_time(analysis.eta)} 前送达，具体以物流为准。"
     return _template(LOGISTICS, text, evidence_ids=[ev.id])
+
+
+def not_received(
+    ctx: ConversationContext,
+    ev: Evidence,
+    analysis: LogisticsAnalysis,
+    *,
+    apply_rule: Evidence | None = None,
+) -> Draft:
+    """显示签收但没收到（§7.3.1、§11.3）：物流进度（签收细分状态：本人 / 驿站 / 快递柜代收）、
+    驿站或快递柜的取件指引；已签收、且有平台申请售后规则的证据时，最后告诉买家"还是没找到就在
+    订单页申请售后"（只能买家发起，客服不替买家申请，§1.4）。没签收时只说物流进度。"""
+    s = style_for(ctx.config)
+    base = logistics(ctx, ev, analysis)
+    text, ids = base.text, list(base.evidence_ids)
+    if analysis.status == LogisticsStatus.SIGNED and apply_rule is not None:
+        text += f"{NOT_FOUND_APPLY}{s.particle}。"
+        ids.append(apply_rule.id)
+    return _template(NOT_RECEIVED, text, evidence_ids=ids)
 
 
 # ---------------------------------------------------------------- 售后（§7.3.1）

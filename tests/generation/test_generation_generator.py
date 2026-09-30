@@ -262,14 +262,21 @@ def test_soothe_count_and_llm(world, ev, route):
 
 
 def test_need_clarify_becomes_clarify_variant(world, ev, route):
-    llm = FakeLLMClient(lambda r: llm_reply("亲，请问您平时穿什么码呢？", clarify=True))
+    def reply(request):
+        if "追问一个问题" in request.messages[1].content:
+            return llm_reply("亲，这款是棉的，您平时穿什么码呢？")
+        return llm_reply("亲，请问您平时穿什么码呢？", clarify=True)
+
+    llm = FakeLLMClient(reply)
     drafts = gen(llm).generate(
         make_context("我该买哪个码", world, item_id="i_777"),
         route(Intent.SIZE_ADVICE),
         EvidenceBundle(evidences=[ev.item_attr("面料", item_id="i_777")]),
     )
+    # 追问之后不再用第二条（两条并行生成，结果和逐条生成一样）
     assert len(drafts) == 1 and drafts[0].variant == "clarify" and drafts[0].need_clarify
-    assert len(llm.calls) == 1  # 追问之后不再生成第二条
+    assert drafts[0].text == "亲，请问您平时穿什么码呢？"
+    assert len(llm.calls) == 2  # 并行时每条各调一次，不重试
 
 
 def test_model_evidence_ids_kept_as_is(world, ev, route):
@@ -292,7 +299,19 @@ def test_llm_failure_falls_back_to_templates(world, ev, route):
     llm = FakeLLMClient(lambda r: LLMTimeout("超时"))
     drafts = gen(llm).generate(make_context("能退吗", world), route(Intent.RETURN_POLICY), bundle)
     assert [d.template_id for d in drafts] == [T.APPLY_AFTERSALE, T.TOOL_UNAVAILABLE]
-    assert len(llm.calls) == 1  # 超时后不再重复调用
+    assert len(llm.calls) == 2  # 两条并行各调一次，超时后不再重复调用
+    # 第一条（直接回答）超时：和逐条调用一样，后面那条的结果也不用，退回模板
+    first_times_out = FakeLLMClient(
+        lambda r: (
+            llm_reply("亲，支持七天无理由，您穿什么码呢？", "policy:seven_day_return")
+            if "追问一个问题" in r.messages[1].content
+            else LLMTimeout("超时")
+        )
+    )
+    again = gen(first_times_out).generate(
+        make_context("能退吗", world), route(Intent.RETURN_POLICY), bundle
+    )
+    assert [d.template_id for d in again] == [T.APPLY_AFTERSALE, T.TOOL_UNAVAILABLE]
     llm2 = FakeLLMClient(lambda r: LLMError("限流"))
     no_template = EvidenceBundle(evidences=[ev.item_attr("面料")])
     assert (
@@ -304,11 +323,13 @@ def test_llm_failure_falls_back_to_templates(world, ev, route):
 
 
 def test_unparseable_output_tries_next_variant(world, ev, route):
+    # 两条并行生成（调用先后不固定）：按变体给回复，直接回答那条格式不对
     llm = FakeLLMClient(
-        responses=[
-            "亲，是纯棉的哦",
-            json.dumps(llm_reply("亲，棉 95%，您穿什么码呢？"), ensure_ascii=False),
-        ]
+        lambda r: (
+            json.dumps(llm_reply("亲，棉 95%，您穿什么码呢？"), ensure_ascii=False)
+            if "追问一个问题" in r.messages[1].content
+            else "亲，是纯棉的哦"
+        )
     )
     drafts = gen(llm).generate(
         make_context("纯棉吗", world, item_id="i_555"),

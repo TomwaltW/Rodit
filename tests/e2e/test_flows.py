@@ -175,10 +175,19 @@ def test_11_3_signed_not_received_pickup_guidance_then_r4_review_and_confirm():
     result = Chat(service, "c_11_3").say("显示签收了但我根本没收到", order_id="o_1003")
     assert result.route.intent == Intent.NOT_RECEIVED
     assert result.route.action == RouteAction.HIGH_RISK_ANSWER and result.route.rule == 4
-    [card] = result.suggestions
-    assert "菜鸟驿站" in card.text
-    assert [e.id for e in card.evidence] == ["tool:logistics:o_1003"]
+    # 第一条是确定性模板：签收细分状态 + 驿站取件指引 + 没找到就在订单页申请售后（§7.3.1）；
+    # 第二条是大模型的回答
+    card, llm_card = result.suggestions
+    assert card.kind == DraftKind.TEMPLATE
+    assert "菜鸟驿站" in card.text and "请凭取件码取件" in card.text and "申请售后" in card.text
+    assert [e.id for e in card.evidence] == [
+        "tool:logistics:o_1003",
+        "platform:taobao:apply_aftersale",
+    ]
     assert "请核查物流签收细分状态" in card.risk_hints
+    assert llm_card.kind == DraftKind.LLM and llm_card.text == NR_ANSWER
+    assert [e.id for e in llm_card.evidence] == ["tool:logistics:o_1003"]
+    assert "请核查物流签收细分状态" in llm_card.risk_hints
     service.feedback_sent(SHOP_A, card.suggestion_id, agent_id=AGENT)  # 客服发送取件指引
 
     # 买家没找到，在订单页申请仅退款（as_2003）→ 审核助手命中 R4，进入签收核查
