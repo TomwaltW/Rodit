@@ -192,6 +192,7 @@ def record_eval(
     print(
         f"配置指纹 {fp.config_fingerprint[:12]}，路由问题 {fp.router_questions_ver}，"
         f"质检问题 {fp.qa_questions_ver}，生成环节 {fp.generation_ver or '未知'}，"
+        f"判断层提示词 {fp.judge_prompt_ver or '未知'}，"
         f"判断层 {fp.decision_provider or '未知'}，大模型 {model}，代码 {code}",
         file=out,
     )

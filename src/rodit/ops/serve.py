@@ -287,11 +287,13 @@ def load_route_classifier(
     meta = classifier.meta
     assert meta is not None
     logger.info(
-        "路由分类器已加载：训练时间 %s，训练样本 %d 条，问题类型 %d 个，sha256 %s",
+        "路由分类器已加载：训练时间 %s，训练样本 %d 条，问题类型 %d 个，sha256 %s，文件 sha256 %s"
+        "（上线状态、评测指纹按文件的比）",
         meta.trained_at.astimezone(CST).isoformat(timespec="minutes"),
         meta.samples,
         len(classifier.classes),
         classifier.artifact_sha256,
+        classifier.file_sha256,
     )
     if meta.questions_version != ROUTER_QUESTIONS_VER:
         logger.warning(
