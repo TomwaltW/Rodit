@@ -27,8 +27,9 @@
 判断层，两种模式都可以；上线前和 --baseline 一起跑回归（§13.5）。
 完整结果：--json 输出 JSON 到标准输出；--json out.json 写文件（文本报告照常输出）。
 报告带指纹（rodit.eval.fingerprint）：按实际跑的记——配置的 config_fingerprint（--classifier 时
-判断层记为 classifier）、路由 / 质检问题定义版本、生成环节的版本、用的大模型（模型名、接口主机）、
---classifier 模型文件的 SHA-256、代码版本；python -m rodit.ops record-eval --report out.json
+判断层记为 classifier）、路由 / 质检问题定义版本、生成环节和判断层提示词的版本、用的大模型
+（模型名、接口主机）、--classifier 模型文件的 SHA-256、代码版本；
+python -m rodit.ops record-eval --report out.json
 把完整评测的结论记成 eval.verdict，上线状态只认指纹和线上一致的结论（§13.4、§13.5）。
 退出码：0 正常；1 回归比较有指标下降；2 配置错误（环境变量、基线文件、筛选后没有用例等）。
 """
@@ -735,6 +736,7 @@ def _render_fingerprint(fp: EvalFingerprint, add: Add) -> None:
     add(
         f"== 配置指纹 {fp.config_fingerprint[:12]}（路由问题 {fp.router_questions_ver}，"
         f"质检问题 {fp.qa_questions_ver}，生成环节 {fp.generation_ver or '未知'}，"
+        f"判断层提示词 {fp.judge_prompt_ver or '未知'}，"
         f"判断层 {fp.decision_provider or '未知'}{classifier}，大模型 {model}{where}，代码 {code}）"
     )
     add("记录这次的结论（完整评测才行）：python -m rodit.ops record-eval --report <--json 的文件>")

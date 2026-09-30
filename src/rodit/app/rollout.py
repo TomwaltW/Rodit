@@ -13,12 +13,13 @@
   原因写进 shop.rollout_stage。已经在目标阶段时什么都不写。全自动的开关（auto_reply_enabled）
   要平台准入，不在这里改。
 - 门槛里原来没有数据来源的条件（rollout_evidence）：测试集 = eval.verdict 系统事件里和线上一致
-  （配置、问题定义、生成环节、判断层和分类器、大模型）、用真实大模型跑的最近一次结论
-  （rodit.eval.fingerprint）；平台违规、投诉 = 复核人员按周登记的 shop.rollout_incident
-  （record_incident：周、条数、备注，不记原文）；另加实际发出去的文字的合规扫描（feedback.compliance，
-  代理指标，单独一条）：扫描命中是候选，复核人员逐条确认或标记误报（review_compliance，写
-  compliance.reviewed：推荐 / 消息 ID、结论、规则名、备注，不记文字），确认的违规才算不通过、
-  没确认的列为 unchecked。查看上线状态只读这些，不写任何东西。
+  （配置、问题定义、生成环节和判断层的提示词、判断层和分类器、大模型）、用真实大模型跑的最近一次
+  结论（rodit.eval.fingerprint；分类器按这个进程实际加载的模型文件核对，
+  见 unit_classifier_sha256）；平台违规、投诉 = 复核人员按周登记的 shop.rollout_incident
+  （record_incident：周、条数、备注，不记原文）；另加实际发出去的文字的合规扫描
+  （feedback.compliance，代理指标，单独一条）：扫描命中是候选，复核人员逐条确认或标记误报
+  （review_compliance，写 compliance.reviewed：推荐 / 消息 ID、结论、规则名、备注，不记文字），
+  确认的违规才算不通过、没确认的列为 unchecked。查看上线状态只读这些，不写任何东西。
 写操作开始前先确认店铺还在（取消订购删掉店铺后不会把样本、审计、配置写回来）。
 """
 
@@ -47,6 +48,7 @@ from rodit.core.models import (
     strip_control_chars,
 )
 from rodit.core.ports import AuditLog
+from rodit.decision.classifier import ClassifierProvider
 from rodit.eval.fingerprint import current_fingerprint, test_set_evidence
 from rodit.feedback.acceptance import ShopAcceptanceInput, message_latencies
 from rodit.feedback.compliance import (
@@ -57,6 +59,7 @@ from rodit.feedback.compliance import (
     ComplianceWeek,
     check_flag_ref,
     find_flag,
+    pairing_window,
     parse_reviews,
     review_detail,
     scan_sent,
@@ -230,15 +233,32 @@ class IncidentList(_Model):
 # ================================================================ 门槛的依据（§13.4）
 
 
+def unit_classifier_sha256(unit: Unit) -> str | None:
+    """这个进程的路由实际加载的分类器模型文件的 SHA-256（ClassifierProvider.file_sha256）。
+    路由不是分类器、分类器不是从模型文件加载的（测试里现训的）返回 None：这时按
+    RODIT_CLASSIFIER_PATH 读文件（rodit.eval.fingerprint.running_classifier_sha256）。"""
+    provider = unit.router.provider
+    return provider.file_sha256 if isinstance(provider, ClassifierProvider) else None
+
+
 def eval_evidence(
-    audit: AuditLog, config: EngineConfig, *, environ: Mapping[str, str] | None = None
+    audit: AuditLog,
+    config: EngineConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+    loaded_classifier_sha256: str | None = None,
 ) -> TestSetEvidence:
-    """测试集依据：eval.verdict 系统事件里和线上一致（配置、问题定义、生成环节、判断层和分类器、
-    大模型都一样）、用真实大模型跑的最近一次结论。线上的大模型和分类器按部署规则从配置和环境变量
-    解析（rodit.eval.fingerprint.current_fingerprint；environ 默认 os.environ，和线上单元读的是
-    同一份）。"""
+    """测试集依据：eval.verdict 系统事件里和线上一致（配置、问题定义、生成环节和判断层的提示词、
+    判断层和分类器、大模型都一样）、用真实大模型跑的最近一次结论。线上的大模型按部署规则从配置和
+    环境变量解析（rodit.eval.fingerprint.current_fingerprint；environ 默认 os.environ，
+    和线上单元读的是同一份）；分类器：同一进程里的调用方传 serve 实际加载的
+    loaded_classifier_sha256（模型文件启动后被换掉也照旧），别的进程（运维任务）不传，
+    读 RODIT_CLASSIFIER_PATH 指向的文件。"""
     events = audit.list_system_events(action=AuditAction.EVAL_VERDICT.value)
-    return test_set_evidence(events, current_fingerprint(config, environ=environ))
+    running = current_fingerprint(
+        config, environ=environ, loaded_classifier_sha256=loaded_classifier_sha256
+    )
+    return test_set_evidence(events, running)
 
 
 def incident_entries(audit: AuditLog, shop_id: str, *, since: datetime) -> list[IncidentEntry]:
@@ -260,22 +280,32 @@ def compliance_weeks(
     repos: Repos, config: EngineConfig, shop: Shop, *, since: datetime, until: datetime
 ) -> list[ComplianceWeek]:
     """[since, until) 里这家店实际发出去的文字的合规扫描，按 ISO 周（feedback.compliance）。
-    禁用词用店铺的生效配置，绝对化用语用 config.qa_gate。"""
+    禁用词用店铺的生效配置，绝对化用语用 config.qa_gate。推荐和消息按 pairing_window 多取一段：
+    窗口开始前展示、窗口里发出的推荐也要配上它的消息，同一次发送在哪个窗口里都记在推荐上
+    （上线状态、验收报告列出的 ID，review_compliance 的扫描里都有）。"""
     rules = ComplianceRules.from_config(config.qa_gate, effective_shop_config(config, shop))
+    earliest, latest = pairing_window(since, until)
     edited = [
         r
-        for r in repos.suggestions.list(shop.id, status=SuggestionStatus.EDITED_SENT, since=since)
-        if r.shop_id == shop.id and r.created_at < until
+        for r in repos.suggestions.list(
+            shop.id, status=SuggestionStatus.EDITED_SENT, since=earliest
+        )
+        if r.shop_id == shop.id and r.created_at < latest
     ]
-    messages = repos.conversations.list_outgoing(shop.id, since=since, until=until)
+    messages = repos.conversations.list_outgoing(shop.id, since=earliest, until=until)
     return scan_sent(edited, messages, shop_id=shop.id, rules=rules, since=since, until=until)
 
 
 def rollout_evidence(
-    repos: Repos, config: EngineConfig, shop: Shop, now: datetime
+    repos: Repos,
+    config: EngineConfig,
+    shop: Shop,
+    now: datetime,
+    *,
+    loaded_classifier_sha256: str | None = None,
 ) -> RolloutEvidence:
-    """上线状态用的依据：测试集结论；智能辅助门槛的 2 周（+ 本周）的平台违规登记和合规扫描；
-    全自动门槛的 4 周（+ 本周）的投诉登记。只读。"""
+    """上线状态用的依据：测试集结论（loaded_classifier_sha256 见 eval_evidence）；智能辅助门槛的
+    2 周（+ 本周）的平台违规登记和合规扫描；全自动门槛的 4 周（+ 本周）的投诉登记。只读。"""
     assist = week_windows(now, ASSIST_PERIODS)
     auto = week_windows(now, AUTO_PERIODS)
     current = [iso_period(now)]
@@ -283,7 +313,9 @@ def rollout_evidence(
     weeks = compliance_weeks(repos, config, shop, since=assist[0][1], until=now)
     reviews = compliance_reviews(repos.audit, shop.id, since=assist[0][1])
     return RolloutEvidence(
-        test_set=eval_evidence(repos.audit, config),
+        test_set=eval_evidence(
+            repos.audit, config, loaded_classifier_sha256=loaded_classifier_sha256
+        ),
         platform_violations=incident_total(
             entries,
             IncidentKind.VIOLATION,
@@ -466,7 +498,13 @@ class RolloutService:
             shadow_since=shadow_since,
             reviews=self._reviews(shop_id, periods_between(shadow_since, now)),
             latest_quality=self._latest_quality(shop_id, now),
-            evidence=rollout_evidence(self.unit.repos, self.unit.config, shop, now),
+            evidence=rollout_evidence(
+                self.unit.repos,
+                self.unit.config,
+                shop,
+                now,
+                loaded_classifier_sha256=unit_classifier_sha256(self.unit),
+            ),
         )
 
     def shadow(
@@ -490,7 +528,11 @@ class RolloutService:
         by_id = {r.id: r for r in records if r.id is not None}
         reviews = self._reviews(shop_id, periods_between(since, now))
         picked = shadow_reviews(reviews, by_id, shop_id=shop_id, since=since)
-        test_set = eval_evidence(self.unit.repos.audit, self.unit.config)
+        test_set = eval_evidence(
+            self.unit.repos.audit,
+            self.unit.config,
+            loaded_classifier_sha256=unit_classifier_sha256(self.unit),
+        )
         return shadow_gate(
             launch_gate(picked),
             test_set_passed=test_set.passed,
@@ -878,6 +920,7 @@ __all__ = [
     "compliance_reviews",
     "compliance_weeks",
     "eval_evidence",
+    "unit_classifier_sha256",
     "incident_entries",
     "rollout_evidence",
 ]

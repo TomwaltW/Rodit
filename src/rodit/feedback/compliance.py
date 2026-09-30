@@ -19,6 +19,11 @@ ComplianceReviewEntry）：confirmed（确实违规）算门槛不通过；dismi
 
 同一次发送的两份记录只算一次（记在推荐上）：写回会话的那条（msg_id "agent:{推荐 id}"），或同一会话
 里文字相同的一条消息（平台回声；比较前 NFKC 归一、遮个人信息、去掉空白），每条推荐最多配一条。
+消息要在推荐展示之后 PAIR_LOOKBACK 以内发出（平台回声的时间容许早 PAIR_CLOCK_SKEW）。
+配对和扫描窗口无关：推荐和消息按 pairing_window 多取一段（窗口开始前 PAIR_LOOKBACK、
+窗口结束后 PAIR_CLOCK_SKEW 的推荐），只用来配对、不计数；配上的推荐不在窗口里（窗口开始前展示、
+窗口里发出）时照样记在推荐上，按发出的时间落到周。所以不管上线状态、验收报告、复核确认各用哪个
+窗口，同一次发送都是同一个 ID（推荐 ID），列出来的都能确认。
 
 输出按店铺、按 ISO 周（东八区）：扫描条数、疑似违规条数、各规则命中数、推荐 ID / 消息 ID 和命中的
 规则名。不含任何文字（买家的、客服的都没有），可以写进审计（compliance.flag）和报表。纯函数，不读写仓储。
@@ -67,6 +72,12 @@ MAX_LISTED_IDS = 100
 """汇总里最多列出多少个推荐 ID / 消息 ID（计数不受影响）。"""
 
 MAX_MSG_ID_CHARS = 200
+
+PAIR_LOOKBACK = timedelta(days=7)
+"""同一次发送的推荐和消息最多相隔多久（推荐展示 → 发出）还配成一对。卡片没有过期时间（买家发新消息
+才作废），相隔更久的两份记录各算一条——在哪个窗口里都一样，不会一会儿配上一会儿配不上。"""
+PAIR_CLOCK_SKEW = timedelta(minutes=2)
+"""平台回声的时间是平台的发送时间：比推荐的展示时间早这么一点（两边的时钟）也算配得上。"""
 
 COMPLIANCE_REVIEWED = AuditAction.COMPLIANCE_REVIEWED.value
 """复核人员确认 / 标记误报一条疑似违规的审计动作（shop_id 是店铺；detail 见 review_detail）。"""
@@ -160,6 +171,49 @@ def _weeks(since: datetime, until: datetime) -> list[tuple[str, datetime, dateti
     return out
 
 
+def pairing_window(since: datetime, until: datetime) -> tuple[datetime, datetime]:
+    """扫描 [since, until) 时要取哪一段的推荐（created_at 在 [起, 止) 里）：窗口开始前 PAIR_LOOKBACK
+    和窗口结束后 PAIR_CLOCK_SKEW 的也要拿来配对（见模块说明）。消息从同一个"起"取到 until。
+    窗口里的一条消息能配上的推荐都在这一段里，配不配得上就只看这两份记录，和窗口无关。"""
+    return since - PAIR_LOOKBACK - PAIR_CLOCK_SKEW, until + PAIR_CLOCK_SKEW
+
+
+def _can_pair(record: SuggestionRecord, message: StoredMessage) -> bool:
+    """消息在推荐展示之后 PAIR_LOOKBACK 以内发出（容许 PAIR_CLOCK_SKEW 的时钟误差）。"""
+    shown = record.created_at
+    return shown - PAIR_CLOCK_SKEW <= message.created_at <= shown + PAIR_LOOKBACK
+
+
+def _pair_sends(
+    edited: Sequence[SuggestionRecord], outgoing: Sequence[StoredMessage]
+) -> dict[int, SuggestionRecord]:
+    """同一次发送：outgoing 的下标 → 配上的推荐。先按写回的消息 ID 配，再按同一会话里文字相同的配
+    （按时间先后一一对上）；每条推荐最多配一条，消息要在推荐展示之后 PAIR_LOOKBACK 以内。"""
+    by_id = {r.id: r for r in edited if r.id is not None}
+    unpaired = set(by_id)
+    pairs: dict[int, SuggestionRecord] = {}
+    for i, m in enumerate(outgoing):
+        if m.msg_id.startswith(_WRITE_BACK_PREFIX):
+            sid = m.msg_id[len(_WRITE_BACK_PREFIX) :]
+            r = by_id.get(int(sid)) if sid.isdigit() else None
+            if r is not None and r.id in unpaired and _can_pair(r, m):
+                unpaired.discard(r.id)
+                pairs[i] = r
+    by_text: dict[tuple[str, str], list[SuggestionRecord]] = {}
+    for r in edited:
+        if r.id is not None:
+            by_text.setdefault((r.conversation_id, _send_key(r.edited_text)), []).append(r)
+    for i, m in enumerate(outgoing):
+        if i in pairs:
+            continue
+        for r in by_text.get((m.conversation_id, _send_key(m.text)), []):
+            if r.id in unpaired and _can_pair(r, m):
+                unpaired.discard(r.id)
+                pairs[i] = r
+                break
+    return pairs
+
+
 def scan_sent(
     records: Iterable[SuggestionRecord],
     messages: Iterable[StoredMessage],
@@ -173,53 +227,41 @@ def scan_sent(
 
     records：这家店的推荐记录（只取 EDITED_SENT 且有 edited_text 的，按 created_at 落到周）；
     messages：ConversationRepository.list_outgoing 的结果（只取客服、机器人的，按 created_at）。
-    别的店铺、窗口外的记录忽略。"""
+    两样都按 pairing_window(since, until) 取：窗口外的只用来配对、不计数——配上的推荐不在窗口里时
+    记在推荐上，按发出的时间落到周（见模块说明）。别的店铺、这一段以外的记录忽略。"""
     if since >= until:
         raise ValueError("since 要早于 until")
-    edited = [
-        r
-        for r in records
-        if r.shop_id == shop_id
-        and r.status == SuggestionStatus.EDITED_SENT
-        and r.edited_text
-        and _in(r.created_at, since, until)
-    ]
-    outgoing = [
-        m
-        for m in messages
-        if m.shop_id == shop_id
-        and m.role in OUTGOING_ROLES
-        and m.text
-        and _in(m.created_at, since, until)
-    ]
-    # 同一次发送：先按写回的消息 ID 配，再按同一会话里文字相同的配（每条推荐最多配一条）
-    open_by_id = {r.id: r for r in edited if r.id is not None}
-    open_by_text: dict[tuple[str, str], list[int]] = {}
-    for r in edited:
-        if r.id is not None:
-            open_by_text.setdefault((r.conversation_id, _send_key(r.edited_text)), []).append(r.id)
-    duplicate_ids: set[str] = set()
-    for m in outgoing:
-        if m.msg_id.startswith(_WRITE_BACK_PREFIX):
-            sid = m.msg_id[len(_WRITE_BACK_PREFIX) :]
-            if sid.isdigit() and int(sid) in open_by_id:
-                open_by_id.pop(int(sid))
-                duplicate_ids.add(m.msg_id)
-    for m in outgoing:
-        if m.msg_id in duplicate_ids:
-            continue
-        candidates = open_by_text.get((m.conversation_id, _send_key(m.text)), [])
-        while candidates:
-            sid = candidates.pop(0)
-            if open_by_id.pop(sid, None) is not None:
-                duplicate_ids.add(m.msg_id)
-                break
+    earliest, latest = pairing_window(since, until)
+    edited = sorted(
+        (
+            r
+            for r in records
+            if r.shop_id == shop_id
+            and r.status == SuggestionStatus.EDITED_SENT
+            and r.edited_text
+            and _in(r.created_at, earliest, latest)
+        ),
+        key=lambda r: r.created_at,
+    )
+    outgoing = sorted(
+        (
+            m
+            for m in messages
+            if m.shop_id == shop_id
+            and m.role in OUTGOING_ROLES
+            and m.text
+            and _in(m.created_at, earliest, until)
+        ),
+        key=lambda m: m.created_at,
+    )
+    pairs = _pair_sends(edited, outgoing)
 
     weeks: list[ComplianceWeek] = []
     for period, start, end in _weeks(since, until):
         flags: list[ComplianceFlag] = []
         week_edited = [r for r in edited if _in(r.created_at, start, end)]
-        week_messages = [m for m in outgoing if _in(m.created_at, start, end)]
+        week_messages = [(i, m) for i, m in enumerate(outgoing) if _in(m.created_at, start, end)]
+        scanned_suggestions = len(week_edited)
         for r in week_edited:
             hit = scan_text(r.edited_text or "", rules)
             if hit:
@@ -229,9 +271,24 @@ def scan_sent(
                     )
                 )
         duplicates = 0
-        for m in week_messages:
-            if m.msg_id in duplicate_ids:
+        for i, m in week_messages:
+            paired = pairs.get(i)
+            if paired is not None:
                 duplicates += 1
+                if not _in(paired.created_at, since, until):
+                    # 推荐不在窗口里（窗口开始前展示、这一周发出）：这次发送照样记在推荐上，
+                    # 和别的窗口里是同一个 ID
+                    scanned_suggestions += 1
+                    hit = scan_text(paired.edited_text or "", rules)
+                    if hit:
+                        flags.append(
+                            ComplianceFlag(
+                                source="edited_suggestion",
+                                suggestion_id=paired.id,
+                                rules=hit,
+                                at=m.created_at,
+                            )
+                        )
                 continue
             hit = scan_text(m.text or "", rules)
             if hit:
@@ -248,7 +305,7 @@ def scan_sent(
                 period=period,
                 since=start,
                 until=end,
-                scanned_suggestions=len(week_edited),
+                scanned_suggestions=scanned_suggestions,
                 scanned_messages=len(week_messages),
                 duplicates=duplicates,
                 flagged=len(flags),
@@ -513,6 +570,8 @@ __all__ = [
     "MAX_LISTED_IDS",
     "MAX_MSG_ID_CHARS",
     "OUTGOING_ROLES",
+    "PAIR_CLOCK_SKEW",
+    "PAIR_LOOKBACK",
     "RULE_ABSOLUTE",
     "RULE_BANNED",
     "RULE_OFF_PLATFORM",
@@ -528,6 +587,7 @@ __all__ = [
     "find_flag",
     "flag_detail",
     "flag_key",
+    "pairing_window",
     "parse_reviews",
     "pending_reason",
     "review_detail",
