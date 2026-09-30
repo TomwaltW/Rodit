@@ -17,6 +17,10 @@
 5. multi_intent ≥ multi_intent   → 辅助：按问题分条推荐（概率 ≥ multi_intent_min_prob 的类型，
                                     降序最多 max_parts 个；不足两个就往下走，并提醒客服可能有
                                     漏答的问题）；自动：转人工；
+                                    这里的"概率"是每个类型被问到的概率：intent 的概率加上追问
+                                    second_intent 的票数占比（投票制大模型判断层才有追问，
+                                    decision.voting.mention_probabilities）；只在规则 5 里合并，
+                                    没达到 multi_intent 阈值的消息不分条，其他规则只看 intent；
 6. intent 置信度 ≥ 辅助阈值        → 检索、生成、质检出推荐；达到该类型的自动阈值、店铺开了全自动、
                                     没降级时 auto_eligible；
 7. 置信度低且前两名相差 < clarify_max_gap → 澄清；
@@ -36,7 +40,14 @@ from rodit.core.decision import ChoiceAnswer, DecisionResponse, NoulAnswer, Scor
 from rodit.core.enums import Intent, Mode, RouteAction
 from rodit.core.models import RouteDecision, RoutePart, ShopConfig
 from rodit.core.pipeline import DEFAULT_RISK_HINT, RISK_HINTS, risk_hint, soothe_with_answer
-from rodit.core.questions import Q_EMOTION, Q_INTENT, Q_MULTI_INTENT, Q_NEED_HUMAN
+from rodit.core.questions import (
+    Q_EMOTION,
+    Q_INTENT,
+    Q_MULTI_INTENT,
+    Q_NEED_HUMAN,
+    Q_SECOND_INTENT,
+)
+from rodit.decision.voting import mention_probabilities
 
 EPS = 1e-9
 
@@ -208,15 +219,17 @@ class RoutingPolicy:
         if _ge(multi, vote_threshold(cfg.multi_intent, vote_samples)):
             if auto:
                 return decide(RouteAction.TRANSFER_HUMAN, 5)
-            parts, dropped_complaint = self._parts(probs, disabled, high_risk, degraded)
+            mentioned = self._mentioned(answers, probs)
+            parts, dropped_complaint = self._parts(mentioned, disabled, high_risk, degraded)
             alerts = [ALERT_COMPLAINT] if dropped_complaint else []
             if len(parts) >= 2:
                 hints = [risk_hint(p.intent) for p in parts if p.intent in high_risk]
                 return decide(
                     RouteAction.SPLIT_MULTI, 5, parts=parts, risk_hints=hints, alerts=alerts
                 )
-            # 判断层说有多个问题、却认不出第二个类型（投票时各票常常选同一个"主要"类型）：
-            # 往下走只答一个问题，提醒客服别漏答；被去掉的投诉照样提醒人工
+            # 判断层说有多个问题、却认不出能单独成条的第二个类型（追问没答 / 答"无"、
+            # 是"其他"、投诉、店铺关闭的类型…）：往下走只答一个问题，提醒客服别漏答；
+            # 被去掉的投诉照样提醒人工
             pending_alerts = [ALERT_MULTI_UNSPLIT, *alerts]
 
         # 规则 6：置信度够 → 出推荐
@@ -251,6 +264,16 @@ class RoutingPolicy:
     def _score(answers: DecisionResponse, key: str) -> float:
         a = answers.answers.get(key)
         return a.score if isinstance(a, ScoreAnswer) else 0.0
+
+    @staticmethod
+    def _mentioned(answers: DecisionResponse, probs: dict[Intent, float]) -> dict[Intent, float]:
+        """规则 5 分条用的概率：intent 的概率 + 追问 second_intent 的占比（没有追问就是 probs）。"""
+        second = answers.answers.get(Q_SECOND_INTENT)
+        if not isinstance(second, ChoiceAnswer):
+            return probs
+        intent = answers.answers.get(Q_INTENT)
+        merged = mention_probabilities(intent if isinstance(intent, ChoiceAnswer) else None, second)
+        return {i: p for key, p in merged.items() if (i := _as_intent(key)) is not None}
 
     def _parts(
         self,

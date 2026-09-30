@@ -7,6 +7,11 @@
 - 投票：单选题的概率 = 各选项在有效票里的占比，置信度 = 多数选项的占比，同票按选项定义顺序取前者；
   接口给了选项概率（LLMResponse.logprobs）时直接用它（多次采样取平均）；
   是否题 = 有效票里"是"的占比（只采样一次时用模型自报的 p）；打分题 = 有效票的平均等级。
+- 追问 second_intent（core.questions.followup_questions）按票配对：同一次采样里，追问的类型和主要
+  问题（intent）不同、而且这一票说有多个问题（multi_intent 是）才算这一票的第二个问题，否则这一票
+  算"无"；没答或答不出来也算"无"（追问答不好只是不分条，不让整次路由降级）；
+  主要问题都没答出来的采样不参与追问的计票。这样同一票里主要问题和追问不会重复，
+  mention_probabilities 把两者的占比直接相加，就是每个类型"被问到"的票数占比（§6.6 规则 5 分条用）。
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from rodit.core.decision import (
     ScoreQuestion,
 )
 from rodit.core.errors import DecisionError
+from rodit.core.questions import NO_SECOND_INTENT, Q_INTENT, Q_MULTI_INTENT, Q_SECOND_INTENT
 
 _FENCE = re.compile(r"```[A-Za-z]*\s*(.*?)```", re.DOTALL)
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -314,3 +320,61 @@ def aggregate_score(key: str, question: ScoreQuestion, votes: list[float]) -> Sc
         raise DecisionError(f"问题 {key!r} 没有有效的投票")
     mean = sum(votes) / len(votes)
     return ScoreAnswer(score=round(min(max(mean, 0.0), float(question.max_score)), ROUND_DIGITS))
+
+
+# ---------------------------------------------------------------- 追问 second_intent（§6.6 规则 5）
+
+
+def second_intent_votes(samples: Iterable[dict[str, Vote]]) -> list[str]:
+    """各次采样（parse_sample 的结果）里追问 second_intent 的票，按模块说明和主要问题配对。
+
+    主要问题（intent）没有有效票的采样不计；其余每次采样出一票：另一个问题的选项键，或"无"。
+    """
+    votes: list[str] = []
+    for sample in samples:
+        primary = sample.get(Q_INTENT)
+        if not isinstance(primary, str):
+            continue
+        second = sample.get(Q_SECOND_INTENT)
+        multi = sample.get(Q_MULTI_INTENT)
+        if (
+            isinstance(second, str)
+            and second not in (NO_SECOND_INTENT, primary)
+            and isinstance(multi, NoulVote)
+            and multi.yes
+        ):
+            votes.append(second)
+        else:
+            votes.append(NO_SECOND_INTENT)
+    return votes
+
+
+def aggregate_second_intent(key: str, question: ChoiceQuestion, votes: list[str]) -> ChoiceAnswer:
+    """追问的答案：各选项的票数占比；一票都没有时答"无"（不分条）。"""
+    if not votes:
+        return ChoiceAnswer(
+            choice=NO_SECOND_INTENT, confidence=1.0, probabilities={NO_SECOND_INTENT: 1.0}
+        )
+    return aggregate_choice(key, question, votes)
+
+
+def _shares(answer: ChoiceAnswer | None) -> dict[str, float]:
+    if answer is None:
+        return {}
+    return dict(answer.probabilities) or {answer.choice: answer.confidence}
+
+
+def mention_probabilities(
+    intent: ChoiceAnswer | None, second: ChoiceAnswer | None
+) -> dict[str, float]:
+    """每个选项"被问到"的概率：主要问题的概率 + 追问的占比（去掉"无"），截到 1。
+
+    追问按票和主要问题配对（second_intent_votes），同一票里两者不同，直接相加不会重复计数。
+    路由规则 5 在 multi_intent 达到阈值时用它分条（routing.policy）；没有追问时就是 intent 的概率。
+    """
+    merged = _shares(intent)
+    for option, p in _shares(second).items():
+        if option == NO_SECOND_INTENT:
+            continue
+        merged[option] = min(1.0, round(merged.get(option, 0.0) + p, ROUND_DIGITS))
+    return {option: p for option, p in merged.items() if p > 0}
