@@ -149,8 +149,11 @@ router = APIRouter()
 
 
 @router.get("/healthz", response_model=HealthView, tags=["运维"])
-def healthz() -> HealthView:
-    """存活检查（不需要鉴权，不返回任何店铺信息）。"""
+async def healthz() -> HealthView:
+    """存活检查（不需要鉴权，不返回任何店铺信息）。
+
+    async：在事件循环上直接回答，不排在线程池里的业务请求后面（数据库网络不通时业务请求
+    都在等连接超时，线程池排满；同步的存活检查跟着超时，容器被判不健康。见 rodit.ops.router）。"""
     return HealthView()
 
 

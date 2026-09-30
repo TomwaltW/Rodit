@@ -647,7 +647,9 @@ class AuthExpiryMonitor:
       清理过、没有再开通的店铺，见 rodit.ops.serve）；
     - serve 的后台线程按间隔调 refresh（rodit.ops.background），不挂在抓取 /metrics 的路径上
       （要查库）；距上次检查不到 refresh_s 秒时不查库（force 除外）；
-    - 检查失败（数据库故障等）计入 rodit_auth_expiry_check_errors_total，保留上次的结果。
+    - 检查失败（数据库故障等）计入 rodit_auth_expiry_check_errors_total，保留上次的结果，
+      refresh 返回 False：后台任务这一轮记 error（rodit_background_task_runs_total），
+      上次成功的时刻不往前走。
     """
 
     def __init__(
@@ -674,7 +676,8 @@ class AuthExpiryMonitor:
         self._last: float | None = None
 
     def refresh(self, *, force: bool = False) -> bool:
-        """需要时检查一次；真的检查了返回 True。"""
+        """需要时检查一次。检查成功返回 True；没到间隔（非 force，没有查库）或检查出错返回 False
+        （serve 的后台任务总是 force，False 只表示出错，BackgroundRunner 记 error）。"""
         with self._lock:
             now = self._timer()
             if not force and self._last is not None and now - self._last < self._refresh_s:
@@ -688,7 +691,7 @@ class AuthExpiryMonitor:
             except Exception as exc:  # noqa: BLE001  数据库故障等：保留上次结果
                 self._metrics.auth_check_errors.inc()
                 logger.warning("授权过期检查失败：%s", type(exc).__name__)
-                return True
+                return False
             self._metrics.auth_expiring.set(value=len(expiring))
             self._metrics.auth_expired.set(value=len(expired))
             self._metrics.auth_expiring_shop.replace(({"shop_id": s}, 1) for s in expiring)
@@ -702,8 +705,8 @@ class AuthExpiryMonitor:
 
 class ObservedReadinessChecker(ReadinessChecker):
     """就绪检查（rodit.ops.health.ReadinessChecker），每次的结果顺手记成 rodit_ready 和
-    rodit_readiness_check_ok{check}。/readyz 和 serve 的后台线程刷新它（结果有缓存）。
-    记指标失败只记日志，不影响就绪检查本身。
+    rodit_readiness_check_ok{check}。/readyz（结果有缓存）和 serve 的后台线程（每轮都真的检查，
+    fresh=True）刷新它。记指标失败只记日志，不影响就绪检查本身。
 
     publish 挂在 /metrics 渲染前：不跑探针（不查库），输出上次的结果和它的年龄
     （rodit_readiness_age_seconds）；还没检查过、或者上次的结果超过 stale_after_s 秒（后台刷新

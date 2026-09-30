@@ -375,11 +375,13 @@ def test_auth_expiry_monitor_keeps_last_result_on_error(metrics):
         AuthGuard(repo, clock), lambda: [SHOP_A], metrics, refresh_s=0, clock=clock
     )
     assert monitor.refresh() is True
+    checked_at = sample(_samples(metrics), "rodit_auth_expiry_last_check_timestamp_seconds")
     repo.broken = True
-    assert monitor.refresh() is True
+    assert monitor.refresh() is False  # 检查出错：serve 的后台任务这一轮记 error
     s = _samples(metrics)
     assert sample(s, "rodit_auth_expiring_shops") == 1  # 上次的结果
     assert sample(s, "rodit_auth_expiry_check_errors_total") == 1
+    assert sample(s, "rodit_auth_expiry_last_check_timestamp_seconds") == checked_at
 
 
 # ================================================================ HTTP 中间件

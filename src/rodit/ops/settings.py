@@ -19,13 +19,15 @@
 | RODIT_MIGRATE_ON_START | false | serve 启动前先迁移（需要属主权限，一般用单独的 migrate 命令） |
 | RODIT_AUTH_EXPIRY_WARN_DAYS | 7 | 授权在这么多天内到期就告警（§12.4） |
 | RODIT_AUTH_EXPIRY_CHECK_S | 300 | 授权过期检查的间隔（秒，serve 的后台线程；0 = 不检查） |
-| RODIT_READINESS_CACHE_S | 2 | /readyz 结果缓存（秒） |
-| RODIT_READINESS_REFRESH_S | 10 | 后台刷新就绪检查的间隔（秒；0 = 只由 /readyz 刷新） |
+| RODIT_READINESS_CACHE_S | 2 | /readyz 结果缓存（秒；后台刷新不用缓存） |
+| RODIT_READINESS_REFRESH_S | 10 | 后台就绪检查的间隔（秒，每轮都真的检查；0 = 只由 /readyz 刷新） |
 | RODIT_TOKEN_REFRESH_INTERVAL_S | 3600 | serve 里令牌续期的间隔（秒，§8.4；0 = 不跑） |
 | RODIT_PURGE_EXPIRED_INTERVAL_S | 21600 | serve 里过期清理的间隔（秒，§8.4；0 = 不跑） |
 | RODIT_CLASSIFIER_PATH | | 路由分类器模型文件（provider 是 classifier 时必填） |
 
 数字一律要有限的非负数（inf、nan 拒绝：后面要换成时间间隔，溢出会变成没有说明的崩溃）。
+/metrics 输出的就绪结果超过多久算太旧（记成不就绪）由两项就绪设置算出来，见
+rodit.ops.serve.readiness_stale_after_s（间隔为 0 时加上缓存期）。
 
 离线任务 recalibrate / train-classifier 不用 ServerSettings（不需要 RODIT_PLATFORM），标注从
 RODIT_TRAINER_DSN 读（只属于 rodit_trainer 的登录账号，见 rodit.ops.serve）。

@@ -139,8 +139,8 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `RODIT_LOG_LEVEL` / `RODIT_LOG_FORMAT` | `INFO` / `json` | 日志 |
 | `RODIT_MIGRATE_ON_START` | `false` | `serve` 前先迁移（服务进程需要属主权限，不推荐） |
 | `RODIT_AUTH_EXPIRY_WARN_DAYS` / `RODIT_AUTH_EXPIRY_CHECK_S` | 7 / 300 | 授权即将过期告警的窗口、检查间隔（`serve` 的后台线程；0 = 不检查） |
-| `RODIT_READINESS_CACHE_S` | 2 | `/readyz` 结果缓存 |
-| `RODIT_READINESS_REFRESH_S` | 10 | 后台刷新就绪检查的间隔（0 = 只由 `/readyz` 刷新）；`/metrics` 只输出上次的结果 |
+| `RODIT_READINESS_CACHE_S` | 2 | `/readyz` 结果缓存（后台刷新不用缓存） |
+| `RODIT_READINESS_REFRESH_S` | 10 | 后台刷新就绪检查的间隔（每轮都真的检查；0 = 只由 `/readyz` 刷新）；`/metrics` 只输出上次的结果，超过 max(60, 3 × 间隔) 秒没更新按不就绪报（间隔为 0 时是 60 秒 + 缓存期） |
 | `RODIT_TOKEN_REFRESH_INTERVAL_S` / `RODIT_PURGE_EXPIRED_INTERVAL_S` | 3600 / 21600 | `serve` 里令牌续期、过期清理的间隔（0 = 不跑），见"上线就绪" |
 | `RODIT_CLASSIFIER_PATH` | | `decision.provider: classifier` 时必填：`train-classifier` 输出的模型文件；缺失或校验不过拒绝启动 |
 | `RODIT_TRAINER_DSN` | | 只给离线任务（`recalibrate`、`train-classifier`）：能 `SET ROLE rodit_trainer` 的登录账号，不给服务进程 |
@@ -259,8 +259,13 @@ FAQ / 模板；超时的只留已经通过质检的 FAQ / 模板卡片，降级�
   持有者）；`/readyz` 多一项 `lease`。会话锁、取消订购的闸门都在进程内，Phase 1 一个平台单元只跑一个副本；
   改数据的运维命令也拿这个租约（见上），运维命令在跑时 `serve` 起不来（退出码 2，命令做完后编排系统重启即可）；
   连接串要直连或走会话模式的连接池（事务模式的连接池拿不住会话锁）。
+- 抓取、存活检查不排队：业务接口是同步函数，共用一个线程池，数据库连不通时每个请求都要等连接超时、线程池会排满；
+  `/metrics`、`/healthz` 是 async 接口，不占这个线程池，照样马上回答（`/metrics` 只读内存，不查库）。
+  就绪结果由后台每轮真的检查一次（不用 `/readyz` 的缓存，缓存调长了也不会误报不就绪）；授权过期检查出错时
+  后台任务这一轮记 `error`（`RoditBackgroundTaskFailing`），上次成功的时刻不往前走。
 - 大模型出口可注入：平台绑定的 `llm_transport`（和 OpenAI 兼容客户端的 transport 同签名）给奇门 / EGW 等报备通道用，
-  计量和就绪检查照旧。
+  计量和就绪检查照旧。`RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` 去掉首尾空白再用（从密钥文件注入常带换行），
+  组装客户端、启动前检查、就绪检查、评测指纹看到的是同一个值。
 - 模型公示：配置 `llm.public_name` / `llm.filing_no`（【待定：D5】），`/v1/me` 返回、`/assist` 页脚显示；
   `llm.require_disclosure: true` 时生产部署缺了拒绝启动。
 - 指标：`rodit_tenant_isolation_total{stage}`（串店拦截：`http` 是调用方令牌不是这家店的，`server` 是接口处理中

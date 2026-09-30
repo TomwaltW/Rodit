@@ -33,7 +33,9 @@ groups:
           description: >
             这些店铺的消息不再处理（§8.4），客服看不到推荐。请商家重新授权；过期超过宽限期的由 serve
             的后台任务 purge_expired 按约定清理数据。清理过（shop.purged）、没有再开通的店铺不再计入，
-            告警随之消失；令牌文件里这些店铺的访问令牌也要删掉。店铺列表见 rodit_shop_auth_expiring。
+            告警随之消失；令牌文件里这些店铺的访问令牌也要删掉。清理中途被打断的店铺（进程重启、
+            数据库出错），serve 下一轮 purge_expired 会自动接着删完，不用手动处理；一直删不完时
+            RoditBackgroundTaskFailing{task="purge_expired"} 会报。店铺列表见 rodit_shop_auth_expiring。
       - alert: RoditAuthCheckErrors
         expr: increase(rodit_auth_expiry_check_errors_total[30m]) > 0
         labels:
@@ -168,7 +170,10 @@ groups:
           summary: "{{ $labels.instance }}：抓不到 Rodit 的指标"
           description: >
             进程没在运行、一直重启（数据库连不上退出码 1、单副本租约被占退出码 2），或者 /metrics
-            超时（抓取时不查库，正常不会超时）。这时其他告警都看不到数据。看容器日志"启动失败"。
+            超时。/metrics 抓取时不查库、不占业务接口的工作线程，但数据库连不通时每个业务请求都要等
+            连接超时，工作线程排满、请求越积越多，进程忙不过来时抓取照样可能超时。这时其他告警都看不到
+            数据。看容器日志：有"启动失败"是起不来；一直在刷"接口错误 StorageUnavailable"是数据库
+            不可用，查数据库连通性（网络策略、连接串、数据库本身）。
             抓取任务的 job_name 要是 rodit，否则这条告警找不到目标。
 
       # ================================================================ serve 的后台任务（§8.4、§12.4）
@@ -181,6 +186,8 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}：后台任务 {{ $labels.task }} 出错"
           description: >
-            serve 里按间隔跑的续期（refresh_tokens）、过期清理（purge_expired）、授权检查
-            （auth_expiry）或就绪检查（readiness）这一轮出错或没做完，下一轮会重试。查应用日志
-            "后台任务"、"令牌续期（serve 后台任务）"、"过期清理（serve 后台任务）没有删完的店铺"。
+            serve 里按间隔跑的续期（refresh_tokens）、过期清理（purge_expired）或授权检查
+            （auth_expiry）这一轮出错或没做完，下一轮会重试。查应用日志"后台任务"、
+            "令牌续期（serve 后台任务）"、"过期清理（serve 后台任务）没有删完的店铺"、
+            "授权过期检查失败"。就绪检查（readiness）每轮都能做完，检查结果是不就绪时报的是
+            RoditNotReady，不在这条里。

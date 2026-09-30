@@ -36,8 +36,10 @@ PostgreSQL 会话级 advisory lock，按平台单元取键）：组装好服务�
 revoke、set-status）拿同一个租约，serve 在跑时拒绝执行（见 rodit.ops.jobs.tenancy）。
 
 serve 的后台任务（rodit.ops.background，拿到租约之后启动、退出时停下）：
-    readiness     每 RODIT_READINESS_REFRESH_S 秒刷新就绪检查（/metrics 只输出上次的结果和年龄，
-                  抓取时不查库；结果超过 max(60, 3 × 间隔) 秒没更新就记成不就绪）；
+    readiness     每 RODIT_READINESS_REFRESH_S 秒真的跑一遍就绪检查（不用 /readyz 的缓存；/metrics
+                  只输出上次的结果和年龄，抓取时不查库；结果超过 max(60, 3 × 间隔) 秒没更新就记成
+                  不就绪。间隔为 0 时只由 /readyz 刷新，/readyz 在缓存期内拿缓存的结果，所以再加上
+                  RODIT_READINESS_CACHE_S，见 readiness_stale_after_s）；
     auth_expiry   每 RODIT_AUTH_EXPIRY_CHECK_S 秒检查授权即将过期 / 已过期的店铺（取消订购清理过、
                   没有再开通的店铺不算，令牌文件里还有它也一样）；
     refresh_tokens / purge_expired
@@ -418,6 +420,20 @@ def _offline_unit(
     )
 
 
+def readiness_stale_after_s(settings: ServerSettings) -> float:
+    """/metrics 输出的就绪结果最多多旧（秒），再旧就记成不就绪（刷新卡住了）。
+
+    后台刷新（RODIT_READINESS_REFRESH_S > 0）每轮都真的跑探针，正常情况下结果最多旧一个间隔
+    （加上检查本身的耗时），阈值留足余量：max(60, 3 × 间隔)。间隔为 0 时只由 /readyz 刷新：
+    /readyz 在缓存期（RODIT_READINESS_CACHE_S）内拿缓存的结果（年龄从真的检查那一刻算），
+    结果最多旧"缓存期 + 探针间隔"，所以阈值再加上缓存期，不然缓存期一长，健康的服务也按
+    不就绪报。"""
+    stale = max(DEFAULT_READINESS_STALE_S, 3 * settings.readiness_refresh_s)
+    if settings.readiness_refresh_s <= 0:
+        stale += settings.readiness_cache_s
+    return stale
+
+
 def _metrics_guard(settings: ServerSettings, auth: TokenFileAuthenticator) -> MetricsGuard | None:
     if settings.metrics_public:
         return None
@@ -465,15 +481,17 @@ def build_server(
         probes,
         metrics,
         cache_s=settings.readiness_cache_s,
-        stale_after_s=max(DEFAULT_READINESS_STALE_S, 3 * settings.readiness_refresh_s),
+        stale_after_s=readiness_stale_after_s(settings),
     )
     # 抓取时不跑探针：数据库网络不通时一次检查要十几秒，超过抓取超时，反而一个样本都没有
     metrics.registry.before_render(readiness.publish)
     gateway = unit.gateway
     metrics.registry.before_render(lambda: metrics.observe_tool_cache(gateway.totals()))
     service = AssistService(unit)
+    # 后台刷新每轮都真的跑探针（fresh）：缓存只给 /readyz 省查询。用缓存的话，缓存期
+    # （RODIT_READINESS_CACHE_S）比过期阈值长时，后台拿到的一直是旧结果，抓取按"太旧"记成不就绪
     periodic: list[PeriodicJob] = [
-        PeriodicJob("readiness", readiness.check, settings.readiness_refresh_s)
+        PeriodicJob("readiness", lambda: readiness.check(fresh=True), settings.readiness_refresh_s)
     ]
     monitor: AuthExpiryMonitor | None = None
     if not composed.bindings.mode_c_only:  # 模式 C 不需要平台授权（§8.1），不告警
