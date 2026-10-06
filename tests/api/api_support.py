@@ -13,6 +13,7 @@ from typing import Any
 
 from api_routes import CORE_ROUTES, Route
 from api_routes_console import ROUTES as CONSOLE_ROUTES
+from api_routes_platform_metrics import ROUTES as PLATFORM_METRICS_ROUTES
 from api_routes_rollout import ROUTES as ROLLOUT_ROUTES
 from starlette.exceptions import StarletteDeprecationWarning
 
@@ -87,7 +88,9 @@ def build_api(platform: Platform = Platform.TAOBAO, *, raise_server_exceptions: 
     return Api(TestClient(app, raise_server_exceptions=raise_server_exceptions), service)
 
 
-SHOP_ROUTES: tuple[Route, ...] = CORE_ROUTES + CONSOLE_ROUTES + ROLLOUT_ROUTES
+SHOP_ROUTES: tuple[Route, ...] = (
+    CORE_ROUTES + CONSOLE_ROUTES + ROLLOUT_ROUTES + PLATFORM_METRICS_ROUTES
+)
 """全部店铺范围的路由（§9.2 串店测试要覆盖每一个）。"""
 
 EVENTS_PATH = "/v1/platform/B/events"
@@ -112,6 +115,10 @@ def shop_snapshot(api: Api, shop_id: str, conversations: tuple[str, ...] = ()) -
         ],
         "items": [(c.item_id, c.updated_at) for c in repos.knowledge.list_item_cards(shop_id)],
         "quality": [(q.id, q.status, q.reviewer) for q in repos.quality_reviews.list(shop_id)],
+        "platform_metrics": [
+            (m.metric, m.day, m.source, m.value, m.recorded_at)
+            for m in (repos.platform_metrics.list(shop_id) if repos.platform_metrics else [])
+        ],
         "audit": len(repos.audit.list_events(shop_id)),
         "gaps": len(repos.feedback.list_gaps(shop_id)),
         "actions": [c for c in (api.unit.action_port.calls if api.unit.action_port else [])],

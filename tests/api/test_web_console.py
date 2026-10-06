@@ -108,9 +108,18 @@ def test_console_has_no_shop_data_or_secrets(api: Api):
 # ================================================================ 不引用外部地址、CSP 友好
 
 
+SVG_NAMESPACE = "'http://www.w3.org/2000/svg'"
+"""createElementNS 要的 SVG 命名空间：是名字不是地址，浏览器不会去取它（报表页的按周柱状图）。"""
+
+
 def test_console_references_no_external_urls(api: Api):
     for path in (PAGE, JS, CSS):
-        assert not _EXTERNAL.search(api.get(path).text), path
+        text = api.get(path).text
+        if path == JS:
+            assert text.count(SVG_NAMESPACE) == 1  # 只有这一处，且只用作命名空间
+            assert f"const SVG_NS = {SVG_NAMESPACE};" in text
+            text = text.replace(SVG_NAMESPACE, "")
+        assert not _EXTERNAL.search(text), path
     css = api.get(CSS).text
     assert "@import" not in css and "url(" not in css
 
@@ -317,6 +326,7 @@ ASYNC_LOADERS = {
     "loadQualityReport",
     "loadQueue",
     "loadReports",
+    "loadPlatformMetrics",
 }
 """取数的异步函数：响应回来时既要核对身份（换人登录），也要核对是不是这块区域最近一次的请求。"""
 
@@ -354,11 +364,19 @@ def test_console_busy_contexts_belong_to_the_person_who_started_them(api: Api):
     # 页面上固定的按钮共用的标记都登记过，退出时复位并重新启用按钮
     assert not re.search(r"\n  const \w+ = \{ busy: false \};", js)
     shared = dict(re.findall(r"\n  const (\w+Ctx) = sharedCtx\(([^)]*)\);", js))
-    assert set(shared) == {"faqCreateCtx", "syncCtx", "sampleCtx", "queueCtx"}
+    assert set(shared) == {
+        "faqCreateCtx",
+        "syncCtx",
+        "sampleCtx",
+        "queueCtx",
+        "pmSyncCtx",
+        "pmRecordCtx",
+    }
     html = api.get(PAGE).text
     for ids in shared.values():
         for control in re.findall(r"'([\w-]+)'", ids):
-            assert f'id="{control}"' in html, control
+            # 页面模板里的，或启动时由脚本建好的（报表页的平台客服指标一节）
+            assert f'id="{control}"' in html or f"id: '{control}'" in js, control
     assert "resetBusy();" in plain["signOut"]
     assert "$(id).disabled = false;" in plain["resetBusy"]
 
@@ -408,7 +426,11 @@ TAB_READS: dict[str, set[tuple[str, str]]] = {
     "config": {("GET", "console/config")},
     "rollout": {("GET", "rollout/status"), ("GET", "rollout/shadow")},
     "review": {("GET", "quality/report"), ("GET", "quality/reviews")},
-    "reports": {("GET", "reports/adoption"), ("GET", "reports/qa")},
+    "reports": {
+        ("GET", "reports/adoption"),
+        ("GET", "reports/qa"),
+        ("GET", "reports/platform-metrics"),
+    },
 }
 """各页签读的接口：页签对谁显示，这些接口就得允许谁读。"""
 
@@ -423,7 +445,10 @@ MERCHANT_WRITES = {
     ("POST", "console/items/{}"),
     ("POST", "console/items/sync"),
     ("POST", "console/config"),
+    ("POST", "platform-metrics"),  # 登记平台后台的数据（§12.4）
 }
+CONSOLE_WRITES = {("POST", "platform-metrics/sync")}
+"""店长、商家都能做的写操作：从平台接口同步客服考核数据（§12.4）。"""
 REVIEWER_WRITES = {("POST", "quality/sample"), ("POST", "quality/reviews/{}")}
 STAGE_WRITE = ("POST", "rollout/stage")
 
@@ -458,6 +483,7 @@ def test_console_script_calls_only_existing_endpoints(api: Api):
         {("GET", "v1/me"), STAGE_WRITE}
         | set().union(*TAB_READS.values())
         | MERCHANT_WRITES
+        | CONSOLE_WRITES
         | REVIEWER_WRITES
     )
     assert used == expected
@@ -486,6 +512,8 @@ def test_console_tabs_and_write_buttons_match_the_endpoint_roles():
         assert all(roles == set(groups["merchant"]) for roles in _route_roles(method, path))
     for method, path in REVIEWER_WRITES:
         assert all(roles == set(groups["reviewer"]) for roles in _route_roles(method, path))
+    for method, path in CONSOLE_WRITES:
+        assert all(roles == set(groups["console"]) for roles in _route_roles(method, path))
     [stage_roles] = _route_roles(*STAGE_WRITE)
     assert stage_roles == set(groups["stage_shadow"]) == MERCHANT_ROLES | REVIEWER_ROLES
     assert groups["stage_assist"] == ["reviewer"]  # 切到智能辅助：路由里再判，只给复核人员
