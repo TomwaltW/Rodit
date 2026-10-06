@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 import psycopg
 
-from rodit.core.config import LLM_ENV_PREFIX, LLMConfig, llm_endpoint
+from rodit.core.config import LLM_ENV_PREFIX, LLMConfig, llm_endpoint, llm_request_options
 from rodit.core.errors import StorageUnavailable
 from rodit.storage import MIGRATIONS, Migration
 
@@ -196,8 +196,9 @@ def llm_probe(
     env_prefix: str = LLM_ENV_PREFIX,
 ) -> Probe:
     """大模型是否配好：地址、模型名（core.config.llm_endpoint：配置里两项都写了用配置，否则两项
-    都取环境变量，和 rodit.app.production.build_production_unit 同一条规则），密钥环境变量有值。
-    只看有没有，不输出值。"""
+    都取环境变量，和 rodit.app.production.build_production_unit 同一条规则），密钥环境变量有值，
+    请求参数（core.config.llm_request_options：extra_body / json_mode / logprobs）合法。
+    只看有没有、合不合法，不输出值。"""
 
     def probe() -> dict[str, CheckResult]:
         env = os.environ if environ is None else environ
@@ -206,6 +207,10 @@ def llm_probe(
             return {"llm": CheckResult(False, {"reason": "not_configured"})}
         if not env.get(config.api_key_env, "").strip():
             return {"llm": CheckResult(False, {"reason": "missing_api_key"})}
+        try:
+            llm_request_options(config, env, prefix=env_prefix)
+        except ValueError:
+            return {"llm": CheckResult(False, {"reason": "invalid_request_options"})}
         return {"llm": CheckResult(True, {})}
 
     return probe

@@ -10,6 +10,8 @@
 
 环境变量：RODIT_DATABASE_DSN、RODIT_TOKEN_KEY、RODIT_BUYER_SALT、
 RODIT_LLM_BASE_URL、RODIT_LLM_MODEL、RODIT_LLM_API_KEY、RODIT_LLM_TIMEOUT_S（可选）、
+RODIT_LLM_EXTRA_BODY / RODIT_LLM_JSON_MODE / RODIT_LLM_LOGPROBS（可选，模型服务特有的参数和
+能力开关，core.config.env_request_options；配置里写了 llm.base_url 和 llm.model 时改用配置的），
 RODIT_DB_STATEMENT_TIMEOUT_MS / RODIT_DB_LOCK_TIMEOUT_MS（可选，数据库语句 / 等锁超时，毫秒）。
 """
 
@@ -21,7 +23,7 @@ from dataclasses import replace
 
 from rodit.app.unit import Repos, Unit, build_unit
 from rodit.core.clock import Clock, SystemClock
-from rodit.core.config import EngineConfig, llm_endpoint
+from rodit.core.config import EngineConfig
 from rodit.core.decision import DecisionProvider
 from rodit.core.enums import Platform
 from rodit.core.pii import BuyerRefHasher
@@ -138,19 +140,9 @@ def build_production_unit(
     repos = postgres_repos(db, clock=clock)
     if audit_wrapper is not None:
         repos = replace(repos, audit=audit_wrapper(repos.audit))
-    base_url, model, from_config = llm_endpoint(config.llm)
-    if from_config:
-        client = OpenAICompatibleClient(
-            base_url=base_url,
-            model=model,
-            api_key_env=config.llm.api_key_env,
-            timeout_s=config.llm.timeout_s,
-            transport=llm_transport,
-        )
-    else:
-        client = OpenAICompatibleClient.from_env(
-            api_key_env=config.llm.api_key_env, transport=llm_transport
-        )
+    # 接口、模型名、请求参数（extra_body / json_mode / logprobs）都按 core.config.llm_endpoint 的
+    # 规则取（配置里 base_url 和 model 都写了用配置，否则整组取环境变量），和就绪检查、评测指纹一致
+    client = OpenAICompatibleClient.from_config(config.llm, transport=llm_transport)
     llm = MeteredLLMClient(client, repos.audit, clock)
     return build_unit(
         platform=platform,
