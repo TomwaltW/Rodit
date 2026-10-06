@@ -13,6 +13,8 @@
   focus_intent；安抚（规则 3）要求先道歉安抚；高风险（规则 4）加谨慎要求和 route.risk_hints；
 - 签收未收到（§7.3.1、§11.3）加一条要求：说明签收细分状态、驿站 / 快递柜给取件指引、
   还是没找到就在订单页申请售后；
+- 买家发了图片（ctx.image_findings，§15 Phase 3）加一条要求：对话里【买家发来图片：…】是系统对图片的
+  识别，只供参考，不据此下结论、不承诺处理结果，质量问题请买家申请售后时上传照片；
 - 重新生成时附上"上次回答未通过质检：…，请修改"。
 """
 
@@ -45,6 +47,13 @@ NOT_RECEIVED_REQUIREMENT = (
     "不要替买家申请售后，也不要承诺赔偿或补发。"
 )
 """签收未收到（§7.3.1、§11.3）的回答要求：物流细分状态、驿站 / 快递柜信息、没找到引导申请售后。"""
+
+IMAGE_REQUIREMENT = (
+    "买家发了图片：对话里【买家发来图片：…】是系统对图片内容的识别，只供参考。"
+    "不要根据图片下结论，也不要承诺退款、补发、赔偿等处理结果；"
+    "商品破损、有瑕疵或发错的，请买家在申请售后时上传照片。"
+)
+"""买家发了图片时的回答要求（§15 Phase 3 图片理解只是参考、§7.3.2 R5 由客服看凭证决定）。"""
 
 _ROLE_NAMES = {Role.BUYER: "买家", Role.AGENT: "客服", Role.BOT: "客服（自动回复）"}
 _TONE_HINTS = {
@@ -200,6 +209,7 @@ def build_generation_messages(
             *_requirements(
                 route, variant=variant, focus_intent=focus, retry_feedback=retry_feedback
             ),
+            *([f"- {IMAGE_REQUIREMENT}"] if ctx.image_findings else []),
             _OUTPUT_FORMAT,
         ]
     )

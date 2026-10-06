@@ -10,7 +10,7 @@
       "seller_id": "s_1001",              店铺 ID
       "session_id": "conv_889",           会话 ID
       "msg_id": "m_20260928_0001",        平台消息 ID（同一平台内唯一）
-      "msg_type": "text",                 text / item / order；image、voice、video、system 忽略；
+      "msg_type": "text",                 text / item / order / image；voice、video、system 忽略；
                                           recall 撤回（recall_msg_id 是被撤回的消息）
       "direction": "in",                  in 买家发来；out 客服或机器人发出（回声）
       "buyer_open_uid": "tb_…",           买家 ID → buyer_ref（哈希），原值不向后传
@@ -21,10 +21,15 @@
       "sub_account": "小雅女装旗舰店:kf_02",  当前接待的子账号，agent_id 取冒号后的部分
       "send_time_ms": 1790563331000,      毫秒时间戳 → 东八区时间
       "reception": "human",               human 人工接待 / robot 机器人接待（模式 A 全自动）
-      "recall_msg_id": "…"
+      "recall_msg_id": "…",
+      "pic_key": "img_…",                 图片消息（msg_type=image）的平台图片标识：不透明 ID，
+                                          平台云内的视觉模型凭它取图（§15 Phase 3）；
+                                          没有或不合格（网址等，见 base.image_ref）时整条忽略
+      "pic_url": "https://…"              图片的临时地址（可能带签名）：丢弃，不向后传
     }
 
 订单卡片里常见的收件人字段（receiver_name / receiver_mobile / receiver_address）同样丢弃。
+图片消息的 content 常是占位文字"[图片]"，不算买家说的话；买家随图写了字时照常作为 text。
 """
 
 from __future__ import annotations
@@ -32,10 +37,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from rodit.adapters.base import BaseMockAdapter, RawEvent, cst_from_epoch_ms, opt_str
+from rodit.adapters.base import (
+    BaseMockAdapter,
+    RawEvent,
+    caption,
+    cst_from_epoch_ms,
+    image_ref,
+    opt_str,
+)
 from rodit.core.enums import Platform
 
-_BUYER_TYPES = frozenset({"text", "item", "order"})
+_BUYER_TYPES = frozenset({"text", "item", "order", "image"})
 
 
 class TaobaoMockAdapter(BaseMockAdapter):
@@ -58,11 +70,20 @@ class TaobaoMockAdapter(BaseMockAdapter):
                 kind="recall", recalled_msg_id=opt_str(raw.get("recall_msg_id")), **common
             )
         if msg_type not in _BUYER_TYPES:
-            return None  # 图片、语音、系统提示：MVP 不处理（§1.4 不做图片理解）
+            return None  # 语音、视频、系统提示：不处理
         content = raw.get("content")
         text = content if isinstance(content, str) else ""
         direction = opt_str(raw.get("direction")) or "in"
+        images: tuple[object, ...] = ()
+        if msg_type == "image":
+            key = image_ref(raw.get("pic_key"))  # pic_url 不读（§15 Phase 3，见模块说明）
+            if key is None:
+                return None  # 没有可用的图片标识：照旧忽略
+            images = (key,)
+            text = caption(text)
         if direction == "out":
+            if msg_type == "image":
+                return None  # 客服发的图片：会话记录只记文字
             return RawEvent(kind="agent", text=text, at=at, **common)
         if direction != "in":
             return None
@@ -77,6 +98,7 @@ class TaobaoMockAdapter(BaseMockAdapter):
             at=at,
             extension={"msg_type": msg_type, "reception": opt_str(raw.get("reception"))},
             auto_requested=opt_str(raw.get("reception")) == "robot",
+            images=images,
             **common,
         )
 

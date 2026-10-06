@@ -7,6 +7,9 @@
    - 商品字段（标题、相关属性、SKU、尺码表 + 尺码建议、洗涤 / 使用、详情页逐句）；
      需要商品但会话里没有当前商品：候选商品多于一个 → 澄清"请问您问的是哪一款呢？"，
      否则记缺失 MISSING_ITEM；
+     买家发来了商品图（ctx.image_findings 里有 PRODUCT_PHOTO，§15 Phase 3）而当前商品不确定：
+     图片认不出是店里哪件商品，问"请问您图片里的是哪一款呢？"（§5.2.4，库存、价格类问题也一样，
+     不拿别的商品回答）；
    - 店铺政策（policy_keys_for，没填的记 policy:{key}）、平台规则（platform_rules_for，按平台）；
    - FAQ 语义检索补充（前 faq_top_k 条、分数下限 faq_min_score）；类目通用知识兜底。
 3. 实时依据（TOOL_NEEDS）交给 ToolEvidenceProvider，结果合并（证据、缺失、不可用、澄清、提醒）；
@@ -28,7 +31,7 @@ from typing import TypeVar
 
 from rodit.core import evidence as ev
 from rodit.core.config import GenerationConfig
-from rodit.core.enums import POLICY_LABELS, EvidenceSource, Intent, PolicyKey
+from rodit.core.enums import POLICY_LABELS, EvidenceSource, ImageKind, Intent, PolicyKey
 from rodit.core.errors import KnowledgeUnavailable, TenantIsolationError, ToolError
 from rodit.core.evidence import KNOWLEDGE_NEEDS, TOOL_NEEDS, Need
 from rodit.core.models import (
@@ -59,11 +62,20 @@ _POLICY_TOPICS = frozenset(ev.topic_for_policy(k.value) for k in PolicyKey)
 CLARIFY_ITEM_QUESTION = "请问您问的是哪一款呢？"
 """会话里有多个商品、又判断不出指哪个时的澄清问题（§5.2.4）。"""
 
+CLARIFY_PHOTO_ITEM_QUESTION = "请问您图片里的是哪一款呢？"
+"""买家发来商品图、当前商品又不确定时的澄清问题（§5.2.4、§15 Phase 3）。"""
+
+PHOTO_MIN_CONFIDENCE = 0.5
+"""图片理解的置信度达到它才当作"买家发来了商品图"（和引擎描述图片的下限一致）。"""
+
 DEFAULT_FAQ_MIN_SCORE = 0.3
 """FAQ 分数下限：低于它的检索结果和问题基本无关，不作为依据。"""
 
 ITEM_NEEDS = frozenset({Need.ITEM_ATTRS, Need.SIZE, Need.CARE_USAGE, Need.ITEM_DETAIL})
 """需要"当前商品"的依据。"""
+
+PHOTO_ITEM_NEEDS = ITEM_NEEDS | {Need.STOCK, Need.PRICE}
+"""买家发来商品图时，这些依据都要先确定是哪件商品（库存、价格由工具查，同样针对某件商品）。"""
 
 TOOL_KINDS: dict[Need, str] = {
     Need.ORDER: "order",
@@ -86,6 +98,18 @@ def route_intents(route: RouteDecision) -> list[Intent]:
         if intent not in out:
             out.append(intent)
     return out
+
+
+def photo_item_clarify(ctx: ConversationContext) -> str | None:
+    """买家发来了商品图、当前商品又不确定时的澄清问题（见模块说明）；不是这种情况返回 None。"""
+    if ctx.item is not None:
+        return None
+    if any(
+        f.kind == ImageKind.PRODUCT_PHOTO and f.confidence >= PHOTO_MIN_CONFIDENCE
+        for f in ctx.image_findings
+    ):
+        return CLARIFY_PHOTO_ITEM_QUESTION
+    return None
 
 
 def _sorted_needs(needs: Iterable[Need]) -> list[Need]:
@@ -149,6 +173,8 @@ class KnowledgeRetriever:
         # 知识在前：知识库故障时直接抛出，不再白白调用平台接口
         if needs & KNOWLEDGE_NEEDS:
             clarify = self._collect_knowledge(ctx, intents, needs, cands, missing)
+        if clarify is None and ctx.item is None and needs & PHOTO_ITEM_NEEDS:
+            clarify = photo_item_clarify(ctx)
 
         tool_needs = needs & TOOL_NEEDS
         if tool_needs:
@@ -217,6 +243,8 @@ class KnowledgeRetriever:
         if needs & ITEM_NEEDS:
             if card is not None:
                 self._item_evidence(card, ctx.sku_id, question, needs, cands, missing)
+            elif (photo := photo_item_clarify(ctx)) is not None:
+                clarify = photo
             elif len(set(ctx.candidate_item_ids)) > 1:
                 clarify = CLARIFY_ITEM_QUESTION
             else:

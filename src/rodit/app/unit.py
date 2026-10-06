@@ -266,6 +266,9 @@ def build_unit(
         audit=repos.audit,
         clock=clock,
         gaps=repos.feedback,
+        # 买家图片（§15 Phase 3）：图片标识和识别结果记在单元缓存里（按店铺，取消订购一并删除）
+        vision=vision,
+        image_cache=cache,
     )
 
     def index_approved(item: KnowledgeItem) -> None:
@@ -294,6 +297,7 @@ def build_unit(
         config.aftersale,
         shop_config=shop_config,
         action_port=action_port,
+        vision=vision,  # R5 凭证的图片理解（§7.3.2），只加一句参考摘要
     )
     registry = AdapterRegistry()
     for adapter in adapters:

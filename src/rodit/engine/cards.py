@@ -47,6 +47,7 @@ _DEGRADATION_NOTES: dict[str, str] = {
     "decision:qa": "判断层质检暂不可用，只做了硬规则检查，请核实",
     "storage": "会话记录暂时读不到，上下文可能不全，请核实",
     "knowledge": "知识库暂时读不全，请核实",
+    "vision": "买家发的图片没能识别，推荐没有参考图片内容，请先看图再发送",
 }
 
 

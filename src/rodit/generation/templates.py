@@ -7,6 +7,9 @@
 - 物流：始终写"截至 {时间}"；驿站 / 快递柜给取件指引；只有接口给出预计送达时间才提到货时间（§7.2）。
 - 签收未收到（§7.3.1、§11.3）：物流进度（签收细分状态）+ 驿站 / 快递柜取件指引 + 已签收时
   "还是没找到就在订单页申请售后"（有平台申请售后规则的证据时，引用它）。
+- 买家发来质量问题的照片（§7.3.1 收到的东西坏了、§15 Phase 3 图片理解）：先道歉、说照片看到了，
+  请买家在订单页申请售后并上传照片；图片理解只是参考，不说"确实是破损"，也不承诺退款、补发、
+  赔偿等处理结果（§5.5、§7.3.2 R5 由客服看凭证决定）。
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from datetime import datetime
 from typing import Literal
 
 from rodit.core.clock import CST, fmt_time
-from rodit.core.enums import INTENT_LABELS, DraftKind, Intent, LogisticsStatus
+from rodit.core.enums import INTENT_LABELS, DraftKind, ImageKind, Intent, LogisticsStatus
 from rodit.core.evidence import PlatformRuleKey
 from rodit.core.models import (
     ConversationContext,
@@ -45,6 +48,7 @@ LOGISTICS = "logistics"
 NOT_RECEIVED = "not_received"
 REFUND_PROGRESS = "refund_progress"
 APPLY_AFTERSALE = "apply_aftersale"
+QUALITY_PHOTO = "quality_photo"
 
 NOT_FOUND_APPLY = "如果还是没找到，您可以在订单页申请售后"
 """签收未收到的最后一步（§7.3.1 没找到就引导申请售后；平台只允许买家在订单页发起）。"""
@@ -282,6 +286,34 @@ def refund_progress(
             text += f"{rule}。"
             ids.append(timing.id)
     return _template(REFUND_PROGRESS, text, evidence_ids=ids)
+
+
+PROBLEM_PHOTO_KINDS = frozenset({ImageKind.DAMAGE, ImageKind.DEFECT, ImageKind.WRONG_ITEM})
+"""质量问题类的照片：破损、质量瑕疵、错发漏发（§7.3.1、§7.3.2 R5）。"""
+
+PROBLEM_PHOTO_MIN_CONFIDENCE = 0.5
+"""图片理解的置信度达到它才当作"买家发来了质量问题的照片"（和引擎描述图片的下限一致）。"""
+
+
+def has_problem_photo(ctx: ConversationContext) -> bool:
+    """当前买家消息里有质量问题类的照片（ctx.image_findings，§15 Phase 3）。"""
+    return any(
+        f.kind in PROBLEM_PHOTO_KINDS and f.confidence >= PROBLEM_PHOTO_MIN_CONFIDENCE
+        for f in ctx.image_findings
+    )
+
+
+def quality_photo(ctx: ConversationContext, apply_rule: Evidence | None = None) -> Draft:
+    """买家发来质量问题的照片（§7.3.1）：道歉、说照片看到了、请买家在订单页申请售后并上传照片。
+
+    不复述图片理解的结论、不承诺处理结果（见模块说明）；有平台申请售后规则的证据时引用它。"""
+    s = style_for(ctx.config)
+    text = (
+        f"{s.opening}非常抱歉给您带来不好的体验，您发来的照片我们看到了。"
+        f"麻烦您在订单页申请售后，申请时把照片一起上传，我们核实后会跟您说明处理方式{s.particle}。"
+    )
+    ids = [apply_rule.id] if apply_rule is not None else []
+    return _template(QUALITY_PHOTO, text, evidence_ids=ids)
 
 
 def apply_aftersale(ctx: ConversationContext, rule: Evidence) -> Draft:
