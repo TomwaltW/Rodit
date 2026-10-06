@@ -426,6 +426,7 @@ MERCHANT_WRITES = {
 }
 REVIEWER_WRITES = {("POST", "quality/sample"), ("POST", "quality/reviews/{}")}
 STAGE_WRITE = ("POST", "rollout/stage")
+SEMI_AUTO_WRITE = ("POST", "rollout/semi-auto")  # 关：商家、复核；开：只有复核（路由内再判）
 
 
 def _script_calls(js: str) -> list[tuple[str, str]]:
@@ -455,7 +456,7 @@ def test_console_script_calls_only_existing_endpoints(api: Api):
         assert (method, full) in known, (method, path)
     used = set(calls)
     expected = (
-        {("GET", "v1/me"), STAGE_WRITE}
+        {("GET", "v1/me"), STAGE_WRITE, SEMI_AUTO_WRITE}
         | set().union(*TAB_READS.values())
         | MERCHANT_WRITES
         | REVIEWER_WRITES
@@ -489,6 +490,8 @@ def test_console_tabs_and_write_buttons_match_the_endpoint_roles():
     [stage_roles] = _route_roles(*STAGE_WRITE)
     assert stage_roles == set(groups["stage_shadow"]) == MERCHANT_ROLES | REVIEWER_ROLES
     assert groups["stage_assist"] == ["reviewer"]  # 切到智能辅助：路由里再判，只给复核人员
+    [semi_auto_roles] = _route_roles(*SEMI_AUTO_WRITE)  # 开启半自动同样路由里再判，只给复核人员
+    assert semi_auto_roles == stage_roles and set(groups["reviewer"]) == REVIEWER_ROLES
     assert set(groups["person"]) == PERSON_ROLES
     # 客服没有任何页签（控制台提示去话术助手）；每个能登录控制台的人至少有一个页签
     assert not [t for t, roles in config["tabs"].items() if "agent" in roles]

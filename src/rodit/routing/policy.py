@@ -26,6 +26,8 @@
                                     没达到 multi_intent 阈值的消息不分条，其他规则只看 intent；
 6. intent 置信度 ≥ 辅助阈值        → 检索、生成、质检出推荐；达到该类型的自动阈值、店铺开了全自动、
                                     没降级时 auto_eligible；
+                                    （mode 是生效模式，已经按全自动生效时段判断过——客服工作时间内
+                                    退回智能辅助，engine.modes——所以 auto_eligible 和生效模式一致）
 7. 置信度低且前两名相差 < clarify_max_gap → 澄清；
 8. 其他                            → 不推荐。
 

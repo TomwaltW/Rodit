@@ -186,8 +186,11 @@ def demo_service(
     return AssistService(unit)
 
 
-def enable_auto(service: AssistService, shop_id: str = SHOP_A) -> TaobaoMockAdapter:
-    """给单元加一个淘宝模式 A 适配器（开了全自动发送），并打开店铺的全自动总开关。"""
+def enable_auto(
+    service: AssistService, shop_id: str = SHOP_A, *, schedule: str = "always"
+) -> TaobaoMockAdapter:
+    """给单元加一个淘宝模式 A 适配器（开了全自动发送），并打开店铺的全自动总开关。
+    schedule 是全自动生效时段（默认全天；off_hours 只在客服工作时间以外，§15 Phase 3）。"""
     unit = service.unit
     adapter = TaobaoMockAdapter(
         unit.tools, unit.clock, unit.hasher, access="A", auto_send_enabled=True
@@ -196,7 +199,11 @@ def enable_auto(service: AssistService, shop_id: str = SHOP_A) -> TaobaoMockAdap
     repo = unit.repos.knowledge
     shop = repo.get_shop(shop_id)
     assert shop is not None
-    overrides = {**shop.config_overrides, "auto_reply_enabled": True}
+    overrides = {
+        **shop.config_overrides,
+        "auto_reply_enabled": True,
+        "auto_reply_schedule": schedule,
+    }
     repo.upsert_shop(shop.model_copy(update={"config_overrides": overrides}))
     return adapter
 

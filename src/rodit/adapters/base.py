@@ -14,6 +14,9 @@
   客服回声和撤回也由 on_event 交给应用层，写进会话仓储（§5.3 最近几轮对话）；
 - 推荐展示：show_suggestions 把推荐卡片放进该会话的"侧边栏"（模式 B；模式 A 的辅助、模式 C 的
   网页工具同理），连同标红提醒（alerts）和没有推荐时的原因（notice），新的一批替换旧的。
+  半自动（§5.6 "推荐直接填进输入框，客服按发送即可（视平台插件能力）"）：卡片带 prefill 的
+  那一条由插件填进客服输入框（sidebar_payload 的 input_prefill），客服按发送才发出，不是自动发送；
+  一批里最多一条，要有推荐编号（发送后照常记反馈），有标红提醒时不填（提醒要先看）。
 
 所有状态按 shop_id 分开保存（§9.2）；线程安全（一把锁）。这是模拟实现：
 真实适配器部署在对应平台云内（§9.1），发送、转人工调用平台接口。
@@ -172,6 +175,46 @@ class TransferRecord(_Model):
     conversation_id: str
     reason: str
     at: AwareDatetime
+
+
+class InputPrefill(_Model):
+    """半自动（§5.6）：插件填进客服输入框的那条推荐。客服看过、按发送才发出（不是自动发送），
+    发出后照常按推荐编号记反馈（§5.8）。"""
+
+    suggestion_id: int
+    text: str
+
+
+class SidebarPayload(_Model):
+    """推给插件侧边栏的当前一批内容（模拟插件按它渲染，§5.6、§8.2）。
+
+    input_prefill 只在模式 A / B 有：插件在平台工作台里，能把文字填进客服输入框；模式 C 是我们自己的
+    网页工具，卡片上的 prefill 显示成"可直接发送"标记，不往平台输入框里填。"""
+
+    shop_id: str
+    conversation_id: str
+    cards: list[SuggestionCard]
+    alerts: list[str]
+    notice: str | None = None
+    input_prefill: InputPrefill | None = None
+
+
+PREFILL_ACCESS: frozenset[str] = frozenset({"A", "B"})
+"""能把推荐填进平台客服输入框的接入模式（工作台插件 / 官方接待工作台，§8.1）。"""
+
+
+def _one_prefill(cards: Sequence[SuggestionCard], *, allowed: bool) -> list[SuggestionCard]:
+    """卡片复制一份；prefill 最多留一条（第一条带编号的），allowed=False 时全部去掉。"""
+    out: list[SuggestionCard] = []
+    kept = False
+    for card in cards:
+        copy = card.model_copy(deep=True)
+        keep = allowed and not kept and copy.prefill and copy.suggestion_id is not None
+        if copy.prefill and not keep:
+            copy = copy.model_copy(update={"prefill": False})
+        kept = kept or keep
+        out.append(copy)
+    return out
 
 
 class _LRU:
@@ -369,12 +412,13 @@ class BaseMockAdapter:
         alerts（标红提醒客服）和 notice（没有推荐时的原因）和卡片一起替换：不传就清掉上一批的。
         它们不含买家原文；万一带了个人信息也先做最小化再展示。
         没收到过这个店铺这个会话的消息时不展示（插件只能在当前会话里展示）。
+        半自动的 prefill 最多留一条（第一条带推荐编号的）；有标红提醒时一条都不留。
         """
         with self._lock:
             conv = self._conversation(shop_id, conversation_id)
             if conv is not None:
-                conv.cards = [c.model_copy(deep=True) for c in cards]
                 conv.alerts = [minimize(a) for a in alerts if isinstance(a, str) and a.strip()]
+                conv.cards = _one_prefill(cards, allowed=not conv.alerts)
                 conv.notice = minimize(notice) if notice and notice.strip() else None
 
     def send(self, shop_id: str, conversation_id: str, text: str) -> SendResult:
@@ -461,6 +505,28 @@ class BaseMockAdapter:
         with self._lock:
             conv = self._conversation(shop_id, conversation_id)
             return conv.notice if conv else None
+
+    def sidebar_payload(self, shop_id: str, conversation_id: str) -> SidebarPayload | None:
+        """插件侧边栏当前要渲染的内容：推荐卡片、标红提醒、没有推荐的原因，以及半自动要填进客服
+        输入框的那条（input_prefill，只在模式 A / B）。没见过的会话返回 None。"""
+        with self._lock:
+            conv = self._conversation(shop_id, conversation_id)
+            if conv is None:
+                return None
+            cards = [c.model_copy(deep=True) for c in conv.cards]
+            prefill: InputPrefill | None = None
+            if self.access in PREFILL_ACCESS:
+                top = next((c for c in cards if c.prefill and c.suggestion_id is not None), None)
+                if top is not None and top.suggestion_id is not None:
+                    prefill = InputPrefill(suggestion_id=top.suggestion_id, text=top.text)
+            return SidebarPayload(
+                shop_id=shop_id,
+                conversation_id=conversation_id,
+                cards=cards,
+                alerts=list(conv.alerts),
+                notice=conv.notice,
+                input_prefill=prefill,
+            )
 
     def sent_messages(self, shop_id: str) -> list[OutgoingMessage]:
         with self._lock:

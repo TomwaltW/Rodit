@@ -1,7 +1,9 @@
 """店铺政策问卷（方案 §5.2.3 冷启动第 1 步、附录 C）。
 
 商家开通时回答 15 个问题：1–13 写进店铺政策（PolicyKey），14 禁用词、15 语气和称呼写进
-店铺配置覆盖项（Shop.config_overrides，§9.3）。
+店铺配置覆盖项（Shop.config_overrides，§9.3）；13 客服工作时间看得懂时（"9:00-23:00"、
+"早9点到晚11点"……，见 parse_service_hours_text）同时写进 ShopConfig.service_hours（北京时间，
+全自动先在非工作时间试行用，§15 Phase 3），看不懂就只留政策原文。
 
 一题可能对应两个政策键（如第 1 题"付款后多久发货？预售商品怎么说明？"对应 ship_time 和
 presale），商家只写一段回答。拆分规则：
@@ -16,12 +18,14 @@ presale），商家只写一段回答。拆分规则：
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from rodit.core.enums import PolicyKey
 from rodit.core.models import SHOP_CONFIG_FIELDS, PolicyEntry, ShopConfig
+from rodit.core.schedule import normalize_service_hours, parse_window
 
 
 @dataclass(frozen=True)
@@ -132,7 +136,12 @@ QUESTIONNAIRE: tuple[QuestionnaireItem, ...] = (
     ),
     _q(11, "保修期多久？怎么报修？", PolicyTarget(_P.WARRANTY)),
     _q(12, "尺码偏大还是偏小？（服饰类）", PolicyTarget(_P.SIZE_TENDENCY)),
-    _q(13, "客服的工作时间？", PolicyTarget(_P.SERVICE_HOURS)),
+    QuestionnaireItem(
+        id=13,
+        text="客服的工作时间？",
+        policy_targets=(PolicyTarget(_P.SERVICE_HOURS),),
+        config_fields=("service_hours",),  # 看得懂时（parse_service_hours_text）
+    ),
     QuestionnaireItem(
         id=14,
         text="哪些话绝对不能说？（商家禁用词、不能宣传的功效）",
@@ -213,6 +222,111 @@ def parse_banned_words(answer: str) -> list[str]:
     return words
 
 
+# ================================================================ 13：客服工作时间
+
+_NUM = r"(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})"
+_PERIOD = r"(?:凌晨|清晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里|夜间|次日|第二天|早|晚)"
+_CLOCK = rf"({_PERIOD})?\s*({_NUM})\s*(?:(:)\s*(\d{{2}})|(点|时)\s*(半|整|{_NUM}\s*分?)?)?"
+_HOURS_RANGE = re.compile(_CLOCK + r"\s*(?:-|–|—|~|至|到)\s*" + _CLOCK)
+_HOURS_SHORT = re.compile(
+    rf"早上?\s*({_NUM})\s*点?\s*(半)?\s*[,、]?\s*晚上?\s*({_NUM})\s*点?\s*(半)?"
+)
+_HOURS_DAYS = re.compile(r"周[一二三四五六日天末]|星期|礼拜|工作日|节假日|节日|假期|法定|双休|单休")
+_HOURS_ALL_DAY = re.compile(r"全天|24\s*(?:小时|h)|二十四小时|不打烊")
+_PM = frozenset({"下午", "傍晚", "晚上", "晚", "夜里", "夜间"})
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4}
+_CN_DIGITS |= {"五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+MAX_SERVICE_HOURS_TEXT = 200
+
+
+def _cn_number(text: str) -> int:
+    """ "9" / "九" / "十一" / "二十三" → 整数。"""
+    text = text.strip()
+    if text.isdigit():
+        return int(text)
+    if "十" not in text:
+        if len(text) != 1:
+            raise ValueError(f"看不懂的数字：{text}")
+        return _CN_DIGITS[text]
+    tens, _, ones = text.partition("十")
+    return (_CN_DIGITS[tens] if tens else 1) * 10 + (_CN_DIGITS[ones] if ones else 0)
+
+
+def _minute(colon: str | None, dian_minute: str | None) -> int:
+    if colon is not None:
+        return int(colon)
+    if not dian_minute or dian_minute == "整":
+        return 0
+    if dian_minute == "半":
+        return 30
+    return _cn_number(dian_minute.rstrip("分").strip())
+
+
+def _hour_24(period: str | None, hour: int, *, end: bool) -> int:
+    """按"早 / 下午 / 晚上"换成 24 小时制。晚上 12 点是半夜：作结束是 24，作开始是 0。"""
+    if period in _PM:
+        if hour == 12:
+            return 24 if end else 0
+        return hour + 12 if hour < 12 else hour
+    if period == "中午":
+        return hour + 12 if hour <= 2 else hour
+    if period == "凌晨" and hour == 12:
+        return 0
+    return hour
+
+
+def _window(start: tuple[int, int], finish: tuple[int, int]) -> str:
+    (sh, sm), (eh, em) = start, finish
+    if (eh, em) == (0, 0) and (sh, sm) != (0, 0):
+        eh = 24  # 到 0 点 = 到半夜
+    text = f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}"
+    return parse_window(text).text()  # 时间不对、开始等于结束时抛 ValueError
+
+
+def parse_service_hours_text(answer: str) -> list[str]:
+    """第 13 题 / 设置页填的客服工作时间 → 统一写法的时段（"HH:MM-HH:MM"，北京时间，可以跨午夜）。
+
+    认得："9:00-23:00""09：00～23：00""9点到22点""早9点到晚11点""早上九点到晚上十一点半"
+    "下午1点到5点""8:00-12:00，13:30-22:00"（多个时段）"早9晚11""全天 / 24 小时"。
+    看不懂时抛 ValueError（原因给商家看），调用方决定怎么办（问卷只留政策原文，设置页提示改写）：
+    - 按星期、节假日区分的（"周一至周五……"）：一个店铺只有一套每天的时段，不猜；
+    - 结束时间是 1–12 点、又没写上午 / 晚上、也不是 HH:MM 写法（"9点到11点"）：说不准是上午 11 点
+      还是晚上 11 点，不猜——猜错了全自动会在客服在岗时回复。开始写了下午 / 晚上时，结束跟着算
+      （"下午1点到5点" → 13:00-17:00）。
+    """
+    text = unicodedata.normalize("NFKC", answer or "").strip()
+    if not text:
+        raise ValueError("没有填写")
+    if len(text) > MAX_SERVICE_HOURS_TEXT:
+        raise ValueError(f"最多 {MAX_SERVICE_HOURS_TEXT} 个字")
+    if _HOURS_DAYS.search(text):
+        raise ValueError("按星期或节假日区分的时间暂不支持，请写每天的时段，如 09:00-23:00")
+    windows: list[str] = []
+    for m in _HOURS_RANGE.finditer(text):
+        p1, h1, _, cm1, _, dm1, p2, h2, c2, cm2, _, dm2 = m.groups()
+        start_hour, end_hour = _cn_number(h1), _cn_number(h2)
+        if p2 is None and c2 is None and 1 <= end_hour <= 12:
+            if p1 not in _PM:
+                said = m.group(0).strip()
+                raise ValueError(f"「{said}」分不清上午还是晚上，请用 24 小时制，如 09:00-23:00")
+            p2 = p1  # "下午1点到5点"：结束跟着开始算
+        start = (_hour_24(p1, start_hour, end=False), _minute(cm1, dm1))
+        finish = (_hour_24(p2, end_hour, end=True), _minute(cm2, dm2))
+        windows.append(_window(start, finish))
+    if not windows:
+        short = _HOURS_SHORT.search(text)
+        if short is not None:
+            h1, half1, h2, half2 = short.groups()
+            start = (_cn_number(h1), 30 if half1 else 0)
+            finish = (_hour_24("晚", _cn_number(h2), end=True), 30 if half2 else 0)
+            windows.append(_window(start, finish))
+        elif _HOURS_ALL_DAY.search(text):
+            windows.append("00:00-24:00")
+    if not windows:
+        raise ValueError("没有认出时段，请写成 09:00-23:00 这样（北京时间）")
+    return normalize_service_hours(windows)
+
+
 # ================================================================ 15：语气与称呼
 
 _TONE_WORDS: tuple[tuple[str, str], ...] = (
@@ -274,7 +388,8 @@ def apply_questionnaire(
     - answers：题号 → 回答文字；空白回答跳过；题号不存在抛 ValueError；
     - now：写进 PolicyEntry.updated_at，必须带时区；
     - 返回 (政策条目，按题号、键顺序；config_overrides 补丁)。补丁里的 banned_words 是完整列表
-      （替换，不追加），合并进 Shop.config_overrides 由调用方完成。
+      （替换，不追加），合并进 Shop.config_overrides 由调用方完成；第 13 题看得懂时补丁里有
+      service_hours（完整列表，替换），看不懂时只写政策原文、补丁里没有这一项。
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now 必须带时区")
@@ -297,6 +412,11 @@ def apply_questionnaire(
             patch["banned_words"] = parse_banned_words(answer)
         if "tone" in item.config_fields:
             patch.update(parse_tone(answer))
+        if "service_hours" in item.config_fields:
+            try:
+                patch["service_hours"] = parse_service_hours_text(answer)
+            except ValueError:
+                pass  # 看不懂就只留政策原文（商家可以在设置页填）
     assert set(patch) <= SHOP_CONFIG_FIELDS
     ShopConfig.model_validate(patch)  # 补丁取值必须合法
     return entries, patch

@@ -217,7 +217,7 @@ def test_regeneration_still_happens_with_time_left(kit: Kit) -> None:
 
 def test_budget_blocks_auto_reply_and_transfers(kit: Kit) -> None:
     """全自动下超时 = 故障：不自动回复，转人工（§12.2）。"""
-    kit.set_shop_config(SHOP_A, auto_reply_enabled=True)
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True, auto_reply_schedule="always")
     kit.router.decide = make_route(Intent.SHIPPING_POLICY, confidence=0.97, auto_eligible=True)
     clock = Monotonic()
     faq = faq_draft(SHIP)

@@ -611,11 +611,17 @@
       article: null,
       buttons: [],
     };
+    // 半自动（§5.6）：高置信度的简单问题，可以直接发送；仍由客服看过、点发送（不是自动发送）
+    const prefill = card.prefill === true && typeof card.suggestion_id === 'number';
     const meta = h('p', { className: 'card-meta' }, [
+      prefill ? h('span', { className: 'badge prefill' }, '半自动：可直接发送') : null,
       h('span', { className: `badge conf-${card.confidence}` }, `置信度 ${label(LABELS.confidence, card.confidence)}`),
       h('span', { className: 'badge' }, label(LABELS.intents, card.intent)),
       h('span', { className: 'badge' }, label(LABELS.kinds, card.kind)),
     ]);
+    const prefillHint = prefill
+      ? h('p', { className: 'prefill-hint' }, '这类问题已开半自动：核对无误后可以直接发送，仍由你来发。')
+      : null;
     const evidenceBox = h('div', { className: 'evidence' }, [
       h('span', { className: 'evidence-title' }, '依据：'),
       evidence.length
@@ -625,9 +631,10 @@
     const riskBox = risks.length
       ? h('ul', { className: 'risks', 'aria-label': '风险提示' }, risks.map((r) => h('li', null, r)))
       : null;
-    cs.article = h('article', { className: 'card', 'aria-labelledby': titleId }, [
+    cs.article = h('article', { className: prefill ? 'card prefill' : 'card', 'aria-labelledby': titleId }, [
       h('h3', { id: titleId, className: 'card-title' }, total > 1 ? `推荐 ${index + 1} / ${total}` : '推荐回答'),
       meta,
+      prefillHint,
       text,
       evidenceBox,
       riskBox,

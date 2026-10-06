@@ -45,6 +45,17 @@ class StageRequest(_Request):
     note: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
 
 
+class SemiAutoRequest(_Request):
+    """开 / 关某个问题类型的半自动（§5.6、§13.4）：enabled=true 只有复核人员能用，要过门槛（该类型
+    原样采纳率 ≥ 90%），没过时 force=true 强制开启，且必须写明原因（note）；高风险类型永远不能开。
+    enabled=false 商家和复核人员都能用。操作人取自调用方身份。"""
+
+    intent: Intent
+    enabled: bool = Field(strict=True)
+    force: bool = False
+    note: str | None = Field(default=None, max_length=MAX_NOTE_CHARS)
+
+
 class SampleRequest(_Request):
     """每周抽样（§13.5）。period 默认上一个完整的 ISO 周（东八区），size 默认 50。"""
 
@@ -184,6 +195,7 @@ __all__ = [
     "QualityReviewView",
     "SampleRequest",
     "ScoreRequest",
+    "SemiAutoRequest",
     "ShadowItemView",
     "ShadowView",
     "StageRequest",

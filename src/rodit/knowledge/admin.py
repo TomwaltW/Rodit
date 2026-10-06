@@ -20,8 +20,9 @@ FAQ（§5.2.1 优先级 4）：
 尺码表、详情文字属于平台，只由商品同步（knowledge.sync）更新。
 
 店铺配置（§9.3）：商家能改的是语气、称呼、回答长度、禁用词、关闭的问题类型、推荐条数、售后金额上限、
-店长账号；影子模式、全自动开关属于上线节奏和平台准入（§13.4），商家不能改。值为 None 表示删掉
-店铺覆盖项、回到类目 / 平台默认。
+店长账号、客服工作时间（北京时间，附录 C 第 13 题；全自动默认只在工作时间以外生效，§15 Phase 3）；
+影子模式、全自动开关和生效时段、半自动的类型属于上线节奏和平台准入（§13.4），商家不能改。值为 None
+表示删掉店铺覆盖项、回到类目 / 平台默认。
 
 所有写操作写审计（core.audit.AuditAction），detail 只放 ID、字段名、条数，不放问答原文和取值。
 调用方负责和取消订购互斥（app.console 在 processing(shop_id) 里调用）；这里每次写之前都重新确认店铺
@@ -71,10 +72,13 @@ from rodit.core.models import (
     strip_control_chars,
 )
 from rodit.core.ports import AuditSink, KnowledgeRepository
+from rodit.core.schedule import MAX_SERVICE_WINDOWS, normalize_service_hours
 from rodit.knowledge.conflict import Candidate, ordered_topics, resolve_conflicts
 from rodit.knowledge.questionnaire import (
     MAX_BANNED_WORD_CHARS,
+    MAX_SERVICE_HOURS_TEXT,
     parse_banned_words,
+    parse_service_hours_text,
     question_for_policy,
 )
 
@@ -95,6 +99,7 @@ MAX_DISPLAY_NAME_CHARS = 64
 MAX_BANNED_WORDS = 100
 MAX_MANAGER_IDS = 50
 MAX_ACCOUNT_CHARS = 64
+MAX_SERVICE_HOURS_CHARS = 20  # 客服工作时间每一行（"早上9点到晚上11点半"），同设置页的输入上限
 
 _NOT_HUMAN = frozenset({"system", "bot", "auto"})
 
@@ -114,6 +119,7 @@ MERCHANT_CONFIG_FIELDS: tuple[str, ...] = (
     "suggestion_count",
     "aftersale_amount_limit",
     "manager_ids",
+    "service_hours",
 )
 """商家能改的店铺配置项（§9.3）。白名单：core 以后新增的配置项默认不开放给商家。"""
 
@@ -1013,6 +1019,8 @@ def _normalize_config_value(key: str, value: Any) -> Any:
         )
         for account in value:
             require_human(account, "店长账号")
+    elif key == "service_hours":
+        value = _service_hours(value)
     elif key == "disabled_intents":
         if not isinstance(value, list | tuple):
             raise ValueError("关闭的问题类型必须是列表")
@@ -1030,6 +1038,37 @@ def _normalize_config_value(key: str, value: Any) -> Any:
     return _canonical(key, value)
 
 
+def _service_hours(value: Any) -> list[str]:
+    """客服工作时间（北京时间，附录 C 第 13 题）→ 统一写法的时段列表。
+
+    设置页按行提交（每行一个时段，"9:00-23:00""早9点到晚11点"都行，见
+    questionnaire.parse_service_hours_text）；也接受一段文字（同问卷第 13 题的写法）。
+    空列表 / 空文字表示没填（全自动默认只在工作时间以外生效，没填就不自动）。
+    看不懂、时段太多、时间不对抛 ValueError，写明哪一行、怎么改。"""
+    if isinstance(value, str):
+        text = strip_control_chars(value).strip()
+        if len(text) > MAX_SERVICE_HOURS_TEXT:
+            raise ValueError(f"客服工作时间最多 {MAX_SERVICE_HOURS_TEXT} 个字")
+        lines = [text] if text else []
+    else:
+        lines = clean_lines(
+            value,
+            "客服工作时间",
+            max_chars=MAX_SERVICE_HOURS_CHARS,
+            max_items=MAX_SERVICE_WINDOWS,
+        )
+    windows: list[str] = []
+    for line in lines:
+        try:
+            windows.extend(parse_service_hours_text(line))
+        except ValueError as exc:
+            raise ValueError(f"客服工作时间「{line}」：{exc}") from None
+    try:
+        return normalize_service_hours(windows)
+    except ValueError as exc:
+        raise ValueError(f"客服工作时间：{exc}") from None
+
+
 __all__ = [
     "FAQ_FIELDS",
     "LOCKED_CONFIG_FIELDS",
@@ -1038,6 +1077,7 @@ __all__ = [
     "MAX_ITEM_LINE_CHARS",
     "MAX_POLICY_CHARS",
     "MAX_QUESTION_CHARS",
+    "MAX_SERVICE_HOURS_CHARS",
     "MAX_SIZE_ADVICE_CHARS",
     "MERCHANT_CONFIG_FIELDS",
     "MERCHANT_ITEM_FIELDS",

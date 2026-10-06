@@ -51,7 +51,7 @@ def test_late_message_outside_merge_window_goes_to_history(kit: Kit) -> None:
 
 def test_late_message_in_auto_mode_is_not_auto_sent_again(kit: Kit) -> None:
     """全自动：最新那条已经自动回复过，迟到的旧消息不再自动发一遍，转人工由客服接管。"""
-    kit.set_shop_config(SHOP_A, auto_reply_enabled=True)
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True, auto_reply_schedule="always")
     kit.router.decide = make_route(Intent.SHIPPING_POLICY, confidence=0.97, auto_eligible=True)
     engine = kit.engine()
     newer = kit.msg("什么时候发货", mode=Mode.AUTO)

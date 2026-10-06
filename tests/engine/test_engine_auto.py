@@ -35,6 +35,8 @@ def auto_route(**kw: Any) -> Any:
 
 
 def enable_auto(kit: Kit, **overrides: Any) -> None:
+    # 全天生效：这里测的不是全自动生效时段（见 test_auto_schedule.py）
+    overrides.setdefault("auto_reply_schedule", "always")
     kit.set_shop_config(SHOP_A, auto_reply_enabled=True, **overrides)
     kit.router.decide = auto_route()
 
@@ -254,7 +256,7 @@ def test_shadow_shop_never_auto_replies(kit: Kit) -> None:
 
 def test_auto_emotion_transfer_sends_soothe_script_and_transfers(kit: Kit) -> None:
     """§5.7：全自动模式下情绪激烈 → 转人工，附安抚话术（模板，带 AI 标识前缀）。"""
-    kit.set_shop_config(SHOP_A, auto_reply_enabled=True)
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True, auto_reply_schedule="always")
     kit.router.decide = make_route(
         Intent.QUALITY_ISSUE, action=RouteAction.TRANSFER_HUMAN, rule=3, emotion=3.6
     )
@@ -269,7 +271,7 @@ def test_auto_emotion_transfer_sends_soothe_script_and_transfers(kit: Kit) -> No
 
 
 def test_auto_transfer_for_other_reasons_sends_nothing(kit: Kit) -> None:
-    kit.set_shop_config(SHOP_A, auto_reply_enabled=True)
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True, auto_reply_schedule="always")
     kit.router.decide = make_route(Intent.MODIFY_ORDER, action=RouteAction.TRANSFER_HUMAN, rule=4)
     result = run_auto(kit, "能改个地址吗")
     assert result.transfer_to_human is True
