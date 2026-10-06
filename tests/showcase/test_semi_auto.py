@@ -113,17 +113,21 @@ def test_other_scenarios_are_not_prefilled(showcase: Showcase, platform, scenari
     assert view["result"]["input_prefill"] is None
 
 
-def test_pdd_rewrite_after_qa_block_is_marked_because_shipping_is_semi_auto(showcase: Showcase):
-    """拼多多的质检拦截问法（"明天能到吗？"）路由到发货政策（规则 6）：第一稿被拦下，重写稿通过
-    质检，引擎按最终那份草稿判断半自动（engine.semi_auto），所以标"可直接发送"；页面的说明写明了。"""
+def test_pdd_rewrite_after_qa_block_is_not_marked_even_though_shipping_is_semi_auto(
+    showcase: Showcase,
+):
+    """拼多多的质检拦截问法（"明天能到吗？"）路由到发货政策（规则 6），发货类开了半自动：第一稿被
+    拦下、重写稿通过质检，但这一条的生成出过问题，半自动要保守（engine.semi_auto，§5.6 客服可能
+    不看就发），所以不标"可直接发送"，由客服看过再发；页面的说明写明了。"""
     view = showcase.chat("pdd", "qa_block")
     assert view["trace"]["understand"]["intent"] == "shipping_policy"
     assert view["trace"]["qa_summary"]["blocked"] == 1
     [card] = _cards(view)
-    assert card["prefill"] is True and "24 小时" in card["text"]
+    assert card["prefill"] is False and "24 小时" in card["text"]
+    assert view["result"]["input_prefill"] is None
     scenarios = showcase.get(f"{API}/scenarios", platform="pdd").json()["scenarios"]
     expect = next(s for s in scenarios if s["id"] == "qa_block")["expect"]
-    assert "可直接发送" in expect and "客服核对" in expect
+    assert "不标「可直接发送」" in expect and "客服看过" in expect
 
 
 def test_alerts_block_prefill(showcase: Showcase):

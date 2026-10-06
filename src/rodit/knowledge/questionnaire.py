@@ -3,7 +3,9 @@
 商家开通时回答 15 个问题：1–13 写进店铺政策（PolicyKey），14 禁用词、15 语气和称呼写进
 店铺配置覆盖项（Shop.config_overrides，§9.3）；13 客服工作时间看得懂时（"9:00-23:00"、
 "早9点到晚11点"……，见 parse_service_hours_text）同时写进 ShopConfig.service_hours（北京时间，
-全自动先在非工作时间试行用，§15 Phase 3），看不懂就只留政策原文。
+全自动先在非工作时间试行用，§15 Phase 3）；看不懂时政策原文照写，ShopConfig.service_hours 清空
+（替换掉原来的时段：不知道客服什么时候在岗就不全自动），并提醒商家到设置页填写
+（questionnaire_warnings）。
 
 一题可能对应两个政策键（如第 1 题"付款后多久发货？预售商品怎么说明？"对应 ship_time 和
 presale），商家只写一段回答。拆分规则：
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -233,6 +236,13 @@ _HOURS_SHORT = re.compile(
 )
 _HOURS_DAYS = re.compile(r"周[一二三四五六日天末]|星期|礼拜|工作日|节假日|节日|假期|法定|双休|单休")
 _HOURS_ALL_DAY = re.compile(r"全天|24\s*(?:小时|h)|二十四小时|不打烊")
+_HOURS_OFF_DUTY = re.compile(
+    r"休息|午休|午饭|吃饭|不在|没有客服|没客服|无客服|没人|无人|离线|下线|下班|机器人|自动|托管|值班"
+    r"|留言|除外|以外|之外|不含|不包括|除了|暂停"
+)
+"""说客服不在岗（或"除了……"）的字眼：写了这些，文字里的时段可能是下班、午休、机器人值班的时间，
+按时段读出来就把它当成了客服在岗的时间（全自动反而在客服在岗时回复），所以整段不认。"""
+_HOURS_HINT = "请只写客服在岗的时段，如 09:00-23:00"
 _PM = frozenset({"下午", "傍晚", "晚上", "晚", "夜里", "夜间"})
 _CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4}
 _CN_DIGITS |= {"五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
@@ -263,9 +273,10 @@ def _minute(colon: str | None, dian_minute: str | None) -> int:
 
 
 def _hour_24(period: str | None, hour: int, *, end: bool) -> int:
-    """按"早 / 下午 / 晚上"换成 24 小时制。晚上 12 点是半夜：作结束是 24，作开始是 0。"""
+    """按"早 / 下午 / 晚上"换成 24 小时制。晚上 12 点、晚上 0 点都是半夜（不是中午）：
+    作结束是 24，作开始是 0。"""
     if period in _PM:
-        if hour == 12:
+        if hour in (0, 12):
             return 24 if end else 0
         return hour + 12 if hour < 12 else hour
     if period == "中午":
@@ -288,11 +299,15 @@ def parse_service_hours_text(answer: str) -> list[str]:
 
     认得："9:00-23:00""09：00～23：00""9点到22点""早9点到晚11点""早上九点到晚上十一点半"
     "下午1点到5点""8:00-12:00，13:30-22:00"（多个时段）"早9晚11""全天 / 24 小时"。
-    看不懂时抛 ValueError（原因给商家看），调用方决定怎么办（问卷只留政策原文，设置页提示改写）：
+    晚上 / 夜里的 0 点、12 点是半夜（"早9点到晚0点" → 09:00-24:00）。
+    看不懂时抛 ValueError（原因给商家看），调用方决定怎么办（问卷清空时段并提醒，设置页提示改写）。
+    宁可不认也不猜——猜错了全自动会在客服在岗时回复：
     - 按星期、节假日区分的（"周一至周五……"）：一个店铺只有一套每天的时段，不猜；
+    - 写了不在岗的说明（"晚上11点到早上9点不在线""12:00-13:30午休""机器人值班""……除外"，
+      见 _HOURS_OFF_DUTY）：里面的时段可能是下班时间，不猜；
+    - 既写全天 / 24 小时又写了具体时段（"全天在线，12:00-13:30"）：说不准哪个是客服在岗的时间；
     - 结束时间是 1–12 点、又没写上午 / 晚上、也不是 HH:MM 写法（"9点到11点"）：说不准是上午 11 点
-      还是晚上 11 点，不猜——猜错了全自动会在客服在岗时回复。开始写了下午 / 晚上时，结束跟着算
-      （"下午1点到5点" → 13:00-17:00）。
+      还是晚上 11 点，不猜。开始写了下午 / 晚上时，结束跟着算（"下午1点到5点" → 13:00-17:00）。
     """
     text = unicodedata.normalize("NFKC", answer or "").strip()
     if not text:
@@ -301,6 +316,12 @@ def parse_service_hours_text(answer: str) -> list[str]:
         raise ValueError(f"最多 {MAX_SERVICE_HOURS_TEXT} 个字")
     if _HOURS_DAYS.search(text):
         raise ValueError("按星期或节假日区分的时间暂不支持，请写每天的时段，如 09:00-23:00")
+    off_duty = _HOURS_OFF_DUTY.search(text)
+    if off_duty is not None:
+        raise ValueError(
+            f"写了「{off_duty.group(0)}」这类不在岗的说明，分不清哪段是客服在岗的时间，{_HOURS_HINT}"
+        )
+    all_day = _HOURS_ALL_DAY.search(text) is not None
     windows: list[str] = []
     for m in _HOURS_RANGE.finditer(text):
         p1, h1, _, cm1, _, dm1, p2, h2, c2, cm2, _, dm2 = m.groups()
@@ -320,11 +341,31 @@ def parse_service_hours_text(answer: str) -> list[str]:
             start = (_cn_number(h1), 30 if half1 else 0)
             finish = (_hour_24("晚", _cn_number(h2), end=True), 30 if half2 else 0)
             windows.append(_window(start, finish))
-        elif _HOURS_ALL_DAY.search(text):
-            windows.append("00:00-24:00")
+    if all_day:
+        if windows:  # 原来只认具体时段、把"全天"丢掉：具体时段可能是午休等不在岗的时间
+            raise ValueError(
+                "既写了全天又写了具体时段，分不清客服什么时候在岗；全天在岗只写「全天」，"
+                f"否则{_HOURS_HINT}"
+            )
+        windows.append("00:00-24:00")
     if not windows:
         raise ValueError("没有认出时段，请写成 09:00-23:00 这样（北京时间）")
     return normalize_service_hours(windows)
+
+
+def _service_hours_answer(answer: str) -> tuple[list[str], str | None]:
+    """第 13 题的回答 → (时段, 看不懂的原因)。看不懂时时段是空列表（清空：不知道就不全自动）。"""
+    try:
+        return parse_service_hours_text(answer), None
+    except ValueError as exc:
+        return [], str(exc)
+
+
+SERVICE_HOURS_WARNING = (
+    "第 {qid} 题的客服工作时间没有看懂：{why}。店铺的客服工作时间已清空（不知道客服什么时候在岗，"
+    "就不开全自动），请到控制台「设置」里按 09:00-23:00 这样填写客服工作时间（北京时间）。"
+)
+"""问卷第 13 题看不懂时给商家的提醒（问卷接口响应的 warnings）。"""
 
 
 # ================================================================ 15：语气与称呼
@@ -388,8 +429,10 @@ def apply_questionnaire(
     - answers：题号 → 回答文字；空白回答跳过；题号不存在抛 ValueError；
     - now：写进 PolicyEntry.updated_at，必须带时区；
     - 返回 (政策条目，按题号、键顺序；config_overrides 补丁)。补丁里的 banned_words 是完整列表
-      （替换，不追加），合并进 Shop.config_overrides 由调用方完成；第 13 题看得懂时补丁里有
-      service_hours（完整列表，替换），看不懂时只写政策原文、补丁里没有这一项。
+      （替换，不追加），合并进 Shop.config_overrides 由调用方完成；答了第 13 题时补丁里有
+      service_hours（完整列表，替换）：看不懂时是空列表——原来的时段不能留着（全自动会按旧时段跑），
+      不知道客服什么时候在岗就不全自动（engine.modes 的 no_service_hours）；给商家的提醒见
+      questionnaire_warnings。
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now 必须带时区")
@@ -413,10 +456,23 @@ def apply_questionnaire(
         if "tone" in item.config_fields:
             patch.update(parse_tone(answer))
         if "service_hours" in item.config_fields:
-            try:
-                patch["service_hours"] = parse_service_hours_text(answer)
-            except ValueError:
-                pass  # 看不懂就只留政策原文（商家可以在设置页填）
+            patch["service_hours"], _ = _service_hours_answer(answer)  # 看不懂时清空
     assert set(patch) <= SHOP_CONFIG_FIELDS
     ShopConfig.model_validate(patch)  # 补丁取值必须合法
     return entries, patch
+
+
+def questionnaire_warnings(answers: Mapping[int, str]) -> list[str]:
+    """问卷回答里要提醒商家的事（问卷接口响应里给商家看）：目前只有客服工作时间（第 13 题）
+    没看懂——apply_questionnaire 已把时段清空，请商家到设置页按 09:00-23:00 这样填写。"""
+    warnings: list[str] = []
+    for item in QUESTIONNAIRE:
+        answer = answers.get(item.id)
+        if "service_hours" not in item.config_fields or not isinstance(answer, str):
+            continue
+        if not answer.strip():
+            continue
+        _, why = _service_hours_answer(answer)
+        if why is not None:
+            warnings.append(SERVICE_HOURS_WARNING.format(qid=item.id, why=why.rstrip("。")))
+    return warnings

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -19,8 +20,12 @@ from rodit.aftersale.evidence_vision import (
     NOTE_FAILED,
     SUMMARY_PREFIX,
     EvidenceReading,
+    evidence_batch,
     read_evidence,
 )
+from rodit.app import AssistService
+from rodit.app.aftersale_desk import AfterSaleDesk
+from rodit.app.demo import build_demo_unit
 from rodit.core.audit import AuditAction, InMemoryAuditSink
 from rodit.core.config import AfterSaleConfig, EngineConfig, effective_shop_config
 from rodit.core.enums import AfterSaleReason, AfterSaleStatus, ImageKind, ReviewAdvice, ReviewState
@@ -283,3 +288,140 @@ def test_status_changes_do_not_skip_vision_on_reevaluate():
     review = env.asst.refresh(SHOP_A, "as_2009")
     assert review.reason.endswith("图片理解（仅供参考）：1 张凭证未识别出破损、质量瑕疵或错发漏发")
     assert review.platform_status == AfterSaleStatus.PENDING_REVIEW
+
+
+# ================================================================ 批量审核：共用预算和熔断
+
+
+class _Hung(FakeImageUnderstanding):
+    """视觉模型挂住：analyze 一直等到 release（refs 记下开始识别的图，finished 记做完的张数）。"""
+
+    def __init__(self) -> None:
+        super().__init__(DEMO_IMAGE_FINDINGS)
+        self.release = threading.Event()
+        self.refs: list[str] = []
+        self.finished = 0
+        self._lock = threading.Lock()
+
+    @property
+    def started(self) -> int:
+        return len(self.refs)
+
+    def analyze(self, shop_id: str, image: ImageRef) -> ImageFinding:
+        with self._lock:
+            self.refs.append(image.ref)
+        try:
+            self.release.wait(10)
+            return super().analyze(shop_id, image)
+        finally:
+            with self._lock:
+                self.finished += 1
+
+
+def test_batch_skips_vision_after_one_review_timed_out():
+    """一批里有一张单的识别超时（视觉模型可能挂了）：这一批剩下的单不再识别，理由里写未能识别；
+    单张审核（不在批量里）照旧每张单都识别。"""
+    vision = _Hung()
+    env = Env(vision=vision, vision_timeout_s=0.05)
+    _with_images(env, "as_2004", ["img_as2009_1"], reason=AfterSaleReason.QUALITY)
+    try:
+        with evidence_batch():
+            first = env.asst.review(SHOP_A, "as_2009")
+            calls_after_first = vision.started
+            second = env.asst.review(SHOP_A, "as_2004")
+        assert calls_after_first == 3 and vision.started == 3  # 第二张单没有再调用
+        assert first.reason.endswith(NOTE_FAILED) and second.reason.endswith(NOTE_FAILED)
+        assert second.state == ReviewState.CONFIRM and second.matched_rules == ["R5"]
+        # 批量之外：照旧识别（熔断只管这一批）
+        _with_images(env, "as_2004", ["img_as2009_2"], status_version="v2")
+        env.asst.refresh(SHOP_A, "as_2004")
+        assert vision.refs[3:] == ["img_as2009_2"]
+    finally:
+        vision.release.set()
+
+
+def test_batch_budget_caps_the_total_wait():
+    """一批的识别加起来不超过预算：预算用完后的单不再识别（不用等到某张单超时）。"""
+    clock = [0.0]
+    env = Env()
+    _with_images(env, "as_2004", ["img_as2009_1"], reason=AfterSaleReason.QUALITY)
+    with evidence_batch(10.0, now=lambda: clock[0]):
+        first = env.asst.review(SHOP_A, "as_2009")
+        assert len(env.vision.calls) == 3 and NOTE_FAILED not in first.reason
+        clock[0] = 10.0  # 预算用完
+        second = env.asst.review(SHOP_A, "as_2004")
+    assert len(env.vision.calls) == 3
+    assert second.reason.endswith(f"{SUMMARY_PREFIX}{NOTE_FAILED}")
+
+
+def test_evidence_batch_rejects_bad_budget():
+    with pytest.raises(ValueError), evidence_batch(0):
+        pass
+
+
+def test_timed_out_vision_is_tracked_until_it_finishes():
+    """超时被丢下的识别记在审核助手的后台任务里（取消订购删数据之前等它们做完）。"""
+    vision = _Hung()
+    env = Env(vision=vision, vision_timeout_s=0.05)
+    try:
+        env.asst.review(SHOP_A, "as_2009")
+        assert vision.finished < vision.started
+        assert not env.asst.wait_background(SHOP_A, timeout=0)
+        assert env.asst.wait_background(SHOP_B, timeout=0)  # 别的店铺不受影响
+    finally:
+        vision.release.set()
+    assert env.asst.wait_background(SHOP_A, timeout=5)
+    assert vision.finished == vision.started == 3
+
+
+# ================================================================ 售后工作台批量跑规则
+
+
+def _desk_service(vision: FakeImageUnderstanding) -> AssistService:
+    world = build_demo_world()
+    info = world.aftersale(SHOP_A, "as_2004")  # 质量问题补了凭证：和 as_2009 一样命中 R5
+    patched = info.model_copy(update={"evidence_images": ["img_as2009_1"], "evidence_count": 1})
+    world.aftersales = [patched if a is info else a for a in world.aftersales]
+    unit = build_demo_unit(world.shop(SHOP_A).platform, world=world)
+    unit.vision.analyze = vision.analyze  # type: ignore[method-assign]  # 引擎和审核助手同一个实例
+    return AssistService(unit)
+
+
+def test_desk_batch_stops_waiting_for_a_hung_vision_model():
+    """售后工作台一次跑一批（最多 50 张）：视觉模型挂住时，第一张 R5 单等到这一批的预算就熔断，
+    后面的 R5 单不再识别——一次请求不会因为每张单各等 8 秒而拖到几分钟。"""
+    vision = _Hung()
+    service = _desk_service(vision)
+    desk = AfterSaleDesk(service.unit, service.review_aftersale, vision_budget_s=0.3)
+    started = time.monotonic()
+    try:
+        result = desk.review_pending(SHOP_A, limit=50)
+        elapsed = time.monotonic() - started
+    finally:
+        vision.release.set()
+    reviews = {o.aftersale_id: o.review for o in result.outcomes if o.review is not None}
+    assert {"as_2004", "as_2009"} <= set(reviews)
+    assert reviews["as_2004"].reason.endswith(NOTE_FAILED)
+    assert reviews["as_2009"].reason.endswith(NOTE_FAILED)
+    assert vision.refs == ["img_as2009_1"]  # 只有第一张 R5 单调用了
+    assert elapsed < 0.3 + 2.0
+
+
+def test_revoke_waits_for_vision_left_running_by_a_review():
+    """取消订购：先等审核助手留在后台的识别做完再删数据（迟到的写入一并删掉，§8.4）。"""
+    vision = _Hung()
+    service = _desk_service(vision)
+    AfterSaleDesk(service.unit, service.review_aftersale, vision_budget_s=0.1).review_pending(
+        SHOP_A, limit=50
+    )
+    assert vision.finished < vision.started
+    service.background_drain_s = 5.0
+    timer = threading.Timer(0.2, vision.release.set)
+    timer.start()
+    try:
+        counts = service.revoke_shop(SHOP_A)
+    finally:
+        timer.cancel()
+        vision.release.set()
+    assert counts is not None
+    assert vision.finished == vision.started == 1

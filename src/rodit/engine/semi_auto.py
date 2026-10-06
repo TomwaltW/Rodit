@@ -8,7 +8,9 @@
 2. 路由是正常的规则 6 回答（ANSWER）：不是高风险（规则 4；routing.high_risk、投诉再查一次）、
    不是分条（规则 5）、不是澄清（规则 7）、不是站外话术或安抚（规则 1、3），判断层没有降级；
 3. 路由的问题类型置信度 ≥ routing.semi_auto_threshold；
-4. 卡片通过了质检、置信度为高、没有风险提示，草稿不是澄清问题；
+4. 卡片通过了质检、置信度为高、没有风险提示，草稿不是澄清问题；这一条（同一次"找 → 写 → 判"）
+   没有草稿被质检拦下过——第一稿被拦、带原因重写后才通过的也不打：生成本身出过问题，
+   客服可能不看就发（§5.6 风险），宁可让客服自己看一眼；
 5. 这条消息没有任何提醒（要人工、情绪激动、可能漏答、连续没听懂、证据包里的提醒……），
    也没有任何降级（engine 的降级标记）。
 
@@ -33,6 +35,7 @@ BLOCK_ROUTE = "route"  # 不是规则 6 的正常回答（分条、澄清、站�
 BLOCK_HIGH_RISK = "high_risk"  # 高风险类型（§6.6 规则 4）
 BLOCK_CONFIDENCE = "confidence"  # 问题类型置信度没达到 semi_auto_threshold
 BLOCK_QA = "qa"  # 没通过质检
+BLOCK_QA_BLOCKED = "qa_blocked"  # 这一条有草稿被质检拦下过（如第一稿被拦、重写稿才通过）
 BLOCK_CLARIFY = "clarify"  # 草稿是澄清问题
 BLOCK_CARD_CONFIDENCE = "card_confidence"  # 卡片置信度不是高
 BLOCK_RISK_HINTS = "risk_hints"  # 卡片有风险提示
@@ -51,8 +54,11 @@ def prefill_blocker(
     qa: QAResult,
     alerts: Sequence[str] = (),
     degraded: Sequence[str] = (),
+    qa_blocked: int = 0,
 ) -> str | None:
-    """第一张卡片能不能打 prefill：能 → None；不能 → 第一条不满足的条件（BLOCK_*）。"""
+    """第一张卡片能不能打 prefill：能 → None；不能 → 第一条不满足的条件（BLOCK_*）。
+
+    qa 是这张卡片那份草稿的质检结果；qa_blocked 是这一条里被质检拦下的草稿数（含重写之前的）。"""
     if mode != Mode.ASSIST:
         return BLOCK_MODE
     if route.intent not in config.semi_auto_intents or card.intent != route.intent:
@@ -67,6 +73,8 @@ def prefill_blocker(
         return BLOCK_CONFIDENCE
     if not qa.passed:
         return BLOCK_QA
+    if qa_blocked > 0:
+        return BLOCK_QA_BLOCKED
     if draft.need_clarify or draft.variant == "clarify":
         return BLOCK_CLARIFY
     if card.confidence != Confidence.HIGH:
@@ -90,6 +98,7 @@ __all__ = [
     "BLOCK_INTENT",
     "BLOCK_MODE",
     "BLOCK_QA",
+    "BLOCK_QA_BLOCKED",
     "BLOCK_RISK_HINTS",
     "BLOCK_ROUTE",
     "prefill_blocker",
