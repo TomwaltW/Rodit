@@ -16,10 +16,46 @@ uv run ruff check . && uv run ruff format --check .
 
 bash scripts/dev-pg.sh           # 可选：启动本机 PostgreSQL，跑存储层测试
 uv run python -m rodit.app.demo  # 用合成数据跑方案 §11 的核心流程（不需要任何密钥）
-uv run python -m rodit.api       # 本地接口 + 模式 C 网页工具 http://127.0.0.1:8000/assist、商家控制台 /console
-                                 # （启动时打印仅本地演示用的合成令牌，粘贴到网页登录）
+uv run python -m rodit.showcase  # 客户演示站 http://127.0.0.1:8100/（不用登录，见下一节）
+uv run python -m rodit.api       # 本地接口 + 模式 C 网页工具 http://127.0.0.1:8000/assist、商家控制台 /console、
+                                 # 售后审核工作台 /aftersale（启动时打印仅本地演示用的合成令牌，粘贴到网页登录）
 uv run python -m rodit.eval      # §13 评测（324 条合成用例；--llm env 用真实大模型）
+uv run python -m rodit.eval.compare  # 判断层离线对比（§6.3、§6.4、§13.3；--jev env 跑 Jev，只发合成数据）
 ```
+
+### 客户演示站（给商家演示用）
+
+```bash
+uv run python -m rodit.showcase                      # 打开 http://127.0.0.1:8100/
+uv run python -m rodit.showcase --platform douyin    # 打开时先显示抖店（taobao / douyin / pdd）
+uv run python -m rodit.showcase --host 0.0.0.0       # 局域网投屏（没有登录，会提醒；只有合成数据）
+```
+
+独立的 FastAPI 应用（`rodit.showcase`），不挂进生产的 `create_app`，平台单元的部署入口（`rodit.ops`）也不带它。
+页面上跑的是真实的问答引擎、售后审核助手和报表，数据全是合成的、大模型是离线替身，不联网：
+
+- **产品概览**：懂→找→写→判→兜底五步、决定架构的三个发现（§0）、§1.3 目标和演示单元的当前值、三平台对比（§2.1）。
+- **智能辅助工作台**：预设的买家会话（§11 尺码咨询、物流查询、签收未收到、站外交易、质检拦截、多问题分条、
+  情绪激动、投诉、价格、破损照片、尺码截图……），讲解的人也可以自己扮买家打字、发合成图片；右侧是推荐卡片
+  （依据、置信度、风险提示，发送 / 编辑后发送 / 不合适），下面的「AI 是怎么想的」逐步展示路由概率、
+  命中的 §6.6 规则、证据、质检分数和各环节耗时。半自动开放的类型标「已填入输入框」。拼多多是模式 C（§8.1）。
+- **售后审核助手**：待审核售后单的 R1–R8 建议、§7.3.2 状态机、人确认后执行（重读状态、幂等键）。
+- **数据看板**：采纳率趋势、问题类型分布、弃用原因、质检拦截、耗时，平台客服指标接入前后对比（§12.4）。
+- **合规与部署**：每个平台云一个单元（§9.1）、个人信息打码的现场演示（§5.3）、话术硬规则、Jev 接口兼容。
+
+三个平台各一个演示单元（§9.1），第一次打开某个平台时回放近 5 周的合成历史（约 1.5 秒），「重置演示」重新生成。
+`--llm env` 用 `RODIT_LLM_*` 的真实大模型写回答（只允许本机地址；路由、质检、历史回放仍用离线替身），
+只在本地开发机上用。§11.5 质检拦截场景的第一稿是演示脚本写的（页面上有标注），拦截和重写是真实的质检和引擎。
+
+- 只认监听地址对应的 Host（防 DNS 重绑定）：默认用 http://127.0.0.1:8100/、http://localhost:8100/ 或
+  http://[::1]:8100/ 打开；`--host` 指定了地址时只能用这个地址；`--host 0.0.0.0` / `::` 不限 Host。
+  写操作的 Origin 和 Host 不一致（别的网站发来的跨站请求）返回 403。
+- 写操作（推荐反馈、售后确认、协商）带页面载入时演示单元的编号：别的窗口重置过或服务重启过时返回
+  409 `stale_epoch`，页面提示并重新载入，重置前的卡片不会落到重置后编号相同的推荐上。
+- `--llm env` 时 `RODIT_LLM_*` 没设或格式不对就拒绝启动（退出码 2，提示里没有密钥）；「推荐出现时间」只算
+  演示时现发的消息（回放的历史是离线替身，不计入），还没有时显示「暂无真实大模型数据」。
+- 「平台话术违规」和上线门槛的合规扫描（`rodit.feedback.compliance`）用同一份词表，客服编辑时加的手机号、
+  邮箱也算；「售后误操作」只展示写操作次数和防护措施，标「后续评估」（对错要人工复核）。
 
 演示默认用离线替身：路由用关键词规则、生成只复述依据、质检用启发式判断，所以能在没有大模型的
 环境里跑通"懂→找→写→判"全链路。设置 `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` / `RODIT_LLM_API_KEY`
@@ -104,6 +140,7 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `train-classifier --out 文件 [--min-samples N] [--force] [--overwrite] [--config YAML]` | §6.4 用反馈标注训练路由分类器：报告留出集和评测集上对比关键词规则的效果，原子写入模型文件（JSON） |
 | `onboard-shop --shop-id … (--token-stdin \| --token-file 文件) [--granted-at 平台开通时间] …` / `refresh-tokens` / `purge-expired [--dry-run]` / `revoke --shop-id …` / `set-status --shop-id … --status …` | §8.4 店铺生命周期（见下文"上线就绪"）。除了 `--dry-run` 都要拿单副本租约：`serve` 在跑时拒绝执行（退出码 2），日志写明改用哪个接口或 `serve` 里的哪个定时任务 |
 | `record-eval --report 结果.json` / `acceptance-report --since … [--json]` / `compliance-scan [--week …]` | §13.2、§13.4、§15 上线门槛的数据和 Phase 1 验收报告 |
+| `sync-platform-metrics [--days N] [--shop-id …]` | §12.4 从平台指标接口同步客服考核数据（见"Phase 2 / 3"） |
 
 `recalibrate` 和 `train-classifier` 是离线任务，标注从 `RODIT_TRAINER_DSN` 读（这个登录账号要能
 `SET ROLE rodit_trainer`，只能跨店读 `labeled_sample`，读不到别的表）；退出码 0 完成、1 数据库不可用、
@@ -159,7 +196,9 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
   `adapters` 实现 `PlatformAdapter`（模式 A / B；用 `ctx.hasher` 把平台买家 ID 变成 `buyer_ref`；`peek_shop_id` 不改状态）；
   `action_port` 二期才有（写售后，必须人确认）；`shop_ids` 返回订购列表（授权过期告警用）；
   `catalog` 实现 `ItemCatalog`（平台商品接口，只读）、`ocr` 实现 `ImageTextExtractor`（详情图 OCR，图片不出云），
-  用于商家控制台的商品同步（§5.2.3），不给时同步接口返回 503。
+  用于商家控制台的商品同步（§5.2.3），不给时同步接口返回 503；
+  `vision` 实现 `ImageUnderstanding`（平台云内的视觉模型，买家图片和售后凭证，返回的文字要先打码；不给时没有图片理解）；
+  `metrics_source` 实现 `PlatformMetricsSource`（平台客服考核数据，只读；不给时报表只有商家登记的数）。
 - **令牌文件**：由平台的登录体系（工作台子账号等）签发令牌，写进挂载的密钥文件（格式见 `rodit.ops.tokens`）。
 - **数据库账号**：属主账号给 `migrate` 任务；服务账号 `GRANT rodit_app TO <账号>`；
   离线训练 / 重算任务单独一个账号 `GRANT rodit_trainer TO <账号>`（`RODIT_TRAINER_DSN`）。
@@ -285,6 +324,87 @@ FAQ / 模板；超时的只留已经通过质检的 FAQ / 模板卡片，降级�
   （授权即将过期 / 已过期、任何串店、端到端 P95 > 5 秒、工具和大模型失败率、降级突增、就绪失败、抓不到指标、
   后台任务出错）。Prometheus 抓取任务的 `job_name` 要叫 `rodit`（`RoditScrapeDown` 按它找目标）。
 
+## Phase 2 / 3：售后审核工作台、平台指标接入前后对比、全自动与半自动、图片理解、判断层对比（方案 §15）
+
+**售后审核工作台（§7.3.2、§15 Phase 2）**：网页 `/aftersale`（客服、店长、商家；和 `/assist`、`/console` 同样的
+登录和安全约束）。
+
+| 接口 | 作用 |
+|---|---|
+| `GET /v1/shops/{shop_id}/aftersales` | 待审核队列：平台待审核的售后单 + 本地还没结束的审核记录，按紧急程度排；只读，不跑规则 |
+| `POST /v1/shops/{shop_id}/aftersales/review-pending` | 批量"拉取并跑规则"（最多 20 张，逐张报告结果，单张失败不影响别的） |
+| `GET /v1/shops/{shop_id}/aftersales/{aftersale_id}` | 详情：平台快照、命中规则和理由、本平台支持的操作（拼多多没有拒绝接口）、能否确认（R6 店长）、有没有写售后权限 |
+| `GET /v1/shops/{shop_id}/aftersales/stats` | 各状态条数、按规则的待处理数、平均审核时长（申请 → 经工作台人工确认执行；抖店"售后平均审核时长"的参考） |
+
+建议、协商、确认执行仍是原来的 `aftersales/{id}/review | negotiate | negotiation-done | confirm`：
+确认前重读平台状态、核对状态版本、带幂等键，写操作一律要人确认。统计不读平台：申请时间取确认执行时写进
+`aftersale.confirm` / `aftersale.action` 审计的 `aftersale_created_at`（之前确认的单计入"时长未知"）；
+列表和统计整批读审核记录。批量跑规则时 R5 凭证的图片识别这一批共用 20 秒预算、超时一次就熔断
+（其余单的理由注明"凭证图片未能识别"）。
+
+**平台客服指标接入前后对比（§1.3、§2.1、§12.4、§15 Phase 2）**：每个平台只看本平台的考核指标
+（`core.platform_metrics`：淘宝 3 分钟人工响应率；抖店飞鸽平均响应时长、会话不满意率、平台求助率、售后平均审核时长；
+拼多多 3 分钟人工回复率）。数据来源按优先级：平台接口（平台绑定 `metrics_source`）> 商家登记 > 系统估算。
+接入日期：填写的 > 第一次切到智能辅助 > 这次开通的时间（该店最早的 `auth.granted` 审计，优先用平台事件时间；
+续订不改变它）> `ShopAuth.granted_at`（续订会改写，只作兜底）> 未知；接入前后各取 28 天，按样本量加权，给出每项的变化和
+"较接入前改善 / 有好有坏 / 变差 / 数据不足"。
+
+| 接口 / 命令 | 角色 |
+|---|---|
+| `GET /v1/shops/{shop_id}/reports/platform-metrics?go_live=&window_days=` | 店长、商家、复核人员 |
+| `GET /v1/shops/{shop_id}/platform-metrics?since=&until=`（原始数据） | 同上 |
+| `POST /v1/shops/{shop_id}/platform-metrics`（商家登记一天的数） | 商家 |
+| `POST /v1/shops/{shop_id}/platform-metrics/sync?days=`（同步平台数据） | 店长、商家 |
+| `python -m rodit.ops sync-platform-metrics [--days N] [--shop-id ID …]` | 运维；不拿单副本租约（原因见模块说明），每天一次 |
+
+存储是迁移版本 6 的 `platform_metric` 表（行级安全按店铺隔离，离线训练账号读不到；取消订购一并删除）。
+商家控制台「报表」页有"平台客服指标 · 接入前后对比"一节。
+
+**全自动先在非工作时间试行（§15 Phase 3）**：全自动除了总开关（`auto_reply_enabled`，要平台准入）和类型阈值，
+还看生效时段 `auto_reply_schedule`：默认 `off_hours`，只在店铺客服工作时间（`service_hours`，北京时间，
+如 `09:00-23:00`，可跨午夜）以外自动回复；没填工作时间就不自动（`always` 才全天）。被时段拦下的消息
+转给人工、照常出推荐，`engine.result` 记 `auto_gate`。工作时间商家可以在控制台「设置」里改，问卷第 13 题
+（"早9点到晚11点"之类）也会写进去；生效时段只能由我们改。工作时间只认"在岗时段"，读不准就不认（宁可不自动）：
+带休息、午休、不在、下班、机器人、值班、以外、除了……这类说明的拒绝，"全天 / 24 小时"和具体时段混写的拒绝，
+"晚上 0 点 / 12 点"按午夜算；问卷第 13 题读不懂时清空工作时间（不能全自动），接口返回 `warnings` 提醒商家去「设置」填。
+
+**半自动（§5.6、§13.4）**：复核人员按类型开启（`POST /v1/shops/{shop_id}/rollout/semi-auto`，商家和复核人员都能关）：
+最近 2 个完整周、每周至少 10 组推荐、原样采纳率 ≥ 90% 才能开，没过门槛要强制并写原因；高风险类型永远不能开。
+开了的类型，置信度 ≥ `routing.semi_auto_threshold`（0.9）、规则 6 正常回答、质检一次就通过（被质检拦过、重写后
+才通过的不算）、没有提醒和降级的第一条推荐
+带 `prefill`：工作台插件直接填进输入框，客服按发送（不是自动发送）。上线状态（`rollout/status`）带各类型的门槛
+和全自动的生效时段；控制台「上线」页可以操作。
+
+**图片理解（§15 Phase 3）**：买家发来的图片（模式 A / B，最多 3 张）交给平台云内的视觉模型（平台绑定 `vision`，
+`core.ports.ImageUnderstanding`，返回的文字必须已打码），每条消息另有 1.5 秒的识别预算。识别结果写成打码后的
+描述进路由和生成（物流 / 订单截图和其他图片可能有收件人姓名，进提示词和推荐记录的只有类型名，识别摘要只在
+给客服的提醒里）：破损、质量瑕疵、错发漏发 → 质量问题（推荐里先回应照片、引导在订单页申请售后并上传照片，
+不承诺处理结果）；尺码截图里的身高体重 → 尺码推荐；物流截图 → 物流问答；商品图 → 澄清是哪一款。
+每条带图片的消息都给客服一条提醒（识别摘要"仅供参考"，或"没能识别，请自己看图"），所以不会被半自动填入、
+也不会被全自动发出。识别失败、超时记 `vision` 降级，照常出推荐。售后 R5（质量问题）有凭证图片时，审核建议的
+理由后面加一句"图片理解（仅供参考）：…"，最多看 6 张，建议仍由客服决定。
+
+**判断层离线对比（§6.3、§6.4、§13.3；§15 Phase 0 / 3）**：
+
+```bash
+uv run python -m rodit.eval.compare                                  # 关键词规则（离线基线）
+uv run python -m rodit.eval.compare --classifier model.json --llm env \
+    --json ~/rodit-evals/compare.json                                 # 加上分类器、境内大模型
+set -a; source .env; set +a                                           # 只在本地开发机：RODIT_JEV_BASE_URL / RODIT_JEV_API_KEY
+uv run python -m rodit.eval.compare --providers rules,incloud_llm,jev --llm env --jev env
+```
+
+每个判断层收到完全相同的路由请求（§6.5 Jev 格式），报告类型准确率（总体、按类型、dev / test）、macro-F1、
+常见混淆、要人工 / 情绪的一致率（数据集没有逐条标注，用路由标注推出的近似标签，报告里注明）、
+校准（ECE、Brier、可靠性表）、§13.3 按类型的阈值和覆盖率、耗时和用量。跑了 Jev 时给出 §6.3 条件 4
+（"中文测试集上准确率和概率校准达到境内方案的水平"：类型准确率比境内最好的低不超过 1 个百分点、ECE 高出不超过
+0.02，可用 `--accuracy-tolerance` / `--ece-tolerance` 调）的结论，
+只对照 §6.4 的境内方案（境内大模型 `--llm env`、路由分类器 `--classifier`），关键词规则只是兜底、不作对照：
+只加 `--jev env` 时条件 4 判"无法判定"；`--limit` 抽样时也不下结论（数字照列）。macro-F1 按"算对"口径
+（答了可接受的备选类型算对）。条件 1–3 需要人工确认。只发合成数据；结论不代表 Jev 可以进生产链路（§6.2）。Jev 的环境变量：
+`RODIT_JEV_BASE_URL`（https，不带 `/api/v1/systemone`）、`RODIT_JEV_API_KEY`（只放本地 `.env`）、`RODIT_JEV_TIMEOUT_S`
+（默认 10）、`RODIT_JEV_MODEL`（默认 `jev-1.13.0`）。退出码 0 完成、2 配置不对。
+
 ## 一条买家消息怎么走（方案 §4.2）
 
 ```
@@ -311,7 +431,8 @@ FAQ / 模板；超时的只留已经通过质检的 FAQ / 模板卡片，降级�
 | `rodit.app` | 平台单元组装、应用服务、本地演示、生产组装 | §9.1 |
 | `rodit.api` | HTTP 接口（按店铺鉴权、串店拦截）；商家控制台、上线节奏与复核接口；模式 C 独立话术助手网页 `/assist`、商家 / 复核控制台网页 `/console` | §8.1、§8.4、§9.1、§9.2、§13.4 |
 | `rodit.ops` | 部署入口（`python -m rodit.ops`）、健康 / 就绪检查、Prometheus 指标、个人信息过滤的 JSON 日志 | §9.1、§12 |
-| `rodit.eval` | 合成评测集（324 条）、§13.2 评分、§13.3 阈值校准；离线替身或真实大模型、耗时与成本、回归比较；每月阈值重算、路由分类器训练 | §13、§12.1、§14、§6.4 |
+| `rodit.eval` | 合成评测集（324 条）、§13.2 评分、§13.3 阈值校准；离线替身或真实大模型、耗时与成本、回归比较；每月阈值重算、路由分类器训练；判断层离线对比（含 Jev） | §13、§12.1、§14、§6.3、§6.4 |
+| `rodit.showcase` | 客户演示站（独立应用，合成数据 + 离线替身）：产品概览、智能辅助工作台、售后审核、数据看板、合规与部署 | §0、§5、§7.3、§9.1、§11、§12.4 |
 
 ## 数据合规（摘自 CLAUDE.md）
 

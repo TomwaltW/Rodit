@@ -87,7 +87,9 @@ async function main() {
     await page.goto(`${BASE}/console`);
     await page.getByRole('heading', { name: '登录' }).waitFor();
     check((await page.locator('#platform-name').textContent()) === '淘宝', '平台名');
-    check((await page.locator('a.page-link').getAttribute('href')) === 'assist', '去话术助手的链接');
+    const links = await page.locator('a.page-link').evaluateAll((as) => as.map((a) => a.getAttribute('href')));
+    check(JSON.stringify(links) === JSON.stringify(['assist', 'aftersale']), '页头链接到话术助手和售后审核工作台');
+    check(await page.locator('#aftersale-link').isVisible(), '登录前显示去售后审核的链接');
     check(await page.locator('#app').isHidden(), '登录前不显示控制台');
     await login('wrong-token-0000000000000000');
     await page.locator('#error').filter({ hasText: '401' }).waitFor();
@@ -100,6 +102,7 @@ async function main() {
     // 令牌留给话术助手，但页头显示是谁、可以退出（不然看起来没登录）
     check((await page.locator('#identity').textContent()).includes('客服'), '客服：页头显示身份');
     check(await page.getByRole('button', { name: '退出' }).isVisible(), '客服：有退出按钮');
+    check(await page.locator('#aftersale-link').isVisible(), '客服：页头有去售后审核的链接');
     steps.push('login-guards');
 
     // ---------------------------------------------------------------- 店长：只读
@@ -276,6 +279,7 @@ async function main() {
     await login(TOKENS.reviewer);
     await page.locator('#identity').filter({ hasText: '复核人员' }).waitFor();
     check((await tab('复核').getAttribute('aria-selected')) === 'true', '复核人员默认进「复核」');
+    check(await page.locator('#aftersale-link').isHidden(), '复核人员：页头不显示去售后审核的链接');
     for (const name of ['知识', '政策', '商品', '设置', '报表']) check(await tab(name).isHidden(), `复核人员看不到「${name}」`);
     check(await page.locator('.access-notice').filter({ hasText: '访问日志' }).isVisible(), '访问留痕提示');
     await page.locator('#review-report .summary').filter({ hasText: DEFAULT_PERIOD }).waitFor();
@@ -333,10 +337,12 @@ async function main() {
     await page.locator('#error').filter({ hasText: '复核人员请使用商家控制台' }).waitFor();
     check(await page.locator('#assist').isHidden(), '话术助手页不给复核人员显示工具');
     check(await page.getByRole('button', { name: '退出' }).isVisible(), '复核人员：话术助手页有退出按钮');
+    check(await page.locator('#aftersale-link').isHidden(), '复核人员：话术助手页也不显示去售后审核的链接');
     await page.locator('#error a').click();
     await page.locator('#identity').filter({ hasText: '复核人员' }).waitFor();
     check(page.url() === `${BASE}/console`, '回到控制台');
     await signOut();
+    check(await page.locator('#aftersale-link').isVisible(), '退出后照常显示去售后审核的链接');
     steps.push('assist-link');
 
     // ---------------------------------------------------------------- 令牌从不出现在网址里

@@ -14,6 +14,9 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    撤回（on_recall，应用层在撤回事件里调用）：被撤回的那条消息触发的 SHOWN 推荐改成 EXPIRED，
    返回会话里仍在展示的推荐卡片给侧边栏刷新（§5.3 撤回的消息不再进上下文）；
 4. 会话理解（engine.understanding.ConversationBuilder）→ ConversationContext；
+   买家图片（§15 Phase 3，engine.images.ImageReader）：消息一到就记下它的图片标识，会话理解之后识别
+   当前买家消息里的图片，结果放进 ctx.image_findings、描述接在当前买家消息后面（路由、检索、生成、
+   质检都看得到），给客服一条图片摘要提醒；识别失败、超时记降级 "vision"，照常往下走；
 5. 路由 → RouteDecision，按 core.pipeline.ACTION_PLANS[route.action] 执行：
    - 检索（KnowledgeUnavailable → 不推荐，§12.2）；
    - ANSWER / HIGH_RISK_ANSWER：证据包没有依据、没有澄清问题、也没有查不到的工具 → 不生成，
@@ -37,6 +40,11 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    - 店铺在 ShopConfig.disabled_intents 里关闭的问题类型，回答类路由（含分条）不推荐。
 6. 推荐卡片（engine.cards，§5.6）写 SuggestionRecord（SHOWN；影子模式 SHADOW），
    question_text = mask_pii(当前买家消息)，回填 SuggestionCard.suggestion_id；
+   半自动（engine.semi_auto，§5.6、§13.4）：智能辅助下第一张卡片满足条件时 prefill=True
+   （店铺开了这个类型的半自动、规则 6 的正常回答、置信度够、卡片为高、这一条没有草稿被质检拦下过
+   ——重写后才通过的也不填，没有提醒和降级），
+   客服仍要按发送；记录写不进去（没有推荐编号）时去掉 prefill。SUGGEST 审计另加 prefill
+   （打了 prefill 的推荐编号，只在有时写）；
 7. 全自动（§5.6、§12.2、§12.3）：以下全部满足才出 auto_reply——
    ctx.mode == AUTO、ctx.config.auto_reply_enabled、route.auto_eligible、不是分条推荐、
    第一张卡片通过质检且置信度为高、卡片没有风险提示、结果没有提醒（含连续没听懂）、
@@ -44,6 +52,10 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    auto_reply = 第一张卡片、文本前加 generation.auto_reply_prefix（AI 生成内容标识，
    整个系统只在这里加）。不满足时退回智能辅助（照常给推荐），并且 transfer_to_human=True——
    §5.7 全自动模式下质检不通过、依据不足、投诉等都要转人工，§12.2 全自动出故障由客服接管。
+   全自动生效时段（engine.modes，§15 Phase 3 先在非工作时间试行）：消息是 AUTO、店铺开了全自动，
+   但现在是客服工作时间（或没填工作时间）→ 生效模式是 ASSIST（路由也按智能辅助走），照常给推荐，
+   并且 transfer_to_human=True（机器人接待的会话交给在岗客服，§12.2），engine.result 另加可选键
+   auto_gate（拦下原因，core.audit.RESULT_AUTO_GATE）。
    影子模式（§13.4）：mode=SHADOW，推荐只用于事后对比，app 层不得展示；不出 auto_reply、不转人工。
    影子记录每轮一套：乱序时重算最新一轮（run.late），这一轮（按最新买家消息的 msg_id）已经有
    SHADOW 记录就不再写第二套（事后对比不重复计数），结果照常返回（卡片没有 suggestion_id），
@@ -83,9 +95,10 @@ min_llm_remaining_s=latency.min_llm_remaining_s) 里处理（EngineConfig.latenc
 - "qa"           质检抛错 → 该草稿不推荐（没有验证过的文字不能推荐），保留已通过的
 - "budget"       时间预算不够，有步骤没做或草稿被丢掉（见上）
 - "tool:<kind>"  平台工具不可用：会话理解查订单（tool:order），或 EvidenceBundle.unavailable
+- "vision"       买家图片识别失败或超时（engine.images）→ 照常出推荐，提醒客服自己看图
 - "audit"        审计写入失败
 - "engine"       其他意外异常 → 不推荐
-和卡片内容有关的降级（decision、decision:qa、tool:*、storage、knowledge）会写进卡片的风险提示。
+和卡片内容有关的降级（decision、decision:qa、tool:*、storage、knowledge、vision）会写进卡片的风险提示。
 
 缺失知识（EngineResult.missing_knowledge）= 各证据包的 missing；没有依据、证据包又没说缺什么时记
 "knowledge:{intent}"。KnowledgeGap 只记知识类缺失（不记 core.evidence.MISSING_ORDER /
@@ -106,13 +119,15 @@ UNDERSTAND、ROUTE 各一条；RETRIEVE、GENERATE、QA 每次调用 / 每条分
 - "missing"     list[str]   同 EngineResult.missing_knowledge
 另有 "no_suggestion_reason"、"qa_checked"、"qa_reasons"、"transfer_to_human"；
 键的完整定义见 core.audit.ResultKey（常量 RESULT_DETAIL_KEYS，报表按同一份读）。
-超过时间预算时另加可选键 "budget_exceeded"（True，core.audit.OPTIONAL_RESULT_DETAIL_KEYS）。
+超过时间预算时另加可选键 "budget_exceeded"（True，core.audit.OPTIONAL_RESULT_DETAIL_KEYS）；
+全自动不在生效时段被拦下时另加可选键 "auto_gate"（core.audit.RESULT_AUTO_GATE，同在
+OPTIONAL_RESULT_DETAIL_KEYS 里）。
 
 耗时（EngineResult.latency_ms，§12.1、§12.4）：键固定为 understand / route / retrieve / generate /
 qa / total / since_received（LATENCY_KEYS），毫秒整数，没跑的环节为 0。分条并行时同一环节取各条里
 最长的（墙钟口径，和 total 对得上）；同一条里重写的几轮累加。各环节用 time.perf_counter 量墙钟耗时
 （单调时钟），不用注入的 Clock——Clock 只管业务时间戳（记录的 created_at 等）。
-understand 含店铺检查和会话理解；total 是整条消息从进入 handle 到出结果；since_received
+understand 含店铺检查、会话理解、图片识别；total 是整条消息从进入 handle 到出结果；since_received
 （core.audit.LATENCY_SINCE_RECEIVED）是从平台收到消息（交给 handle 的那条消息的 received_at）到
 出结果：Clock.now() − received_at，含排队、会话锁等待；时钟精度不够或两边时间对不齐时不小于 total。
 """
@@ -133,6 +148,7 @@ from rodit.core.audit import (
     DEGRADED_BUDGET,
     DEGRADED_TENANT_ISOLATION,
     LATENCY_SINCE_RECEIVED,
+    RESULT_AUTO_GATE,
     RESULT_BUDGET_EXCEEDED,
     AuditAction,
     ResultKey,
@@ -173,9 +189,11 @@ from rodit.core.pipeline import ACTION_PLANS, ActionPlan, risk_hint, soothe_with
 from rodit.core.ports import (
     AnswerGenerator,
     AuditSink,
+    Cache,
     ConversationRepository,
     EvidenceRetriever,
     FeedbackRepository,
+    ImageUnderstanding,
     KnowledgeRepository,
     QualityGate,
     Router,
@@ -198,7 +216,18 @@ from rodit.engine.concurrency import (
     run_inline,
     run_ordered,
 )
-from rodit.engine.understanding import ConversationBuilder, ShopInactive, effective_mode
+from rodit.engine.images import (
+    ALERT_VISION_FAILED,
+    DEGRADED_VISION,
+    MAX_IMAGES,
+    VISION_BUDGET_S,
+    ImageReader,
+    ImageReading,
+    describe_for_audit,
+)
+from rodit.engine.modes import resolve_mode
+from rodit.engine.semi_auto import prefill_blocker
+from rodit.engine.understanding import ConversationBuilder, ShopInactive
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +368,8 @@ class _Run:
     mode: Mode = Mode.ASSIST
     # 消息是 AUTO、但店铺 / 配置读不出来、生效模式无从判断：按全自动兜底转人工（§12.2）
     auto_unverified: bool = False
+    # 消息是 AUTO、店铺开了全自动，但不在全自动生效时段（engine.modes）：退回智能辅助并转人工
+    auto_gate: str | None = None
     # 乱序：本条晚到，改为重新处理会话里最新的买家消息（run.msg 已换成那条），不出 auto_reply
     late: bool = False
     ctx: ConversationContext | None = None
@@ -386,6 +417,8 @@ class AssistEngine:
     monotonic：时间预算用的单调时钟（秒，core.budget.Deadline 的 now），测试可以注入假的；
     外层已经有截止时间时（调用方设的）要用同一个时钟。
     交给线程池的任务按店铺记在 BackgroundWork 里，wait_background 等某家店的全部做完（取消订购用）。
+    vision / image_cache：买家图片理解和记图片标识、识别结果的短时缓存（engine.images；单元组装时
+    传单元缓存，取消订购一并删除）；vision 为空时不识别，只提醒客服买家发了图片。
     """
 
     def __init__(
@@ -404,6 +437,10 @@ class AssistEngine:
         clock: Clock,
         gaps: FeedbackRepository | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        vision: ImageUnderstanding | None = None,
+        image_cache: Cache | None = None,
+        vision_budget_s: float = VISION_BUDGET_S,
+        max_images: int = MAX_IMAGES,
     ) -> None:
         self._config = config
         self._monotonic = monotonic
@@ -418,6 +455,14 @@ class AssistEngine:
         self._gaps = gaps
         self._builder = ConversationBuilder(knowledge, conversations, tools, config, clock)
         self._background = BackgroundWork()
+        self._images = ImageReader(
+            vision,
+            image_cache,
+            clock,
+            max_images=max_images,
+            budget_s=vision_budget_s,
+            monotonic=monotonic,
+        )
 
     @property
     def builder(self) -> ConversationBuilder:
@@ -458,7 +503,7 @@ class AssistEngine:
     # ------------------------------------------------------------ 主流程
 
     def _handle(self, run: _Run) -> EngineResult | None:
-        msg = run.msg
+        msg = incoming = run.msg
         if msg.role != Role.BUYER:
             return None
 
@@ -478,7 +523,8 @@ class AssistEngine:
         if shop is not None:
             # 先定生效模式：后面任何一步失败，影子模式的结果也不能被展示
             try:
-                run.mode = effective_mode(msg.mode, self._builder.shop_config(shop))
+                decided = resolve_mode(msg.mode, self._builder.shop_config(shop), self._clock.now())
+                run.mode, run.auto_gate = decided.mode, decided.auto_gate
             except Exception as exc:  # noqa: BLE001 — 配置算不出来时会话理解会再失败一次
                 self._warn("shop_config", exc)
                 run.auto_unverified = msg.mode == Mode.AUTO
@@ -495,6 +541,7 @@ class AssistEngine:
             added = True
         if not added:
             return None
+        self._images.remember(msg)  # 同一 Turn 里后到的消息要用到这条的图片（engine.images）
         if shop is None:
             return self._finish(run, reason=shop_error)
         latest = self._newer_buyer_message(msg)
@@ -513,6 +560,7 @@ class AssistEngine:
         try:
             understanding = self._builder.build_with_notes(msg, shop=shop)
             ctx = understanding.context
+            run.auto_gate = understanding.auto_gate  # 和 ctx.mode 同一时刻判断的
             for code in understanding.degraded:
                 run.degrade(code)
                 run.context_notes.append(code)
@@ -531,9 +579,10 @@ class AssistEngine:
         run.add_latency("understand", t)
         if ctx is None:
             return self._finish(run, reason=reason)
+        ctx, images = self._read_images(run, ctx, incoming)
         run.ctx = ctx
         run.mode = ctx.mode
-        self._audit(run, AuditAction.UNDERSTAND, _understand_detail(ctx, run.context_notes))
+        self._audit(run, AuditAction.UNDERSTAND, _understand_detail(ctx, run.context_notes, images))
         threshold = self._config.conversation.unresolved_turns_alert
         if ctx.unresolved_turns >= threshold:
             run.alerts.append(ALERT_UNRESOLVED.format(n=ctx.unresolved_turns))
@@ -570,7 +619,7 @@ class AssistEngine:
         units = self._run_units(run, ctx, units, plan)
         self._record_gaps(run, ctx, units)
 
-        scored = self._cards(run, units)
+        scored = self._semi_auto(run, ctx, route, plan, units, self._cards(run, units))
         cards = self._persist(
             run, ctx, [(c, d) for c, d, _ in scored], confidences=[x for _, _, x in scored]
         )
@@ -582,6 +631,32 @@ class AssistEngine:
             units=units,
             auto_reply=auto_reply,
         )
+
+    # ------------------------------------------------------------ 买家图片（§15 Phase 3）
+
+    def _read_images(
+        self, run: _Run, ctx: ConversationContext, incoming: StandardMessage
+    ) -> tuple[ConversationContext, ImageReading | None]:
+        """识别当前买家消息里的图片（engine.images），耗时记在 understand 里。
+
+        识别失败、超时：记 vision 降级（写进卡片的风险提示），提醒客服自己看图，照常往下走；
+        这一步意外抛错也一样（上下文保持原样）。"""
+        t = time.perf_counter()
+        try:
+            ctx, reading = self._images.read(ctx, incoming)
+        except Exception as exc:  # noqa: BLE001 — 图片理解出任何问题都不影响出推荐（§12.2）
+            self._warn("vision", exc)
+            run.degrade(DEGRADED_VISION)
+            run.context_notes.append(DEGRADED_VISION)
+            run.alerts.append(ALERT_VISION_FAILED)
+            return ctx, None
+        finally:
+            run.add_latency("understand", t)
+        if reading.degraded:
+            run.degrade(DEGRADED_VISION)
+            run.context_notes.append(DEGRADED_VISION)
+        run.alerts.extend(reading.alerts)
+        return ctx, reading
 
     # ------------------------------------------------------------ 乱序（§8.3）
 
@@ -609,6 +684,8 @@ class AssistEngine:
                 if last.item_id
                 else None,
                 "order_card": OrderRef(order_id=last.order_ref) if last.order_ref else None,
+                # 记录里没有图片：那条消息的图片由 engine.images 按 msg_id 从缓存里找，不沿用 msg 的
+                "images": [],
                 "received_at": last.created_at,
             }
         )
@@ -666,6 +743,7 @@ class AssistEngine:
                 continue
             expired = True
         self._forget_recalled_text(shop_id, conversation_id, msg_id)
+        self._images.forget(shop_id, conversation_id, msg_id)
         if not expired:
             return None
         return [card_from_record(r) for r in remaining]
@@ -1090,18 +1168,20 @@ class AssistEngine:
             except Exception as exc:  # noqa: BLE001 — 记录失败也照常展示推荐
                 self._warn("suggestion", exc)
                 run.degrade(DEGRADED_STORAGE)
+                # 半自动：没有推荐编号，客服按发送后记不了反馈——不填进输入框
+                card = card.model_copy(update={"prefill": False})
             out.append((card, draft))
-        self._audit(
-            run,
-            AuditAction.SUGGEST,
-            {
-                "suggestion_ids": [c.suggestion_id for c, _ in out],
-                "count": len(out),
-                "status": str(status),
-                "intents": [str(c.intent) for c, _ in out],
-                "kinds": [str(c.kind) for c, _ in out],
-            },
-        )
+        detail: dict[str, Any] = {
+            "suggestion_ids": [c.suggestion_id for c, _ in out],
+            "count": len(out),
+            "status": str(status),
+            "intents": [str(c.intent) for c, _ in out],
+            "kinds": [str(c.kind) for c, _ in out],
+        }
+        prefilled = [c.suggestion_id for c, _ in out if c.prefill]
+        if prefilled:  # 可选键：半自动填进输入框的推荐（§5.6）
+            detail["prefill"] = prefilled
+        self._audit(run, AuditAction.SUGGEST, detail)
         return out
 
     def _shadow_turn_recorded(self, run: _Run) -> bool:
@@ -1115,6 +1195,42 @@ class AssistEngine:
             self._warn("shadow_check", exc)
             return False
         return any(r.msg_id == msg.msg_id for r in records)
+
+    # ------------------------------------------------------------ 半自动（§5.6、§13.4）
+
+    def _semi_auto(
+        self,
+        run: _Run,
+        ctx: ConversationContext,
+        route: RouteDecision,
+        plan: ActionPlan,
+        units: list[_Unit],
+        scored: list[tuple[SuggestionCard, Draft, float]],
+    ) -> list[tuple[SuggestionCard, Draft, float]]:
+        """第一张卡片满足半自动的条件（engine.semi_auto）时打上 prefill，最多一张。
+        分条推荐（每条一张卡片）不打。"""
+        if not scored or plan.per_part or len(units) != 1 or not units[0].passed:
+            return scored
+        unit = units[0]
+        card, draft, confidence = scored[0]
+        passed_draft, qa = unit.passed[0]
+        if passed_draft is not draft:  # 第一张卡片就是这一条第一份通过的草稿
+            return scored
+        blocker = prefill_blocker(
+            mode=ctx.mode,
+            config=ctx.config,
+            routing=self._config.routing,
+            route=route,
+            card=card,
+            draft=draft,
+            qa=qa,
+            alerts=[*run.alerts, *unit.alerts, *unit.bundle.alerts],
+            degraded=run.degraded,
+            qa_blocked=unit.qa_failed,  # 第一稿被拦、重写后才通过的也不填（§5.6 宁可保守）
+        )
+        if blocker is not None:
+            return scored
+        return [(card.model_copy(update={"prefill": True}), draft, confidence), *scored[1:]]
 
     # ------------------------------------------------------------ 全自动（§5.6、§12.2、§12.3）
 
@@ -1232,6 +1348,7 @@ class AssistEngine:
         transfer = not shadow and (
             (route is not None and route.action == RouteAction.TRANSFER_HUMAN)
             or (auto and auto_reply is None)
+            or run.auto_gate is not None  # 不在全自动生效时段：交给在岗客服（engine.modes）
         )
         ctx = run.ctx
         result = EngineResult(
@@ -1271,7 +1388,9 @@ class AssistEngine:
             msg_ids=[run.msg.msg_id],
             mode=run.mode,
             no_suggestion_reason=REASON_ENGINE,
-            transfer_to_human=run.mode == Mode.AUTO or run.auto_unverified,
+            transfer_to_human=(
+                run.mode == Mode.AUTO or run.auto_unverified or run.auto_gate is not None
+            ),
             degraded=list(run.degraded),
             latency_ms=run.latency_ms(now),
         )
@@ -1299,6 +1418,8 @@ class AssistEngine:
         detail = {str(k): v for k, v in detail.items()}
         if DEGRADED_BUDGET in result.degraded:  # 可选键：只在超过时间预算时写
             detail[RESULT_BUDGET_EXCEEDED] = True
+        if run.auto_gate is not None:  # 可选键：全自动不在生效时段，退回智能辅助（engine.modes）
+            detail[RESULT_AUTO_GATE] = run.auto_gate
         self._audit(run, AuditAction.RESULT, detail)
 
     # ------------------------------------------------------------ 留痕
@@ -1348,8 +1469,10 @@ def _qa_reasons(qa: QAResult) -> list[str]:
     return rules or ["质检未通过"]
 
 
-def _understand_detail(ctx: ConversationContext, degraded: list[str]) -> dict[str, Any]:
-    return {
+def _understand_detail(
+    ctx: ConversationContext, degraded: list[str], images: ImageReading | None = None
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
         "msg_ids": list(ctx.current.msg_ids),
         "mode": str(ctx.mode),
         "history_turns": len(ctx.history),
@@ -1361,6 +1484,10 @@ def _understand_detail(ctx: ConversationContext, degraded: list[str]) -> dict[st
         "unresolved_turns": ctx.unresolved_turns,
         "degraded": list(degraded),
     }
+    if images is not None and images.total:
+        # 买家图片（§15 Phase 3）：只记张数和类型，不记识别出的文字（§5.3）
+        detail.update(describe_for_audit(images))
+    return detail
 
 
 def _route_detail(route: RouteDecision) -> dict[str, Any]:

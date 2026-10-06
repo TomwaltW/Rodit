@@ -59,7 +59,12 @@ def _auto_service(intent: Intent = Intent.GREETING) -> tuple[AssistService, Taob
     repo = unit.repos.knowledge
     shop = repo.get_shop(SHOP_A)
     assert shop is not None
-    overrides = {**shop.config_overrides, "auto_reply_enabled": True}
+    # 全天生效：这里测的不是全自动生效时段（见 tests/engine/test_auto_schedule.py）
+    overrides = {
+        **shop.config_overrides,
+        "auto_reply_enabled": True,
+        "auto_reply_schedule": "always",
+    }
     repo.upsert_shop(shop.model_copy(update={"config_overrides": overrides}))
     return AssistService(unit), adapter
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from pydantic import SecretStr
 
@@ -25,6 +25,8 @@ from rodit.core.enums import (
     Intent,
     KnowledgeSource,
     KnowledgeStatus,
+    MetricSource,
+    PlatformMetric,
     QualityReviewStatus,
     ReviewAdvice,
     ReviewState,
@@ -39,6 +41,7 @@ from rodit.core.models import (
     KnowledgeGap,
     KnowledgeItem,
     LabeledSample,
+    PlatformMetricSample,
     PolicyEntry,
     QualityReview,
     QualityScores,
@@ -53,6 +56,7 @@ from rodit.core.ports import (
     ConversationRepository,
     FeedbackRepository,
     KnowledgeRepository,
+    PlatformMetricsRepository,
     QualityReviewRepository,
     ShopAuthRepository,
     SuggestionRepository,
@@ -1525,3 +1529,120 @@ def check_text_sanitation(make: Callable[[], RepoSet]) -> None:
     assert got_card.title == CLEAN_TEXT and got_card.category == "女装/连衣裙"
     assert got_card.skus[0].sku_id == "k1" and got_card.skus[0].props() == {"颜色": "黑色"}
     assert got_card.size_chart == [{"尺码": "M", "胸围cm": 88}]
+
+
+# ---------------------------------------------------------------- 平台客服考核指标（§12.4）
+
+_TB_RATE = PlatformMetric.TAOBAO_3MIN_RESPONSE_RATE
+_DY_RESPONSE = PlatformMetric.DOUYIN_AVG_RESPONSE_S
+_DAY = date(2026, 9, 20)
+
+
+def _metric_sample(
+    shop_id: str,
+    metric: PlatformMetric,
+    day: date,
+    value: float,
+    source: MetricSource = MetricSource.MERCHANT,
+    *,
+    sample_size: int | None = None,
+    recorded_by: str | None = None,
+    minutes: float = 0,
+) -> PlatformMetricSample:
+    return PlatformMetricSample(
+        shop_id=shop_id,
+        metric=metric,
+        day=day,
+        value=value,
+        source=source,
+        sample_size=sample_size,
+        recorded_by=recorded_by,
+        recorded_at=NOW + timedelta(minutes=minutes),
+    )
+
+
+def check_platform_metrics_repository(make: Callable[[], PlatformMetricsRepository]) -> None:
+    """按（店铺、指标、日期、来源）覆盖写入；不同来源并存；list 按（日期、指标、来源）升序，
+    since / until 含两端；返回副本；purge_shop 只删这家店、返回条数、可以重复调。"""
+    repo = make()
+    d1, d2, d3 = _DAY, _DAY + timedelta(days=1), _DAY + timedelta(days=2)
+    first = _metric_sample(SHOP_A, _TB_RATE, d2, 0.8, sample_size=120, recorded_by="owner_a")
+    assert repo.upsert(first) == first
+    assert repo.list(SHOP_A) == [first]
+    # 同一店铺、指标、日期、来源：覆盖 value / sample_size / recorded_by / recorded_at
+    again = _metric_sample(SHOP_A, _TB_RATE, d2, 0.85, recorded_by="owner_a2", minutes=5)
+    assert repo.upsert(again) == again
+    assert repo.list(SHOP_A) == [again]
+    stored = repo.list(SHOP_A)[0]
+    assert stored.value == 0.85 and stored.sample_size is None
+    assert stored.recorded_by == "owner_a2" and stored.recorded_at == NOW + timedelta(minutes=5)
+    # 不同来源并存（报表按 平台 > 商家 > 估算 取）
+    platform = _metric_sample(SHOP_A, _TB_RATE, d2, 0.9, MetricSource.PLATFORM, sample_size=0)
+    computed = _metric_sample(SHOP_A, _TB_RATE, d2, 0.7, MetricSource.COMPUTED)
+    repo.upsert(computed)
+    repo.upsert(platform)
+    older = _metric_sample(SHOP_A, _DY_RESPONSE, d1, 0.0, MetricSource.PLATFORM)
+    later = _metric_sample(SHOP_A, _TB_RATE, d3, 0.123456789, sample_size=5_000_000_000)
+    other_metric = _metric_sample(SHOP_A, _DY_RESPONSE, d2, 47.5, sample_size=300)
+    for s in (later, older, other_metric):
+        repo.upsert(s)
+    rows = repo.list(SHOP_A)
+    # 日期升序；同一天按指标、来源的码点升序
+    assert [(r.day, r.metric, r.source) for r in rows] == [
+        (d1, _DY_RESPONSE, MetricSource.PLATFORM),
+        (d2, _DY_RESPONSE, MetricSource.MERCHANT),
+        (d2, _TB_RATE, MetricSource.COMPUTED),
+        (d2, _TB_RATE, MetricSource.MERCHANT),
+        (d2, _TB_RATE, MetricSource.PLATFORM),
+        (d3, _TB_RATE, MetricSource.MERCHANT),
+    ]
+    assert rows[0] == older and rows[0].value == 0.0
+    assert rows[-1] == later and rows[-1].value == 0.123456789
+    assert rows[-1].sample_size == 5_000_000_000
+    assert rows[4] == platform and rows[4].sample_size == 0
+    # 过滤：指标、起止日期（含两端）、组合
+    assert [r.day for r in repo.list(SHOP_A, metric=_DY_RESPONSE)] == [d1, d2]
+    assert [r.day for r in repo.list(SHOP_A, since=d2, until=d2)] == [d2] * 4
+    assert [r.day for r in repo.list(SHOP_A, since=d3)] == [d3]
+    assert [r.day for r in repo.list(SHOP_A, until=d1)] == [d1]
+    assert repo.list(SHOP_A, metric=_TB_RATE, since=d3, until=d3) == [later]
+    assert repo.list(SHOP_A, since=d3 + timedelta(days=1)) == []
+    assert repo.list(SHOP_A, metric=PlatformMetric.PDD_3MIN_REPLY_RATE) == []
+    assert repo.list("s_nope") == []
+    # 返回的是副本
+    copy = repo.list(SHOP_A, metric=_TB_RATE, since=d3)[0]
+    copy.value = 0.0
+    assert repo.list(SHOP_A, metric=_TB_RATE, since=d3)[0].value == 0.123456789
+    # 清理：只删这家店，返回条数，可以重复调
+    b_row = _metric_sample(SHOP_B, _TB_RATE, d2, 0.5)
+    repo.upsert(b_row)
+    assert repo.purge_shop(SHOP_A) == 6
+    assert repo.purge_shop(SHOP_A) == 0
+    assert repo.list(SHOP_A) == [] and repo.list(SHOP_B) == [b_row]
+
+
+def check_platform_metrics_cross_shop_isolation(
+    make: Callable[[], PlatformMetricsRepository],
+) -> None:
+    """§9.2 串店：B 店铺的数据（和 A 同一指标、日期、来源）用 A 的身份读不到、改不到、删不到。"""
+    repo = make()
+    b_rows = [  # 按 list 的顺序：日期、指标、来源
+        _metric_sample(SHOP_B, _TB_RATE, _DAY, 0.41, recorded_by="owner_b"),
+        _metric_sample(SHOP_B, _TB_RATE, _DAY, 0.42, MetricSource.PLATFORM, sample_size=90),
+        _metric_sample(SHOP_B, _DY_RESPONSE, _DAY + timedelta(days=1), 30.0),
+    ]
+    for row in b_rows:
+        repo.upsert(row)
+    assert repo.list(SHOP_A) == []
+    assert repo.list(SHOP_A, metric=_TB_RATE, since=_DAY, until=_DAY) == []
+    assert repo.list(SHOP_C) == []
+    # A 写同一个键：是 A 自己的一条，B 的不被覆盖
+    a_row = _metric_sample(SHOP_A, _TB_RATE, _DAY, 0.99, MetricSource.PLATFORM)
+    repo.upsert(a_row)
+    assert repo.list(SHOP_A) == [a_row]
+    assert repo.list(SHOP_B) == b_rows
+    # A 清理只删 A 的
+    assert repo.purge_shop(SHOP_A) == 1
+    assert repo.list(SHOP_B) == b_rows
+    assert repo.purge_shop(SHOP_C) == 0
+    assert repo.list(SHOP_B) == b_rows

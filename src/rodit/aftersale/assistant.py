@@ -16,8 +16,16 @@
   状态版本和客服确认时看到的不一致，或者建议是按旧版本给的（platform_status_version）
   → ActionNotAllowed（请刷新）；幂等键 = 售后单 + 操作 + 平台状态版本。
 
+凭证的图片理解（§7.3.2 R5、§15 Phase 3，aftersale.evidence_vision）：R5 命中、售后单有凭证图片标识、
+注入了 vision 时，识别最多 6 张凭证，在建议理由后面加一句"图片理解（仅供参考）：…"；不改命中的规则和
+建议（仍由客服查看凭证后决定），识别失败时理由里写明未能识别。超时被丢下、还在后台跑的识别按店铺
+记在 BackgroundWork 里：取消订购删数据之前 AssistService.revoke_shop 用 wait_background 等它们做完
+（和问答引擎一样，§8.4）。
+
 留痕：aftersale.suggest（规则建议）、aftersale.transition（每次迁移）、aftersale.confirm（谁确认了
-什么）、aftersale.action（平台返回结果）。审计 detail 不放买家原文（售后说明不进审计）。
+什么）、aftersale.action（平台返回结果）；确认和平台结果都带售后单的平台申请时间
+（aftersale_created_at，工作台统计审核时长用）。审计 detail 不放买家原文（售后说明不进审计）；
+凭证识别只记张数和类型（aftersale.suggest 的 evidence_vision）。
 迁移审计在记录保存成功后写；确认和平台结果在发生时就写（平台已经操作过，保存失败也要留痕）。
 
 网关必须读平台最新数据（§7.3.2 调用前重新读取）：传入带缓存的网关（有 uncached() 方法，
@@ -32,6 +40,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from rodit.aftersale.advisor import AFTERSALE_STATUS_LABELS
+from rodit.aftersale.durations import CREATED_AT_KEY
+from rodit.aftersale.evidence_vision import EVIDENCE_VISION_TIMEOUT_S, read_evidence
 from rodit.aftersale.rules import REASON_WAIT_SELLER_CONFIRM, ReviewSuggestion, evaluate
 from rodit.aftersale.state_machine import (
     TERMINAL_STATES,
@@ -40,6 +50,7 @@ from rodit.aftersale.state_machine import (
     with_result,
 )
 from rodit.core.audit import AuditAction
+from rodit.core.budget import BackgroundWork, background_scope
 from rodit.core.clock import Clock
 from rodit.core.config import AfterSaleConfig
 from rodit.core.enums import (
@@ -67,7 +78,13 @@ from rodit.core.models import (
     strip_control_chars,
 )
 from rodit.core.pii import mask_pii
-from rodit.core.ports import AfterSaleActionPort, AfterSaleReviewRepository, AuditSink, ToolGateway
+from rodit.core.ports import (
+    AfterSaleActionPort,
+    AfterSaleReviewRepository,
+    AuditSink,
+    ImageUnderstanding,
+    ToolGateway,
+)
 
 SYSTEM_ACTOR = "system"
 
@@ -125,7 +142,12 @@ class ReviewAssistant:
         *,
         shop_config: Callable[[str], ShopConfig],
         action_port: AfterSaleActionPort | None,
+        vision: ImageUnderstanding | None = None,
+        vision_timeout_s: float = EVIDENCE_VISION_TIMEOUT_S,
     ) -> None:
+        self._vision = vision
+        self._vision_timeout_s = vision_timeout_s
+        self._background = BackgroundWork()  # 超时被丢下、还在跑的凭证识别（按店铺）
         uncached = getattr(gateway, "uncached", None)
         self._gateway: ToolGateway = uncached() if callable(uncached) else gateway
         self._repo = repo
@@ -139,6 +161,11 @@ class ReviewAssistant:
         )
 
     # ================================================================ 公开接口
+
+    def wait_background(self, shop_id: str, timeout: float | None = None) -> bool:
+        """等这家店留在后台的凭证识别（超时被丢下、还在跑的）全部做完；timeout 秒之内做完
+        （或本来就没有）返回 True。取消订购删数据之前调（AssistService.revoke_shop）。"""
+        return self._background.wait_idle(shop_id, timeout)
 
     def review(self, shop_id: str, aftersale_id: str) -> AfterSaleReview:
         """拉取售后单并跑规则，新建审核记录。已有记录时等同 refresh。
@@ -297,6 +324,8 @@ class ReviewAssistant:
             "rules": list(current.matched_rules),
             "suggestion": str(current.suggestion) if current.suggestion else None,
             "idempotency_key": key,
+            # 平台申请时间：工作台统计审核时长用，统计时不再逐张读平台（aftersale.durations）
+            CREATED_AT_KEY: info.created_at.isoformat(),
         }
         self._record(
             shop_id,
@@ -399,7 +428,24 @@ class ReviewAssistant:
             suggestion = suggestion.model_copy(
                 update={"risk_flags": [*suggestion.risk_flags, *flags]}
             )
-        return suggestion
+        return self._with_evidence_vision(shop_id, info, suggestion)
+
+    def _with_evidence_vision(
+        self, shop_id: str, info: AfterSaleInfo, suggestion: ReviewSuggestion
+    ) -> ReviewSuggestion:
+        """R5 有凭证图片时，在理由后面加图片理解的摘要（只是参考：规则、建议、状态都不变）。"""
+        if self._vision is None or "R5" not in suggestion.matched_rules or not info.evidence_images:
+            return suggestion
+        with background_scope(self._background, shop_id):  # 识别任务记进 BackgroundWork
+            reading = read_evidence(
+                self._vision, shop_id, info.evidence_images, timeout_s=self._vision_timeout_s
+            )
+        return suggestion.model_copy(
+            update={
+                "reason": f"{suggestion.reason}；{reading.summary()}",
+                "evidence_vision": reading.audit(),
+            }
+        )
 
     def _apply(
         self,
@@ -408,22 +454,19 @@ class ReviewAssistant:
         now: datetime,
         pending: list[AuditEvent],
     ) -> AfterSaleReview:
+        detail: dict[str, Any] = {
+            "aftersale_id": rec.aftersale_id,
+            "rules": list(s.matched_rules),
+            "suggestion": str(s.advice),
+            "next_state": str(s.next_state),
+            "requires_manager": s.requires_manager,
+            "risk_flags": list(s.risk_flags),
+            "platform_status": str(rec.platform_status),
+        }
+        if s.evidence_vision is not None:
+            detail["evidence_vision"] = dict(s.evidence_vision)  # 只有张数和类型
         pending.append(
-            self._event(
-                rec.shop_id,
-                AuditAction.REVIEW_SUGGEST,
-                SYSTEM_ACTOR,
-                now,
-                {
-                    "aftersale_id": rec.aftersale_id,
-                    "rules": list(s.matched_rules),
-                    "suggestion": str(s.advice),
-                    "next_state": str(s.next_state),
-                    "requires_manager": s.requires_manager,
-                    "risk_flags": list(s.risk_flags),
-                    "platform_status": str(rec.platform_status),
-                },
-            )
+            self._event(rec.shop_id, AuditAction.REVIEW_SUGGEST, SYSTEM_ACTOR, now, detail)
         )
         return rec.model_copy(
             update={

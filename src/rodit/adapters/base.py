@@ -7,6 +7,9 @@
 - 买家身份：平台买家 ID 只在这里用注入的 BuyerRefHasher 哈希成 buyer_ref，原值不向后传；
 - 个人信息：昵称、手机号、收件地址等字段一律丢弃（§5.3）。extension 只保留子类白名单里的
   平台字段，白名单不能包含 PII_FIELD_NAMES，字符串取值含个人信息时也丢弃；
+- 图片消息（§15 Phase 3 图片理解）：子类只交出平台的图片标识，经 image_ref 检查——不透明的 ID /
+  存储键才收下，网址（可能带签名、令牌）一律不要；收下的进 StandardMessage.images（最多
+  MAX_IMAGES_PER_MESSAGE 张），只发图时 text 为空串。没有可用图片标识的图片消息照旧忽略；
 - 接入模式：A 官方机器人 / 消息接口（可全自动发送、转人工）；B 工作台插件（只展示推荐）；
   C 独立话术助手（没有平台数据，tools 必须是 NullToolGateway）。send 只在模式 A 且开了
   全自动时可用，transfer_to_human 只在模式 A 可用，其余抛 ActionNotAllowed（§8.2）；
@@ -14,6 +17,9 @@
   客服回声和撤回也由 on_event 交给应用层，写进会话仓储（§5.3 最近几轮对话）；
 - 推荐展示：show_suggestions 把推荐卡片放进该会话的"侧边栏"（模式 B；模式 A 的辅助、模式 C 的
   网页工具同理），连同标红提醒（alerts）和没有推荐时的原因（notice），新的一批替换旧的。
+  半自动（§5.6 "推荐直接填进输入框，客服按发送即可（视平台插件能力）"）：卡片带 prefill 的
+  那一条由插件填进客服输入框（sidebar_payload 的 input_prefill），客服按发送才发出，不是自动发送；
+  一批里最多一条，要有推荐编号（发送后照常记反馈），有标红提醒时不填（提醒要先看）。
 
 所有状态按 shop_id 分开保存（§9.2）；线程安全（一把锁）。这是模拟实现：
 真实适配器部署在对应平台云内（§9.1），发送、转人工调用平台接口。
@@ -22,6 +28,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 import threading
 from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence
@@ -36,6 +43,7 @@ from rodit.core.clock import CST, Clock
 from rodit.core.enums import Mode, Platform, Role
 from rodit.core.errors import ActionNotAllowed
 from rodit.core.models import (
+    ImageRef,
     ItemRef,
     OrderRef,
     PlatformContext,
@@ -117,6 +125,47 @@ def opt_str(value: Any) -> str | None:
     return None
 
 
+MAX_IMAGES_PER_MESSAGE = 9
+"""一条标准消息最多带几张图片（和 StandardMessage.images 的上限一致）。"""
+
+IMAGE_PLACEHOLDERS = frozenset({"[图片]", "【图片】", "[image]", "[img]", "[photo]"})
+"""平台在图片消息的文字字段里放的占位文字：不算买家说的话。"""
+
+_IMAGE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}")
+_URL_HINT = re.compile(r"://|^//|^www\.", re.IGNORECASE)
+# 没写协议的网址（"img.alicdn.com/…""cdn.example.cn:8080/…"）：第一段像域名
+_HOST_HINT = re.compile(
+    r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|cn|net|org|io|cc|top|xyz|info|invalid)(?:[:/]|$)",
+    re.IGNORECASE,
+)
+_MOBILE_LIKE = re.compile(r"1[3-9]\d{9}")
+
+
+def image_ref(value: Any) -> str | None:
+    """平台图片标识 → 可以往后传的 ImageRef.ref；不合格返回 None。
+
+    只收不透明的 ID / 平台云内的存储键（字母、数字和 _ . : / -，最长 200）。网址（含 "://"、
+    以 "//" 或 "www." 开头、第一段是域名）、带查询参数或空白的、含个人信息（手机号等）的一律不要：
+    带签名的临时地址里有令牌，不能进日志、审计和提示词（§5.3、§12.3）。
+    纯数字的是平台分配的数字 ID，只挡像手机号的（长数字不当银行卡号处理）。"""
+    ref = opt_str(value)
+    if ref is None or _URL_HINT.search(ref) or not _IMAGE_REF.fullmatch(ref):
+        return None
+    if _HOST_HINT.match(ref):
+        return None
+    if ref.isdigit():
+        return None if _MOBILE_LIKE.fullmatch(ref) else ref
+    if contains_pii(ref):
+        return None
+    return ref
+
+
+def caption(value: Any) -> str:
+    """图片消息附带的文字：平台占位文字（"[图片]"）不算，其余原样（去首尾空白）。"""
+    text = value.strip() if isinstance(value, str) else ""
+    return "" if text.lower() in IMAGE_PLACEHOLDERS else text
+
+
 def minimize(text: str) -> str:
     """个人信息最小化：有个人信息时返回 mask_pii 的结果，没有时原样返回。
 
@@ -133,6 +182,7 @@ class RawEvent:
     on_event 返回 StoredMessage；recall 撤回 → 从本地上下文删除 recalled_msg_id，on_event 返回
     MessageRecall。其他事件（系统提示、图片等）子类直接返回 None。
     raw_buyer_id 是平台原始买家 ID，只在 BaseMockAdapter 里哈希，不会出现在任何输出里。
+    images 是买家消息里的平台图片标识（未经检查，BaseMockAdapter 用 image_ref 过滤）。
     """
 
     kind: Literal["buyer", "agent", "recall"]
@@ -149,6 +199,7 @@ class RawEvent:
     extension: Mapping[str, Any] = field(default_factory=dict)
     auto_requested: bool = False  # 平台说明这条消息由机器人接待（模式 A 全自动）
     recalled_msg_id: str | None = None
+    images: tuple[Any, ...] = ()  # 图片消息的平台图片标识（§15 Phase 3）
 
 
 class _Model(BaseModel):
@@ -172,6 +223,46 @@ class TransferRecord(_Model):
     conversation_id: str
     reason: str
     at: AwareDatetime
+
+
+class InputPrefill(_Model):
+    """半自动（§5.6）：插件填进客服输入框的那条推荐。客服看过、按发送才发出（不是自动发送），
+    发出后照常按推荐编号记反馈（§5.8）。"""
+
+    suggestion_id: int
+    text: str
+
+
+class SidebarPayload(_Model):
+    """推给插件侧边栏的当前一批内容（模拟插件按它渲染，§5.6、§8.2）。
+
+    input_prefill 只在模式 A / B 有：插件在平台工作台里，能把文字填进客服输入框；模式 C 是我们自己的
+    网页工具，卡片上的 prefill 显示成"可直接发送"标记，不往平台输入框里填。"""
+
+    shop_id: str
+    conversation_id: str
+    cards: list[SuggestionCard]
+    alerts: list[str]
+    notice: str | None = None
+    input_prefill: InputPrefill | None = None
+
+
+PREFILL_ACCESS: frozenset[str] = frozenset({"A", "B"})
+"""能把推荐填进平台客服输入框的接入模式（工作台插件 / 官方接待工作台，§8.1）。"""
+
+
+def _one_prefill(cards: Sequence[SuggestionCard], *, allowed: bool) -> list[SuggestionCard]:
+    """卡片复制一份；prefill 最多留一条（第一条带编号的），allowed=False 时全部去掉。"""
+    out: list[SuggestionCard] = []
+    kept = False
+    for card in cards:
+        copy = card.model_copy(deep=True)
+        keep = allowed and not kept and copy.prefill and copy.suggestion_id is not None
+        if copy.prefill and not keep:
+            copy = copy.model_copy(update={"prefill": False})
+        kept = kept or keep
+        out.append(copy)
+    return out
 
 
 class _LRU:
@@ -369,12 +460,13 @@ class BaseMockAdapter:
         alerts（标红提醒客服）和 notice（没有推荐时的原因）和卡片一起替换：不传就清掉上一批的。
         它们不含买家原文；万一带了个人信息也先做最小化再展示。
         没收到过这个店铺这个会话的消息时不展示（插件只能在当前会话里展示）。
+        半自动的 prefill 最多留一条（第一条带推荐编号的）；有标红提醒时一条都不留。
         """
         with self._lock:
             conv = self._conversation(shop_id, conversation_id)
             if conv is not None:
-                conv.cards = [c.model_copy(deep=True) for c in cards]
                 conv.alerts = [minimize(a) for a in alerts if isinstance(a, str) and a.strip()]
+                conv.cards = _one_prefill(cards, allowed=not conv.alerts)
                 conv.notice = minimize(notice) if notice and notice.strip() else None
 
     def send(self, shop_id: str, conversation_id: str, text: str) -> SendResult:
@@ -462,6 +554,28 @@ class BaseMockAdapter:
             conv = self._conversation(shop_id, conversation_id)
             return conv.notice if conv else None
 
+    def sidebar_payload(self, shop_id: str, conversation_id: str) -> SidebarPayload | None:
+        """插件侧边栏当前要渲染的内容：推荐卡片、标红提醒、没有推荐的原因，以及半自动要填进客服
+        输入框的那条（input_prefill，只在模式 A / B）。没见过的会话返回 None。"""
+        with self._lock:
+            conv = self._conversation(shop_id, conversation_id)
+            if conv is None:
+                return None
+            cards = [c.model_copy(deep=True) for c in conv.cards]
+            prefill: InputPrefill | None = None
+            if self.access in PREFILL_ACCESS:
+                top = next((c for c in cards if c.prefill and c.suggestion_id is not None), None)
+                if top is not None and top.suggestion_id is not None:
+                    prefill = InputPrefill(suggestion_id=top.suggestion_id, text=top.text)
+            return SidebarPayload(
+                shop_id=shop_id,
+                conversation_id=conversation_id,
+                cards=cards,
+                alerts=list(conv.alerts),
+                notice=conv.notice,
+                input_prefill=prefill,
+            )
+
     def sent_messages(self, shop_id: str) -> list[OutgoingMessage]:
         with self._lock:
             return [m.model_copy() for m in self._outbox if m.shop_id == shop_id]
@@ -537,7 +651,8 @@ class BaseMockAdapter:
         text = event.text.strip() if isinstance(event.text, str) else ""
         item = ItemRef(item_id=event.item_id, sku_id=event.sku_id) if event.item_id else None
         order = OrderRef(order_id=event.order_id) if event.order_id else None
-        if not text and item is None and order is None:
+        images = _image_refs(event.images)
+        if not text and item is None and order is None and not images:
             return None
         with self._lock:
             conv = self._conversation(event.shop_id, event.conversation_id)
@@ -551,6 +666,7 @@ class BaseMockAdapter:
                     text=text,
                     item_card=item,
                     order_card=order,
+                    images=images,
                     agent_id=event.agent_id,
                     mode=self._mode_for(event, conv),
                     received_at=event.at or self._clock.now(),
@@ -640,6 +756,16 @@ class BaseMockAdapter:
             msg_id=event.msg_id,
             recalled_msg_id=recalled,
         )
+
+
+def _image_refs(values: Sequence[Any]) -> list[ImageRef]:
+    """RawEvent.images → 合格的图片（去重保序，最多 MAX_IMAGES_PER_MESSAGE 张）。"""
+    refs: list[str] = []
+    for value in values:
+        ref = image_ref(value)
+        if ref is not None and ref not in refs:
+            refs.append(ref)
+    return [ImageRef(ref=r) for r in refs[:MAX_IMAGES_PER_MESSAGE]]
 
 
 def as_mapping(value: Any) -> Mapping[str, Any]:

@@ -424,3 +424,54 @@ class ProviderName(StrEnum):
     CLASSIFIER = "classifier"
     RULES = "rules"
     JEV = "jev"
+
+
+# ---------------------------------------------------------------- 平台客服考核指标（§2.1、§12.4）
+
+
+class PlatformMetric(StrEnum):
+    """各平台考核商家客服的指标（§2.1 "客服考核"、§12.4 平台客服指标接入前后对比）。
+
+    口径以平台为准，接入时按平台文档核对【待确认】；单位和好坏方向见 core.platform_metrics。
+    """
+
+    TAOBAO_3MIN_RESPONSE_RATE = "taobao_3min_response_rate"  # 淘宝：旺旺 3 分钟人工响应率
+    DOUYIN_AVG_RESPONSE_S = "douyin_avg_response_s"  # 抖店：飞鸽平均响应时长（秒）
+    DOUYIN_DISSATISFACTION_RATE = "douyin_dissatisfaction_rate"  # 抖店：会话不满意率
+    DOUYIN_HELP_RATE = "douyin_help_rate"  # 抖店：平台求助率
+    DOUYIN_AFTERSALE_REVIEW_H = "douyin_aftersale_review_h"  # 抖店：售后平均审核时长（小时）
+    PDD_3MIN_REPLY_RATE = "pdd_3min_reply_rate"  # 拼多多：3 分钟人工回复率（8:00–23:00）
+
+
+class MetricSource(StrEnum):
+    """一条平台指标数据从哪来。同一天同一指标可以各来源各一条，报表优先用平台的。"""
+
+    PLATFORM = "platform"  # 平台接口 / 平台后台的官方数据（平台云内的 PlatformMetricsSource）
+    MERCHANT = "merchant"  # 商家从平台后台抄录、手工登记
+    COMPUTED = "computed"  # 本系统按会话和售后记录估算（口径近似，只作参考）
+
+
+# ---------------------------------------------------------------- 图片理解（§15 Phase 3）
+
+
+class ImageKind(StrEnum):
+    """买家发来的图片 / 售后凭证图片是什么（§15 Phase 3 "图片理解：破损照片、尺码截图"）。"""
+
+    DAMAGE = "damage"  # 商品或包装破损
+    DEFECT = "defect"  # 质量瑕疵（开线、污渍、色差……）
+    WRONG_ITEM = "wrong_item"  # 错发 / 漏发（收到的和下单的不一样）
+    SIZE_REFERENCE = "size_reference"  # 尺码截图：身高体重、尺码表、量体数据
+    LOGISTICS_SCREENSHOT = "logistics_screenshot"  # 物流 / 订单页面截图
+    PRODUCT_PHOTO = "product_photo"  # 商品图（问"这个有没有"、对比款式）
+    OTHER = "other"
+
+
+IMAGE_KIND_LABELS: dict[ImageKind, str] = {
+    ImageKind.DAMAGE: "破损",
+    ImageKind.DEFECT: "质量瑕疵",
+    ImageKind.WRONG_ITEM: "错发漏发",
+    ImageKind.SIZE_REFERENCE: "尺码截图",
+    ImageKind.LOGISTICS_SCREENSHOT: "物流 / 订单截图",
+    ImageKind.PRODUCT_PHOTO: "商品图",
+    ImageKind.OTHER: "其他图片",
+}

@@ -20,6 +20,8 @@ from rodit.core.enums import (
     DecisionStage,
     DraftKind,
     Intent,
+    MetricSource,
+    PlatformMetric,
     ReviewState,
     SuggestionStatus,
 )
@@ -29,6 +31,7 @@ from rodit.core.models import (
     DecisionLogEntry,
     KnowledgeGap,
     LabeledSample,
+    PlatformMetricSample,
     QualityReview,
     ShopAuth,
     SuggestionRecord,
@@ -42,6 +45,7 @@ from rodit.storage import (
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgPlatformMetricsRepository,
     PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
@@ -70,7 +74,19 @@ def seeded(db: Database, truncate, token_key: str) -> None:
     auth = PgShopAuthRepository(db, encryption_key=token_key)
     audit = PgAuditLog(db)
     quality = PgQualityReviewRepository(db)
+    platform_metrics = PgPlatformMetricsRepository(db)
     for shop in (SHOP_A, SHOP_B):
+        # 平台客服考核指标（迁移版本 6）
+        platform_metrics.upsert(
+            PlatformMetricSample(
+                shop_id=shop,
+                metric=PlatformMetric.TAOBAO_3MIN_RESPONSE_RATE,
+                day=NOW.date(),
+                value=0.9,
+                source=MetricSource.PLATFORM,
+                recorded_at=NOW,
+            )
+        )
         conversations.add_message(
             make_message("在吗", world=world, shop_id=shop, msg_id=f"m_{shop}")
         )

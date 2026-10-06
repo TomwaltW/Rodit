@@ -363,6 +363,8 @@ def compose_unit(
             audit_wrapper=observe,
             catalog=bindings.catalog,
             ocr=bindings.ocr,
+            vision=bindings.vision,
+            metrics_source=bindings.metrics_source,
             route_provider=classifier,
             llm_transport=bindings.llm_transport,  # 平台可报备的通道（§9.1、§12.3），没给用默认出口
         )
@@ -419,6 +421,8 @@ def _offline_unit(
         qa_provider=HeuristicQAJudge(),
         catalog=bindings.catalog,
         ocr=bindings.ocr,
+        vision=bindings.vision,
+        metrics_source=bindings.metrics_source,
     )
 
 

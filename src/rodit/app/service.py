@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -80,7 +81,7 @@ from rodit.feedback import (
     adoption_report,
     qa_report,
 )
-from rodit.knowledge import apply_questionnaire, describe_gap, find_gaps
+from rodit.knowledge import apply_questionnaire, describe_gap, find_gaps, questionnaire_warnings
 
 logger = logging.getLogger(__name__)
 
@@ -611,7 +612,8 @@ class AssistService:
         return [{"marker": m, "description": describe_gap(m)} for m in markers]
 
     def apply_questionnaire(self, shop_id: str, answers: Mapping[int, str]) -> dict[str, Any]:
-        """店铺政策问卷（附录 C）：写入政策，合并店铺配置覆盖项。"""
+        """店铺政策问卷（附录 C）：写入政策，合并店铺配置覆盖项。返回写了哪些政策键（policies）、
+        改了哪些配置项（config）和给商家的提醒（warnings，如第 13 题的工作时间没看懂、已清空）。"""
         repo = self.unit.repos.knowledge
         # 回答先去掉 NUL 等控制字符（PostgreSQL 的 TEXT / JSONB 写不进去）
         cleaned = {
@@ -627,7 +629,11 @@ class AssistService:
             # 只写问卷改到的配置键（仓储里原子地读改写，并发的配置修改不会互相覆盖）
             if patch and repo.update_shop_config(shop_id, patch) is None:
                 raise KeyError(shop_id)
-            return {"policies": [e.key for e in entries], "config": sorted(patch)}
+            return {
+                "policies": [e.key for e in entries],
+                "config": sorted(patch),
+                "warnings": questionnaire_warnings(cleaned),
+            }
 
     # ================================================================ 报表（§12.4）
 
@@ -735,18 +741,22 @@ class AssistService:
             return counts
 
     def _drain_background(self, shop_id: str) -> None:
-        """等引擎为这家店留在后台的任务做完（调用方持有写方闸门：期间不会有新的）。
-        单次平台 / 大模型调用都有自己的超时，这里再兜一个上限；超时照常删除并记警告。"""
-        wait = getattr(self.unit.engine, "wait_background", None)
-        if wait is None:
-            return
-        if not wait(shop_id, timeout=self.background_drain_s):
-            logger.warning(
-                "取消订购：店铺 %s 还有后台任务超过 %.0f 秒没做完，照常删除"
-                "（之后迟到的写入不在这次清理里）",
-                shop_id,
-                self.background_drain_s,
-            )
+        """等引擎、售后审核助手（超时被丢下的凭证识别）为这家店留在后台的任务做完（调用方持有
+        写方闸门：期间不会有新的）。单次平台 / 大模型调用都有自己的超时，这里再兜一个上限
+        （两者共用）；超时照常删除并记警告。"""
+        limit = time.monotonic() + self.background_drain_s
+        for owner in (self.unit.engine, self.unit.reviews):
+            wait = getattr(owner, "wait_background", None)
+            if wait is None:
+                continue
+            if not wait(shop_id, timeout=max(0.0, limit - time.monotonic())):
+                logger.warning(
+                    "取消订购：店铺 %s 还有后台任务超过 %.0f 秒没做完，照常删除"
+                    "（之后迟到的写入不在这次清理里）",
+                    shop_id,
+                    self.background_drain_s,
+                )
+                return
 
 
 __all__ = ["AFTERSALE_WRITE_SCOPES", "AssistService", "aftersale_scopes"]

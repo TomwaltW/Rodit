@@ -180,6 +180,7 @@ class SuggestionView(_View):
     confidence: Confidence
     evidence: list[EvidenceLabelView] = Field(default_factory=list)
     risk_hints: list[str] = Field(default_factory=list)
+    prefill: bool = False  # 半自动（§5.6）：可以直接填进客服输入框
 
     @classmethod
     def from_card(cls, card: SuggestionCard) -> SuggestionView:
@@ -191,6 +192,7 @@ class SuggestionView(_View):
             confidence=card.confidence,
             evidence=[EvidenceLabelView(id=e.id, label=e.label) for e in card.evidence],
             risk_hints=list(card.risk_hints),
+            prefill=card.prefill,
         )
 
 
@@ -282,10 +284,12 @@ class KnowledgeView(_View):
 
 
 class QuestionnaireView(_View):
-    """问卷写入结果：写进了哪些政策键、改了哪些店铺配置项。"""
+    """问卷写入结果：写进了哪些政策键、改了哪些店铺配置项；warnings 是要提醒商家的事
+    （如第 13 题的客服工作时间没看懂：已清空，请到设置页填写）。"""
 
     policies: list[str]
     config: list[str]
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RevokeView(_View):
@@ -442,6 +446,8 @@ class MeView(_View):
     user_id: str
     role: PrincipalRole
     platform: Platform  # 本平台单元（§9.1）
+    # 服务端当前时间：网页按它算"近 7 天"等统计范围（本机时钟不准、本地演示时钟固定时也对得上）
+    server_time: AwareDatetime
     llm: LLMDisclosureView | None = None
 
 

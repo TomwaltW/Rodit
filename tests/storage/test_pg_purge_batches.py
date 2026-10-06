@@ -96,6 +96,11 @@ LOADERS: dict[str, str] = {
         " SELECT %(s)s, '2026-W40', g, 'greeting', 'pending', now()"
         " FROM generate_series(1, %(n)s) g"
     ),
+    "platform_metric": (
+        "INSERT INTO platform_metric (shop_id, metric, day, value, source, recorded_at)"
+        " SELECT %(s)s, 'taobao_3min_response_rate', DATE '2026-01-01' + g, 0.9, 'platform', now()"
+        " FROM generate_series(1, %(n)s) g"
+    ),
 }
 SINGLE_ROW = frozenset({"shop", "shop_auth"})
 

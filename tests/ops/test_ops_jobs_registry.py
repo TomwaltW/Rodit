@@ -16,6 +16,7 @@ import pytest
 import rodit.ops.jobs as jobs
 from rodit.core.errors import StorageUnavailable
 from rodit.ops import serve
+from rodit.ops.jobs import platform_metrics as metrics_jobs
 from rodit.ops.jobs import rollout as rollout_jobs
 from rodit.ops.jobs import tenancy as tenancy_jobs
 from rodit.ops.settings import SettingsError
@@ -38,9 +39,13 @@ def _commands(parser: argparse.ArgumentParser) -> set[str]:
     return set()
 
 
-def test_registry_lists_both_job_modules():
-    assert jobs.JOB_MODULES == ("rodit.ops.jobs.tenancy", "rodit.ops.jobs.rollout")
-    assert jobs.modules() == [tenancy_jobs, rollout_jobs]
+def test_registry_lists_the_job_modules():
+    assert jobs.JOB_MODULES == (
+        "rodit.ops.jobs.tenancy",
+        "rodit.ops.jobs.rollout",
+        "rodit.ops.jobs.platform_metrics",
+    )
+    assert jobs.modules() == [tenancy_jobs, rollout_jobs, metrics_jobs]
 
 
 def test_builtin_commands_stay_with_job_modules_registered(monkeypatch):
@@ -56,6 +61,7 @@ def test_job_modules_do_not_claim_builtin_commands():
         args = serve._parser().parse_args(argv)  # noqa: SLF001
         assert jobs.dispatch(args, {}) is None
         assert tenancy_jobs.run(args, {}) is None and rollout_jobs.run(args, {}) is None
+        assert metrics_jobs.run(args, {}) is None
 
 
 @pytest.fixture

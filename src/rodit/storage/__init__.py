@@ -12,6 +12,7 @@ from rodit.storage.db import (
     Migration,
     StorageUnavailable,
 )
+from rodit.storage.platform_metrics import PgPlatformMetricsRepository
 from rodit.storage.repositories import (
     PgAfterSaleReviewRepository,
     PgAuditLog,
@@ -35,6 +36,7 @@ __all__ = [
     "PgAuditLog",
     "PgConversationRepository",
     "PgFeedbackRepository",
+    "PgPlatformMetricsRepository",
     "PgQualityReviewRepository",
     "PgKnowledgeRepository",
     "PgShopAuthRepository",

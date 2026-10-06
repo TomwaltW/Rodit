@@ -49,6 +49,7 @@
     token: null,
     stored: null, // 本页写进 sessionStorage 的令牌（退出时只清自己的；存不了时为 null）
     me: null,
+    clockSkew: 0, // 服务端时钟减本机时钟（毫秒），登录时按 /v1/me 的 server_time 算
     items: [],
     sessionId: null,
     asked: 0,
@@ -301,6 +302,7 @@
       return false;
     }
     state.me = me;
+    state.clockSkew = clockSkewOf(me);
     keepToken(token);
     enterApp();
     return true;
@@ -309,6 +311,8 @@
   function showIdentity(me) {
     $('whoami').hidden = false;
     $('identity').textContent = `${label(LABELS.roles, me.role)} ${me.user_id} · 店铺 ${me.shop_id}`;
+    // 售后审核工作台只给客服、店长和商家（和售后审核接口的角色一致）：复核人员不显示这个链接
+    $('aftersale-link').hidden = !HUMAN_ROLES.includes(me.role);
     showDisclosure(me.llm);
   }
 
@@ -373,6 +377,7 @@
     $('console').hidden = true;
     $('whoami').hidden = true;
     $('identity').textContent = '';
+    $('aftersale-link').hidden = false; // 没登录时谁都可能用得上：照常显示
     showDisclosure(null);
     $('notice').open = true;
     $('login').hidden = false;
@@ -609,11 +614,17 @@
       article: null,
       buttons: [],
     };
+    // 半自动（§5.6）：高置信度的简单问题，可以直接发送；仍由客服看过、点发送（不是自动发送）
+    const prefill = card.prefill === true && typeof card.suggestion_id === 'number';
     const meta = h('p', { className: 'card-meta' }, [
+      prefill ? h('span', { className: 'badge prefill' }, '半自动：可直接发送') : null,
       h('span', { className: `badge conf-${card.confidence}` }, `置信度 ${label(LABELS.confidence, card.confidence)}`),
       h('span', { className: 'badge' }, label(LABELS.intents, card.intent)),
       h('span', { className: 'badge' }, label(LABELS.kinds, card.kind)),
     ]);
+    const prefillHint = prefill
+      ? h('p', { className: 'prefill-hint' }, '这类问题已开半自动：核对无误后可以直接发送，仍由你来发。')
+      : null;
     const evidenceBox = h('div', { className: 'evidence' }, [
       h('span', { className: 'evidence-title' }, '依据：'),
       evidence.length
@@ -623,9 +634,10 @@
     const riskBox = risks.length
       ? h('ul', { className: 'risks', 'aria-label': '风险提示' }, risks.map((r) => h('li', null, r)))
       : null;
-    cs.article = h('article', { className: 'card', 'aria-labelledby': titleId }, [
+    cs.article = h('article', { className: prefill ? 'card prefill' : 'card', 'aria-labelledby': titleId }, [
       h('h3', { id: titleId, className: 'card-title' }, total > 1 ? `推荐 ${index + 1} / ${total}` : '推荐回答'),
       meta,
+      prefillHint,
       text,
       evidenceBox,
       riskBox,
@@ -904,10 +916,18 @@
 
   // ================================================================ 店铺数据（店长、商家：§12.4 报表、§5.2.3 缺失知识、附录 C 问卷）
 
+  // 服务端时钟（/v1/me 的 server_time）减本机时钟：统计范围按服务端的时间算，
+  // 本机时钟不准、或者本地演示的时钟固定在合成数据的日期时，"近 7 天"照样对得上
+  function clockSkewOf(me) {
+    const t = Date.parse(me && me.server_time);
+    return Number.isFinite(t) ? t - Date.now() : 0;
+  }
+
   function sinceParam() {
     const days = Number($('range').value);
     if (!days) return '';
-    return `?since=${enc(new Date(Date.now() - days * 86400000).toISOString())}`;
+    const now = Date.now() + (state.clockSkew || 0);
+    return `?since=${enc(new Date(now - days * 86400000).toISOString())}`;
   }
 
   async function loadConsole() {
@@ -1038,8 +1058,10 @@
     try {
       const result = await api('POST', shopPath('questionnaire'), { answers });
       if (state.me !== me) return;
-      status.textContent = `已保存：写入政策 ${result.policies.length} 项，更新店铺配置 ${result.config.length} 项。`;
-      status.className = 'status ok';
+      // warnings：要商家处理的事（如第 13 题的客服工作时间没看懂，已清空，请到设置页填写）
+      const warnings = result.warnings || [];
+      status.textContent = `已保存：写入政策 ${result.policies.length} 项，更新店铺配置 ${result.config.length} 项。${warnings.join('')}`;
+      status.className = warnings.length ? 'status error' : 'status ok';
       loadConsole();
     } catch (err) {
       if (state.me !== me) return;

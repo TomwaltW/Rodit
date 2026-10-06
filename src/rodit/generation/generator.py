@@ -10,6 +10,8 @@
 7. 没有任何证据：工具不可用 → "我帮您查一下"（§12.2）；缺订单 / 缺商品 → 澄清；否则不推荐（§5.7）；
 8. not_received 且物流显示已签收 → 签收未收到模板放第一条（§7.3.1、§11.3：签收细分状态、
    驿站 / 快递柜的取件指引、还是没找到就在订单页申请售后），其余名额照常出 FAQ / 大模型；
+   quality_issue 且买家发来了破损、瑕疵、错发漏发的照片（ctx.image_findings，§15 Phase 3）→
+   "照片看到了，请在订单页申请售后并上传照片"模板放第一条（不承诺处理结果），其余名额照常；
 9. FAQ 相似度 ≥ faq_direct_min_score → 商家审核过的标准回答原文；
 10. 其余交给大模型：一条直接回答，名额够时再加一条附带追问（§5.4 "1–3 条候选"）。
 
@@ -181,14 +183,20 @@ class DefaultAnswerGenerator:
             and logistics[1].status == LogisticsStatus.SIGNED
             else []
         )
+        # 买家发来质量问题的照片（§7.3.1、§15 Phase 3）：确定性模板放第一条
+        photo = (
+            [T.quality_photo(ctx, apply_rule)]
+            if route.intent == Intent.QUALITY_ISSUE and T.has_problem_photo(ctx)
+            else []
+        )
         faq = [
             self._faq_draft(ev) for ev in V.faq_hits(evidence, self._config.faq_direct_min_score)
         ]
         faq = _dedupe(faq)
         if faq and not self._llm_alongside_faq:
-            return _dedupe([*lost, *faq])[:slots]
+            return _dedupe([*lost, *photo, *faq])[:slots]
 
-        primary: list[Draft] = [*lost, *faq]
+        primary: list[Draft] = [*lost, *photo, *faq]
         apply_draft = T.apply_aftersale(ctx, apply_rule) if apply_rule is not None else None
         if (
             apply_draft is not None

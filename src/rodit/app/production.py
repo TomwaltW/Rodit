@@ -29,8 +29,10 @@ from rodit.core.ports import (
     AfterSaleActionPort,
     AuditLog,
     ImageTextExtractor,
+    ImageUnderstanding,
     ItemCatalog,
     PlatformAdapter,
+    PlatformMetricsSource,
     ToolGateway,
 )
 from rodit.llm import MeteredLLMClient, OpenAICompatibleClient
@@ -42,6 +44,7 @@ from rodit.storage import (
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgPlatformMetricsRepository,
     PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
@@ -92,6 +95,7 @@ def postgres_repos(db: Database, *, clock: Clock, token_env: str = "RODIT_TOKEN_
         auth=PgShopAuthRepository.from_env(db, env_name=token_env),
         audit=PgAuditLog(db),
         quality_reviews=PgQualityReviewRepository(db),
+        platform_metrics=PgPlatformMetricsRepository(db),  # §12.4 平台指标接入前后对比（迁移 6）
     )
 
 
@@ -114,6 +118,8 @@ def build_production_unit(
     ocr: ImageTextExtractor | None = None,
     route_provider: DecisionProvider | None = None,
     llm_transport: Transport | None = None,
+    vision: ImageUnderstanding | None = None,
+    metrics_source: PlatformMetricsSource | None = None,
 ) -> Unit:
     """生产单元：tools / adapters / action_port 由平台云里的实现注入（见模块说明）。
 
@@ -159,4 +165,6 @@ def build_production_unit(
         catalog=catalog,
         ocr=ocr,
         route_provider=route_provider,
+        vision=vision,
+        metrics_source=metrics_source,
     )

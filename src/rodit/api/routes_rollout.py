@@ -7,6 +7,8 @@
 | GET rollout/status、rollout/shadow、quality/report（只有计数、分数、推荐 ID） | 店长、商家、复核 |
 | POST rollout/stage → shadow（停止展示，安全方向） | 商家、复核 |
 | POST rollout/stage → assist（要过 §13.4 门槛或强制） | 复核 |
+| POST rollout/semi-auto 开启某个类型的半自动（要过门槛或强制；高风险类型不能开） | 复核 |
+| POST rollout/semi-auto 关闭某个类型的半自动（安全方向） | 商家、复核 |
 | POST rollout/incidents（登记平台违规通知、投诉，201） | 复核 |
 | POST rollout/compliance-reviews（确认合规扫描的疑似违规或标记误报，201） | 复核 |
 | GET rollout/incidents（登记列表：周、条数、复核人员备注） | 店长、商家、复核 |
@@ -16,7 +18,9 @@
 （"复核"指我们的复核人员，reviewer 角色。）
 
 复核人、操作人一律取自调用方身份，不取请求体。影子 → 智能辅助的门槛没过、又没有强制切换时返回
-409 gate_not_passed，响应里带门槛结果（哪些条件没过、哪些没法检查），店铺配置不变。
+409 gate_not_passed，响应里带门槛结果（哪些条件没过、哪些没法检查），店铺配置不变；开半自动的
+门槛没过时同样。全自动的总开关和生效时段（§15 Phase 3 先在非工作时间试行）没有接口能改，
+上线状态里只读展示。
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from rodit.api.schemas_rollout import (
     QualityReviewView,
     SampleRequest,
     ScoreRequest,
+    SemiAutoRequest,
     ShadowView,
     StageRequest,
 )
@@ -51,6 +56,8 @@ from rodit.app.rollout import (
     IncidentRecord,
     ReviewList,
     RolloutGateNotPassed,
+    SemiAutoChange,
+    SemiAutoGateNotPassed,
     StageChange,
 )
 from rodit.core.enums import QualityReviewStatus
@@ -69,6 +76,12 @@ ReviewId = Annotated[int, Path(ge=1)]
 
 _GATE_409 = {
     409: {"description": "影子 → 智能辅助的门槛没过（gate_not_passed，带门槛结果）或不允许的切换"}
+}
+_SEMI_AUTO_409 = {
+    409: {
+        "description": "该类型开半自动的门槛没过（gate_not_passed，带门槛结果），"
+        "或高风险类型不能开（action_not_allowed）"
+    }
 }
 
 router = APIRouter()
@@ -115,6 +128,37 @@ def rollout_stage(body: StageRequest, principal: StageDep, service: ServiceDep) 
             role=principal.role,
         )
     except RolloutGateNotPassed as exc:
+        raise ApiError(
+            409, ERROR_GATE_NOT_PASSED, str(exc), extra={"gate": exc.gate.model_dump(mode="json")}
+        ) from None
+
+
+@router.post(
+    "/v1/shops/{shop_id}/rollout/semi-auto",
+    response_model=SemiAutoChange,
+    responses=_SEMI_AUTO_409,
+    tags=["上线节奏"],
+)
+def rollout_semi_auto(
+    body: SemiAutoRequest, principal: StageDep, service: ServiceDep
+) -> SemiAutoChange:
+    """开 / 关某个问题类型的半自动（§5.6 高置信度的推荐直接填进客服输入框，客服按发送即可；
+    §13.4 "该类型原样采纳率 ≥ 90%"）。开启只有复核人员可以，要过门槛，没过时 force=true 并写明
+    原因才开；高风险类型永远不能开。关闭商家和复核人员都可以。记进审计（shop.rollout_semi_auto），
+    操作人取自调用方身份。"""
+    if body.enabled and principal.role not in REVIEWER_ROLES:
+        raise ApiError(403, "forbidden_role", MSG_FORBIDDEN_ROLE)
+    try:
+        return service.rollout.set_semi_auto(
+            principal.shop_id,
+            body.intent,
+            body.enabled,
+            operator=principal.user_id,
+            force=body.force,
+            note=body.note,
+            role=principal.role,
+        )
+    except SemiAutoGateNotPassed as exc:
         raise ApiError(
             409, ERROR_GATE_NOT_PASSED, str(exc), extra={"gate": exc.gate.model_dump(mode="json")}
         ) from None

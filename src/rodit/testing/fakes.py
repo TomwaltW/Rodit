@@ -10,7 +10,7 @@ import json
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from pydantic import SecretStr, ValidationError
@@ -30,6 +30,7 @@ from rodit.core.enums import (
     ACTIONABLE_STATUSES,
     AfterSaleAction,
     AfterSaleStatus,
+    ImageKind,
     Intent,
     Mode,
     Platform,
@@ -41,11 +42,14 @@ from rodit.core.models import (
     AfterSaleInfo,
     ConversationContext,
     HumanConfirmation,
+    ImageFinding,
+    ImageRef,
     ItemRef,
     LogisticsTrace,
     OrderInfo,
     OrderRef,
     PlatformItem,
+    PlatformMetricSample,
     PriceInfo,
     RefreshedToken,
     StandardMessage,
@@ -712,6 +716,69 @@ class FakeImageTextExtractor:
         if image_ref not in self.texts:
             raise ToolUnavailable(f"图片 {image_ref} 识别失败（模拟）")
         return self.texts[image_ref]
+
+
+class FakeImageUnderstanding:
+    """图片理解的替身（实现 core.ports.ImageUnderstanding）：按图片引用查表
+    （rodit.testing.fixtures.DEMO_IMAGE_FINDINGS 的格式），表里没有的图抛 ToolUnavailable
+    （模拟识别失败）。和真实实现一样，返回前把 summary / extracted_text 过 mask_pii。
+    shop_ids 给了时只认这些店铺的图（其他店铺的图当作识别失败，§9.2）。
+    calls 记录 (shop_id, ref)。"""
+
+    provider = "fake_vision"
+
+    def __init__(
+        self,
+        findings: Mapping[str, Mapping[str, object]],
+        *,
+        shop_ids: Iterable[str] | None = None,
+    ) -> None:
+        self.findings = {ref: dict(data) for ref, data in findings.items()}
+        self.shop_ids = frozenset(shop_ids) if shop_ids is not None else None
+        self.calls: list[tuple[str, str]] = []
+        self.fail = False  # 置为 True 模拟视觉模型整体不可用
+
+    def analyze(self, shop_id: str, image: ImageRef) -> ImageFinding:
+        self.calls.append((shop_id, image.ref))
+        if self.fail:
+            raise ToolUnavailable("图片理解不可用（模拟）")
+        data = self.findings.get(image.ref)
+        if data is None or (self.shop_ids is not None and shop_id not in self.shop_ids):
+            raise ToolUnavailable(f"图片 {image.ref} 识别失败（模拟）")
+        extracted = data.get("extracted_text")
+        return ImageFinding(
+            ref=image.ref,
+            kind=ImageKind(str(data["kind"])),
+            confidence=float(data["confidence"]),  # type: ignore[arg-type]
+            summary=mask_pii(str(data.get("summary", ""))),
+            extracted_text=mask_pii(str(extracted)) if extracted is not None else None,
+            provider=self.provider,
+        )
+
+
+class InMemoryPlatformMetricsSource:
+    """平台客服考核数据接口的替身（实现 core.ports.PlatformMetricsSource）：只返回本平台的指标、
+    这家店铺、日期范围内的数据（数据来自 rodit.testing.fixtures.demo_platform_metrics）。
+    fail 置为 True 时抛 ToolUnavailable。"""
+
+    def __init__(self, samples: Iterable[PlatformMetricSample], platform: Platform) -> None:
+        from rodit.core.platform_metrics import metrics_for
+
+        allowed = set(metrics_for(platform))
+        self.platform = platform
+        self.samples = [s.model_copy(deep=True) for s in samples if s.metric in allowed]
+        self.calls: list[tuple[str, date, date]] = []
+        self.fail = False
+
+    def fetch(self, shop_id: str, since: date, until: date) -> list[PlatformMetricSample]:
+        self.calls.append((shop_id, since, until))
+        if self.fail:
+            raise ToolUnavailable("平台指标接口不可用（模拟）")
+        return [
+            s.model_copy(deep=True)
+            for s in self.samples
+            if s.shop_id == shop_id and since <= s.day <= until
+        ]
 
 
 def _masked(info: AfterSaleInfo) -> AfterSaleInfo:

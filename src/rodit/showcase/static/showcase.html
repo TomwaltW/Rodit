@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>Rodit · 电商平台 AI 客服演示</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="showcase/showcase.css">
+<script id="showcase-config" type="application/json">__SHOWCASE_CONFIG__</script>
+<script src="showcase/showcase.js" defer></script>
+</head>
+<body data-platform="taobao">
+<a class="skip-link" href="#main">跳到正文</a>
+
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="#/overview" aria-label="Rodit 产品概览">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <rect class="brand-mark-bg" x="1" y="1" width="30" height="30" rx="9"></rect>
+        <path class="brand-mark-fg" d="M9 10.5c0-1.4 1.1-2.5 2.5-2.5h9c1.4 0 2.5 1.1 2.5 2.5v6.2c0 1.4-1.1 2.5-2.5 2.5h-4.6L12 22.8v-3.6h-.5A2.5 2.5 0 0 1 9 16.7z"></path>
+        <circle class="brand-mark-dot" cx="13" cy="13.6" r="1.3"></circle>
+        <circle class="brand-mark-dot" cx="16" cy="13.6" r="1.3"></circle>
+        <circle class="brand-mark-dot" cx="19" cy="13.6" r="1.3"></circle>
+      </svg>
+      <span class="brand-text">
+        <span class="brand-name">Rodit</span>
+        <span class="brand-tagline">淘宝 · 抖店 · 拼多多 商家 AI 客服</span>
+      </span>
+    </a>
+    <nav class="main-nav" aria-label="主导航">
+      <a href="#/overview" data-route="overview">产品概览</a>
+      <a href="#/workbench" data-route="workbench">智能辅助工作台</a>
+      <a href="#/aftersale" data-route="aftersale">售后审核助手</a>
+      <a href="#/dashboard" data-route="dashboard">数据看板</a>
+      <a href="#/compliance" data-route="compliance">合规与部署</a>
+    </nav>
+    <div class="header-tools">
+      <div id="platform-switch" class="platform-switch" role="group" aria-label="切换平台"></div>
+      <button type="button" id="reset" class="btn btn-quiet btn-small">重置演示</button>
+    </div>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <noscript><p class="notice notice-danger">这个演示页面需要启用 JavaScript。</p></noscript>
+  <p id="loading" class="loading" role="status" aria-live="polite" hidden></p>
+
+  <!-- ============================================================ 产品概览 -->
+  <section id="page-overview" class="page" data-page="overview" aria-labelledby="hero-title" hidden>
+    <div class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">给商家用的 AI 客服 · 方案 v0.2</p>
+        <h1 id="hero-title">买家问什么，<span class="accent-text">几秒内</span>给出有依据的回答</h1>
+        <p class="lede">根据商品知识、店铺政策和实时订单数据起草回答，客服一键发送；依据里没有的不猜，拿不准的交给人，售后操作必须由人确认（方案 §0）。</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="#/workbench">进入智能辅助工作台</a>
+          <a class="btn btn-secondary" href="#/dashboard">看数据看板</a>
+        </div>
+        <ul class="hero-points">
+          <li>智能辅助：AI 起草、客服发出，计入人工回复</li>
+          <li>每个平台一个单元，数据不出平台云</li>
+          <li>判断层接口与 Jev 格式一致</li>
+        </ul>
+      </div>
+      <div class="hero-visual" aria-hidden="true">
+        <div class="mock">
+          <div class="mock-head"><span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-title">客服工作台 · 侧边栏推荐</span></div>
+          <div class="mock-body">
+            <p class="mock-bubble">165 110斤穿什么码</p>
+            <div class="mock-card">
+              <div class="mock-card-head"><span class="badge badge-kind">AI 生成</span><span class="badge badge-ok">置信度 高</span></div>
+              <p class="mock-card-text">亲，身高 160–165 cm、体重 100–115 斤建议 M</p>
+              <p class="mock-chips"><span class="chip">商品属性 · 尺码建议</span></p>
+              <div class="mock-actions"><span class="mock-btn mock-btn-primary">发送</span><span class="mock-btn">编辑后发送</span><span class="mock-btn">不合适</span></div>
+            </div>
+            <ol class="mock-steps"><li>懂</li><li>找</li><li>写</li><li>判</li><li>兜底</li></ol>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <section class="section" aria-labelledby="steps-title">
+      <div class="section-head">
+        <h2 id="steps-title">把"回答一个问题"拆成五步</h2>
+        <p class="section-sub">懂、找、写、判分开，每一步可以单独评估、单独替换（§4.1 原则 2）</p>
+      </div>
+      <ol class="steps">
+        <li class="step-card">
+          <svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="6.5"></circle><path d="M16 16l4.5 4.5"></path><path d="M8.5 11h5M11 8.5v5"></path></svg>
+          <h3><span class="step-no">1</span>懂问题</h3>
+          <p class="step-owner">判断层 · 路由</p>
+          <p>这是什么问题、需要哪些依据、要不要转人工；每个判断都带概率。</p>
+        </li>
+        <li class="step-card">
+          <svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 6.5h10M4 11.5h7M4 16.5h10"></path><path d="M16.5 9l3.5 3.5-3.5 3.5"></path></svg>
+          <h3><span class="step-no">2</span>找依据</h3>
+          <p class="step-owner">知识中心 + 平台工具</p>
+          <p>商品知识、店铺政策，加上订单、物流、售后的实时数据；冲突时高优先级覆盖。</p>
+        </li>
+        <li class="step-card">
+          <svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 19l1-4L15.5 5.5a2 2 0 0 1 3 3L9 18z"></path><path d="M13.5 7.5l3 3"></path></svg>
+          <h3><span class="step-no">3</span>写回答</h3>
+          <p class="step-owner">FAQ / 模板优先，其次大模型</p>
+          <p>只根据找到的依据写，回答带依据 ID；依据里没有的，不猜。</p>
+        </li>
+        <li class="step-card">
+          <svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3l7 3v5.5c0 4.3-3 7.7-7 9.5-4-1.8-7-5.2-7-9.5V6z"></path><path d="M8.8 12.2l2.2 2.2 4.2-4.4"></path></svg>
+          <h3><span class="step-no">4</span>把关</h3>
+          <p class="step-owner">硬规则 + 判断层质检</p>
+          <p>有没有依据、是否答非所问、有没有承诺风险、是否违反平台话术规则。</p>
+        </li>
+        <li class="step-card">
+          <svg class="step-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="3.5"></circle><path d="M5 20c.8-3.6 3.6-5.5 7-5.5s6.2 1.9 7 5.5"></path></svg>
+          <h3><span class="step-no">5</span>兜底</h3>
+          <p class="step-owner">人工客服</p>
+          <p>拿不准的交给人；情绪激动、投诉先提醒客服；售后操作必须由人确认。</p>
+        </li>
+      </ol>
+    </section>
+
+    <section class="section" aria-labelledby="findings-title">
+      <div class="section-head">
+        <h2 id="findings-title">调研后决定架构的三个发现</h2>
+        <p class="section-sub">方案 §0、§2.2</p>
+      </div>
+      <div class="findings">
+        <article class="finding">
+          <p class="finding-no">01</p>
+          <h3>智能辅助是三个平台都走得通的路</h3>
+          <p>全自动接待准入严格，抖店、拼多多没有查到公开的消息收发接口。AI 起草、客服一键发送，在淘宝和抖店计为人工回复，反而改善平台的客服考核指标。</p>
+        </article>
+        <article class="finding">
+          <p class="finding-no">02</p>
+          <h3>数据必须留在平台云里</h3>
+          <p>淘宝要求入驻聚石塔，拼多多的订单和售后接口要在多多云内调用，抖店有抖店云。所以每个平台单独部署一个单元，买家数据不跨云、不出境。</p>
+        </article>
+        <article class="finding">
+          <p class="finding-no">03</p>
+          <h3>保留 Jev 的接口，先用境内实现</h3>
+          <p>判断层内部统一用 Jev 的请求和响应格式（noul / choice / score + 概率）。买家消息不能发往境外；满足 §6.3 的条件后，只换一个实现就能接回 Jev。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="targets-title">
+      <div class="section-head">
+        <h2 id="targets-title">§1.3 目标 · 当前演示值</h2>
+        <p class="section-sub"><span class="badge badge-synthetic">演示数据（合成）</span> 当前平台：<span data-bind="platform-name"></span>，近 5 周回放 + 你在演示里的操作</p>
+      </div>
+      <div id="targets" class="kpi-grid kpi-grid-targets"></div>
+    </section>
+
+    <section class="section" aria-labelledby="platforms-title">
+      <div class="section-head">
+        <h2 id="platforms-title">三个平台，三个单元</h2>
+        <p class="section-sub">方案 §2.1 调研结论（节选）；一套代码部署到三个平台云，只有接入适配器和工具实现不同</p>
+      </div>
+      <div class="table-wrap">
+        <table class="compare">
+          <thead>
+            <tr><th scope="col">项目</th><th scope="col"><span class="pdot pdot-taobao"></span>淘宝 / 天猫</th><th scope="col"><span class="pdot pdot-douyin"></span>抖店</th><th scope="col"><span class="pdot pdot-pdd"></span>拼多多</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">客服工作台</th><td>千牛（旺旺）</td><td>飞鸽</td><td>多多客服</td></tr>
+            <tr><th scope="row">本方案的接入</th><td>模式 B 客服面板插件；准入后可做模式 A</td><td>模式 B 飞鸽客服工具插件，只做智能辅助</td><td>模式 C 独立话术助手（没有查到客服消息开放接口）</td></tr>
+            <tr><th scope="row">数据部署</th><td>入驻聚石塔，订单数据存 RDS</td><td>抖店云</td><td>多多云，出网要开通 EGW</td></tr>
+            <tr><th scope="row">售后接口</th><td>同意 / 拒绝；拒绝前部分场景要先协商</td><td>同意 / 拒绝；拒绝要传原因码</td><td>同意退款 / 同意退货；没有查到拒绝接口</td></tr>
+            <tr><th scope="row">客服考核</th><td>旺旺 3 分钟人工响应率</td><td>飞鸽平均响应时长、会话不满意率、售后平均审核时长</td><td>3 分钟人工回复率（8:00–23:00）</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="cta-band" aria-labelledby="cta-title">
+      <div>
+        <h2 id="cta-title">用真实的问答引擎，跑一遍 §11 的核心流程</h2>
+        <p>尺码咨询、物流查询、签收未收到、站外交易、质检拦截……每一条都能展开看"AI 是怎么想的"。</p>
+      </div>
+      <a class="btn btn-primary" href="#/workbench">打开工作台</a>
+    </section>
+  </section>
+
+  <!-- ============================================================ 智能辅助工作台 -->
+  <section id="page-workbench" class="page" data-page="workbench" aria-labelledby="workbench-title" hidden>
+    <div class="page-head">
+      <div>
+        <h1 id="workbench-title">智能辅助工作台</h1>
+        <p class="page-sub"><span id="mode-label"></span></p>
+      </div>
+      <p class="page-note">你扮演买家：点一个会话发出预设问题，或在输入框里自己打字、发图片。<span class="badge badge-synthetic">合成数据</span></p>
+    </div>
+    <details id="rollout" class="rollout" hidden>
+      <summary class="rollout-head">
+        <h2 id="rollout-title">上线节奏</h2>
+        <span class="small muted">影子 → 智能辅助 → 半自动 → 全自动，每一步都要过门槛（§13.4、§15）· 本店现在：<strong id="rollout-stage"></strong></span>
+      </summary>
+      <ol id="rollout-steps" class="rollout-steps" aria-labelledby="rollout-title"></ol>
+    </details>
+    <div class="workbench">
+      <aside class="wb-list" aria-labelledby="conv-title">
+        <h2 id="conv-title" class="wb-col-title">会话 <span id="conv-count" class="muted"></span></h2>
+        <ul id="conversations" class="conv-list"></ul>
+      </aside>
+      <section class="wb-chat" aria-labelledby="chat-title">
+        <div class="chat-head">
+          <div>
+            <h2 id="chat-title" class="wb-col-title">选择左边的一位买家</h2>
+            <p id="chat-section" class="muted small"></p>
+          </div>
+          <div id="chat-card" class="context-card" hidden></div>
+        </div>
+        <p id="chat-expect" class="expect" hidden></p>
+        <ol id="messages" class="messages" aria-live="polite" aria-label="聊天记录"></ol>
+        <form id="composer" class="composer" novalidate>
+          <div id="image-picker" class="image-picker" role="group" aria-labelledby="picker-title" hidden>
+            <p id="picker-title" class="picker-head"><strong>以买家身份发图片</strong> <span class="muted">最多 <span id="picker-max">3</span> 张 · 演示站没有真实图片，图块是合成图片的占位</span></p>
+            <div id="picker-tiles" class="picker-tiles"></div>
+          </div>
+          <div id="composer-images" class="composer-images" aria-label="要发的图片" hidden></div>
+          <div class="composer-row">
+            <button type="button" id="composer-image" class="btn btn-secondary composer-image-btn" aria-expanded="false" aria-controls="image-picker" disabled>
+              <svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3.5" y="5" width="17" height="14" rx="2.5"></rect><circle cx="9" cy="10" r="1.6"></circle><path d="M5 17l4.5-4.5 3 3 2.5-2.5L19 17"></path></svg>
+              <span>发图片</span>
+            </button>
+            <label for="composer-text" class="visually-hidden">以买家身份输入</label>
+            <textarea id="composer-text" rows="2" placeholder="以买家身份输入，Ctrl + Enter 发送" maxlength="500" disabled></textarea>
+            <button type="submit" id="composer-send" class="btn btn-primary" disabled>发送</button>
+          </div>
+          <p id="composer-note" class="composer-note" hidden></p>
+        </form>
+      </section>
+      <aside class="wb-ai" aria-labelledby="ai-title">
+        <div class="ai-head">
+          <h2 id="ai-title" class="wb-col-title">AI 推荐回答</h2>
+          <span id="ai-mode" class="badge badge-kind"></span>
+        </div>
+        <div id="ai-alerts"></div>
+        <p id="ai-simulated" class="notice notice-warn" hidden></p>
+        <div id="suggestions" class="suggestions">
+          <p class="empty">买家发来消息后，推荐回答出现在这里。</p>
+        </div>
+        <button type="button" id="trace-toggle" class="btn btn-secondary btn-block" aria-controls="trace" aria-expanded="false" disabled>AI 是怎么想的</button>
+      </aside>
+    </div>
+    <section id="trace" class="trace" aria-labelledby="trace-title" hidden>
+      <div class="trace-head">
+        <h2 id="trace-title">AI 是怎么想的：懂 → 找 → 写 → 判 → 兜底</h2>
+        <p id="trace-total" class="muted"></p>
+      </div>
+      <div id="trace-body"></div>
+    </section>
+  </section>
+
+  <!-- ============================================================ 售后审核助手 -->
+  <section id="page-aftersale" class="page" data-page="aftersale" aria-labelledby="aftersale-title" hidden>
+    <div class="page-head">
+      <div>
+        <h1 id="aftersale-title">售后审核助手</h1>
+        <p class="page-sub">规则 R1–R8 给建议和理由；<strong>售后写操作必须人确认</strong>，执行前重读平台状态，幂等键防止重复操作（§7.3.2）</p>
+        <p class="page-sub small muted" id="aftersale-desk-note">这里是演示版。生产环境的售后审核工作台在各平台单元的 <code>/aftersale</code> 页面（客服令牌登录：客服、店长、商家各用自己的访问令牌），只列本店铺的售后单；质量问题单的凭证图片由平台云内的图片理解先看一遍，结论只供参考。</p>
+      </div>
+      <p id="aftersale-note" class="page-note"></p>
+    </div>
+    <div class="state-strip-wrap">
+      <p class="small muted" id="strip-caption">审核状态机（§7.3.2）</p>
+      <ol id="state-strip" class="state-strip" aria-describedby="strip-caption"></ol>
+    </div>
+    <div id="aftersales" class="aftersale-grid"></div>
+  </section>
+
+  <!-- ============================================================ 数据看板 -->
+  <section id="page-dashboard" class="page" data-page="dashboard" aria-labelledby="dashboard-title" hidden>
+    <div class="page-head">
+      <div>
+        <h1 id="dashboard-title">数据看板</h1>
+        <p class="page-sub">给商家看的业务指标和我们自己看的质量指标（§12.4）<span class="badge badge-synthetic">演示数据（合成）</span></p>
+      </div>
+      <p id="dashboard-asof" class="page-note"></p>
+    </div>
+    <div id="kpis" class="kpi-grid"></div>
+    <div class="dash-grid">
+      <article class="panel panel-wide">
+        <h2>每周采纳率（按推荐组）</h2>
+        <p class="panel-sub">第 1 周是影子模式：生成推荐但不展示，事后对比（§13.4）；目标线 60%（§1.3）</p>
+        <div id="chart-weekly" class="chart"></div>
+      </article>
+      <article class="panel panel-wide">
+        <h2>平台客服指标：接入前 vs 接入后</h2>
+        <p class="panel-sub" id="metrics-sub">接入前后各 28 天的均值（§12.4）</p>
+        <div id="chart-metrics" class="metrics-panel"></div>
+      </article>
+      <article class="panel">
+        <h2>"不合适"的原因</h2>
+        <p class="panel-sub">知识缺失提醒商家补知识，理解错误进判断层标注集（§5.8）</p>
+        <div id="chart-reasons" class="chart"></div>
+      </article>
+      <article class="panel">
+        <h2>问题类型分布</h2>
+        <p class="panel-sub">按路由结果统计的买家消息（§5.1）</p>
+        <div id="chart-intents" class="chart"></div>
+      </article>
+      <article class="panel">
+        <h2>各类问题的采纳率</h2>
+        <p class="panel-sub">推荐组最多的前 8 类</p>
+        <div id="chart-by-intent" class="chart"></div>
+      </article>
+      <article class="panel">
+        <h2>质检拦截与硬规则命中</h2>
+        <p class="panel-sub">拦下的不推荐、或带原因重写（§5.5）</p>
+        <div id="chart-qa" class="chart"></div>
+      </article>
+      <article class="panel">
+        <h2>推荐出现耗时</h2>
+        <p class="panel-sub" id="latency-sub">各环节 P95（悬停看 P50），端到端目标 ≤ 5 秒（§12.1）</p>
+        <div id="chart-latency" class="chart"></div>
+      </article>
+      <article class="panel">
+        <h2>反馈闭环攒下了什么</h2>
+        <p class="panel-sub">客服每点一次就是一条带标签的数据（§5.8）</p>
+        <div id="chart-loop" class="chart"></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ============================================================ 合规与部署 -->
+  <section id="page-compliance" class="page" data-page="compliance" aria-labelledby="compliance-title" hidden>
+    <div class="page-head">
+      <div>
+        <h1 id="compliance-title">合规与部署</h1>
+        <p class="page-sub">数据留在平台云、最小化个人信息、发出前过平台话术规则（§4.1、§9、§12.3）</p>
+      </div>
+    </div>
+
+    <section class="section" aria-labelledby="units-title">
+      <div class="section-head">
+        <h2 id="units-title">单元化部署：一个平台云一个单元</h2>
+        <p class="section-sub">方案 §9.1 · 实线是业务调用，虚线只传不含买家数据的统计</p>
+      </div>
+      <div class="units" role="img" aria-label="三个平台单元：聚石塔淘宝单元、抖店云抖店单元、多多云拼多多单元，各自有接入适配器、问答引擎、知识库和业务库、商家控制台；三个单元都调用境内大模型服务；只向中心管理传不含买家数据的统计">
+        <div class="unit unit-taobao">
+          <p class="unit-cloud">聚石塔</p>
+          <p class="unit-name">淘宝单元</p>
+          <ol class="unit-chain"><li>接入适配器</li><li>问答引擎</li><li>知识库 + 业务库</li></ol>
+          <p class="unit-console">商家控制台</p>
+        </div>
+        <div class="unit unit-douyin">
+          <p class="unit-cloud">抖店云</p>
+          <p class="unit-name">抖店单元</p>
+          <ol class="unit-chain"><li>接入适配器</li><li>问答引擎</li><li>知识库 + 业务库</li></ol>
+          <p class="unit-console">商家控制台</p>
+        </div>
+        <div class="unit unit-pdd">
+          <p class="unit-cloud">多多云</p>
+          <p class="unit-name">拼多多单元</p>
+          <ol class="unit-chain"><li>接入适配器</li><li>问答引擎</li><li>知识库 + 业务库</li></ol>
+          <p class="unit-console">商家控制台</p>
+        </div>
+        <div class="unit-links">
+          <div class="unit-link unit-link-solid"><span class="link-line"></span>境内大模型服务 · 经平台可报备的通道调用</div>
+          <div class="unit-link unit-link-dashed"><span class="link-line"></span>中心管理 · 租户开通、计费、匿名化统计</div>
+        </div>
+      </div>
+      <ul class="checklist">
+        <li>买家和订单数据只在对应的平台云内处理，不跨云、不出境（§4.1 原则 4、§12.3）</li>
+        <li>商家控制台跟着单元走：知识编辑、配置、报表都会读到平台数据（§9.1）</li>
+        <li>所有业务表带店铺 ID，按店铺隔离；上线前做"串店测试"（§9.2）</li>
+        <li>大模型、判断层都用境内服务；Jev 暂不进生产链路（§6.2）</li>
+      </ul>
+    </section>
+
+    <section class="section" aria-labelledby="mask-title">
+      <div class="section-head">
+        <h2 id="mask-title">个人信息最小化：进提示词之前先打码</h2>
+        <p class="section-sub">方案 §5.3 · 买家昵称、手机号、收件地址不放进大模型的提示词；平台订单号保留（回答要用）</p>
+      </div>
+      <div class="mask-demo panel">
+        <form id="mask-form" novalidate>
+          <label for="mask-input" class="field-label">一段买家消息（合成示例，可以改）</label>
+          <textarea id="mask-input" rows="3" maxlength="500">我的手机号 13912345678，收件地址是杭州市西湖区文三路 100 号 3 幢 2 单元 502，订单 o_1002 明天能到吗？微信 wx_demo_2026 加一下</textarea>
+          <div class="mask-actions">
+            <button type="submit" class="btn btn-primary" id="mask-run">打码</button>
+            <span id="mask-found" class="chips"></span>
+          </div>
+        </form>
+        <p class="field-label">进提示词、审计日志的样子</p>
+        <p id="mask-output" class="mask-output" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="rules-title">
+      <div class="section-head">
+        <h2 id="rules-title">发出前的平台话术规则</h2>
+        <p class="section-sub">方案 §5.5 第一道关（硬规则）：命中就拦截，带原因重写一次；仍不通过就不推荐</p>
+      </div>
+      <div class="rules">
+        <article class="rule-card">
+          <h3>站外引流</h3>
+          <p>微信、手机号、QQ、链接、二维码、"加我"……抖店、拼多多明确禁止，违规扣分（§2.1）。</p>
+          <p class="rule-eg">买家要站外交易时，直接推荐审核过的平台规则标准话术（§11.4）</p>
+        </article>
+        <article class="rule-card">
+          <h3>绝对化用语</h3>
+          <p>"最""第一""绝对""100%"等，商家可以补充；如实的成分标注（"桑蚕丝 100%"）放行。</p>
+          <p class="rule-eg">依据《广告法》和虚假宣传相关规定（§12.3）</p>
+        </article>
+        <article class="rule-card">
+          <h3>虚假承诺</h3>
+          <p>依据之外的价格、赠品、到货时间、赔偿；回答里的数字必须能在依据里找到。</p>
+          <p class="rule-eg">"亲，明天一定能到哦！" → 拦截，改成只说物流事实（§11.5）</p>
+        </article>
+        <article class="rule-card">
+          <h3>商家禁用词</h3>
+          <p>店铺政策里的禁用词和商品上标注的"不能说的卖点"（比如没有检测报告的"防晒"）。</p>
+          <p class="rule-eg">质检时一并检查（§5.2.2、§5.5）</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section two-col" aria-labelledby="jev-title">
+      <article class="panel">
+        <h2 id="jev-title">判断层与 Jev：接口兼容，先用境内实现</h2>
+        <p>路由和质检都是"判断题"，统一用 Jev 的三种题型：<code>noul</code> 是否、<code>choice</code> 多选一、<code>score</code> 打分，每个答案带概率（§6.1、§6.5）。</p>
+        <p>买家消息发给 Jev 会流向境外处理方，和平台"不得转委托他人处理个人信息"的规则、个人信息出境的法律要求冲突（§6.2），所以生产上先用平台云内的境内大模型投票 + 规则兜底。</p>
+        <p>满足 §6.3 的四个条件（境内 / 私有化部署、公开运营主体和数据处理协议、通过平台报备、中文效果达标）后，只换一个实现就能接回 Jev，编排、阈值、审计都不用改。</p>
+      </article>
+      <article class="panel">
+        <h2>不用 RPA、模拟登录</h2>
+        <p>RPA、模拟登录、逆向客户端、抓包，一律不用（§2.4）。平台安全规范禁止用爬虫和插件获取用户数据，违规服务商会被清退，商家店铺会被扣分甚至封店。</p>
+        <p>拼多多暂时没有查到客服消息开放接口，就先做模式 C 独立话术助手：客服把买家的问题粘贴进来，拿到推荐后自己复制回去，不做任何自动抓取（§8.1）。</p>
+        <p class="small muted">以上不构成法律意见，涉及合规判断的地方建议法务确认。</p>
+      </article>
+    </section>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <p id="footer-text">演示站使用合成数据和离线大模型替身；生产部署在各平台云内（方案 §9.1）</p>
+</footer>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<div id="chart-tip" class="chart-tip" role="tooltip" hidden></div>
+
+<dialog id="confirm-dialog" class="dialog" aria-labelledby="dialog-title">
+  <form id="dialog-form" novalidate>
+    <h2 id="dialog-title">确认操作</h2>
+    <p id="dialog-lead" class="dialog-lead"></p>
+    <dl id="dialog-details" class="dialog-details"></dl>
+    <div id="dialog-extra"></div>
+    <div class="dialog-actions">
+      <button type="button" class="btn btn-secondary" id="dialog-cancel">取消</button>
+      <button type="button" class="btn btn-primary" id="dialog-ok">确认执行</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

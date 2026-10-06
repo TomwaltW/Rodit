@@ -50,6 +50,8 @@ class RoutingConfig(_Model):
     multi_intent_min_prob: float = 0.2  # 规则 5 分条推荐：概率达到这个值的问题类型才单独成条
     max_parts: int = Field(default=3, ge=2, le=5)
     assist_threshold: float = 0.6  # 智能辅助有人把关，阈值可以低
+    # 半自动（§5.6、§13.4）：店铺开了半自动的类型，置信度达到这个值的推荐直接填进客服输入框
+    semi_auto_threshold: float = Field(default=0.9, gt=0, le=1)
     # 按问题类型校准过的智能辅助阈值（§13.3 按类型扫描、§13.5 每月重算）；没列出的类型用
     # assist_threshold。由我们统一校准，不开放给商家（§9.3）
     assist_threshold_by_intent: dict[Intent, float] = Field(default_factory=dict)

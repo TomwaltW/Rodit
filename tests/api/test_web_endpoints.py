@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
 from api_support import CALLERS, TOKENS, Api, TestClient, auth
 
@@ -45,8 +47,18 @@ def test_me_returns_the_callers_own_identity(api: Api, caller: str):
         "user_id": p.user_id,
         "role": p.role,
         "platform": "taobao",
+        "server_time": api.unit.clock.now().isoformat(),
     }
     assert TOKENS[caller] not in r.text
+
+
+def test_me_reports_the_server_clock_for_report_ranges(api: Api):
+    """网页按 server_time 算"近 7 天"：本地演示的时钟固定在合成数据的日期，和浏览器的日期无关。"""
+    first = datetime.fromisoformat(api.get("/v1/me", "merchant_a").json()["server_time"])
+    assert first == api.unit.clock.now() and first.tzinfo is not None
+    api.unit.clock.set(api.unit.clock.now() + timedelta(days=3))
+    later = datetime.fromisoformat(api.get("/v1/me", "merchant_a").json()["server_time"])
+    assert later - first == timedelta(days=3)
 
 
 @pytest.mark.parametrize(
@@ -298,7 +310,8 @@ def test_page_flow_questionnaire_answers_use_string_keys(api: Api):
         "merchant_a",
         json={"answers": {"11": "保修一年，联系客服寄回维修"}},
     )
-    assert r.status_code == 200 and r.json() == {"policies": ["warranty"], "config": []}
+    assert r.status_code == 200
+    assert r.json() == {"policies": ["warranty"], "config": [], "warnings": []}
     policy = api.unit.repos.knowledge.get_policies(SHOP_A)["warranty"]
     assert policy.value == "保修一年，联系客服寄回维修"
     # 店长能看缺失知识，但不能填问卷（页面只给商家显示问卷）

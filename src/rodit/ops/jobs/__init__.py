@@ -23,7 +23,8 @@ rodit.ops.jobs.tenancy）。serve 占着租约时拒绝执行（退出码 2）�
 定时任务。
 
 - rodit.ops.jobs.tenancy：店铺生命周期（开通、续期、过期清理、取消订购，§8.4）；
-- rodit.ops.jobs.rollout：上线节奏（评测结论、验收报告，§13.4、§13.5）。
+- rodit.ops.jobs.rollout：上线节奏（评测结论、验收报告，§13.4、§13.5）；
+- rodit.ops.jobs.platform_metrics：平台客服指标同步（§12.4 接入前后对比；不拿租约，理由见该模块）。
 """
 
 from __future__ import annotations
@@ -34,7 +35,11 @@ from collections.abc import Mapping
 from types import ModuleType
 from typing import Any, Protocol, cast
 
-JOB_MODULES: tuple[str, ...] = ("rodit.ops.jobs.tenancy", "rodit.ops.jobs.rollout")
+JOB_MODULES: tuple[str, ...] = (
+    "rodit.ops.jobs.tenancy",
+    "rodit.ops.jobs.rollout",
+    "rodit.ops.jobs.platform_metrics",
+)
 
 
 class JobModule(Protocol):

@@ -2,8 +2,10 @@
 
 - 店铺：不存在或已停用（SUSPENDED）抛 ShopInactive（§8.4 停止处理）；生效配置用
   core.config.effective_shop_config（平台默认 → 类目默认 → 店铺覆盖，§9.3）。
-- 生效模式：店铺开了影子模式 → SHADOW；消息是 AUTO 且店铺开了全自动 → AUTO；其余 ASSIST
-  （引擎决定，不直接信任接入层，见 ConversationContext 文档）。
+- 生效模式：店铺开了影子模式 → SHADOW；消息是 AUTO 且店铺开了全自动、又在全自动生效时段
+  （默认只在客服工作时间以外）→ AUTO；其余 ASSIST（引擎决定，不直接信任接入层，规则见
+  engine.modes）。生效模式和 ConversationContext.now 用同一个时刻；全自动被拦下的原因放在
+  Understanding.auto_gate。
 - 合并连发：同一角色、和上一条间隔不超过 conversation.merge_window_s 的消息合并成一个 Turn
   （按相邻两条的间隔判断，连续发的一串都会合并），文字用空格连接，Turn.at 取最后一条的时间。
   current 是末尾那个合并后的买家 Turn（一定包含本条消息）；history 保留最近
@@ -30,6 +32,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -53,6 +56,7 @@ from rodit.core.models import (
     Turn,
 )
 from rodit.core.ports import ConversationRepository, KnowledgeRepository, ToolGateway
+from rodit.engine.modes import resolve_mode
 from rodit.engine.references import (
     expresses_confusion,
     find_known_order_id,
@@ -72,21 +76,20 @@ _MAX_ITEM_CANDIDATES = 5  # 消歧时最多读取的候选商品卡片数
 
 
 class Understanding(BaseModel):
-    """会话理解的结果：上下文 + 本步骤的降级标记（如 "tool:order"）。"""
+    """会话理解的结果：上下文 + 本步骤的降级标记（如 "tool:order"）+ 全自动被拦下的原因
+    （engine.modes.AUTO_GATES；没被拦下时为 None）。"""
 
     model_config = ConfigDict(extra="forbid")
 
     context: ConversationContext
     degraded: list[str] = Field(default_factory=list)
+    auto_gate: str | None = None
 
 
-def effective_mode(msg_mode: Mode, config: ShopConfig) -> Mode:
-    """本条消息的生效模式（ConversationContext.mode 的规则）。"""
-    if config.shadow_mode:
-        return Mode.SHADOW
-    if msg_mode == Mode.AUTO and config.auto_reply_enabled:
-        return Mode.AUTO
-    return Mode.ASSIST
+def effective_mode(msg_mode: Mode, config: ShopConfig, at: datetime | None = None) -> Mode:
+    """本条消息的生效模式（ConversationContext.mode 的规则，见 engine.modes.resolve_mode）。
+    at 是处理时刻；不给时不知道是不是客服工作时间，全自动只在 auto_reply_schedule=always 时生效。"""
+    return resolve_mode(msg_mode, config, at).mode
 
 
 def merge_turns(messages: Sequence[StoredMessage], window_s: float) -> list[Turn]:
@@ -222,6 +225,8 @@ class ConversationBuilder:
             raise ShopInactive(shop.id, shop.status)
         notes = _Notes()
         config = self.shop_config(shop)
+        now = self._clock.now()  # 生效模式（客服工作时间）和上下文用同一个时刻
+        decided = resolve_mode(msg.mode, config, now)
 
         messages = self._load_messages(msg, notes)
         turns = merge_turns(messages, self._config.conversation.merge_window_s)
@@ -240,7 +245,7 @@ class ConversationBuilder:
             config=config,
             conversation_id=msg.conversation_id,
             buyer_ref=msg.buyer_ref,
-            mode=effective_mode(msg.mode, config),
+            mode=decided.mode,
             agent_id=msg.agent_id,
             current=current,
             history=history,
@@ -250,9 +255,9 @@ class ConversationBuilder:
             order=order,
             recent_orders=recent_orders,
             unresolved_turns=count_unresolved(turns),
-            now=self._clock.now(),
+            now=now,
         )
-        return Understanding(context=ctx, degraded=notes.items)
+        return Understanding(context=ctx, degraded=notes.items, auto_gate=decided.auto_gate)
 
     # ------------------------------------------------------------ 消息
 

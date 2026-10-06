@@ -49,6 +49,7 @@ from rodit.knowledge.questionnaire import (
     parse_banned_words,
     parse_tone,
     question_for_policy,
+    questionnaire_warnings,
     split_policy_answer,
 )
 from rodit.knowledge.retrieval import (
@@ -113,6 +114,7 @@ __all__ = [
     "platform_rule_evidence",
     "platform_rule_text",
     "question_for_policy",
+    "questionnaire_warnings",
     "route_intents",
     "split_policy_answer",
 ]

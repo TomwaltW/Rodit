@@ -11,12 +11,13 @@ import itertools
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from rodit.core.clock import Clock, SystemClock
 from rodit.core.enums import (
     KnowledgeStatus,
+    PlatformMetric,
     QualityReviewStatus,
     ReviewState,
     Role,
@@ -30,6 +31,7 @@ from rodit.core.models import (
     KnowledgeGap,
     KnowledgeItem,
     LabeledSample,
+    PlatformMetricSample,
     PolicyEntry,
     QualityReview,
     QualityScores,
@@ -736,3 +738,45 @@ class InMemoryShopAuthRepository:
                 return False  # 被拒的那一份已经被换掉了
             self._auth[shop_id] = auth.model_copy(update={"needs_reauth": True})
             return True
+
+
+class InMemoryPlatformMetricsRepository:
+    """实现 core.ports.PlatformMetricsRepository（§12.4 平台客服指标接入前后对比）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # (店铺, 指标, 日期, 来源) → 数据
+        self._rows: dict[tuple[str, str, date, str], PlatformMetricSample] = {}
+
+    def upsert(self, sample: PlatformMetricSample) -> PlatformMetricSample:
+        key = (sample.shop_id, sample.metric.value, sample.day, sample.source.value)
+        with self._lock:
+            self._rows[key] = sample.model_copy(deep=True)
+            return sample.model_copy(deep=True)
+
+    def list(
+        self,
+        shop_id: str,
+        *,
+        metric: PlatformMetric | None = None,
+        since: date | None = None,
+        until: date | None = None,
+    ) -> list[PlatformMetricSample]:
+        with self._lock:
+            rows = [
+                r
+                for r in self._rows.values()
+                if r.shop_id == shop_id
+                and (metric is None or r.metric == metric)
+                and (since is None or r.day >= since)
+                and (until is None or r.day <= until)
+            ]
+        rows.sort(key=lambda r: (r.day, r.metric.value, r.source.value))
+        return [r.model_copy(deep=True) for r in rows]
+
+    def purge_shop(self, shop_id: str) -> int:
+        with self._lock:
+            keys = [k for k in self._rows if k[0] == shop_id]
+            for k in keys:
+                del self._rows[k]
+            return len(keys)

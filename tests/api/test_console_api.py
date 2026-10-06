@@ -345,6 +345,8 @@ def test_config_get_and_update(api: Api):
     assert body["effective"]["tone"] == "亲切" and body["locked"] == [
         "shadow_mode",
         "auto_reply_enabled",
+        "auto_reply_schedule",
+        "semi_auto_intents",
     ]
     assert "banned_words" in body["overrides"]
     r = api.post(
