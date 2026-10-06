@@ -2,13 +2,17 @@
 和商家控制台（§9.1 "知识编辑、配置、报表"、§5.2 知识中心、§9.3 配置分层、§13.4 上线节奏、
 §13.5 每周复核）。
 
-两个自带的页面：HTML + 原生 JS + CSS，没有构建步骤，不引用任何外部地址（CDN、字体）——要能在平台云 /
+三个自带的页面：HTML + 原生 JS + CSS，没有构建步骤，不引用任何外部地址（CDN、字体）——要能在平台云 /
 内网里直接用。文件在 rodit/api/static/，应用启动时读进内存。
 
 - 话术助手：GET / 和 GET /assist；GET /assist/assist.js、/assist/assist.css：脚本和样式。
 - 商家控制台：GET /console；GET /console/console.js、/console/console.css（基础样式沿用
   /assist/assist.css，两个页面长得一样）。店长、商家看知识、政策、商品、设置、上线状态和报表（写操作
   只给商家），复核人员做每周复核、切换上线阶段；客服在控制台只看到去话术助手的提示。
+- 售后审核工作台（§7.3.2、§15 Phase 2）：GET /aftersale；GET /aftersale/aftersale.js、
+  /aftersale/aftersale.css（基础样式沿用 /assist/assist.css）。客服、店长、商家看待审核列表、
+  批量跑规则、看详情和规则说明，确认执行（R6 店长确认、平台差异由接口把关）；
+  复核人员只看到去控制台的提示。
 - 页面本身不含任何店铺数据，不需要鉴权；数据都由页面脚本带 Bearer 令牌调用 /v1 接口取
   （/v1/me 登录，/v1/shops/{shop_id}/... 取数、写入），鉴权、角色和串店检查都在接口上（§9.2）。
 - 令牌只放在 sessionStorage（关掉标签页就没了），不进 URL、不进日志；两个页面用同一个键，
@@ -31,6 +35,8 @@ from typing import Any
 from fastapi import APIRouter
 from fastapi.responses import Response
 
+from rodit.aftersale import AFTERSALE_STATUS_LABELS, TERMINAL_STATES
+from rodit.aftersale.assistant import ACTION_LABELS as AFTERSALE_ACTION_LABELS
 from rodit.api.auth import (
     CONSOLE_ROLES,
     HUMAN_ROLES,
@@ -38,12 +44,32 @@ from rodit.api.auth import (
     PERSON_ROLES,
     REVIEWER_ROLES,
 )
-from rodit.api.schemas import MAX_TEXT_CHARS
+from rodit.api.schemas import MAX_ID_CHARS, MAX_NOTE_CHARS, MAX_TEXT_CHARS
 from rodit.api.schemas_console import MAX_LIST_ITEMS
+from rodit.app.aftersale_desk import (
+    ADVICE_LABELS,
+    DEFAULT_BATCH,
+    DEFAULT_QUEUE_LIMIT,
+    MAX_BATCH,
+    NEEDS_ACTION,
+    NEXT_STEP_LABELS,
+    PLATFORM_ACTIONS,
+    PLATFORM_NOTES,
+    REFUSE_HINTS,
+    REVIEW_STATE_LABELS,
+    RULES,
+    STATE_FLOW,
+    UNREVIEWED,
+    NextStep,
+)
 from rodit.app.rollout import MAX_NOTE_CHARS as MAX_REVIEW_NOTE_CHARS
 from rodit.core.enums import (
     INTENT_LABELS,
     POLICY_LABELS,
+    AfterSaleAction,
+    AfterSaleReason,
+    AfterSaleStatus,
+    AfterSaleType,
     Confidence,
     DraftKind,
     Intent,
@@ -53,6 +79,8 @@ from rodit.core.enums import (
     PolicyKey,
     QualityReviewStatus,
     RejectReason,
+    ReviewAdvice,
+    ReviewState,
     SuggestionStatus,
 )
 from rodit.core.evidence import PLATFORM_NAMES
@@ -87,6 +115,7 @@ from rodit.knowledge.admin import (
     MERCHANT_CONFIG_FIELDS,
     MERCHANT_ITEM_FIELDS,
 )
+from rodit.tools.evidence import AFTERSALE_REASON_LABELS, AFTERSALE_TYPE_LABELS
 
 PAGE_PATHS: tuple[str, ...] = ("/", "/assist")
 """话术助手页面地址。脚本和样式用相对地址引用，两个地址下都能找到。"""
@@ -444,6 +473,72 @@ def console_page_config(platform: Platform) -> dict[str, Any]:
     }
 
 
+# ================================================================ 售后审核工作台（§7.3.2）
+
+AFTERSALE_PAGE_PATHS: tuple[str, ...] = ("/aftersale",)
+"""售后审核工作台页面地址（相对地址 aftersale/aftersale.js、assist/assist.css 都从根目录算起）。"""
+
+AFTERSALE_ASSET_PREFIX = "/aftersale/"
+AFTERSALE_ASSETS: dict[str, str] = {
+    "aftersale.js": "text/javascript",
+    "aftersale.css": "text/css",
+}
+
+AFTERSALE_PAGE_FILE = "aftersale.html"
+
+AFTERSALE_CONFIRM_RULE = (
+    "售后写操作必须由人确认（§4.1 原则 3、§7.3.2）：执行前会重读平台售后单，"
+    "状态或状态版本变了就不操作；同一操作带幂等键，重复点击不会重复执行；"
+    "谁确认的、依据哪条规则、平台返回什么都会留痕。"
+)
+"""确认对话框里说明的人工确认规则。"""
+
+
+def aftersale_page_config(platform: Platform) -> dict[str, Any]:
+    """写进售后审核工作台页面的配置：审核状态、建议、售后单类型 / 原因 / 平台状态、R1–R8 说明、
+    本平台开放的写操作和平台差异提示、角色分组、长度上限。都是服务端常量，没有店铺数据。
+    每张售后单实际能做哪些操作以详情接口为准（单元有没有接写接口、店铺有没有写售后权限）。"""
+    return {
+        "platform": platform.value,
+        "platform_name": PLATFORM_NAMES.get(platform, platform.value),
+        "roles": ROLE_LABELS,
+        "role_groups": {
+            "person": sorted(PERSON_ROLES),
+            "desk": sorted(HUMAN_ROLES),  # 和售后审核接口的角色一致（AgentDep）
+            "console": sorted(CONSOLE_ROLES),
+        },
+        "review_states": {s.value: REVIEW_STATE_LABELS[s] for s in ReviewState},
+        "state_flow": [s.value for s in STATE_FLOW],
+        "terminal_states": sorted(s.value for s in TERMINAL_STATES),
+        "advice": {a.value: ADVICE_LABELS[a] for a in ReviewAdvice},
+        "types": {t.value: AFTERSALE_TYPE_LABELS[t] for t in AfterSaleType},
+        "reasons": {r.value: AFTERSALE_REASON_LABELS[r] for r in AfterSaleReason},
+        "statuses": {s.value: AFTERSALE_STATUS_LABELS[s] for s in AfterSaleStatus},
+        "rules": {rule: info.model_dump() for rule, info in RULES.items()},
+        "actions": {a.value: AFTERSALE_ACTION_LABELS[a] for a in AfterSaleAction},
+        "platform_actions": [a.value for a in AfterSaleAction if a in PLATFORM_ACTIONS[platform]],
+        "platform_note": PLATFORM_NOTES[platform],
+        "refuse_hint": REFUSE_HINTS[platform],
+        "reason_code_required": platform == Platform.DOUYIN,
+        "next_steps": {s.value: NEXT_STEP_LABELS[s] for s in NextStep},
+        "needs_action": sorted(s.value for s in NEEDS_ACTION),
+        "unreviewed": UNREVIEWED,
+        "confirm_rule": AFTERSALE_CONFIRM_RULE,
+        "limits": {
+            "note": MAX_NOTE_CHARS,
+            "reason_code": MAX_ID_CHARS,
+            "batch": DEFAULT_BATCH,
+            "batch_max": MAX_BATCH,
+            "queue": DEFAULT_QUEUE_LIMIT,
+        },
+    }
+
+
+def render_aftersale_page(platform: Platform) -> bytes:
+    """售后审核工作台页面（配置已写进数据块）。"""
+    return _render(AFTERSALE_PAGE_FILE, aftersale_page_config(platform))
+
+
 def json_for_html(data: Any) -> str:
     """JSON → 可以放进 <script type="application/json"> 的文字：转义 < > &，
     内容里出现 "</script>" 也不会提前结束数据块。"""
@@ -476,10 +571,12 @@ def render_console_page(platform: Platform) -> bytes:
 _PAGES: tuple[tuple[tuple[str, ...], Callable[[Platform], bytes]], ...] = (
     (PAGE_PATHS, render_page),
     (CONSOLE_PAGE_PATHS, render_console_page),
+    (AFTERSALE_PAGE_PATHS, render_aftersale_page),
 )
 _ASSET_GROUPS: tuple[tuple[str, dict[str, str]], ...] = (
     (ASSET_PREFIX, ASSETS),
     (CONSOLE_ASSET_PREFIX, CONSOLE_ASSETS),
+    (AFTERSALE_ASSET_PREFIX, AFTERSALE_ASSETS),
 )
 
 
@@ -511,6 +608,10 @@ def build_web_router(platform: Platform) -> APIRouter:
 
 
 __all__ = [
+    "AFTERSALE_ASSETS",
+    "AFTERSALE_ASSET_PREFIX",
+    "AFTERSALE_CONFIRM_RULE",
+    "AFTERSALE_PAGE_PATHS",
     "ASSETS",
     "ASSET_PREFIX",
     "CONSOLE_ASSETS",
@@ -523,11 +624,13 @@ __all__ = [
     "PAGE_PATHS",
     "PHASE0_ADOPTION_TARGET",
     "SECURITY_HEADERS",
+    "aftersale_page_config",
     "build_web_router",
     "config_fields",
     "console_page_config",
     "json_for_html",
     "page_config",
+    "render_aftersale_page",
     "render_console_page",
     "render_page",
 ]
