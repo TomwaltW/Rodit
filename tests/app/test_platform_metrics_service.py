@@ -26,6 +26,7 @@ from rodit.core.enums import MetricSource, Platform, PlatformMetric, ShopStatus
 from rodit.core.errors import AuthExpired, ShopInactive, TenantIsolationError, ToolUnavailable
 from rodit.core.models import PlatformMetricSample, ShopAuth
 from rodit.core.scopes import MVP_SCOPES
+from rodit.testing.fakes import parse_subscription, subscription_push
 from rodit.testing.fixtures import (
     DEMO_GO_LIVE_DAYS_AGO,
     SHOP_A,
@@ -498,6 +499,53 @@ def test_report_go_live_from_authorization_granted_at():
     report = metrics.report(SHOP_A)
     assert report.go_live_source == "authorization"
     assert report.go_live == granted.astimezone(CST).date()
+
+
+def _subscribe(service: AssistService, kind: str, at: datetime):
+    """平台推送的开通 / 续订（合成令牌）；at 是平台的事件时间。"""
+    event = parse_subscription(subscription_push(kind, SHOP_A, at=at))
+    assert event is not None
+    return service.tenancy.handle_subscription(event)
+
+
+def test_report_go_live_from_authorization_ignores_later_renewals():
+    """续订会改写 ShopAuth.granted_at；接入日期按这次开通的第一条 auth.granted（平台事件时间）。"""
+    service, metrics = make()
+    clock = service.unit.clock
+    now = clock.now()
+    subscribed_at = now - timedelta(days=31)  # 平台的开通事件时间
+    clock.set(now - timedelta(days=30))  # 晚一天才送到
+    assert _subscribe(service, "subscribed", subscribed_at).action == "granted"
+    clock.set(now - timedelta(days=2))
+    assert _subscribe(service, "renewed", clock.now()).action == "granted"
+    clock.set(now)
+    assert service.unit.repos.auth.stamp(SHOP_A).granted_at == now - timedelta(days=2)
+    report = metrics.report(SHOP_A)
+    assert report.go_live_source == "authorization"
+    assert report.go_live == subscribed_at.astimezone(CST).date()
+    assert "续订" in report.go_live_label
+
+
+def test_report_go_live_after_reonboarding_without_granted_at():
+    """取消订购删掉了上一次开通的审计；运维重新开通（不知道平台开通时间，granted_at 为空）后
+    按这次开通的 auth.granted，之后续订也不变。"""
+    service, metrics = make()
+    clock = service.unit.clock
+    now = clock.now()
+    clock.set(now - timedelta(days=60))
+    _subscribe(service, "subscribed", clock.now())
+    clock.set(now - timedelta(days=40))
+    service.tenancy.revoke(SHOP_A, reason="ops", actor="ops")
+    clock.set(now - timedelta(days=20))
+    reonboard = parse_subscription(subscription_push("subscribed", SHOP_A, at=clock.now()))
+    service.tenancy.onboard(reonboard, actor="ops")  # 运维开通：不给 granted_at
+    assert service.unit.repos.auth.stamp(SHOP_A).granted_at is None
+    clock.set(now - timedelta(days=5))
+    _subscribe(service, "renewed", clock.now())
+    clock.set(now)
+    report = metrics.report(SHOP_A)
+    assert report.go_live_source == "authorization"
+    assert report.go_live == (now - timedelta(days=20)).astimezone(CST).date()
 
 
 def test_report_explicit_go_live_is_validated():

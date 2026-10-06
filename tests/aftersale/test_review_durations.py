@@ -7,8 +7,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from rodit.aftersale.durations import (
+    CREATED_AT_KEY,
     DECISION_STATES,
     DurationSummary,
+    application_times,
     decision_times,
     first_decision,
     merge_decisions,
@@ -124,6 +126,26 @@ def test_decision_times_skip_events_without_an_aftersale_id():
         created_at=T0,
     )
     assert decision_times([bad]) == {}
+
+
+def _with_created(event: AuditEvent, created: object) -> AuditEvent:
+    return event.model_copy(update={"detail": {**event.detail, CREATED_AT_KEY: created}})
+
+
+def test_application_times_come_from_the_confirmation_audit():
+    """申请时间取确认 / 平台结果审计里记下的（统计时不读平台）；没记、格式不对的跳过。"""
+    applied = T0 - timedelta(hours=5)
+    events = [
+        _with_created(_action("as_1", T0, ok=False), applied.isoformat()),  # 失败的也记了申请时间
+        _with_created(_action("as_2", T0, action=AuditAction.REVIEW_CONFIRM.value), "2026-09-01"),
+        _with_created(_action("as_3", T0), "not-a-time"),
+        _action("as_4", T0),  # 加这个字段之前确认的
+        _with_created(
+            _action("as_5", T0, action=AuditAction.REVIEW_SUGGEST.value), applied.isoformat()
+        ),
+        _with_created(_action("as_6", T0, action=AuditAction.REVIEW_CONFIRM.value), applied),
+    ]
+    assert application_times(events) == {"as_1": applied, "as_6": applied}
 
 
 def test_merge_decisions_keeps_the_earliest():

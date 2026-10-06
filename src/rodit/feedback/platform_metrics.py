@@ -120,12 +120,15 @@ GoLiveSource = Literal["query", "rollout", "authorization", "unknown"]
 GO_LIVE_LABELS: dict[str, str] = {
     "query": "按填写的接入日期",
     "rollout": "按第一次切到智能辅助的日期（上线记录，§13.4）",
-    "authorization": "按店铺开通授权的日期",
+    "authorization": "按这次开通授权的日期（第一条开通记录的平台事件时间，续订不改变它）",
     "unknown": "接入日期未知：没有上线记录，授权也没有开通时间，请填写接入日期",
 }
 
 ROLLOUT_STAGE_ACTION = AuditAction.ROLLOUT_STAGE.value
 """rodit.app.rollout 切换上线阶段时写的审计事件；detail 的 to 是目标阶段。"""
+AUTH_GRANTED_ACTION = AuditAction.AUTH_GRANTED.value
+"""rodit.app.tenancy 每次开通 / 续订都写的审计事件；detail 的 event_at 是平台的事件时间。
+取消订购时和店铺的其他审计一起删掉，所以最早的一条就是这次开通（不会被续订改写）。"""
 ASSIST_STAGE = RolloutStage.ASSIST.value
 
 
@@ -212,20 +215,45 @@ def first_assist_day(events: Iterable[AuditEvent]) -> date | None:
     return min(times).astimezone(CST).date() if times else None
 
 
+def _aware_time(value: object) -> datetime | None:
+    """审计 detail 里的 ISO 时间（必须带时区）；格式不对时为空。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def first_grant_time(events: Iterable[AuditEvent]) -> datetime | None:
+    """这次开通的时间：开通记录（auth.granted）里最早的一条。每条优先用平台的事件时间
+    （detail 的 event_at），没记或格式不对时用写入时间。续订也写 auth.granted，但不会早于开通。"""
+    times = [
+        _aware_time(e.detail.get("event_at")) or e.created_at
+        for e in events
+        if e.action == AUTH_GRANTED_ACTION
+    ]
+    return min(times) if times else None
+
+
 def resolve_go_live(
     explicit: date | None,
     *,
     stage_events: Iterable[AuditEvent] = (),
+    grant_events: Iterable[AuditEvent] = (),
     granted_at: datetime | None = None,
 ) -> GoLive:
-    """接入日期：填写的 > 第一次切到智能辅助（上线记录）> 店铺授权的开通时间 > 未知。"""
+    """接入日期：填写的 > 第一次切到智能辅助（上线记录）> 这次开通授权的时间（最早的开通记录
+    auth.granted；没有开通记录时用 ShopAuth.granted_at——它每次续订都会被改写，只作兜底）> 未知。"""
     if explicit is not None:
         return GoLive(day=explicit, source="query", label=GO_LIVE_LABELS["query"])
     rollout = first_assist_day(stage_events)
     if rollout is not None:
         return GoLive(day=rollout, source="rollout", label=GO_LIVE_LABELS["rollout"])
-    if granted_at is not None:
-        day = granted_at.astimezone(CST).date()
+    granted = first_grant_time(grant_events) or granted_at
+    if granted is not None:
+        day = granted.astimezone(CST).date()
         return GoLive(day=day, source="authorization", label=GO_LIVE_LABELS["authorization"])
     return GoLive(day=None, source="unknown", label=GO_LIVE_LABELS["unknown"])
 
@@ -554,6 +582,7 @@ def build_report(
 
 
 __all__ = [
+    "AUTH_GRANTED_ACTION",
     "DEFAULT_WINDOW_DAYS",
     "DIRECTION_LABELS",
     "FLAG_LABELS",
@@ -583,6 +612,7 @@ __all__ = [
     "check_window_days",
     "compare_metric",
     "first_assist_day",
+    "first_grant_time",
     "overall_verdict",
     "pick_daily",
     "resolve_go_live",

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import timedelta
 from decimal import Decimal
 
@@ -26,6 +27,7 @@ from rodit.aftersale.assistant import (
     MSG_STALE,
     MSG_TAOBAO_REFUSE,
 )
+from rodit.aftersale.durations import CREATED_AT_KEY
 from rodit.api import StaticTokenAuthenticator, create_app
 from rodit.app import AssistService
 from rodit.app.aftersale_desk import (
@@ -858,21 +860,99 @@ def test_stats_average_review_duration_from_confirmations(api: Api):
 
 
 def test_stats_use_review_history_when_audit_events_are_missing(api: Api, monkeypatch):
+    """审计里没有确认记录时按审核记录的迁移历史算确认了几张；申请时间只记在确认的审计里，
+    这时不知道，算 duration_unknown（不为它读平台）。"""
     _run(api)
     _confirm(api, "as_2001", "agree_refund")
     monkeypatch.setattr(api.unit.repos.audit, "list_events", lambda *a, **k: [])
-    s = api.get(f"{A}/stats", "agent_a").json()
-    assert s["decided"] == 1 and s["review_duration"]["average_s"] == pytest.approx(0.1 * 86400)
-
-
-def test_stats_count_unknown_durations_when_the_platform_is_down(api: Api):
-    _run(api)
-    _confirm(api, "as_2001", "agree_refund")
-    _expire_cache(api, minutes=STALE_LIMIT_MINUTES)
-    api.unit.tools.fail_on |= {"get_aftersale", "list_aftersales"}
+    calls = len(api.unit.tools.calls)
     s = api.get(f"{A}/stats", "agent_a").json()
     assert s["decided"] == 1 and s["duration_unknown"] == 1
-    assert s["review_duration"]["count"] == 0 and s["platform_unavailable"] is True
+    assert s["review_duration"]["count"] == 0
+    assert all(name != "get_aftersale" for name, *_ in api.unit.tools.calls[calls:])
+
+
+def test_stats_never_read_the_platform_for_review_durations(api: Api):
+    """GET 统计不按确认过的单数逐张读平台（范围选"全部"就是历史上全部的单）：申请时间来自
+    确认执行时审计里记下的 aftersale_created_at，缓存过期也不往上游读。"""
+    _run(api)
+    assert _confirm(api, "as_2001", "agree_refund").status_code == 200  # 申请 0.1 天前
+    assert _confirm(api, "as_2009", "agree_refund").status_code == 200  # 申请 0.05 天前
+    [event, _] = api.unit.repos.audit.list_events(SHOP_A, action=AuditAction.REVIEW_ACTION.value)
+    world = {a.aftersale_id: a for a in api.unit.tools.world.aftersales}
+    assert event.detail[CREATED_AT_KEY] == world["as_2001"].created_at.isoformat()
+    _expire_cache(api)  # 缓存过期：读平台就会打到上游
+    calls = len(api.unit.tools.calls)
+    s = api.get(f"{A}/stats", "agent_a").json()
+    upstream = [call[:2] for call in api.unit.tools.calls[calls:]]
+    assert upstream == [("list_aftersales", SHOP_A)]  # 只有待审核列表
+    assert s["decided"] == 2 and s["duration_unknown"] == 0
+    d = s["review_duration"]
+    assert d["count"] == 2 and d["max_s"] == pytest.approx(0.1 * 86400)
+    assert d["average_s"] == pytest.approx(0.075 * 86400)
+
+
+def test_stats_durations_do_not_depend_on_the_platform(api: Api, monkeypatch):
+    """平台接口故障不影响已记下的时长；加这个字段之前确认的（审计里没有申请时间）算
+    duration_unknown，也不去读平台。"""
+    _run(api)
+    _confirm(api, "as_2001", "agree_refund")
+    _confirm(api, "as_2009", "agree_refund")
+    audit = api.unit.repos.audit
+    real = audit.list_events
+
+    def older(shop_id, **kwargs):  # as_2001 是加字段之前确认的
+        return [
+            e.model_copy(
+                update={"detail": {k: v for k, v in e.detail.items() if k != CREATED_AT_KEY}}
+            )
+            if e.detail.get("aftersale_id") == "as_2001"
+            else e
+            for e in real(shop_id, **kwargs)
+        ]
+
+    monkeypatch.setattr(audit, "list_events", older)
+    _expire_cache(api, minutes=STALE_LIMIT_MINUTES)
+    api.unit.tools.fail_on |= {"get_aftersale", "list_aftersales"}
+    calls = len(api.unit.tools.calls)
+    s = api.get(f"{A}/stats", "agent_a").json()
+    assert s["decided"] == 2 and s["duration_unknown"] == 1
+    d = s["review_duration"]
+    assert d["count"] == 1 and d["average_s"] == pytest.approx(0.05 * 86400)
+    assert s["platform_unavailable"] is True
+    # 还没结束的单照样读缓存兜底（工作量）；确认过的两张不为算时长去读
+    reads = {args for name, _, args in api.unit.tools.calls[calls:] if name == "get_aftersale"}
+    assert not reads & {("as_2001",), ("as_2009",)}
+
+
+def test_queue_and_stats_read_reviews_in_bulk(api: Api, monkeypatch):
+    """列表、统计不逐张读审核记录（PostgreSQL 上每次读一个事务）：整批读出来在内存里分。"""
+    _run(api)
+    _confirm(api, "as_2001", "agree_refund")  # 已结束；缓存里的平台待审核列表还有它
+    _add_aftersale(api, SHOP_A, "as_2100", "buyer_x")  # 缓存过期后才看得到，没跑规则
+    repo = api.unit.repos.reviews
+    counts: Counter[str] = Counter()
+    for name in ("get", "list_by_state"):
+        real = getattr(repo, name)
+
+        def counted(*args, _real=real, _name=name, **kwargs):
+            counts[_name] += 1
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(repo, name, counted)
+    queue = _queue(api)
+    assert "as_2001" not in _ids(queue) and queue["total"] == 7
+    assert counts["get"] == 0 and counts["list_by_state"] <= 2
+    _expire_cache(api)
+    counts.clear()
+    queue = _queue(api)
+    assert "as_2100" in _ids(queue) and queue["unreviewed"] == 1 and queue["total"] == 8
+    assert counts["get"] == 0 and counts["list_by_state"] <= 2
+    counts.clear()
+    s = api.get(f"{A}/stats", "agent_a").json()
+    assert s["by_state"]["unreviewed"] == 1 and s["by_state"]["agreed"] == 1
+    assert s["open_total"] == 8
+    assert counts == {"list_by_state": 1}
 
 
 def test_stats_since_needs_a_timezone(api: Api):
