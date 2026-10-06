@@ -185,6 +185,7 @@ def whoami(principal: PrincipalDep, service: ServiceDep) -> MeView:
         user_id=principal.user_id,
         role=principal.role,
         platform=service.unit.platform,
+        server_time=service.unit.clock.now(),
         llm=_disclosure(service),
     )
 

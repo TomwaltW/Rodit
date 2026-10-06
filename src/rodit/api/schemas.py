@@ -442,6 +442,8 @@ class MeView(_View):
     user_id: str
     role: PrincipalRole
     platform: Platform  # 本平台单元（§9.1）
+    # 服务端当前时间：网页按它算"近 7 天"等统计范围（本机时钟不准、本地演示时钟固定时也对得上）
+    server_time: AwareDatetime
     llm: LLMDisclosureView | None = None
 
 

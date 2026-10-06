@@ -527,6 +527,12 @@ class ObservedAuditLog:
     ) -> list[DecisionLogEntry]:
         return self._inner.list_decisions(shop_id, stage=stage, since=since)
 
+    def list_system_events(
+        self, *, action: str | None = None, since: datetime | None = None
+    ) -> list[AuditEvent]:
+        # 显式转发：runtime_checkable 协议的 isinstance 只看类上的属性，不经过 __getattr__
+        return self._inner.list_system_events(action=action, since=since)
+
     def purge_shop(self, shop_id: str) -> int:
         count = self._inner.purge_shop(shop_id)
         self._safely(lambda: self._metrics.forget_shop(shop_id))

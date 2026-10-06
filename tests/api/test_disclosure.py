@@ -60,6 +60,7 @@ def test_me_includes_disclosure_when_configured(disclosed: Api, caller: str):
         "user_id": p.user_id,
         "role": p.role,
         "platform": "taobao",
+        "server_time": disclosed.unit.clock.now().isoformat(),
         "llm": {"public_name": PUBLIC_NAME, "filing_no": FILING_NO},
     }
 
@@ -67,7 +68,8 @@ def test_me_includes_disclosure_when_configured(disclosed: Api, caller: str):
 def test_me_without_disclosure_is_unchanged(api: Api):
     """没配置时不带 llm 字段（和原来的响应一模一样）。"""
     body = api.get("/v1/me", "agent_a").json()
-    assert "llm" not in body and set(body) == {"shop_id", "user_id", "role", "platform"}
+    assert "llm" not in body
+    assert set(body) == {"shop_id", "user_id", "role", "platform", "server_time"}
 
 
 def test_me_with_only_a_name_or_blank_values():

@@ -49,6 +49,7 @@
     token: null,
     stored: null, // 本页写进 sessionStorage 的令牌（退出时只清自己的；存不了时为 null）
     me: null,
+    clockSkew: 0, // 服务端时钟减本机时钟（毫秒），登录时按 /v1/me 的 server_time 算
     items: [],
     sessionId: null,
     asked: 0,
@@ -301,6 +302,7 @@
       return false;
     }
     state.me = me;
+    state.clockSkew = clockSkewOf(me);
     keepToken(token);
     enterApp();
     return true;
@@ -904,10 +906,18 @@
 
   // ================================================================ 店铺数据（店长、商家：§12.4 报表、§5.2.3 缺失知识、附录 C 问卷）
 
+  // 服务端时钟（/v1/me 的 server_time）减本机时钟：统计范围按服务端的时间算，
+  // 本机时钟不准、或者本地演示的时钟固定在合成数据的日期时，"近 7 天"照样对得上
+  function clockSkewOf(me) {
+    const t = Date.parse(me && me.server_time);
+    return Number.isFinite(t) ? t - Date.now() : 0;
+  }
+
   function sinceParam() {
     const days = Number($('range').value);
     if (!days) return '';
-    return `?since=${enc(new Date(Date.now() - days * 86400000).toISOString())}`;
+    const now = Date.now() + (state.clockSkew || 0);
+    return `?since=${enc(new Date(now - days * 86400000).toISOString())}`;
   }
 
   async function loadConsole() {
