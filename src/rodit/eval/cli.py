@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -50,10 +49,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from rodit.app.offline import EvidenceEchoLLM
-from rodit.core.config import EngineConfig, load_config
+from rodit.core.config import EngineConfig, llm_endpoint, load_config
 from rodit.core.decision import DecisionProvider
 from rodit.core.enums import INTENT_LABELS, Intent, ProviderName
-from rodit.core.errors import LLMError
 from rodit.core.models import EngineResult
 from rodit.core.ports import LLMClient
 from rodit.decision import ClassifierArtifactError, ClassifierProvider, RuleProvider
@@ -71,10 +69,13 @@ from rodit.eval.harness import DEMO_PLATFORM, DemoHarness, demo_harness, llm_har
 from rodit.eval.llm_env import (
     PRICE_INPUT_ENV,
     PRICE_OUTPUT_ENV,
-    client_from_env,
+    SettingNames,
+    client_from_config,
     describe_endpoint,
     describe_model,
-    preflight,
+    describe_options,
+    probe_capabilities,
+    render_capabilities,
     resolve_pricing,
 )
 from rodit.eval.perf import (
@@ -475,6 +476,7 @@ def _run_fingerprint(
         llm_endpoint=endpoint,
         classifier_sha256=classifier_sha256 if route_provider is not None else None,
         git=True,
+        llm_options=describe_options(llm),
     )
 
 
@@ -808,22 +810,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def env_client(config: EngineConfig | None) -> OpenAICompatibleClient:
-    """--llm env 的大模型客户端，和 app.production.build_production_unit 取同一个：配置里
-    llm.base_url 和 llm.model 都写了用配置（超时 llm.timeout_s），否则用环境变量 RODIT_LLM_*
-    （llm_env.client_from_env）。密钥从 llm.api_key_env 指的环境变量读，没设时抛 RuntimeError
-    （信息里只有变量名）。评测记下的大模型（指纹）就是它。"""
-    llm = (config or EngineConfig()).llm
-    if not (llm.base_url and llm.model):
-        return client_from_env(api_key_env=llm.api_key_env)
-    client = OpenAICompatibleClient(
-        base_url=llm.base_url,
-        model=llm.model,
-        api_key_env=llm.api_key_env,
-        timeout_s=llm.timeout_s,
-    )
-    if not os.environ.get(client.api_key_env, "").strip():
-        raise RuntimeError(f"环境变量 {client.api_key_env} 未设置：没有大模型 API key")
-    return client
+    """--llm env 的大模型客户端，和 app.production.build_production_unit 取同一个
+    （OpenAICompatibleClient.from_config）：配置里 llm.base_url 和 llm.model 都写了整组用配置
+    （超时 llm.timeout_s，请求参数 llm.extra_body / json_mode / logprobs），否则整组用环境变量
+    RODIT_LLM_*。密钥从 llm.api_key_env 指的环境变量读，没设时抛 RuntimeError（信息里只有变量名）；
+    请求参数不合法抛 ValueError。评测记下的大模型和请求参数（指纹）就是它的。"""
+    return client_from_config((config or EngineConfig()).llm)
 
 
 def _progress_printer(err: TextIO) -> Progress:
@@ -871,10 +863,25 @@ def main(
         llm: LLMClient | None = None
         if args.llm == "env":
             llm = client_factory() if client_factory is not None else env_client(config)
-            try:
-                preflight(llm)
-            except LLMError as e:  # 客户端的错误信息里已经抹掉了密钥
-                raise RuntimeError(f"大模型连通性检查失败：{e}") from None
+            # 连通性检查（preflight 的请求）+ JSON 模式、logprobs 接不接受（至多三个小请求）。
+            # 只有路由用大模型投票时请求才带 logprobs（--classifier、decision.provider: rules
+            # 时一个请求都不带，不检查，和演示站一样）；接口写在配置里时提示说 llm.*
+            votes = (
+                route_provider is None
+                and (config or EngineConfig()).decision.provider == ProviderName.INCLOUD_LLM
+            )
+            from_config = config is not None and llm_endpoint(config.llm)[2]
+            capabilities = probe_capabilities(
+                llm,
+                check_logprobs=votes,
+                names=SettingNames.of(llm, from_config=from_config),
+            )
+            for line in render_capabilities(capabilities):
+                print(line, file=err)
+            if not capabilities.reachable:  # 客户端的错误信息里已经抹掉了密钥
+                raise RuntimeError(f"大模型连通性检查失败：{capabilities.check('plain').error}")
+            if capabilities.blocking:
+                raise RuntimeError("大模型能力检查没通过：" + "；".join(capabilities.hints))
         report = evaluate(
             args.split,
             intent=args.intent,

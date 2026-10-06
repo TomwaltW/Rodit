@@ -61,6 +61,15 @@ aftersale:
 llm:
   api_key_env: RODIT_LLM_API_KEY
   timeout_s: 10.0
+  # 接口和模型（D5）：不写时取环境变量 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL。
+  # 请求参数跟着接口走：base_url 和 model 都写在这里时才用下面三项；否则整组取环境变量
+  # RODIT_LLM_EXTRA_BODY（JSON 对象）/ RODIT_LLM_JSON_MODE / RODIT_LLM_LOGPROBS（on / off，默认 on）。
+  # 只写请求参数、不写接口会报错（那一路不会生效）。
+  # base_url: https://<服务商的 OpenAI 兼容地址>/v1
+  # model: <服务商当前的模型 ID>
+  # extra_body: {thinking: {type: disabled}}  # 服务特有的参数，如关闭思考模式（写法按服务商）
+  # json_mode: true                           # 服务 / 模型不接受 response_format 时改 false
+  # logprobs: true                            # 不接受 logprobs 时改 false（路由按投票占比算置信度）
   # 对外公示的模型名称和备案号（§12.3）【待定：D5 选定后填】；require_disclosure: true 时
   # 生产部署缺这两项拒绝启动
   # public_name: ...

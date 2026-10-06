@@ -254,19 +254,21 @@ def test_cli_env_mode_with_injected_client(tmp_path):
 
 def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_path):
     """真实客户端 + 假 transport：地址、模型、超时来自环境变量；密钥只出现在请求头里。"""
-    monkeypatch.setenv("RODIT_LLM_BASE_URL", "https://user:pw@llm.example.invalid:8443/v1")
+    monkeypatch.setenv("RODIT_LLM_BASE_URL", "https://llm.example.invalid:8443/v1")
     monkeypatch.setenv("RODIT_LLM_MODEL", "synthetic-model")
     monkeypatch.setenv("RODIT_LLM_API_KEY", FAKE_KEY)
     monkeypatch.setenv("RODIT_LLM_TIMEOUT_S", "7")
     model = ScriptedModel()
     seen: list[tuple[str, str, float]] = []
+    probes: list[dict[str, Any]] = []
 
     def transport(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float):
         seen.append((url, headers["Authorization"], timeout))
         messages = [LLMMessage(**m) for m in body["messages"]]
         if messages[0].content == JUDGE_SYSTEM_PROMPT:
             purpose = "route" if "### intent" in messages[-1].content else "qa"
-        elif "连通性检查" in messages[-1].content:
+        elif "连通性检查" in messages[-1].content or "能力检查" in messages[-1].content:
+            probes.append(body)
             purpose = "other"
         else:
             purpose = "generate"
@@ -299,7 +301,7 @@ def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_pat
     )
     assert code == 0, err
     assert seen and all(
-        url == "https://user:pw@llm.example.invalid:8443/v1/chat/completions" for url, _, _ in seen
+        url == "https://llm.example.invalid:8443/v1/chat/completions" for url, _, _ in seen
     )
     assert all(auth == f"Bearer {FAKE_KEY}" for _, auth, _ in seen)
     assert seen[0][2] == 7.0  # 连通性检查用客户端默认超时（RODIT_LLM_TIMEOUT_S）
@@ -311,7 +313,12 @@ def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_pat
     assert data["llm"]["endpoint"] == "https://llm.example.invalid:8443"
     assert data["llm"]["model"] == "synthetic-model"
     calls = data["usage"]["calls"]
-    assert calls == len(seen) - 1  # 连通性检查不计入评测用量
+    # 连通性检查 + 能力检查（JSON 模式、logprobs）三个小请求，不计入评测用量
+    assert calls == len(seen) - 3 and len(probes) == 3
+    assert "response_format" not in probes[0] and "logprobs" not in probes[0]
+    assert probes[1]["response_format"] == {"type": "json_object"}
+    assert probes[2]["logprobs"] is True and "response_format" not in probes[2]
+    assert "大模型能力检查（synthetic-model @ https://llm.example.invalid:8443" in err
     assert data["usage"]["input_tokens"] == 100 * calls
     assert data["usage"]["cost"] == pytest.approx(calls * (100 * 0.001 + 20 * 0.002) / 1000)
     assert "（https://llm.example.invalid:8443）" in out

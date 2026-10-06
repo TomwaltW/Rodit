@@ -133,7 +133,8 @@ async function main() {
     // 质检拦截：第一稿被拦下、重写后通过
     await page.locator('.conv-btn[data-scenario="qa_block"]').click();
     await page.locator('#ai-simulated').waitFor();
-    check((await page.locator('#ai-simulated').textContent()).includes('演示：模拟大模型先写出没有依据的承诺'), '模拟说明');
+    const simulatedText = await page.locator('#ai-simulated').textContent();
+    check(simulatedText.includes('演示：模拟大模型先写出没有依据的承诺') && simulatedText.includes('下面是重写后通过的回答'), `模拟说明：${simulatedText}`);
     await page.locator('#trace .check-fail').waitFor();
     check((await page.locator('#trace .check-fail .check-text').textContent()) === '亲，明天一定能到哦！', '被拦下的第一稿');
     check((await page.locator('#trace .check-pass').count()) >= 1, '重写后通过');

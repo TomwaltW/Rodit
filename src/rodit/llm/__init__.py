@@ -4,9 +4,15 @@
 """
 
 from rodit.llm.metering import MeteredLLMClient
-from rodit.llm.openai_compat import OpenAICompatibleClient, Transport, urllib_transport
+from rodit.llm.openai_compat import (
+    LLMHTTPError,
+    OpenAICompatibleClient,
+    Transport,
+    urllib_transport,
+)
 
 __all__ = [
+    "LLMHTTPError",
     "MeteredLLMClient",
     "OpenAICompatibleClient",
     "Transport",

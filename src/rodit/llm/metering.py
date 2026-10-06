@@ -50,6 +50,11 @@ class MeteredLLMClient:
     def model(self) -> str:
         return str(getattr(self._inner, "model", "") or "")
 
+    @property
+    def options(self) -> Any:
+        """inner 的请求参数（OpenAICompatibleClient.options，能力检查、指纹用）；没有时为 None。"""
+        return getattr(self._inner, "options", None)
+
     def __repr__(self) -> str:
         return f"MeteredLLMClient(inner={self._inner!r})"
 

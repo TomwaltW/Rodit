@@ -4,7 +4,10 @@
 base_url / model 由部署配置决定，代码里不写死。实现 core.ports.LLMClient：
 
 - 密钥：每次调用时从环境变量读（默认 RODIT_LLM_API_KEY），不保存在对象上；
-  缺失时抛 LLMError。密钥不出现在 repr、异常消息、日志里（传输层异常的文字也会先抹掉密钥）。
+  缺失、中间有空白 / 换行 / 控制字符时抛 LLMError（只写变量名，不发请求）。密钥不出现在 repr、
+  异常消息、日志里（传输层异常的文字也会先抹掉密钥，原样的和 repr 转义过的都抹）。
+- base_url 不能带用户名密码（urllib 用不了，报错时还会带出来）：构造时拒绝，不回显；
+  超时必须是有限的正数（环境变量 RODIT_LLM_TIMEOUT_S 写错时报错写变量名）。
 - 超时：request.timeout_s 优先，否则用构造时的 timeout_s（路由 ≤ 1 秒由调用方传入，§12.1）。
 - 错误（§12.2 调用方据此退回 FAQ / 模板）：超时 → LLMTimeout；HTTP 429 / 5xx / 其他非 2xx、
   网络错误、响应格式不对 → LLMError。不重试：延迟预算紧，降级比重试更可控。
@@ -15,6 +18,15 @@ base_url / model 由部署配置决定，代码里不写死。实现 core.ports.
   适用于"先输出选项标签"的提示词；JSON 模式下第一个有内容的 token 往往是键名，不适合用。
   接口不返回 logprobs 时为 None。
 - request.purpose / shop_id 只用于本地计量（MeteredLLMClient），不发给模型服务。
+- 模型服务的差异用数据表达，不按厂商名写分支（core.config.LLMRequestOptions）：
+  extra_body 放服务特有的参数（如关闭思考模式），标准字段优先、不能覆盖；
+  json_mode / logprobs 两个开关关掉时不发 response_format / logprobs+top_logprobs
+  （服务不支持时；提示词本来就要求只输出 JSON，判断层没有选项概率时按投票占比算置信度）。
+  构造：from_env（环境变量 RODIT_LLM_*）、from_config（和 core.config.llm_endpoint 同一条规则：
+  配置里 base_url 和 model 都写了用配置，否则整组取环境变量）。
+- 输出开头是 <think>…</think> 思考过程时（有的模型把思考过程放在正文里）去掉它，只留后面的回答；
+  只有思考、没有结束标记时报 LLMError，提示在 extra_body 里关闭思考模式。
+- 非 2xx 抛 LLMHTTPError（LLMError 的子类，带状态码和错误类型 / 代码），能力检查据此给出提示。
 
 默认传输层用标准库 urllib（不引入新依赖）；测试注入假的 transport，不访问网络。
 默认传输层不跟随重定向：urllib 跟随 3xx 时会把 Authorization 原样带到新地址（别的主机、
@@ -30,7 +42,17 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
+from rodit.core.config import (
+    LLM_ENV_PREFIX,
+    LLMConfig,
+    LLMRequestOptions,
+    check_extra_body,
+    env_request_options,
+    llm_endpoint,
+    llm_request_options,
+)
 from rodit.core.errors import LLMError, LLMTimeout
 from rodit.core.ports import LLMRequest, LLMResponse
 
@@ -42,6 +64,17 @@ Transport = Callable[[str, dict[str, str], dict[str, Any], float], tuple[int, di
 
 _SKIP_CHARS = " \t\r\n\"'`{}[]:,"
 _FILTERED = frozenset({"content_filter", "sensitive"})  # 模型服务的内容安全拦截
+_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+
+
+class LLMHTTPError(LLMError):
+    """模型服务返回非 2xx：status 是 HTTP 状态码，code 是响应体里的错误类型 / 代码（已抹掉密钥，
+    没有时为 None）。消息和 LLMError 一样只有状态码和类型 / 代码，没有错误消息原文。"""
+
+    def __init__(self, message: str, status: int | None = None, code: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 def _parse_body(raw: bytes) -> dict[str, Any]:
@@ -91,7 +124,29 @@ def urllib_transport(
 
 
 def _scrub(text: str, secret: str, *, limit: int = 200) -> str:
-    return (text.replace(secret, "***") if secret else text)[:limit]
+    """抹掉错误信息里的密钥：原样的，和 repr 转义过的（http.client 报 "Invalid header value
+    b'Bearer …'" 时换行写成 \\n）。"""
+    if secret:
+        for form in {secret, repr(secret)[1:-1]}:
+            text = text.replace(form, "***")
+    return text[:limit]
+
+
+def _positive_seconds(raw: str, name: str) -> float:
+    """环境变量里的超时（秒）：必须是有限的正数，否则报错（只写变量名和原因）。"""
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"环境变量 {name} 必须是正数（秒）")
+    return value
+
+
+def _bad_key(key: str) -> bool:
+    """密钥中间有空白或控制字符（两行的密钥文件、粘贴时带了换行）：放进请求头会让 http.client 报错，
+    错误信息里有整个密钥。首尾的空白读的时候已经去掉。"""
+    return any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in key)
 
 
 def _non_negative_int(value: Any) -> int:
@@ -137,6 +192,32 @@ def _option_probabilities(logprobs: Any) -> dict[str, float] | None:
     return None
 
 
+THINKING_ONLY = (
+    "大模型只输出了思考过程、没有回答：请在 RODIT_LLM_EXTRA_BODY（或 llm.extra_body）里关闭思考模式"
+)
+"""模型只输出了思考过程（<think> 没有结束，或正文为空、只有 reasoning_content）时的错误信息；
+启动检查据"只输出了思考过程"认出是思考模式没关（showcase.preflight、eval.llm_env）。"""
+_REASONING_FIELDS = ("reasoning_content", "reasoning")
+
+
+def _has_reasoning(message: Any) -> bool:
+    """响应里有单独的思考字段且有内容（有的服务把思考过程放在 reasoning_content 里）。"""
+    if not isinstance(message, dict):
+        return False
+    return any(isinstance(v := message.get(k), str) and v.strip() for k in _REASONING_FIELDS)
+
+
+def _strip_reasoning(text: str) -> str:
+    """去掉开头的 <think>…</think>（有的模型把思考过程放在正文里），只留后面的回答。"""
+    head = text.lstrip()
+    if head[: len(_THINK_OPEN)].lower() != _THINK_OPEN:
+        return text
+    end = head.lower().find(_THINK_CLOSE)
+    if end < 0:
+        raise LLMError(f"{THINKING_ONLY}（<think> 没有结束）")
+    return head[end + len(_THINK_CLOSE) :].lstrip()
+
+
 def _text_content(content: Any) -> str | None:
     if isinstance(content, str):
         return content
@@ -151,8 +232,11 @@ class OpenAICompatibleClient:
     """实现 core.ports.LLMClient，调用 OpenAI 兼容的 {base_url}/chat/completions。
 
     - top_logprobs：want_logprobs 时每个位置返回的候选数。
-    - extra_body：模型服务特有的参数（如关闭思考模式），会被标准字段覆盖。
-    线程安全（无可变状态），可以给自一致性投票并发调用。
+    - extra_body：模型服务特有的参数（如关闭思考模式），按 core.config.check_extra_body 校验
+      （不能设置客户端控制的字段、不能像凭据），标准字段优先。
+    - json_mode / logprobs：模型服务不支持时关掉，请求里就不带 response_format /
+      logprobs+top_logprobs（请求方要了也不带）。
+    options 是生效的请求参数（评测指纹记它）。线程安全（无可变状态），可以给自一致性投票并发调用。
     """
 
     def __init__(
@@ -165,12 +249,22 @@ class OpenAICompatibleClient:
         transport: Transport | None = None,
         top_logprobs: int = 5,
         extra_body: Mapping[str, Any] | None = None,
+        json_mode: bool = True,
+        logprobs: bool = True,
     ) -> None:
         if not base_url.startswith(("https://", "http://")):
             raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+        try:
+            parts = urlsplit(base_url)
+            userinfo = parts.username is not None or parts.password is not None
+        except ValueError:  # 端口之类写错：交给调用时报，这里只管用户名密码
+            userinfo = "@" in base_url.split("://", 1)[1].split("/", 1)[0]
+        if userinfo:
+            # urllib 用不了 URL 里的用户名密码（报错时还会把它带出来）；不回显
+            raise ValueError("base_url 不能带用户名或密码（密钥放 API key 环境变量）")
         if not model:
             raise ValueError("model 不能为空")
-        if timeout_s <= 0:
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s 必须为正数")
         if not 1 <= top_logprobs <= 20:
             raise ValueError("top_logprobs 取值 1–20")
@@ -182,7 +276,12 @@ class OpenAICompatibleClient:
         self.api_key_env = api_key_env
         self.timeout_s = timeout_s
         self.top_logprobs = top_logprobs
-        self._extra_body = dict(extra_body or {})
+        self.options = LLMRequestOptions(
+            extra_body=check_extra_body(extra_body, source="extra_body") if extra_body else {},
+            json_mode=json_mode,
+            logprobs=logprobs,
+        )
+        self._extra_body_text = json.dumps(self.options.extra_body, ensure_ascii=False)
         self._transport: Transport = transport or urllib_transport
 
     def __repr__(self) -> str:
@@ -192,39 +291,75 @@ class OpenAICompatibleClient:
         )
 
     @classmethod
-    def from_env(cls, *, prefix: str = "RODIT_LLM_", **kwargs: Any) -> OpenAICompatibleClient:
-        """从环境变量构造：{prefix}BASE_URL、{prefix}MODEL（必填），{prefix}TIMEOUT_S（可选）；
-        密钥仍在每次调用时从 {prefix}API_KEY 读。
+    def from_env(
+        cls,
+        *,
+        prefix: str = LLM_ENV_PREFIX,
+        environ: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> OpenAICompatibleClient:
+        """从环境变量构造：{prefix}BASE_URL、{prefix}MODEL（必填），{prefix}TIMEOUT_S（可选），
+        请求参数 {prefix}EXTRA_BODY / {prefix}JSON_MODE / {prefix}LOGPROBS（可选，
+        core.config.env_request_options）；密钥仍在每次调用时从 {prefix}API_KEY 读。
 
         值去掉首尾空白（从密钥文件、挂载文件注入时常带换行），和 core.config.llm_endpoint 同一条
         规则：启动前检查、就绪检查、评测指纹描述的就是这里造出来的客户端（模型名多一个空格，
-        评测记下的和线上算出来的就对不上）。"""
-        base_url = os.environ.get(f"{prefix}BASE_URL", "").strip()
-        model = os.environ.get(f"{prefix}MODEL", "").strip()
+        评测记下的和线上算出来的就对不上）。请求参数不合法抛 ValueError（信息里没有值）。"""
+        env = os.environ if environ is None else environ
+        base_url = env.get(f"{prefix}BASE_URL", "").strip()
+        model = env.get(f"{prefix}MODEL", "").strip()
         if not base_url or not model:
             raise RuntimeError(
                 f"环境变量 {prefix}BASE_URL 和 {prefix}MODEL 必须设置（D5 所选模型）"
             )
-        timeout = os.environ.get(f"{prefix}TIMEOUT_S", "").strip()
+        timeout = env.get(f"{prefix}TIMEOUT_S", "").strip()
         if timeout:
-            kwargs.setdefault("timeout_s", float(timeout))
+            kwargs.setdefault("timeout_s", _positive_seconds(timeout, f"{prefix}TIMEOUT_S"))
         kwargs.setdefault("api_key_env", f"{prefix}API_KEY")
+        options = env_request_options(env, prefix=prefix, api_key_env=kwargs["api_key_env"])
+        kwargs.setdefault("extra_body", options.extra_body)
+        kwargs.setdefault("json_mode", options.json_mode)
+        kwargs.setdefault("logprobs", options.logprobs)
+        return cls(base_url=base_url, model=model, **kwargs)
+
+    @classmethod
+    def from_config(
+        cls,
+        config: LLMConfig,
+        *,
+        prefix: str = LLM_ENV_PREFIX,
+        environ: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> OpenAICompatibleClient:
+        """按部署配置构造，和 core.config.llm_endpoint / llm_request_options 同一条规则：配置里
+        llm.base_url 和 llm.model 都写了用配置（超时 llm.timeout_s，请求参数 llm.extra_body /
+        json_mode / logprobs）；否则整组取环境变量（from_env）。密钥从 llm.api_key_env 指的
+        环境变量读。线上单元（app.production）和评测（--llm env）都用它。"""
+        base_url, model, from_config = llm_endpoint(config, environ, prefix=prefix)
+        kwargs.setdefault("api_key_env", config.api_key_env)
+        if not from_config:
+            return cls.from_env(prefix=prefix, environ=environ, **kwargs)
+        options = llm_request_options(config, environ, prefix=prefix)
+        kwargs.setdefault("timeout_s", config.timeout_s)
+        kwargs.setdefault("extra_body", options.extra_body)
+        kwargs.setdefault("json_mode", options.json_mode)
+        kwargs.setdefault("logprobs", options.logprobs)
         return cls(base_url=base_url, model=model, **kwargs)
 
     # ---------------------------------------------------------------- 请求
 
     def build_payload(self, request: LLMRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            **self._extra_body,
+            **self.options.extra_body,
             "model": self.model,
             "messages": [m.model_dump() for m in request.messages],
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
             "stream": False,
         }
-        if request.json_mode:
+        if request.json_mode and self.options.json_mode:
             payload["response_format"] = {"type": "json_object"}
-        if request.want_logprobs:
+        if request.want_logprobs and self.options.logprobs:
             payload["logprobs"] = True
             payload["top_logprobs"] = self.top_logprobs
         return payload
@@ -233,6 +368,13 @@ class OpenAICompatibleClient:
         key = os.environ.get(self.api_key_env, "").strip()
         if not key:
             raise LLMError(f"环境变量 {self.api_key_env} 未设置：没有大模型 API key")
+        if _bad_key(key):
+            raise LLMError(
+                f"环境变量 {self.api_key_env} 的值中间有空白、换行或控制字符："
+                "检查密钥文件或粘贴的值"
+            )
+        if len(key) >= 8 and key in self._extra_body_text:
+            raise LLMError(f"extra_body 里不能放大模型密钥（{self.api_key_env} 的值）")
         timeout = request.timeout_s if request.timeout_s is not None else self.timeout_s
         headers = {
             "Authorization": f"Bearer {key}",
@@ -259,7 +401,8 @@ class OpenAICompatibleClient:
         if not isinstance(body, dict):
             raise LLMError("大模型响应格式不对：不是 JSON 对象")
         if not 200 <= status < 300:
-            raise LLMError(self._http_error(status, body, key))
+            message, code = self._http_error(status, body, key)
+            raise LLMHTTPError(message, status=status, code=code)
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise LLMError("大模型响应格式不对：没有 choices")
@@ -269,8 +412,12 @@ class OpenAICompatibleClient:
             raise LLMError("大模型输出被内容安全策略拦截")
         message = choice.get("message")
         text = _text_content(message.get("content")) if isinstance(message, dict) else None
+        if (text is None or not text.strip()) and _has_reasoning(message):
+            # 思考过程放在单独字段（reasoning_content）、正文为空：token 被思考用完了
+            raise LLMError(THINKING_ONLY)
         if text is None:
             raise LLMError("大模型响应格式不对：没有文本内容")
+        text = _strip_reasoning(text)
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         model = body.get("model")
         return LLMResponse(
@@ -279,12 +426,12 @@ class OpenAICompatibleClient:
             input_tokens=_non_negative_int(usage.get("prompt_tokens")),
             output_tokens=_non_negative_int(usage.get("completion_tokens")),
             logprobs=_option_probabilities(choice.get("logprobs"))
-            if request.want_logprobs
+            if request.want_logprobs and self.options.logprobs
             else None,
         )
 
     @staticmethod
-    def _http_error(status: int, body: dict[str, Any], key: str) -> str:
+    def _http_error(status: int, body: dict[str, Any], key: str) -> tuple[str, str | None]:
         if 300 <= status < 400:
             head = f"大模型接口返回重定向（HTTP {status}），不跟随：请检查 base_url"
         elif status == 429:
@@ -295,6 +442,7 @@ class OpenAICompatibleClient:
             head = f"大模型接口拒绝请求（HTTP {status}）"
         # 只带错误类型 / 代码，不带错误消息原文（可能回显提示词里的买家文字或密钥片段）
         err = body.get("error")
+        code: str | None = None
         if isinstance(err, dict):
             tags = [
                 _scrub(str(err[k]), key, limit=64)
@@ -302,5 +450,6 @@ class OpenAICompatibleClient:
                 if isinstance(err.get(k), str | int) and not isinstance(err.get(k), bool)
             ]
             if tags:
-                head += "：" + " / ".join(tags)
-        return head
+                code = " / ".join(tags)
+                head += "：" + code
+        return head, code

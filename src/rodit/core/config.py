@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,7 +24,9 @@ from rodit.core.models import Shop, ShopConfig
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # 校验报错不带输入值：配置里误写的密钥（如 llm.api_key）、extra_body 的值都不会被打出来。
+    # 要设在每一层（EngineConfig 和各段都继承这里）：只设在内层，外层的报错照样带值
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
 class DecisionConfig(_Model):
@@ -130,25 +134,279 @@ class AfterSaleConfig(_Model):
     repeat_threshold: int = 3  # R7
 
 
+LLM_ENV_PREFIX = "RODIT_LLM_"
+"""配置里没写全 llm.base_url / llm.model 时读的环境变量前缀：{前缀}BASE_URL、{前缀}MODEL，
+以及请求参数 {前缀}EXTRA_BODY、{前缀}JSON_MODE、{前缀}LOGPROBS
+（OpenAICompatibleClient.from_env）。"""
+
+LLM_EXTRA_BODY_MAX_CHARS = 2048
+"""extra_body 规范化 JSON 的长度上限（字符）：关思考模式这类参数只有几十个字符。"""
+LLM_EXTRA_BODY_MAX_DEPTH = 6
+LLM_CONTROLLED_FIELDS: frozenset[str] = frozenset(
+    {
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        "response_format",
+        "logprobs",
+        "top_logprobs",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+    }
+)
+"""客户端自己控制的请求字段，extra_body 不能设置：模型名、提示词、非流式调用、JSON 模式和
+logprobs（用开关 json_mode / logprobs）、各环节自己的温度和 token 上限（路由投票、质检、生成
+各不相同；max_completion_tokens 和客户端发的 max_tokens 同时出现时有的服务直接报错）、
+只取第一个候选。"""
+
+# 看起来像凭据的键（按词比较：max_tokens、budget_tokens 这类计数不算）和值的开头
+_SECRET_WORDS = frozenset(
+    {
+        "token",
+        "auth",
+        "authorization",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "credential",
+        "credentials",
+        "cookie",
+        "signature",
+        "sign",
+        "bearer",
+        "apikey",
+        "key",  # app_key、appKey、x_key……（已知不是凭据的见 _BENIGN_KEYS）
+        "ak",
+        "sk",
+        "jwt",
+        "passphrase",
+    }
+)
+_SECRET_FRAGMENTS = (
+    "apikey",
+    "accesskey",
+    "secretkey",
+    "privatekey",
+    "secret",
+    "password",
+    "passwd",
+    "passphrase",
+    "credential",
+    "authorization",
+)
+_BENIGN_KEYS = frozenset({"prompt_cache_key"})
+"""带 key 这个词、但不是凭据的已知参数（规范化的蛇形写法）。"""
+# 值的开头：Bearer、sk-、百度 bce-v3/、PEM，JWT（eyJ）、AWS 风格的 AccessKey（AKIA）
+_SECRET_VALUE_PREFIXES = ("bearer ", "sk-", "bce-v3/", "-----begin", "eyj", "akia")
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NON_WORD = re.compile(r"[^a-z0-9]+")
+
+
+def _key_words(key: str) -> tuple[str, list[str]]:
+    """键名 → (规范化的蛇形写法, 词)：apiKey、X-Api-Key、api_key 都是 api_key。"""
+    norm = _NON_WORD.sub("_", _CAMEL.sub("_", key).lower()).strip("_")
+    return norm, [w for w in norm.split("_") if w]
+
+
+def _looks_like_secret_key(key: str) -> bool:
+    norm, words = _key_words(key)
+    if norm in _BENIGN_KEYS:
+        return False
+    compact = norm.replace("_", "")
+    return any(w in _SECRET_WORDS for w in words) or any(f in compact for f in _SECRET_FRAGMENTS)
+
+
+def _key_path(path: str, key: str) -> str:
+    shown = key if len(key) <= 40 else key[:40] + "…"
+    return f"{path}.{shown}" if path else shown
+
+
+def _walk_extra_body(value: Any, *, path: str, depth: int, source: str) -> None:
+    """逐层检查：键是字符串、不像凭据，值是 JSON 值、字符串不像密钥，嵌套不太深。
+    报错只带键名路径，不带值（值可能就是密钥）。"""
+    if depth > LLM_EXTRA_BODY_MAX_DEPTH:
+        raise ValueError(f"{source} 嵌套太深（超过 {LLM_EXTRA_BODY_MAX_DEPTH} 层）")
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{source} 的键必须是字符串（{path or '顶层'}）")
+            where = _key_path(path, key)
+            if _looks_like_secret_key(key):
+                raise ValueError(
+                    f"{source} 里的键 {where} 看起来像凭据：密钥只放 API key 的环境变量"
+                    "（llm.api_key_env，默认 RODIT_LLM_API_KEY），不放请求参数"
+                )
+            _walk_extra_body(item, path=where, depth=depth + 1, source=source)
+    elif isinstance(value, list | tuple):
+        for i, item in enumerate(value):
+            _walk_extra_body(item, path=f"{path}[{i}]", depth=depth + 1, source=source)
+    elif isinstance(value, str):
+        if value.strip().lower().startswith(_SECRET_VALUE_PREFIXES):
+            raise ValueError(
+                f"{source} 里 {path or '顶层'} 的值看起来像密钥（以 sk- / Bearer 等开头）："
+                "密钥只放 API key 的环境变量，不放请求参数"
+            )
+    elif value is not None and not isinstance(value, bool | int | float):
+        raise ValueError(f"{source} 只能包含 JSON 值（{path or '顶层'} 不是）")
+
+
+def check_extra_body(value: Any, *, source: str = "llm.extra_body") -> dict[str, Any]:
+    """校验模型服务特有的请求参数（OpenAI 兼容接口之外的字段，如关闭思考模式），返回规范化的副本。
+
+    - 必须是 JSON 对象；规范化 JSON 不超过 LLM_EXTRA_BODY_MAX_CHARS 个字符、嵌套不超过
+      LLM_EXTRA_BODY_MAX_DEPTH 层；数字不能是 NaN / 无穷大；
+    - 不能设置客户端控制的字段（LLM_CONTROLLED_FIELDS）；
+    - 任何一层的键都不能像凭据（api_key、app_key、ak / sk、authorization、token、jwt、sign、
+      secret、password……按词比较，max_tokens 这类计数、prompt_cache_key 不算），字符串值不能像
+      密钥（sk-、Bearer、JWT 的 eyJ、AKIA 开头……）：凭据只放 API key 的环境变量。
+      挡不全的（比如网关自己起名的键）也不会被打出来：给人看的输出只有键名，评测指纹里是值的哈希
+      （LLMRequestOptions.summary / describe）。
+    报错（ValueError）只带键名路径，不带值。"""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{source} 必须是 JSON 对象（键值对）")
+    _walk_extra_body(value, path="", depth=1, source=source)
+    try:
+        text = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} 只能包含 JSON 值（数字不能是 NaN / 无穷大）") from None
+    if len(text) > LLM_EXTRA_BODY_MAX_CHARS:
+        raise ValueError(
+            f"{source} 太大（{len(text)} 个字符，上限 {LLM_EXTRA_BODY_MAX_CHARS}）："
+            "只放模型服务特有的少量参数"
+        )
+    controlled = sorted(k for k in value if _key_words(k)[0] in LLM_CONTROLLED_FIELDS)
+    if controlled:
+        raise ValueError(
+            f"{source} 不能设置 {'、'.join(controlled)}：这些字段由客户端控制（JSON 模式、logprobs "
+            "用开关 RODIT_LLM_JSON_MODE / RODIT_LLM_LOGPROBS 或 llm.json_mode / llm.logprobs；"
+            "温度和 token 上限由路由、质检、生成各自的配置决定）"
+        )
+    parsed = json.loads(text)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def parse_extra_body(raw: str | None, *, source: str) -> dict[str, Any]:
+    """环境变量里的 extra_body（JSON 对象文本）→ 校验过的 dict；没设或只有空白是 {}。"""
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    if len(text) > 4 * LLM_EXTRA_BODY_MAX_CHARS:
+        raise ValueError(f"{source} 太长（上限 {LLM_EXTRA_BODY_MAX_CHARS} 个字符的 JSON 对象）")
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError(
+            f'{source} 不是合法的 JSON（应为 JSON 对象，如 {{"thinking": {{"type": "disabled"}}}}）'
+        ) from None
+    return check_extra_body(value, source=source)
+
+
+_ON = frozenset({"on", "true", "1", "yes"})
+_OFF = frozenset({"off", "false", "0", "no"})
+
+
+def parse_switch(raw: str | None, *, source: str) -> bool | None:
+    """on / off 开关（也认 true / false、1 / 0、yes / no，大小写、首尾空白不计）；没设返回 None。"""
+    word = (raw or "").strip().lower()
+    if not word:
+        return None
+    if word in _ON:
+        return True
+    if word in _OFF:
+        return False
+    raise ValueError(f"{source} 只能是 on 或 off")
+
+
+class _Hidden:
+    """没通过校验的 llm.extra_body：pydantic 的错误信息只显示原因，不显示原值（可能是密钥）。"""
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def __repr__(self) -> str:
+        return "（已隐藏）"
+
+
+_REQUEST_OPTION_DEFAULTS: dict[str, Any] = {"extra_body": {}, "json_mode": True, "logprobs": True}
+
+
 class LLMConfig(_Model):
     """境内已备案大模型（D5）的调用配置。密钥不在这里：只写环境变量名，调用时再读。
 
     public_name / filing_no：对外公示的模型名称和备案号（§12.3 生成式人工智能服务登记 / 备案），
     网页工具和 /v1/me 展示；require_disclosure 为 True 时生产部署缺这两项拒绝启动。
+
+    请求参数（extra_body、json_mode、logprobs）跟着接口走（llm_endpoint 的规则）：配置里
+    base_url 和 model 都写了才用这里的，否则整组取环境变量 RODIT_LLM_EXTRA_BODY /
+    RODIT_LLM_JSON_MODE / RODIT_LLM_LOGPROBS。只写了请求参数、没写接口的配置不会生效，直接报错。
     """
 
     base_url: str | None = None  # OpenAI 兼容接口地址；为空时从环境变量 RODIT_LLM_BASE_URL 读
     model: str | None = None  # 为空时从 RODIT_LLM_MODEL 读
     api_key_env: str = "RODIT_LLM_API_KEY"
     timeout_s: float = 10.0  # 单次调用的上限；各环节自己的预算见 decision / generation
+    # 模型服务特有的请求参数（如关闭思考模式），校验规则见 check_extra_body
+    extra_body: dict[str, Any] | None = None
+    json_mode: bool = True  # 关掉时不发 response_format（服务 / 模型不支持 JSON 模式时）
+    logprobs: bool = True  # 关掉时不发 logprobs / top_logprobs（不支持时；路由按投票占比算置信度）
     public_name: str | None = None  # 公示的模型名称【待定：D5 选定后填】
     filing_no: str | None = None  # 备案号【待定：D5 选定后填】
     require_disclosure: bool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def _check_extra_body_quietly(cls, data: Any) -> Any:
+        # 在字段校验之前查：不合格的原值换成 _Hidden，报错里不出现原值
+        if isinstance(data, Mapping) and data.get("extra_body") is not None:
+            try:
+                checked: Any = check_extra_body(data["extra_body"])
+            except ValueError as e:
+                checked = _Hidden(str(e))
+            data = {**data, "extra_body": checked}
+        return data
 
-LLM_ENV_PREFIX = "RODIT_LLM_"
-"""配置里没写全 llm.base_url / llm.model 时读的环境变量前缀：{前缀}BASE_URL、{前缀}MODEL
-（OpenAICompatibleClient.from_env）。"""
+    @field_validator("extra_body", mode="before")
+    @classmethod
+    def _reject_hidden(cls, v: Any) -> Any:
+        if isinstance(v, _Hidden):
+            raise ValueError(v.reason)
+        return v
+
+    @field_validator("base_url", "model", mode="before")
+    @classmethod
+    def _strip(cls, v: Any) -> Any:
+        # 和环境变量同一条规则：去掉首尾空白，只有空白等于没写
+        if isinstance(v, str):
+            return v.strip() or None
+        return v
+
+    @model_validator(mode="after")
+    def _request_options_need_endpoint(self) -> LLMConfig:
+        # 只看和默认值不同的（model_dump 再读回来照样通过）：这些值在环境变量那一路不会生效
+        values = {
+            "extra_body": self.extra_body or {},
+            "json_mode": self.json_mode,
+            "logprobs": self.logprobs,
+        }
+        explicit = [name for name, v in values.items() if v != _REQUEST_OPTION_DEFAULTS[name]]
+        if explicit and not (self.base_url and self.model):
+            fields = "、".join(f"llm.{name}" for name in explicit)
+            raise ValueError(
+                f"{fields} 只在配置里同时写了 llm.base_url 和 llm.model 时生效"
+                "（否则整组取环境变量）：要么把接口也写进配置，要么改用环境变量 "
+                f"{LLM_ENV_PREFIX}EXTRA_BODY / "
+                f"{LLM_ENV_PREFIX}JSON_MODE / {LLM_ENV_PREFIX}LOGPROBS"
+            )
+        return self
 
 
 def llm_endpoint(
@@ -165,6 +423,103 @@ def llm_endpoint(
         return config.base_url, config.model, True
     env = os.environ if environ is None else environ
     return env.get(f"{prefix}BASE_URL", "").strip(), env.get(f"{prefix}MODEL", "").strip(), False
+
+
+@dataclass(frozen=True)
+class LLMRequestOptions:
+    """发给模型服务的请求参数（llm_request_options 解析，OpenAICompatibleClient.options 带着）。
+
+    - extra_body：模型服务特有的参数（check_extra_body 校验过），标准字段优先；
+    - json_mode：False 时不发 response_format（提示词本来就要求只输出 JSON）；
+    - logprobs：False 时不发 logprobs / top_logprobs（路由的置信度按投票占比算）。
+    extra_body 的值不出现在任何输出里（有的网关要在请求体里放凭据，键名校验挡不全）：
+    summary() 是给人看、写进报告的（只有键名）；describe() 记进评测指纹（会改变回答的东西），
+    键名加上值的规范化 JSON 的 SHA-256——值一改指纹就变，指纹里看不到值。"""
+
+    extra_body: dict[str, Any] = field(default_factory=dict, hash=False)
+    json_mode: bool = True
+    logprobs: bool = True
+
+    @staticmethod
+    def _json(data: dict[str, Any]) -> str:
+        return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _public(self) -> dict[str, Any]:
+        return {
+            "extra_body_keys": sorted(self.extra_body),
+            "json_mode": self.json_mode,
+            "logprobs": self.logprobs,
+        }
+
+    def summary(self) -> str:
+        """给人看的（横幅、能力检查、自检报告）：extra_body 只有键名。"""
+        return self._json(self._public())
+
+    def describe(self) -> str:
+        """评测指纹里的：键名 + extra_body 规范化 JSON 的 SHA-256（没有 extra_body 时不带哈希）。"""
+        data = self._public()
+        if self.extra_body:
+            canonical = self._json(self.extra_body)
+            data["extra_body_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return self._json(data)
+
+
+def _reject_api_key_inside(
+    extra_body: Mapping[str, Any], key: str | None, *, source: str, api_key_env: str
+) -> None:
+    """extra_body 里出现了密钥原文（换了个不像凭据的键名放进去）：拒绝，否则会进指纹和报告。"""
+    secret = (key or "").strip()
+    if len(secret) >= 8 and secret in json.dumps(extra_body, ensure_ascii=False):
+        raise ValueError(f"{source} 里不能放大模型密钥（{api_key_env} 的值）")
+
+
+def env_request_options(
+    environ: Mapping[str, str] | None = None,
+    *,
+    prefix: str = LLM_ENV_PREFIX,
+    api_key_env: str | None = None,
+) -> LLMRequestOptions:
+    """环境变量给的请求参数：{prefix}EXTRA_BODY（JSON 对象）、{prefix}JSON_MODE、{prefix}LOGPROBS
+    （on / off，默认 on）。值去掉首尾空白（和 BASE_URL / MODEL 一样）；不合法抛 ValueError
+    （信息里只有变量名和原因，没有值）。"""
+    env = os.environ if environ is None else environ
+    key_env = api_key_env or f"{prefix}API_KEY"
+    source = f"环境变量 {prefix}EXTRA_BODY"
+    extra = parse_extra_body(env.get(f"{prefix}EXTRA_BODY"), source=source)
+    _reject_api_key_inside(extra, env.get(key_env), source=source, api_key_env=key_env)
+    json_mode = parse_switch(env.get(f"{prefix}JSON_MODE"), source=f"环境变量 {prefix}JSON_MODE")
+    logprobs = parse_switch(env.get(f"{prefix}LOGPROBS"), source=f"环境变量 {prefix}LOGPROBS")
+    return LLMRequestOptions(
+        extra_body=extra,
+        json_mode=True if json_mode is None else json_mode,
+        logprobs=True if logprobs is None else logprobs,
+    )
+
+
+def llm_request_options(
+    config: LLMConfig, environ: Mapping[str, str] | None = None, *, prefix: str = LLM_ENV_PREFIX
+) -> LLMRequestOptions:
+    """线上单元实际发的请求参数，和 llm_endpoint 同一条规则：配置里 llm.base_url 和 llm.model
+    都写了用配置的 llm.extra_body / json_mode / logprobs；否则整组取环境变量
+    （env_request_options）。
+    组装客户端（OpenAICompatibleClient.from_config）、启动前检查和就绪检查、评测指纹都用它。
+    不合法抛 ValueError。"""
+    env = os.environ if environ is None else environ
+    _, _, from_config = llm_endpoint(config, env, prefix=prefix)
+    if not from_config:
+        return env_request_options(env, prefix=prefix, api_key_env=config.api_key_env)
+    options = LLMRequestOptions(
+        extra_body=dict(config.extra_body or {}),
+        json_mode=config.json_mode,
+        logprobs=config.logprobs,
+    )
+    _reject_api_key_inside(
+        options.extra_body,
+        env.get(config.api_key_env),
+        source="llm.extra_body",
+        api_key_env=config.api_key_env,
+    )
+    return options
 
 
 class PrivacyConfig(_Model):

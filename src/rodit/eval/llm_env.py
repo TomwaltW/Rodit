@@ -1,7 +1,10 @@
 """用真实大模型跑评测时的环境配置（`python -m rodit.eval --llm env`）。
 
 大模型：rodit.llm.OpenAICompatibleClient.from_env——RODIT_LLM_BASE_URL、RODIT_LLM_MODEL（必填）、
-RODIT_LLM_TIMEOUT_S（可选）；密钥 RODIT_LLM_API_KEY 由客户端在每次调用时自己读。
+RODIT_LLM_TIMEOUT_S（可选）；模型服务特有的请求参数 RODIT_LLM_EXTRA_BODY（JSON 对象，如关闭
+思考模式）和能力开关 RODIT_LLM_JSON_MODE / RODIT_LLM_LOGPROBS（on / off，默认 on），规则见
+core.config.env_request_options；密钥 RODIT_LLM_API_KEY 由客户端在每次调用时自己读。
+部署配置里写了 llm.base_url 和 llm.model 时整组改用配置（client_from_config，和线上同一条规则）。
 这里只检查密钥"有没有设置"，不读出、不打印、不写进报告；报告里的接口地址只留主机名
 （URL 里的用户名密码、路径、查询参数都不要）。密钥只放本地 .env（已 gitignore）或
 云端环境的密钥设置，不进仓库（CLAUDE.md）。
@@ -12,34 +15,62 @@ RODIT_LLM_PRICE_INPUT_PER_1K / RODIT_LLM_PRICE_OUTPUT_PER_1K（每 1000 token �
 
 跑之前先做一次连通性检查（preflight）：一个几个 token 的请求，地址、模型名、密钥不对时立刻报错
 （客户端的错误信息里已经抹掉了密钥），不白跑一整轮、也不让整轮结果全是降级。
+能力检查（probe_capabilities）在它之后再发至多两个很小的请求：JSON 模式（response_format）
+和 logprobs 接不接受，被拒绝时给出要改哪个开关 / 参数的提示——不同模型服务对这两个参数的
+支持不一样，preflight 的请求里没有它们，过了也不代表路由、质检、生成的请求能过。
+演示站 --llm env 的启动检查也是它（rodit.showcase.preflight），两边打出来的检查结果一样；
+路由不用大模型投票时（演示站 --judge offline、decision.provider: rules，评测 --classifier）
+请求里根本没有 logprobs，两边都不检查 logprobs。
+提示里要改的设置名跟着接口的来源走（SettingNames：环境变量那一路是 RODIT_LLM_*，配置文件写全了
+接口时是 llm.*）；没有状态码的失败按错误信息分（error_kind：思考模式没关、出口被网络策略拦下
+——要放行的是域名、重试没有用——、证书、域名解析、连接被拒）。给人看的请求参数只有 extra_body
+的键名（LLMRequestOptions.summary）。
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
-from typing import Any
+import re
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from rodit.core.ports import LLMClient, LLMMessage, LLMRequest
+from pydantic import BaseModel, ConfigDict
+
+from rodit.core.config import LLM_ENV_PREFIX, LLMConfig, LLMRequestOptions
+from rodit.core.errors import LLMError, LLMTimeout
+from rodit.core.ports import LLMClient, LLMMessage, LLMRequest, LLMResponse
+from rodit.decision.voting import extract_json_object
 from rodit.eval.perf import Pricing
 from rodit.llm import OpenAICompatibleClient
 
-ENV_PREFIX = "RODIT_LLM_"
+ENV_PREFIX = LLM_ENV_PREFIX
 PRICE_INPUT_ENV = "RODIT_LLM_PRICE_INPUT_PER_1K"
 PRICE_OUTPUT_ENV = "RODIT_LLM_PRICE_OUTPUT_PER_1K"
 KEY_HINT = "密钥只放本地 .env 或环境的密钥设置，不要提交进仓库"
 
 
-def client_from_env(*, prefix: str = ENV_PREFIX, **kwargs: Any) -> OpenAICompatibleClient:
-    """按环境变量构造客户端（kwargs 原样交给 OpenAICompatibleClient.from_env，测试用来注入
-    transport）。地址或模型没设、密钥没设时抛 RuntimeError（信息里只有变量名）。"""
-    client = OpenAICompatibleClient.from_env(prefix=prefix, **kwargs)
+def _require_key(client: OpenAICompatibleClient) -> OpenAICompatibleClient:
     if not os.environ.get(client.api_key_env, "").strip():
         raise RuntimeError(
             f"环境变量 {client.api_key_env} 未设置：没有大模型 API key（{KEY_HINT}）"
         )
     return client
+
+
+def client_from_env(*, prefix: str = ENV_PREFIX, **kwargs: Any) -> OpenAICompatibleClient:
+    """按环境变量构造客户端（kwargs 原样交给 OpenAICompatibleClient.from_env，测试用来注入
+    transport）。地址或模型没设、密钥没设时抛 RuntimeError（信息里只有变量名）；请求参数
+    （RODIT_LLM_EXTRA_BODY / JSON_MODE / LOGPROBS）不合法抛 ValueError。"""
+    return _require_key(OpenAICompatibleClient.from_env(prefix=prefix, **kwargs))
+
+
+def client_from_config(config: LLMConfig, **kwargs: Any) -> OpenAICompatibleClient:
+    """和线上单元同一条规则构造客户端（OpenAICompatibleClient.from_config：配置里 llm.base_url 和
+    llm.model 都写了整组用配置，否则整组取环境变量）。错误同 client_from_env。"""
+    return _require_key(OpenAICompatibleClient.from_config(config, **kwargs))
 
 
 def describe_endpoint(client: object) -> str | None:
@@ -62,16 +93,415 @@ def describe_model(client: object) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def client_options(client: object) -> LLMRequestOptions:
+    """客户端实际发的请求参数（OpenAICompatibleClient.options；MeteredLLMClient 转发 inner 的）。
+    不暴露请求参数的客户端（测试替身）按默认值算：不带特有参数，JSON 模式和 logprobs 照请求方的
+    要求。"""
+    options = getattr(client, "options", None)
+    return options if isinstance(options, LLMRequestOptions) else LLMRequestOptions()
+
+
+def describe_options(client: object) -> str | None:
+    """评测指纹里的请求参数（LLMRequestOptions.describe）；没有客户端（离线替身）返回 None。"""
+    return None if client is None else client_options(client).describe()
+
+
+def _preflight_request() -> LLMRequest:
+    return LLMRequest(
+        purpose="other",
+        messages=[LLMMessage(role="user", content="连通性检查，只回复：OK")],
+        temperature=0.0,
+        max_tokens=8,
+    )
+
+
 def preflight(client: LLMClient) -> None:
     """连通性检查：失败时照常抛 LLMError / LLMTimeout（调用方报错退出）。"""
-    client.complete(
+    client.complete(_preflight_request())
+
+
+# ================================================================ 能力检查
+
+CheckName = Literal["plain", "json_mode", "logprobs"]
+CheckStatus = Literal["ok", "rejected", "failed", "off", "skipped"]
+
+CHECK_LABELS: dict[str, str] = {
+    "plain": "普通调用",
+    "json_mode": "JSON 模式",
+    "logprobs": "logprobs",
+}
+STATUS_LABELS: dict[str, str] = {
+    "ok": "通过",
+    "rejected": "被拒绝",
+    "failed": "没有结果",
+    "off": "已关闭",
+    "skipped": "没检查",
+}
+_HTTP_STATUS = re.compile(r"HTTP (\d{3})")
+THINKING_HINT = (
+    f"默认开思考模式的模型要在 {ENV_PREFIX}EXTRA_BODY（或 llm.extra_body）里关闭，如 "
+    '{"thinking":{"type":"disabled"}} 或 {"enable_thinking":false}，按服务商的写法'
+)
+JSON_OFF_HINT = (
+    f"设 {ENV_PREFIX}JSON_MODE=off（或 llm.json_mode: false）：提示词本来就要求只输出 JSON，"
+    "解析能容忍代码块和前后的文字"
+)
+LOGPROBS_OFF_HINT = (
+    f"设 {ENV_PREFIX}LOGPROBS=off（或 llm.logprobs: false）：路由的置信度改按投票占比算"
+)
+JSON_PROBE_PROMPT = '能力检查：只输出这个 JSON 对象，不要别的文字：{"ok": true}'
+LOGPROBS_PROBE_PROMPT = "能力检查：只回复一个大写字母 A，不要别的文字"
+
+
+class CapabilityCheck(BaseModel):
+    """一项能力检查的结果。error 是客户端的错误信息（只有状态码和错误类型 / 代码，密钥已抹掉）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: CheckName
+    status: CheckStatus
+    latency_ms: int | None = None
+    http_status: int | None = None
+    timed_out: bool = False  # 没有结果是因为超时（LLMTimeout）
+    error: str | None = None
+    output_ok: bool | None = None  # 通过时输出能不能用：JSON 模式找得到 JSON 对象、logprobs 有返回
+    note: str | None = None  # 通过但有要注意的（输出不是 JSON、没返回 logprobs……）
+    hint: str | None = None  # 要改哪个开关 / 参数
+
+
+class CapabilityReport(BaseModel):
+    """能力检查报告（probe_capabilities）。没有密钥：接口只留协议和主机。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str | None = None
+    model: str | None = None
+    options: str  # 生效的请求参数（LLMRequestOptions.summary：extra_body 只有键名）
+    checks: list[CapabilityCheck]
+
+    def check(self, name: CheckName) -> CapabilityCheck:
+        return next(c for c in self.checks if c.name == name)
+
+    @property
+    def reachable(self) -> bool:
+        """普通调用通过（地址、模型名、密钥都对）。"""
+        return self.check("plain").status == "ok"
+
+    @property
+    def blocking(self) -> list[CapabilityCheck]:
+        """会让整轮请求都失败的问题：普通调用不通，或开着的 JSON 模式 / logprobs 被拒绝。"""
+        return [
+            c
+            for c in self.checks
+            if (c.name == "plain" and c.status != "ok")
+            or (c.name != "plain" and c.status == "rejected")
+        ]
+
+    @property
+    def hints(self) -> list[str]:
+        return [f"{CHECK_LABELS[c.name]}：{c.hint}" for c in self.checks if c.hint]
+
+
+@dataclass(frozen=True)
+class SettingNames:
+    """诊断里叫人去改的设置名。接口来自环境变量时是 RODIT_LLM_*；配置文件里写全了 llm.base_url 和
+    llm.model 时整组用配置（RODIT_LLM_BASE_URL / MODEL / TIMEOUT_S 不起作用），是 llm.*。
+    密钥总是环境变量，名字是客户端实际读的那个（llm.api_key_env，默认 RODIT_LLM_API_KEY）。"""
+
+    base_url: str = f"{ENV_PREFIX}BASE_URL"
+    model: str = f"{ENV_PREFIX}MODEL"
+    timeout: str = f"{ENV_PREFIX}TIMEOUT_S"
+    api_key: str = f"{ENV_PREFIX}API_KEY"
+
+    @classmethod
+    def of(cls, client: object, *, from_config: bool = False) -> SettingNames:
+        key = getattr(client, "api_key_env", None)
+        key = key if isinstance(key, str) and key else f"{ENV_PREFIX}API_KEY"
+        if from_config:
+            return cls("llm.base_url", "llm.model", "llm.timeout_s", key)
+        return cls(api_key=key)
+
+
+# 客户端错误信息里认得出的问题（没有 HTTP 状态码的那类；showcase.preflight 也按这些分类）
+_EGRESS = re.compile(r"Tunnel connection failed|ProxyError|Proxy Authentication Required", re.I)
+_TLS = re.compile(
+    r"CERTIFICATE_VERIFY_FAILED|certificate verify failed|SSLCertVerification|"
+    r"\[SSL[:\]]|SSLError|WRONG_VERSION_NUMBER",
+    re.I,
+)
+_DNS = re.compile(
+    r"Name or service not known|nodename nor servname|getaddrinfo failed|"
+    r"Temporary failure in name resolution|No address associated with hostname",
+    re.I,
+)
+_REFUSED = re.compile(r"Connection refused|ConnectionRefusedError|Errno 111|Errno 61", re.I)
+_THINKING = "只输出了思考过程"  # rodit.llm.openai_compat.THINKING_ONLY
+
+ErrorKind = Literal["thinking", "egress", "tls", "dns", "refused"]
+
+
+def error_kind(message: str) -> ErrorKind | None:
+    """客户端错误信息里认得出的网络 / 输出问题：模型只输出了思考过程（思考模式没关）、出口被代理或
+    网络策略拦下（CONNECT 403 / 407）、TLS 证书、域名解析、连接被拒。认不出返回 None。"""
+    if _THINKING in message:
+        return "thinking"
+    if _EGRESS.search(message):
+        return "egress"
+    if _TLS.search(message):
+        return "tls"
+    if _DNS.search(message):
+        return "dns"
+    if _REFUSED.search(message):
+        return "refused"
+    return None
+
+
+def endpoint_domain(client: object) -> str | None:
+    """接口的域名（不带协议、端口）：网络策略的允许列表按域名放行。"""
+    base_url = getattr(client, "base_url", None)
+    if not isinstance(base_url, str) or not base_url:
+        return None
+    return urlsplit(base_url).hostname
+
+
+def _http_status(error: LLMError) -> int | None:
+    status = getattr(error, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+    match = _HTTP_STATUS.search(str(error))
+    return int(match.group(1)) if match else None
+
+
+def _is_rejection(status: int | None) -> bool:
+    """服务明确拒绝了这个请求（4xx；超时 408、限流 429 不算：换个时间可能就过了）。"""
+    return status is not None and 400 <= status < 500 and status not in (408, 429)
+
+
+def _failure_hint(
+    name: CheckName,
+    status: int | None,
+    timeout: bool,
+    *,
+    message: str = "",
+    names: SettingNames | None = None,
+    domain: str | None = None,
+) -> str:
+    """一步检查没过时的提示：要改哪个设置（names：环境变量那一路是 RODIT_LLM_*，配置文件那一路
+    是 llm.*）。没有状态码的按错误信息认（error_kind）：网络策略拦截时重试没有用，
+    要放行的是域名。"""
+    names = names or SettingNames()
+    kind = None if timeout or status is not None else error_kind(message)
+    if kind == "thinking":
+        return f"模型只输出了思考过程、没有回答：{THINKING_HINT}"
+    if timeout or status == 408:
+        return (
+            f"超时：先把 {names.timeout} 调大量一次延迟（路由 decision.timeout_s、"
+            f"生成 generation.timeout_s 是各环节自己的上限）；{THINKING_HINT}"
+        )
+    if status == 429:
+        return "限流：稍后再试或提高并发额度（路由每条消息并发 decision.vote_samples 次）"
+    if name == "json_mode" and _is_rejection(status):
+        return (
+            f"该服务 / 模型不接受 response_format：{JSON_OFF_HINT}；"
+            f"若是思考模式下不支持 JSON 模式，{THINKING_HINT}"
+        )
+    if name == "logprobs" and _is_rejection(status):
+        return f"该服务 / 模型不接受 logprobs：{LOGPROBS_OFF_HINT}"
+    if status in (401, 403):
+        return f"密钥不对或没有权限：检查环境变量 {names.api_key} 的值"
+    if status == 404:
+        return (
+            f"接口地址或模型名不对：{names.base_url} 写到 /v1 这一级（客户端自己加 "
+            f"/chat/completions），{names.model} 用服务商当前的模型 ID"
+        )
+    if _is_rejection(status):
+        return (
+            f"请求被拒绝：先确认 {names.model}；{THINKING_HINT}；"
+            "不接受 temperature=0 的服务（质检用 0）暂不支持"
+        )
+    if kind == "egress":
+        where = f"域名 {domain}" if domain else "模型服务的域名"
+        return f"出网被代理或网络策略拦下（CONNECT 被拒）：把{where}加进允许的域名，重试没有用"
+    if kind == "dns":
+        return f"解析不了域名：检查 {names.base_url} 的主机名和本机 DNS"
+    if kind == "refused":
+        return f"连接被拒绝：检查 {names.base_url} 的地址和端口，服务有没有启动"
+    if kind == "tls":
+        return (
+            "TLS 证书校验失败：走企业代理时把代理的根证书加进信任（如 SSL_CERT_FILE），"
+            "不要关闭证书校验"
+        )
+    if status is not None and 300 <= status < 400:
+        return f"接口返回重定向（不跟随）：检查 {names.base_url}"
+    if status is not None:
+        return "服务端错误：稍后再试"
+    return "调用失败：稍后再试；网络错误时检查代理和出网策略"
+
+
+def _scrub(text: str, client: object) -> str:
+    """错误信息里抹掉密钥（OpenAICompatibleClient 已经抹过；别的客户端再保险一次）。"""
+    key_env = getattr(client, "api_key_env", None) or f"{ENV_PREFIX}API_KEY"
+    key = os.environ.get(str(key_env), "").strip()
+    if len(key) < 4:
+        return text
+    for form in {key, repr(key)[1:-1]}:  # repr 转义过的（换行写成 \n）也抹掉
+        text = text.replace(form, "***")
+    return text
+
+
+def _attempt(
+    client: LLMClient,
+    name: CheckName,
+    request: LLMRequest,
+    timer: Callable[[], float],
+    names: SettingNames,
+) -> tuple[CapabilityCheck, LLMResponse | None]:
+    started = timer()
+    try:
+        response = client.complete(request)
+    except LLMError as e:
+        latency_ms = max(0, round((timer() - started) * 1000))
+        timeout = isinstance(e, LLMTimeout)
+        status = None if timeout else _http_status(e)
+        error = _scrub(str(e), client)[:200]
+        return (
+            CapabilityCheck(
+                name=name,
+                status="rejected" if _is_rejection(status) else "failed",
+                latency_ms=latency_ms,
+                http_status=status,
+                timed_out=timeout,
+                error=error,
+                hint=_failure_hint(
+                    name,
+                    status,
+                    timeout,
+                    message=error,
+                    names=names,
+                    domain=endpoint_domain(client),
+                ),
+            ),
+            None,
+        )
+    latency_ms = max(0, round((timer() - started) * 1000))
+    return CapabilityCheck(name=name, status="ok", latency_ms=latency_ms), response
+
+
+def probe_capabilities(
+    client: LLMClient,
+    *,
+    timer: Callable[[], float] = time.perf_counter,
+    check_logprobs: bool = True,
+    names: SettingNames | None = None,
+) -> CapabilityReport:
+    """检查这个模型服务接不接受我们会发的参数，至多三个很小的请求（purpose="other"）：
+
+    1. 普通调用：就是 preflight 的请求（地址、模型名、密钥；不通就不再发后面的）；
+    2. JSON 模式：要求只输出一个 JSON 对象（json_mode 开着时带 response_format，关着时只靠提示词），
+       看接不接受、输出能不能解析（判断层的解析规则：容忍代码块和前后文字；output_ok 记结果）；
+    3. logprobs：开着时带 logprobs + top_logprobs，看接不接受、有没有返回（output_ok）；关着时不发。
+       check_logprobs=False：调用方这次根本不会请求 logprobs（如演示站路由不用大模型投票），
+       不发这个请求，记为 skipped。
+    被拒绝（4xx，限流除外）、超时都记下状态码 / 错误类型和要改哪个开关、参数的提示；不抛异常。
+    names：提示里的设置名（SettingNames，默认环境变量那一路；接口写在配置文件里时调用方传 llm.*）。
+    结果里没有密钥：接口只留协议和主机，错误信息只有状态码和错误类型 / 代码。"""
+    options = client_options(client)
+    names = names or SettingNames.of(client)
+    report = CapabilityReport(
+        endpoint=describe_endpoint(client),
+        model=describe_model(client),
+        options=options.summary(),
+        checks=[],
+    )
+    plain, _ = _attempt(client, "plain", _preflight_request(), timer, names)
+    report.checks.append(plain)
+    if plain.status != "ok":
+        report.checks.extend(
+            CapabilityCheck(name=name, status="skipped", note="普通调用没通过，不再检查")
+            for name in ("json_mode", "logprobs")
+        )
+        return report
+
+    json_check, response = _attempt(
+        client,
+        "json_mode",
         LLMRequest(
             purpose="other",
-            messages=[LLMMessage(role="user", content="连通性检查，只回复：OK")],
+            messages=[LLMMessage(role="user", content=JSON_PROBE_PROMPT)],
+            temperature=0.0,
+            max_tokens=32,
+            json_mode=True,
+        ),
+        timer,
+        names,
+    )
+    if response is not None:
+        json_check.output_ok = extract_json_object(response.text) is not None
+    if json_check.output_ok is False:
+        json_check.note = "接受了请求，但输出里找不到 JSON 对象"
+        json_check.hint = (
+            f"确认思考模式已关闭（{ENV_PREFIX}EXTRA_BODY），或换一个能按要求只输出 JSON 的模型"
+        )
+    if not options.json_mode:
+        json_check.note = f"{ENV_PREFIX}JSON_MODE=off：不发 response_format，只靠提示词" + (
+            f"；{json_check.note}" if json_check.note else ""
+        )
+    report.checks.append(json_check)
+
+    if not options.logprobs:
+        report.checks.append(
+            CapabilityCheck(
+                name="logprobs",
+                status="off",
+                note="不发 logprobs：路由的置信度按投票占比算",
+            )
+        )
+        return report
+    if not check_logprobs:
+        report.checks.append(
+            CapabilityCheck(
+                name="logprobs", status="skipped", note="这次的请求不带 logprobs，不检查"
+            )
+        )
+        return report
+    lp_check, response = _attempt(
+        client,
+        "logprobs",
+        LLMRequest(
+            purpose="other",
+            messages=[LLMMessage(role="user", content=LOGPROBS_PROBE_PROMPT)],
             temperature=0.0,
             max_tokens=8,
-        )
+            want_logprobs=True,
+        ),
+        timer,
+        names,
     )
+    if response is not None:
+        lp_check.output_ok = bool(response.logprobs)
+    if lp_check.output_ok is False:
+        lp_check.note = "接受了参数，但没返回选项概率"
+        lp_check.hint = f"可以省掉这个参数：{LOGPROBS_OFF_HINT}"
+    report.checks.append(lp_check)
+    return report
+
+
+def render_capabilities(report: CapabilityReport) -> list[str]:
+    """能力检查的文本（逐行；命令行打到标准错误）。"""
+    where = report.endpoint or "未知地址"
+    model = report.model or "未知模型"
+    lines = [f"大模型能力检查（{model} @ {where}；请求参数 {report.options}）："]
+    for c in report.checks:
+        parts = [STATUS_LABELS[c.status]]
+        if c.latency_ms is not None:
+            parts.append(f"{c.latency_ms} 毫秒")
+        if c.error:
+            parts.append(c.error)
+        if c.note:
+            parts.append(c.note)
+        lines.append(f"  {CHECK_LABELS[c.name]}：" + "，".join(parts))
+    lines.extend(f"  提示（{hint}）" for hint in report.hints)
+    return lines
 
 
 def _price(flag: float | None, env_name: str, env: Mapping[str, str]) -> float | None:
@@ -110,11 +540,27 @@ def resolve_pricing(
 
 
 __all__ = [
+    "CHECK_LABELS",
+    "JSON_OFF_HINT",
+    "LOGPROBS_OFF_HINT",
     "PRICE_INPUT_ENV",
     "PRICE_OUTPUT_ENV",
+    "STATUS_LABELS",
+    "THINKING_HINT",
+    "CapabilityCheck",
+    "CapabilityReport",
+    "ErrorKind",
+    "SettingNames",
+    "client_from_config",
     "client_from_env",
+    "client_options",
     "describe_endpoint",
     "describe_model",
+    "describe_options",
+    "endpoint_domain",
+    "error_kind",
     "preflight",
+    "probe_capabilities",
+    "render_capabilities",
     "resolve_pricing",
 ]

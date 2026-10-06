@@ -125,12 +125,15 @@ def test_base_url_trailing_slash_and_extra_body(api_key):
         base_url=BASE + "/",
         model="qwen-synthetic",
         transport=t,
-        extra_body={"enable_thinking": False, "model": "不能覆盖标准字段"},
+        extra_body={"enable_thinking": False},
     )
     c.complete(req())
     url, _, body, _ = t.calls[0]
     assert url == BASE + "/chat/completions"
     assert body["enable_thinking"] is False and body["model"] == "qwen-synthetic"
+    # 标准字段由客户端控制：extra_body 想覆盖就直接拒绝（以前是悄悄被覆盖，看不出来没生效）
+    with pytest.raises(ValueError, match="不能设置 model"):
+        OpenAICompatibleClient(base_url=BASE, model="m", extra_body={"model": "别的模型"})
 
 
 @pytest.mark.parametrize(

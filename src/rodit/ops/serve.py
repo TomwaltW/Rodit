@@ -96,7 +96,13 @@ from rodit.app.service import AssistService
 from rodit.app.unit import Repos, Unit, build_unit
 from rodit.core.audit import AuditAction
 from rodit.core.clock import CST, Clock, SystemClock
-from rodit.core.config import LLM_ENV_PREFIX, EngineConfig, llm_endpoint, load_config
+from rodit.core.config import (
+    LLM_ENV_PREFIX,
+    EngineConfig,
+    llm_endpoint,
+    llm_request_options,
+    load_config,
+)
 from rodit.core.enums import ProviderName
 from rodit.core.errors import StorageUnavailable, TokenDecryptionError
 from rodit.core.models import LabeledSample
@@ -210,7 +216,8 @@ def preflight(
     settings: ServerSettings, config: EngineConfig, environ: Mapping[str, str] | None = None
 ) -> None:
     """必需的环境变量都有值（只看有没有，报错只列变量名）。大模型密钥缺失不在这里拦：
-    /readyz 报 missing_api_key，进程不接流量，日志里看得到原因。
+    /readyz 报 missing_api_key，进程不接流量，日志里看得到原因。配了大模型时请求参数
+    （RODIT_LLM_EXTRA_BODY / JSON_MODE / LOGPROBS 或配置的 llm 段）不合法拒绝启动。
 
     生产模式下配置要求公示大模型（llm.require_disclosure）时，公示名称和备案号都要填
     （§12.3 生成式人工智能服务登记：公示所用模型的名称和备案号 / 上线编号）。"""
@@ -221,6 +228,13 @@ def preflight(
         missing.append(f"{LLM_ENV_PREFIX}BASE_URL / {LLM_ENV_PREFIX}MODEL（或配置文件 llm 段）")
     if missing:
         raise StartupError("缺少必需的环境变量：" + "、".join(missing))
+    if _llm_configured(config, env):
+        # 请求参数和接口同一条规则（core.config.llm_request_options）；不合法时组装客户端也会失败，
+        # 这里先拦下，报错里只有变量名和原因（不带值）
+        try:
+            llm_request_options(config.llm, env, prefix=LLM_ENV_PREFIX)
+        except ValueError as exc:
+            raise StartupError(f"大模型请求参数不对：{exc}") from None
     if settings.is_production and config.llm.require_disclosure:
         blank = [
             f"llm.{name}"

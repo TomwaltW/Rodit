@@ -7,6 +7,8 @@ showcase_smoke.cjs：产品概览、工作台（推荐卡片、过程面板、�
 结论和按周序列）、合规页的打码演示、切换平台（拼多多不能发图片）、页面载入后演示被重置过时旧卡片的
 操作被拒（409，提示并重新载入）、重置、手机宽度没有横向滚动，
 全程没有控制台报错、没有 CSP 拦截、没有外部请求。
+另一个用例（showcase_llm_smoke.cjs）让演示站接"真实大模型"——本机的 OpenAI 兼容替身
+（llm_stub.py，真实的 OpenAICompatibleClient 走真实 HTTP）：徽标、判断层降级的说明、真实的票数。
 设了 RODIT_SHOWCASE_SHOTS（目录）时把各页的整页截图存进去。
 没有 node / playwright 模块 / 浏览器时跳过（不新增 Python 依赖：用镜像里全局安装的
 Node 版 Playwright）。
@@ -26,15 +28,18 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from llm_stub import StubLLM
 from showcase_support import NOW
 
 from rodit.core.enums import AfterSaleStatus, Platform, SuggestionStatus
+from rodit.eval.llm_env import client_from_env
 from rodit.showcase.app import create_showcase_app
 from rodit.showcase.state import ShowcaseHub
 from rodit.testing.fakes import FakeClock
 
 NODE = shutil.which("node")
 SCRIPT = Path(__file__).with_name("showcase_smoke.cjs")
+LLM_SCRIPT = Path(__file__).with_name("showcase_llm_smoke.cjs")
 SKIP_EXIT = 77
 TIMEOUT_S = 240
 
@@ -68,14 +73,14 @@ def _serve(app) -> Iterator[str]:
         thread.join(timeout=10)
 
 
-@pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
-def test_showcase_in_a_real_browser():
-    hub = ShowcaseHub(clock=FakeClock(NOW))
+def _run_node(script: Path, app, extra_env: dict[str, str] | None = None) -> dict:
+    """起服务、跑 node 脚本，返回脚本最后一行的 JSON 结果（没有 Playwright 时跳过）。"""
     env = _node_env()
-    with _serve(create_showcase_app(hub)) as base:
+    env.update(extra_env or {})
+    with _serve(app) as base:
         env["RODIT_BASE_URL"] = base
         proc = subprocess.run(
-            [str(NODE), str(SCRIPT)],
+            [str(NODE), str(script)],
             env=env,
             capture_output=True,
             text=True,
@@ -86,6 +91,13 @@ def test_showcase_in_a_real_browser():
     lines = proc.stdout.strip().splitlines()
     result = json.loads(lines[-1]) if lines else {"ok": False, "error": proc.stderr}
     assert proc.returncode == 0 and result["ok"], result.get("error") or proc.stderr
+    return result
+
+
+@pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
+def test_showcase_in_a_real_browser():
+    hub = ShowcaseHub(clock=FakeClock(NOW))
+    result = _run_node(SCRIPT, create_showcase_app(hub))
     assert result["steps"] == [
         "landing",
         "suggestion-trace",
@@ -124,3 +136,30 @@ def test_showcase_in_a_real_browser():
     assert len(taobao.unit.action_port.calls) == 1  # 再提交一次没有重复操作（幂等）
     untouched = taobao.unit.tools.get_aftersale(taobao.shop_id, "as_2002")
     assert untouched is not None and untouched.status == AfterSaleStatus.PENDING_REVIEW
+
+
+@pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
+def test_showcase_with_the_real_llm_chain_in_a_real_browser(stub_env: StubLLM):
+    """--llm env --judge llm：徽标、降级说明、真实票数、§11.5 重写失败的说明（大模型是本机的
+    OpenAI 兼容替身）。"""
+    stub_env.fail("route", "429", times=3)  # 第一条消息的三票都被限流：页面要写明退回了关键词规则
+    stub_env.fail("generate_retry", "500")  # §11.5 重写那次生成失败：页面不能说"重写后通过"
+    hub = ShowcaseHub(
+        clock=FakeClock(NOW),
+        llm=client_from_env(),
+        judge="llm",
+        latency="strict",
+        history_seed=None,
+    )
+    result = _run_node(
+        LLM_SCRIPT,
+        create_showcase_app(hub),
+        {
+            "RODIT_LLM_MODEL": stub_env.model,
+            "RODIT_EXPECT_HOST": stub_env.base_url.removesuffix("/v1"),
+        },
+    )
+    assert result["steps"] == ["badge", "fallback", "votes", "rewrite_failed", "phone"]
+    # 页面上的操作真的走到了模型替身：每条消息路由 3 个请求，生成、质检都有
+    assert stub_env.count("route") >= 9 and stub_env.count("generate") >= 1
+    assert stub_env.count("qa") >= 1

@@ -7,7 +7,15 @@
 - 审计（engine.result，这条消息新写的）：硬规则命中和质检原因的汇总；
 - 审计（engine.understand，这条消息新写的）：买家图片的张数、识别失败 / 没识别的张数；
 - 过程记录（showcase.recorder.Recording）：路由看到的图片识别结果和描述、每条依据的内容、每份草稿、
-  每份草稿的质检结果。
+  每份草稿的质检结果；接真实大模型时还有每次大模型判断的每一票（路由、质检，见 showcase.realchain）
+  和每次真实调用的用途、成败、耗时、token。
+
+接真实大模型时（chain.real）判断层的说明按实际情况写：路由是大模型投票答的，还是投票失败（超时、
+限流……）后退回了关键词规则（§12.2 降级，原因写明白）；质检是大模型答的，还是判断层不可用、
+大模型草稿不推荐；生成有没结果的调用（超时……）时写明大模型草稿没拿到、退回 FAQ / 模板
+（fallback.generation，引擎不把它记成降级）。§11.5 模拟第一稿之后的重写结果分三种
+（simulated_rewrite：大模型重写稿通过 / 没通过 / 没有大模型重写稿），模板兜底不算"重写后通过"。
+离线时照旧标"离线替身"。
 
 只放给讲解用的字段：不放 buyer_ref、买家昵称、会话里的其他买家消息；依据内容是引擎给大模型看的
 那份（已做个人信息最小化，§5.3）；图片的识别结果（摘要、图中文字）是图片理解打过码的，这里
@@ -16,6 +24,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 
@@ -50,6 +59,7 @@ from rodit.showcase.labels import (
     qa_thresholds,
     rule_texts,
 )
+from rodit.showcase.realchain import ChainInfo, JudgeRecord, LLMCall
 from rodit.showcase.recorder import Recording
 
 _INTENT_VALUES = frozenset(i.value for i in Intent)
@@ -198,7 +208,195 @@ def _evidence_view(e: Evidence, cited: set[str]) -> dict[str, Any]:
     }
 
 
-def _qa_view(result: QAResult, kind: str, text: str, attempt: int, cfg: EngineConfig) -> dict:
+ROUTE_QUESTION_LABELS: dict[str, str] = {
+    "intent": "问题类型",
+    "need_human": "要求人工 / 投诉",
+    "emotion": "情绪（0–4）",
+    "multi_intent": "多个问题",
+    "second_intent": "另一个问题",
+}
+"""路由投票的题目（§6.5 + 追问 second_intent）。"""
+
+PURPOSE_LABELS: dict[str, str] = {
+    "route": "路由",
+    "generate": "生成",
+    "qa": "质检",
+    "other": "其他",
+}
+
+FALLBACK_ROUTE = "这条消息改用关键词规则路由（降级，§12.2）"
+FALLBACK_QA = "质检不可用：大模型草稿不推荐（§12.2）"
+FALLBACK_GENERATION = "没拿到的大模型草稿已丢掉，退回 FAQ / 模板（§12.2）"
+
+
+def provider_label(name: str | None, chain: ChainInfo | None) -> str:
+    """判断层实现的中文名。接真实大模型、判断层用大模型投票时，关键词规则是兜底（不是替身）。"""
+    if not name:
+        return "只跑硬规则"
+    if chain is not None and chain.real:
+        if name == "rules" and chain.judge_llm and chain.route_by_llm:
+            return "关键词规则（大模型判断层不可用时的兜底）"
+        if name == "rules" and chain.judge_llm:
+            return "关键词规则（配置的 decision.provider = rules）"
+        if name == "incloud_llm":
+            return f"大模型投票（{chain.model}）"
+    return PROVIDER_LABELS.get(name, name)
+
+
+def _option_label(option: str) -> str:
+    if option == "无":
+        return "无（只有一个问题）"
+    return intent_label(option) if option in _INTENT_VALUES else option
+
+
+def _judge_questions(record: JudgeRecord) -> list[dict[str, Any]]:
+    keys: list[str] = []
+    for key in [*record.answers, *(k for v in record.votes for k in v)]:
+        if key not in keys:
+            keys.append(key)
+    out = []
+    for key in keys:
+        votes = [v[key] for v in record.votes if key in v]
+        label = ROUTE_QUESTION_LABELS.get(key) or QA_QUESTION_LABELS.get(key, key)
+        view: dict[str, Any] = {"key": key, "label": label, "valid": len(votes)}
+        if votes and all(isinstance(v, str) for v in votes):
+            view["type"] = "choice"
+            view["counts"] = [
+                {"option": o, "label": _option_label(o), "votes": n}
+                for o, n in Counter(votes).most_common()
+            ]
+        elif votes and all(isinstance(v, float) for v in votes):
+            view["type"] = "score"
+            view["values"] = [round(float(v), 2) for v in votes]
+        elif votes:
+            yes = sum(1 for v in votes if getattr(v, "yes", False))
+            view["type"] = "noul"
+            view["yes"] = yes
+            view["no"] = len(votes) - yes
+            view["p"] = [round(p, 3) for v in votes if (p := getattr(v, "p", None)) is not None]
+        else:
+            view["type"] = "none"
+        out.append(view)
+    return out
+
+
+def judge_failure(record: JudgeRecord) -> str | None:
+    """大模型判断不可用的白话原因（没有失败时返回 None）。"""
+    if record.failed is None:
+        return None
+    errors = Counter(record.errors)
+    listed = "、".join(f"{label} ×{n}" if n > 1 else label for label, n in errors.items())
+    if record.all_timed_out:
+        limit = f"（每次限时 {record.timeout_s:g} 秒）" if record.timeout_s is not None else ""
+        return f"大模型 {record.samples} 次调用全部超时{limit}"
+    if not record.votes and record.errors:
+        return f"大模型 {record.samples} 次调用全部失败（{listed}）"
+    if record.errors:
+        return (
+            f"有效票不够：{len(record.votes)}/{record.samples} 次有回答（另有 {listed}），"
+            f"每题至少要 {record.min_votes} 票"
+        )
+    return f"大模型的回答解析不出足够的有效票（每题至少要 {record.min_votes} 票）"
+
+
+def judge_view(record: JudgeRecord | None, chain: ChainInfo | None) -> dict[str, Any] | None:
+    """一次大模型判断的每一票（页面画"投票几票、每票选了什么、哪几票失败"）。"""
+    if record is None:
+        return None
+    errors = Counter(record.errors)
+    return {
+        "purpose": record.purpose,
+        "provider": record.provider,
+        "provider_label": provider_label(record.provider, chain),
+        "samples": record.samples,
+        "answered": len(record.votes),
+        "errors": [{"label": label, "count": n} for label, n in errors.items()],
+        "min_votes": record.min_votes,
+        "timeout_s": record.timeout_s,
+        "latency_ms": record.latency_ms,
+        "input_tokens": record.input_tokens,
+        "output_tokens": record.output_tokens,
+        "probability_source": "logprobs" if record.logprobs else "votes",
+        "failed": record.failed is not None,
+        "failure": judge_failure(record),
+        "questions": _judge_questions(record),
+    }
+
+
+def generation_failure(calls: Sequence[LLMCall]) -> str | None:
+    """这条消息的大模型生成有没有没结果的调用（超时、限流……）：有就返回白话说明（页面上标为
+    降级）。引擎不把生成失败记成降级（生成器自己退回 FAQ / 模板，§12.2），这里按调用记录补上。"""
+    failed = [c for c in calls if c.purpose == "generate" and c.error]
+    if not failed:
+        return None
+    errors = Counter(str(c.error) for c in failed)
+    listed = "、".join(f"{label} ×{n}" if n > 1 else label for label, n in errors.items())
+    return f"大模型生成有 {len(failed)} 次调用没有结果：{listed} → {FALLBACK_GENERATION}"
+
+
+def rewrite_outcome(parts: Sequence[dict[str, Any]], cards: Sequence[SuggestionCard]) -> str:
+    """§11.5 模拟第一稿被拦之后重写的结果：passed 大模型重写稿通过质检、推荐了出去；
+    blocked 有大模型重写稿，但没通过质检（或质检不可用）；none 没有大模型重写稿（重写超时、
+    生成失败、时间不够，退回 FAQ / 模板）。模板兜底的卡片不算"重写后通过"。"""
+    rewrites = [c for p in parts for c in p["judge"] if c["attempt"] > 1 and c["kind"] == "llm"]
+    if any(c["passed"] for c in rewrites) and any(c.kind.value == "llm" for c in cards):
+        return "passed"
+    return "blocked" if rewrites else "none"
+
+
+_PURPOSE_ORDER = ("route", "generate", "qa", "other")
+
+
+def llm_view(calls: Sequence[LLMCall], chain: ChainInfo | None) -> dict[str, Any] | None:
+    """这条消息的真实大模型调用（按用途汇总）。离线时返回 None。"""
+    if chain is None or not chain.real:
+        return None
+    by: dict[str, dict[str, Any]] = {}
+    for call in calls:
+        row = by.setdefault(
+            call.purpose,
+            {
+                "purpose": call.purpose,
+                "label": PURPOSE_LABELS.get(call.purpose, call.purpose),
+                "calls": 0,
+                "failed": 0,
+                "timeouts": 0,
+                "max_ms": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        )
+        row["calls"] += 1
+        row["failed"] += 1 if call.error else 0
+        row["timeouts"] += 1 if call.timed_out else 0
+        row["max_ms"] = max(row["max_ms"], call.latency_ms)
+        row["input_tokens"] += call.input_tokens
+        row["output_tokens"] += call.output_tokens
+    rows = sorted(
+        by.values(),
+        key=lambda r: _PURPOSE_ORDER.index(r["purpose"]) if r["purpose"] in _PURPOSE_ORDER else 9,
+    )
+    return {
+        "model": chain.model,
+        "host": chain.host,
+        "calls": len(calls),
+        "failed": sum(1 for c in calls if c.error),
+        "input_tokens": sum(c.input_tokens for c in calls),
+        "output_tokens": sum(c.output_tokens for c in calls),
+        "by_purpose": rows,
+    }
+
+
+def _qa_view(
+    result: QAResult,
+    kind: str,
+    text: str,
+    attempt: int,
+    cfg: EngineConfig,
+    *,
+    judge: JudgeRecord | None = None,
+    chain: ChainInfo | None = None,
+) -> dict:
     thresholds = qa_thresholds(cfg.qa_gate)
     scores = []
     for key, value in result.scores.items():
@@ -237,20 +435,36 @@ def _qa_view(result: QAResult, kind: str, text: str, attempt: int, cfg: EngineCo
         "scores": scores,
         "model_checked": result.model_checked,
         "provider": result.provider,
-        "provider_label": PROVIDER_LABELS.get(
-            result.provider or "", result.provider or "只跑硬规则"
-        ),
+        "provider_label": provider_label(result.provider, chain),
         "degraded": result.degraded,
         "reasons": list(result.reasons),
+        "judge": judge_view(judge, chain),
+        "unavailable": (
+            f"{judge_failure(judge)} → {FALLBACK_QA}"
+            if result.degraded and judge is not None and judge.failed is not None
+            else None
+        ),
     }
 
 
-def _understand(result: EngineResult, cfg: EngineConfig, decisions: Sequence[DecisionLogEntry]):
+def _understand(
+    result: EngineResult,
+    cfg: EngineConfig,
+    decisions: Sequence[DecisionLogEntry],
+    recording: Recording,
+    chain: ChainInfo | None,
+):
     route = result.route
     if route is None:
         return None
     rules = rule_texts(cfg.routing)
     route_log = next((d for d in decisions if d.stage == DecisionStage.ROUTE), None)
+    routed = recording.routed[0] if recording.routed else None
+    judge = routed.judge if routed is not None else None
+    fallback = None
+    if route.degraded:
+        reason = judge_failure(judge) if judge is not None else None
+        fallback = f"{reason or '判断层不可用'} → {FALLBACK_ROUTE}"
     return {
         "intent": route.intent.value,
         "intent_label": intent_label(route.intent),
@@ -277,9 +491,11 @@ def _understand(result: EngineResult, cfg: EngineConfig, decisions: Sequence[Dec
         "action": route.action.value,
         "action_label": ROUTE_ACTION_LABELS[route.action],
         "provider": route.provider,
-        "provider_label": PROVIDER_LABELS.get(route.provider, route.provider),
+        "provider_label": provider_label(route.provider, chain),
         "questions_ver": route_log.questions_ver if route_log else None,
         "degraded": route.degraded,
+        "fallback": fallback,
+        "judge": judge_view(judge, chain),
         "risk_hints": list(route.risk_hints),
         "alerts": list(route.alerts),
     }
@@ -294,8 +510,9 @@ def build_trace(
     decisions: Sequence[DecisionLogEntry],
     events: Sequence[AuditEvent],
     simulated_note: str | None = None,
+    chain: ChainInfo | None = None,
 ) -> dict[str, Any]:
-    """页面上"AI 是怎么想的"面板的数据（见模块说明）。"""
+    """页面上"AI 是怎么想的"面板的数据（见模块说明）。chain 是这次演示用的链路（为空按离线）。"""
     shop_id = result.shop_id
     cited = {e.id for card in result.suggestions for e in card.evidence}
     intents: list[Intent] = []
@@ -348,6 +565,8 @@ def build_trace(
                     c.draft.text,
                     attempt_of.get(c.draft.text, 1),
                     config,
+                    judge=c.judge,
+                    chain=chain,
                 )
             )
         parts.append(
@@ -378,8 +597,10 @@ def build_trace(
     since = int(latency.get("since_received", total))
     route = result.route
     blocked = sum(1 for p in parts for c in p["judge"] if not c["passed"])
+    rewrite = rewrite_outcome(parts, result.suggestions) if simulated_note else None
+    real = chain is not None and chain.real
     return {
-        "understand": _understand(result, config, decisions),
+        "understand": _understand(result, config, decisions, recording, chain),
         "images": images_view(result, recording, events),
         "parts": parts,
         "fallback": {
@@ -390,6 +611,8 @@ def build_trace(
                 {"marker": m, "label": gap_label(m)} for m in result.missing_knowledge
             ],
             "degraded": [{"marker": m, "label": degraded_label(m)} for m in result.degraded],
+            # 接真实大模型时生成有没结果的调用（引擎不记降级，生成器自己退回 FAQ / 模板）
+            "generation": generation_failure(recording.llm_calls) if real else None,
             "human_only": route is not None
             and route.action in (RouteAction.HUMAN_PRIORITY, RouteAction.NO_SUGGESTION),
         },
@@ -398,6 +621,7 @@ def build_trace(
             "blocked": blocked,
             "hard_hits": [{"rule": h, "label": HARD_RULE_LABELS.get(h, h)} for h in hard_hits if h],
             "model_checks": len(qa_logs),
+            "unavailable": sum(1 for p in parts for c in p["judge"] if c["degraded"]),
         },
         "latency": {
             "stages": [
@@ -408,18 +632,33 @@ def build_trace(
             "since_received_ms": max(since, total),
             "target_ms": E2E_TARGET_MS,
             "within_target": max(since, total) <= E2E_TARGET_MS,
+            "budget_s": config.latency.message_budget_s,
+            "route_timeout_s": config.decision.timeout_s,
+            "relaxed": chain is not None and chain.real and chain.relaxed,
         },
+        "llm": llm_view(recording.llm_calls, chain),
         "simulated_note": simulated_note,
+        "simulated_rewrite": rewrite,
+        "simulated_rewrite_passed": rewrite == "passed" if simulated_note else None,
     }
 
 
 __all__ = [
+    "FALLBACK_GENERATION",
+    "FALLBACK_QA",
+    "FALLBACK_ROUTE",
     "build_trace",
     "card_view",
     "degraded_label",
     "describe_evidence",
     "gap_label",
+    "generation_failure",
     "images_view",
     "intent_label",
     "is_image_alert",
+    "judge_failure",
+    "judge_view",
+    "llm_view",
+    "provider_label",
+    "rewrite_outcome",
 ]

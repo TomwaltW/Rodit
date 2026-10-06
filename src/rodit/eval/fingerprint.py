@@ -14,7 +14,10 @@
     题型和回答校验 core.decision、路由 / 质检的 state（core.states、core.pii、qa.masking）。
     质检一直用大模型判断层，分类器路由时也比较这一项）；
   - 路由判断层（decision_provider）和路由分类器模型文件的 SHA-256（classifier 路由时）；
-  - 大模型：模型名和接口地址（只留协议和主机）。
+  - 大模型：模型名和接口地址（只留协议和主机），以及请求参数（llm_options：模型服务特有的
+    extra_body、JSON 模式和 logprobs 开关，core.config.LLMRequestOptions.describe 的规范化 JSON——
+    关思考模式、关 logprobs 都会改变回答。extra_body 只记键名和值的 SHA-256：值一改指纹就变，
+    报告、系统事件里看不到值——有的网关要在请求体里放凭据，键名校验挡不全）。
   模块按名字排序、按 importlib 找到源文件来算。列表以外的代码（阈值判断、质检硬规则……）
   改了指纹不变：它们的改动靠代码版本留痕（git，拿得到时；部署镜像里没有 .git 时由环境变量
   RODIT_GIT_SHA 提供），代码版本只作记录，same_setup 不比较。
@@ -22,7 +25,8 @@
   判断层是 classifier（配置里写的是别的也一样）、分类器文件的 SHA-256。
 - 线上的指纹（current_fingerprint）按部署的规则解析，和线上单元实际用的一致：大模型和
   app.production.build_production_unit 同一条规则（配置里 llm.base_url、llm.model 都写了用配置，
-  否则都取环境变量 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL）；decision.provider 是 classifier 时
+  否则都取环境变量 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL，请求参数跟着一起：配置的 llm 段或
+  RODIT_LLM_EXTRA_BODY / JSON_MODE / LOGPROBS）；decision.provider 是 classifier 时
   分类器用 serve 启动时实际加载的模型文件的 SHA-256：同一进程里的调用方（上线状态、切换阶段的
   门槛）传 loaded_classifier_sha256，取自 ClassifierProvider.file_sha256，文件启动后被换掉也照旧
   是加载的那个；别的进程（运维任务 record-eval、acceptance-report）看不到 serve 加载的是什么，
@@ -60,7 +64,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
-from rodit.core.config import EngineConfig, config_fingerprint, llm_endpoint
+from rodit.core.config import (
+    LLM_ENV_PREFIX,
+    EngineConfig,
+    config_fingerprint,
+    llm_endpoint,
+    llm_request_options,
+)
 from rodit.core.enums import ProviderName
 from rodit.core.models import AuditEvent
 from rodit.core.questions import QA_QUESTIONS_VER, ROUTER_QUESTIONS_VER
@@ -118,6 +128,9 @@ class EvalFingerprint(_Model):
     decision_provider: str | None = None  # 路由判断层（ProviderName 的值）
     llm_model: str | None = None  # 大模型的模型名
     llm_endpoint: str | None = None  # 大模型接口的协议和主机（端口），没有路径、用户名密码
+    # 大模型请求参数（LLMRequestOptions.describe：extra_body 的键名和值的 SHA-256、json_mode、
+    # logprobs 的规范化 JSON）
+    llm_options: str | None = None
     git_sha: str | None = None
     git_dirty: bool | None = None  # 有没有提交的改动（环境变量给的版本为 None）
     classifier_sha256: str | None = None  # 路由分类器模型文件（classifier 路由时）
@@ -253,6 +266,18 @@ def running_llm(
     return (model or None), endpoint_of(base_url)
 
 
+def running_llm_options(
+    config: EngineConfig, environ: Mapping[str, str] | None = None
+) -> str | None:
+    """线上单元实际发的大模型请求参数（core.config.llm_request_options，和 running_llm 同一条规则：
+    配置里 llm.base_url 和 llm.model 都写了用配置的 llm 段，否则用环境变量 RODIT_LLM_EXTRA_BODY /
+    JSON_MODE / LOGPROBS）的规范化 JSON。不合法时返回 None（线上组装不起来，和什么都对不上）。"""
+    try:
+        return llm_request_options(config.llm, environ, prefix=LLM_ENV_PREFIX).describe()
+    except ValueError:
+        return None
+
+
 def running_classifier_sha256(
     config: EngineConfig,
     environ: Mapping[str, str] | None = None,
@@ -280,9 +305,11 @@ def fingerprint_of(
     classifier_sha256: str | None = None,
     git: bool = False,
     environ: Mapping[str, str] | None = None,
+    llm_options: str | None = None,
 ) -> EvalFingerprint:
     """给定大模型和分类器的指纹（评测按实际跑的填）。判断层取 config.decision.provider：
-    评测用 --classifier 时调用方先把它换成 classifier。git=True 时带上代码版本。"""
+    评测用 --classifier 时调用方先把它换成 classifier。git=True 时带上代码版本。
+    llm_options：实际发的请求参数（eval.llm_env.describe_options；离线替身为 None）。"""
     sha, dirty = git_revision(environ=environ) if git else (None, None)
     return EvalFingerprint(
         config_fingerprint=config_fingerprint(config),
@@ -293,6 +320,7 @@ def fingerprint_of(
         decision_provider=config.decision.provider.value,
         llm_model=llm_model,
         llm_endpoint=llm_endpoint,
+        llm_options=llm_options,
         git_sha=sha,
         git_dirty=dirty,
         classifier_sha256=classifier_sha256,
@@ -323,6 +351,7 @@ def current_fingerprint(
         classifier_sha256=classifier_sha,
         git=git,
         environ=environ,
+        llm_options=running_llm_options(config, environ),
     )
 
 
@@ -381,6 +410,13 @@ def differences(verdict: EvalFingerprint, running: EvalFingerprint) -> list[str]
         and _known_and_equal(a.llm_endpoint, b.llm_endpoint)
     ):
         out.append(f"大模型（评测 {_llm_label(a)}，线上 {_llm_label(b, running=True)}）")
+    if not _known_and_equal(a.llm_options, b.llm_options):
+        evaluated = a.llm_options or "没记录"
+        deployed = b.llm_options or (
+            f"未知：{LLM_ENV_PREFIX}EXTRA_BODY / {LLM_ENV_PREFIX}JSON_MODE / "
+            f"{LLM_ENV_PREFIX}LOGPROBS（或配置的 llm 段）不合法"
+        )
+        out.append(f"大模型请求参数（评测 {evaluated}，线上 {deployed}）")
     return out
 
 
@@ -592,6 +628,7 @@ __all__ = [
     "parse_verdicts",
     "running_classifier_sha256",
     "running_llm",
+    "running_llm_options",
     "same_setup",
     "source_version",
     "test_set_evidence",
