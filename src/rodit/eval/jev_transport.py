@@ -16,6 +16,7 @@ JevProvider（rodit.decision.jev）里没有 HTTP 代码，transport 由调用�
   处理，§12.2），原异常留在 __cause__ 里，对比评测据此区分超时和其他失败；
 - 用量：响应里带 usage（input_tokens / output_tokens，或 prompt_tokens / completion_tokens）
   时取出来累计（usage_totals），再把 usage 从响应里拿掉——DecisionResponse 不收这个字段；
+  用量不是有限的数（Infinity、NaN、字符串等）时当作没报告，不影响回答；
   其余字段原样交回，格式变了照样由 JevProvider 报错。
 
 只发合成数据：这个传输层只由对比评测在合成评测集上构造；JevProvider 的 offline_eval 护栏
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import threading
 import urllib.error
@@ -100,7 +102,11 @@ def _check_base_url(base_url: str) -> str:
 
 
 def _non_negative_int(value: Any) -> int | None:
+    """用量里的 token 数：不是数、或不是有限数（json.loads 收 Infinity / NaN）时为 None，
+    当作没报告——用量解析不能让一个好的回答变成异常。"""
     if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
         return None
     return max(0, int(value))
 
