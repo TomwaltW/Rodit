@@ -180,6 +180,7 @@ class SuggestionView(_View):
     confidence: Confidence
     evidence: list[EvidenceLabelView] = Field(default_factory=list)
     risk_hints: list[str] = Field(default_factory=list)
+    prefill: bool = False  # 半自动（§5.6）：可以直接填进客服输入框
 
     @classmethod
     def from_card(cls, card: SuggestionCard) -> SuggestionView:
@@ -191,6 +192,7 @@ class SuggestionView(_View):
             confidence=card.confidence,
             evidence=[EvidenceLabelView(id=e.id, label=e.label) for e in card.evidence],
             risk_hints=list(card.risk_hints),
+            prefill=card.prefill,
         )
 
 

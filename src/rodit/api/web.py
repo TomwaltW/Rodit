@@ -57,6 +57,8 @@ from rodit.core.enums import (
 )
 from rodit.core.evidence import PLATFORM_NAMES
 from rodit.core.models import QUALITY_PERIOD_PATTERN, ShopConfig
+from rodit.core.platform_metrics import metric_labels
+from rodit.core.schedule import MAX_SERVICE_WINDOWS
 from rodit.feedback import REJECT_REASON_LABELS
 from rodit.feedback.review import (
     DEFAULT_MIN_SCORED,
@@ -109,6 +111,9 @@ CONSOLE_ASSETS: dict[str, str] = {
 
 CONSOLE_PAGE_FILE = "console.html"
 CONFIG_PLACEHOLDER = "__RODIT_PAGE_CONFIG__"
+
+SERVICE_HOURS_LINE_CHARS = 20
+"""一行工作时段（"09:00-23:00"）的输入长度上限。"""
 
 PHASE0_ADOPTION_TARGET = 0.5
 """Phase 0 验收：模式 C 下种子商家推荐采纳率 ≥ 50%（§15；按推荐组算，同 feedback.phase_gate）。"""
@@ -235,6 +240,9 @@ CONFIG_FIELD_LABELS: dict[str, str] = {
     "manager_ids": "店长子账号",
     "shadow_mode": "影子模式",
     "auto_reply_enabled": "全自动回复",
+    "service_hours": "客服工作时间",
+    "auto_reply_schedule": "全自动生效时段",
+    "semi_auto_intents": "半自动的问题类型",
 }
 """店铺配置项（core.models.ShopConfig）的中文名。"""
 
@@ -248,16 +256,22 @@ CONFIG_FIELD_HINTS: dict[str, str] = {
     "suggestion_count": "每条买家消息最多给几条推荐（§5.4）",
     "aftersale_amount_limit": "超过这个金额的售后操作必须店长确认（R6，§7.3.2）",
     "manager_ids": "每行一个子账号；超额售后只认这里列出的店长",
+    "service_hours": "每行一个时段，如 09:00-23:00（北京时间，附录 C 第 13 题）",
+    "auto_reply_schedule": "off_hours：只在客服工作时间以外自动回复；always：全天",
+    "semi_auto_intents": "这些类型的高置信度推荐直接填进客服输入框，客服按发送即可",
 }
 
 LOCKED_CONFIG_REASONS: dict[str, str] = {
     "shadow_mode": "由上线节奏决定（§13.4）：在「上线」页切换，恢复智能辅助要复核人员确认",
     "auto_reply_enabled": "全自动要平台准入，由我们评估后开启（§13.4），这里不能改",
+    "auto_reply_schedule": "全自动先在非工作时间试行（§15 Phase 3），由我们评估后调整",
+    "semi_auto_intents": "该类型原样采纳率达到门槛后由复核人员开启（§13.4），这里不能改",
 }
 
 CONFIG_LINE_LIMITS: dict[str, dict[str, int]] = {
     "banned_words": {"max_chars": MAX_BANNED_WORD_CHARS, "max_items": MAX_BANNED_WORDS},
     "manager_ids": {"max_chars": MAX_ACCOUNT_CHARS, "max_items": MAX_MANAGER_IDS},
+    "service_hours": {"max_chars": SERVICE_HOURS_LINE_CHARS, "max_items": MAX_SERVICE_WINDOWS},
 }
 
 GATE_STATUS_LABELS: dict[GateStatus, str] = {
@@ -416,6 +430,7 @@ def console_page_config(platform: Platform) -> dict[str, Any]:
         "degraded": DEGRADED_LABELS,
         "adoption_target": PHASE0_ADOPTION_TARGET,
         "period_pattern": QUALITY_PERIOD_PATTERN,
+        "platform_metrics": metric_labels(),  # §12.4 平台客服指标（报表页的接入前后对比）
         "limits": {
             "question": MAX_QUESTION_CHARS,
             "answer": MAX_ANSWER_CHARS,

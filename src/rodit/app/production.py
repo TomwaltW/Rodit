@@ -29,8 +29,10 @@ from rodit.core.ports import (
     AfterSaleActionPort,
     AuditLog,
     ImageTextExtractor,
+    ImageUnderstanding,
     ItemCatalog,
     PlatformAdapter,
+    PlatformMetricsSource,
     ToolGateway,
 )
 from rodit.llm import MeteredLLMClient, OpenAICompatibleClient
@@ -114,6 +116,8 @@ def build_production_unit(
     ocr: ImageTextExtractor | None = None,
     route_provider: DecisionProvider | None = None,
     llm_transport: Transport | None = None,
+    vision: ImageUnderstanding | None = None,
+    metrics_source: PlatformMetricsSource | None = None,
 ) -> Unit:
     """生产单元：tools / adapters / action_port 由平台云里的实现注入（见模块说明）。
 
@@ -159,4 +163,6 @@ def build_production_unit(
         catalog=catalog,
         ocr=ocr,
         route_provider=route_provider,
+        vision=vision,
+        metrics_source=metrics_source,
     )

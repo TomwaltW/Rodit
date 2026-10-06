@@ -25,7 +25,13 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, FastAPI, Path, Response
 
-from rodit.api import routes_console, routes_rollout, routes_tenancy
+from rodit.api import (
+    routes_aftersale,
+    routes_console,
+    routes_platform_metrics,
+    routes_rollout,
+    routes_tenancy,
+)
 from rodit.api.auth import PERSON_ROLES, Authenticator, Principal
 from rodit.api.deps import (
     MSG_FORBIDDEN_ROLE,
@@ -534,6 +540,8 @@ def create_app(
     app.include_router(routes_console.router)  # 商家控制台：知识编辑、店铺配置、商品同步（§9.1）
     app.include_router(routes_rollout.router)  # 上线节奏与每周复核（§13.4、§13.5）
     app.include_router(routes_tenancy.router)  # 店铺生命周期：开通、订购事件（§8.4）
+    app.include_router(routes_aftersale.router)  # 售后审核工作台（§7.3.2，Phase 2）
+    app.include_router(routes_platform_metrics.router)  # 平台客服指标接入前后对比（§12.4）
     if web_page:
         app.include_router(build_web_router(service.unit.platform))
     return app

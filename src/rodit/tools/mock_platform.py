@@ -16,6 +16,8 @@ CLAUDE.md：平台接口一律 mock。MockPlatformTools 演示真实适配器（
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol, TypeVar
@@ -52,6 +54,24 @@ from rodit.tools.normalize import (
     normalize_order_status,
     normalize_trace_status,
 )
+
+_PLACEHOLDER_IMAGE = re.compile(r"^(pic_\d+\.jpg|https://img\.example\.invalid/\d+\.jpg|img_\d+)$")
+"""只有凭证张数、没有图片标识的合成售后单，编码时用的占位图名（解码时不当作图片标识）。"""
+
+
+def _evidence_refs(a: AfterSaleInfo, placeholder: Callable[[int], str]) -> list[str]:
+    """凭证图片在平台原始数据里的写法：有图片标识（AfterSaleInfo.evidence_images）用标识，
+    张数比标识多的部分用占位图名。"""
+    refs = list(a.evidence_images)
+    refs += [placeholder(i) for i in range(len(refs), a.evidence_count)]
+    return refs
+
+
+def _image_refs(raw: object) -> list[str]:
+    """原始数据里的凭证图片 → 图片标识（去掉占位图名）。"""
+    if not isinstance(raw, list):
+        return []
+    return [r for r in raw if isinstance(r, str) and not _PLACEHOLDER_IMAGE.match(r)]
 
 
 class WorldData(Protocol):
@@ -322,7 +342,7 @@ class _TaobaoCodec(_Codec):
             "refund_fee": str(a.amount),
             "created": _fmt(a.created_at),
             "modified": _fmt(a.updated_at),
-            "evidence_pics": [f"pic_{i}.jpg" for i in range(a.evidence_count)],
+            "evidence_pics": _evidence_refs(a, lambda i: f"pic_{i}.jpg"),
             "desc": a.note,
         }
 
@@ -342,6 +362,7 @@ class _TaobaoCodec(_Codec):
                 created_at=_parse(raw["created"]),
                 updated_at=updated,
                 evidence_count=len(raw.get("evidence_pics") or []),
+                evidence_images=_image_refs(raw.get("evidence_pics")),
                 status_version=_version(updated),
                 note=raw.get("desc"),
             )
@@ -505,7 +526,7 @@ class _DouyinCodec(_Codec):
             "refund_amount": _fen(a.amount),
             "create_time": _ts(a.created_at),
             "update_time": _ts(a.updated_at),
-            "evidence": [f"https://img.example.invalid/{i}.jpg" for i in range(a.evidence_count)],
+            "evidence": _evidence_refs(a, lambda i: f"https://img.example.invalid/{i}.jpg"),
             "buyer_remark": a.note,
         }
 
@@ -525,6 +546,7 @@ class _DouyinCodec(_Codec):
                 created_at=_from_ts(raw["create_time"]),
                 updated_at=updated,
                 evidence_count=len(raw.get("evidence") or []),
+                evidence_images=_image_refs(raw.get("evidence")),
                 status_version=_version(updated),
                 note=raw.get("buyer_remark"),
             )
@@ -688,7 +710,7 @@ class _PddCodec(_Codec):
             "refund_amount": _fen(a.amount),
             "created_time": _fmt(a.created_at),
             "updated_time": _fmt(a.updated_at),
-            "images": [f"img_{i}" for i in range(a.evidence_count)],
+            "images": _evidence_refs(a, lambda i: f"img_{i}"),
             "remark": a.note,
         }
 
@@ -708,6 +730,7 @@ class _PddCodec(_Codec):
                 created_at=_parse(raw["created_time"]),
                 updated_at=updated,
                 evidence_count=len(raw.get("images") or []),
+                evidence_images=_image_refs(raw.get("images")),
                 status_version=_version(updated),
                 note=raw.get("remark"),
             )

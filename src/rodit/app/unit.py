@@ -34,10 +34,13 @@ from rodit.core.ports import (
     Embedder,
     FeedbackRepository,
     ImageTextExtractor,
+    ImageUnderstanding,
     ItemCatalog,
     KnowledgeRepository,
     LLMClient,
     PlatformAdapter,
+    PlatformMetricsRepository,
+    PlatformMetricsSource,
     QualityReviewRepository,
     ShopAuthRepository,
     SuggestionRepository,
@@ -56,6 +59,7 @@ from rodit.inmemory import (
     InMemoryConversationRepository,
     InMemoryFeedbackRepository,
     InMemoryKnowledgeRepository,
+    InMemoryPlatformMetricsRepository,
     InMemoryQualityReviewRepository,
     InMemoryShopAuthRepository,
     InMemorySuggestionRepository,
@@ -85,18 +89,23 @@ class Repos:
     auth: ShopAuthRepository
     audit: AuditLog
     quality_reviews: QualityReviewRepository
+    # 平台客服考核指标（§12.4 接入前后对比）；为空时商家报表没有这一节
+    platform_metrics: PlatformMetricsRepository | None = None
 
     def purgers(self) -> list[object]:
         """§8.4 取消订购后要按约定删除数据的仓储（都有 purge_shop）。令牌由 AuthGuard 删除。"""
-        return [
+        purgers: list[object] = [
             self.knowledge,
             self.conversations,
             self.suggestions,
             self.feedback,
             self.reviews,
             self.quality_reviews,
-            self.audit,
         ]
+        if self.platform_metrics is not None:
+            purgers.append(self.platform_metrics)
+        purgers.append(self.audit)  # 审计最后删
+        return purgers
 
 
 def in_memory_repos(clock: Clock) -> Repos:
@@ -109,6 +118,7 @@ def in_memory_repos(clock: Clock) -> Repos:
         auth=InMemoryShopAuthRepository(),
         audit=InMemoryAuditSink(),
         quality_reviews=InMemoryQualityReviewRepository(),
+        platform_metrics=InMemoryPlatformMetricsRepository(),
     )
 
 
@@ -140,6 +150,10 @@ class Unit:
     # 平台商品接口和详情图 OCR（§5.2.3 商品自动同步）；没注入时商品同步不可用，其他照常
     catalog: ItemCatalog | None = None
     ocr: ImageTextExtractor | None = None
+    # 买家图片 / 售后凭证的理解（§15 Phase 3）；没注入时当作没有图片理解，照常给推荐
+    vision: ImageUnderstanding | None = None
+    # 平台客服考核数据接口（§12.4）；没注入时只能商家登记或系统估算
+    metrics_source: PlatformMetricsSource | None = None
     extra_purgers: list[object] = field(default_factory=list)
     # 给平台云代码取店铺令牌（§8.4，core.ports.TokenProvider）；不给时用基于 auth 的默认实现
     tokens: TokenProvider | None = None
@@ -179,6 +193,8 @@ def build_unit(
     ocr: ImageTextExtractor | None = None,
     token_refresher: TokenRefreshPort | None = None,
     parse_subscription: SubscriptionParser | None = None,
+    vision: ImageUnderstanding | None = None,
+    metrics_source: PlatformMetricsSource | None = None,
 ) -> Unit:
     """把各模块接成一个平台单元。
 
@@ -189,7 +205,13 @@ def build_unit(
     - catalog / ocr：平台商品接口和详情图 OCR（§5.2.3），为空时商品同步不可用。
     - token_refresher / parse_subscription：平台的令牌续期接口、订购推送解析（§8.4），
       为空时续期、平台推送订购事件不可用。
+    - vision：买家图片 / 售后凭证的理解（§15 Phase 3），为空时没有图片理解；
+      metrics_source：平台客服考核数据（§12.4），为空时只能商家登记或系统估算。
     """
+    if metrics_source is not None and metrics_source.platform != platform:
+        raise ValueError(
+            f"平台指标接口属于 {metrics_source.platform}，单元是 {platform}（§9.1 数据不跨云）"
+        )
     if catalog is not None and catalog.platform != platform:
         raise ValueError(f"商品接口属于 {catalog.platform}，单元是 {platform}（§9.1 数据不跨云）")
     if token_refresher is not None and token_refresher.platform != platform:
@@ -302,6 +324,8 @@ def build_unit(
         action_port=action_port,
         catalog=catalog,
         ocr=ocr,
+        vision=vision,
+        metrics_source=metrics_source,
         token_refresher=token_refresher,
         parse_subscription=parse_subscription,
     )

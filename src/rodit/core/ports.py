@@ -22,7 +22,7 @@ AuditLog.list_system_events（只有没有店铺归属的系统事件）。
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, SecretStr
@@ -34,6 +34,7 @@ from rodit.core.enums import (
     Intent,
     KnowledgeStatus,
     Platform,
+    PlatformMetric,
     QualityReviewStatus,
     ReviewState,
     Role,
@@ -51,6 +52,8 @@ from rodit.core.models import (
     Draft,
     EvidenceBundle,
     HumanConfirmation,
+    ImageFinding,
+    ImageRef,
     ItemCard,
     KnowledgeGap,
     KnowledgeItem,
@@ -60,6 +63,7 @@ from rodit.core.models import (
     OrderInfo,
     PlatformContext,
     PlatformItem,
+    PlatformMetricSample,
     PolicyEntry,
     PriceInfo,
     QAResult,
@@ -299,6 +303,35 @@ class ImageTextExtractor(Protocol):
     """
 
     def extract_text(self, shop_id: str, image_ref: str) -> str: ...
+
+
+@runtime_checkable
+class ImageUnderstanding(Protocol):
+    """买家图片 / 售后凭证的理解（§15 Phase 3 "图片理解：破损照片、尺码截图"）。
+
+    平台云内的境内视觉模型（和 D5 同样的备案与报备要求），图片不出云。生产实现由平台云注入，
+    沙箱和测试用 rodit.testing.fakes.FakeImageUnderstanding。
+    - 返回的 summary / extracted_text 必须已过 core.pii.mask_pii（面单上的手机号、地址）；
+    - 识别失败、超时、限流抛 core.errors.ToolUnavailable（调用方按 §12.2 降级：当作没有图片理解，
+      照常给推荐，提醒客服自己看图）；
+    - 只看 shop_id 这家店铺的图片（§9.2）。
+    """
+
+    def analyze(self, shop_id: str, image: ImageRef) -> ImageFinding: ...
+
+
+@runtime_checkable
+class PlatformMetricsSource(Protocol):
+    """平台客服考核数据的只读接口（§12.4 平台客服指标；三个平台的数据接口名【待确认】）。
+
+    平台云内实现；沙箱和测试用 rodit.testing.fakes.InMemoryPlatformMetricsSource。
+    只返回本平台、shop_id 这家店铺、[since, until] 日期范围内（含两端）的数据，
+    source 一律是 MetricSource.PLATFORM。故障抛 core.errors.ToolUnavailable。
+    """
+
+    platform: Platform
+
+    def fetch(self, shop_id: str, since: date, until: date) -> list[PlatformMetricSample]: ...
 
 
 class MessageRecall(BaseModel):
@@ -697,6 +730,31 @@ class QualityReviewRepository(Protocol):
         """记下复核结果（scored 带 scores；skipped 不带）。可以改判：后一次覆盖前一次
         （历史在审计里）。status 不能是 pending、结果不合法抛 ValueError；样本不存在
         （含别的店铺的样本）抛 KeyError。返回更新后的样本。"""
+        ...
+
+    def purge_shop(self, shop_id: str) -> int: ...
+
+
+@runtime_checkable
+class PlatformMetricsRepository(Protocol):
+    """平台客服考核指标（§12.4、§15 Phase 2 商家报表：平台指标接入前后对比）。
+
+    按店铺隔离（§9.2）。"""
+
+    def upsert(self, sample: PlatformMetricSample) -> PlatformMetricSample:
+        """按（店铺、指标、日期、来源）写入：已有就覆盖
+        value、sample_size、recorded_by、recorded_at。"""
+        ...
+
+    def list(
+        self,
+        shop_id: str,
+        *,
+        metric: PlatformMetric | None = None,
+        since: date | None = None,
+        until: date | None = None,
+    ) -> list[PlatformMetricSample]:
+        """该店铺的数据，since / until 是日期（含两端），按（日期、指标、来源）升序。"""
         ...
 
     def purge_shop(self, shop_id: str) -> int: ...

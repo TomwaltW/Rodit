@@ -117,8 +117,14 @@ MERCHANT_CONFIG_FIELDS: tuple[str, ...] = (
 )
 """商家能改的店铺配置项（§9.3）。白名单：core 以后新增的配置项默认不开放给商家。"""
 
-LOCKED_CONFIG_FIELDS: tuple[str, ...] = ("shadow_mode", "auto_reply_enabled")
-"""商家不能改的配置项：上线阶段（影子 / 智能辅助，§13.4）和全自动总开关（平台准入）。"""
+LOCKED_CONFIG_FIELDS: tuple[str, ...] = (
+    "shadow_mode",
+    "auto_reply_enabled",
+    "auto_reply_schedule",
+    "semi_auto_intents",
+)
+"""商家不能改的配置项：上线阶段（影子 / 智能辅助，§13.4）、全自动总开关和生效时段（平台准入，
+§15 Phase 3 先在非工作时间试行）、半自动开放的类型（按门槛由复核人员开启，§13.4）。"""
 
 assert set(MERCHANT_CONFIG_FIELDS) <= SHOP_CONFIG_FIELDS
 assert set(LOCKED_CONFIG_FIELDS) <= SHOP_CONFIG_FIELDS

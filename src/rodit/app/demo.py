@@ -37,16 +37,20 @@ from rodit.testing.fakes import (
     FakeActionPort,
     FakeClock,
     FakeImageTextExtractor,
+    FakeImageUnderstanding,
     InMemoryItemCatalog,
+    InMemoryPlatformMetricsSource,
     InMemoryToolGateway,
 )
 from rodit.testing.fixtures import (
+    DEMO_IMAGE_FINDINGS,
     DEMO_OCR_TEXTS,
     RAW_BUYERS,
     TEST_SALT,
     DemoWorld,
     build_demo_world,
     demo_platform_items,
+    demo_platform_metrics,
 )
 
 # 演示用写接口支持的售后操作；拼多多没有查到拒绝售后接口（§7.1），只支持同意
@@ -140,6 +144,8 @@ def build_demo_unit(
         qa_provider=qa_provider,
         catalog=InMemoryItemCatalog(demo_platform_items(world), platform),
         ocr=FakeImageTextExtractor(DEMO_OCR_TEXTS),
+        vision=FakeImageUnderstanding(DEMO_IMAGE_FINDINGS),
+        metrics_source=InMemoryPlatformMetricsSource(demo_platform_metrics(world), platform),
     )
     seed_unit(unit, world)
     return unit

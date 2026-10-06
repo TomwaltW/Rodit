@@ -531,7 +531,11 @@ def test_config_fields_follow_the_shop_config_model():
     assert {k for k, f in fields.items() if f["editable"]} == set(MERCHANT_CONFIG_FIELDS)
     for key in LOCKED_CONFIG_FIELDS:
         assert not fields[key]["editable"] and fields[key]["locked_reason"]
-        assert fields[key]["kind"] == "bool"
+    assert fields["shadow_mode"]["kind"] == fields["auto_reply_enabled"]["kind"] == "bool"
+    assert fields["auto_reply_schedule"]["kind"] == "select"
+    assert fields["auto_reply_schedule"]["options"] == ["off_hours", "always"]
+    assert fields["semi_auto_intents"]["kind"] == "intents"
+    assert fields["service_hours"]["kind"] == "lines" and fields["service_hours"]["max_items"] == 6
     assert fields["tone"]["kind"] == "select"
     assert fields["tone"]["options"] == ["亲切", "专业", "简洁"]
     assert fields["salutation"]["options"] == ["亲", "您"]

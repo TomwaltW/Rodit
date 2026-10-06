@@ -16,7 +16,7 @@ BUYER_RISKY 在 30 天内有 4 单售后（R7）。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from rodit.core.clock import CST
@@ -24,12 +24,15 @@ from rodit.core.enums import (
     AfterSaleReason,
     AfterSaleStatus,
     AfterSaleType,
+    ImageKind,
     Intent,
     KnowledgeSource,
     KnowledgeStatus,
     LogisticsStatus,
+    MetricSource,
     OrderStatus,
     Platform,
+    PlatformMetric,
     PolicyKey,
     ShopStatus,
     SignedDetail,
@@ -42,6 +45,7 @@ from rodit.core.models import (
     OrderInfo,
     OrderLine,
     PlatformItem,
+    PlatformMetricSample,
     PolicyEntry,
     PriceInfo,
     Shop,
@@ -743,6 +747,7 @@ def _aftersales(now: datetime) -> list[AfterSaleInfo]:
         buyer_ref: str = BUYER,
         shop_id: str = SHOP_A,
         evidence_count: int = 0,
+        evidence_images: list[str] | None = None,
         note: str | None = None,
         updated_days: float | None = None,
     ) -> AfterSaleInfo:
@@ -760,6 +765,7 @@ def _aftersales(now: datetime) -> list[AfterSaleInfo]:
             created_at=created,
             updated_at=updated,
             evidence_count=evidence_count,
+            evidence_images=list(evidence_images or []),
             status_version=str(int(updated.timestamp())),
             note=note,
         )
@@ -857,6 +863,7 @@ def _aftersales(now: datetime) -> list[AfterSaleInfo]:
             "259.00",
             days=0.05,
             evidence_count=3,
+            evidence_images=["img_as2009_1", "img_as2009_2", "img_as2009_3"],
             buyer_ref=BUYER_R5,
         ),
         # R7：同一买家 30 天内售后 ≥ 3 次
@@ -1058,3 +1065,102 @@ def demo_platform_items(world: DemoWorld) -> list[PlatformItem]:
         )
     )
     return sorted(out, key=lambda i: (i.shop_id, i.item_id))
+
+
+# ================================================================ 图片理解（§15 Phase 3）
+
+DEMO_IMAGE_FINDINGS: dict[str, dict[str, object]] = {
+    # 买家在聊天里发的图
+    "img_buyer_damage_1": {
+        "kind": ImageKind.DAMAGE,
+        "confidence": 0.93,
+        "summary": "外包装一角压扁，裙摆有一处约 3 厘米的撕裂",
+    },
+    "img_buyer_size_1": {
+        "kind": ImageKind.SIZE_REFERENCE,
+        "confidence": 0.95,
+        "summary": "买家发来的身高体重截图",
+        "extracted_text": "身高 165cm 体重 110 斤",
+    },
+    "img_buyer_wrong_1": {
+        "kind": ImageKind.WRONG_ITEM,
+        "confidence": 0.86,
+        "summary": "收到的商品是黑色，和订单上的颜色不一致",
+    },
+    "img_buyer_logistics_1": {
+        "kind": ImageKind.LOGISTICS_SCREENSHOT,
+        "confidence": 0.9,
+        "summary": "物流页面截图：显示已签收",
+        # 面单上的手机号：图片理解的实现必须先打码（core.ports.ImageUnderstanding）
+        "extracted_text": "中通快递 已签收 联系电话 13812345678",
+    },
+    "img_buyer_product_1": {
+        "kind": ImageKind.PRODUCT_PHOTO,
+        "confidence": 0.72,
+        "summary": "一件碎花连衣裙的商品图",
+    },
+    # 售后凭证（as_2009 质量问题，凭证齐全）
+    "img_as2009_1": {
+        "kind": ImageKind.DAMAGE,
+        "confidence": 0.91,
+        "summary": "裙摆撕裂，线头外露",
+    },
+    "img_as2009_2": {
+        "kind": ImageKind.DAMAGE,
+        "confidence": 0.88,
+        "summary": "外包装压痕明显",
+    },
+    "img_as2009_3": {
+        "kind": ImageKind.OTHER,
+        "confidence": 0.6,
+        "summary": "吊牌特写，未见异常",
+    },
+}
+"""图片引用 → 图片理解结果（合成）。img_unreadable 不在里面：识别失败的图。"""
+
+
+# ================================================================ 平台客服考核指标（§12.4）
+
+DEMO_GO_LIVE_DAYS_AGO = 28
+"""演示数据里"接入"发生在多少天前：之前 4 周是接入前，之后是接入后（§12.4 接入前后对比）。"""
+
+_DEMO_METRIC_CURVES: dict[str, list[tuple[PlatformMetric, float, float, int]]] = {
+    # 店铺 → [(指标, 接入前的水平, 接入后的水平, 每天的样本量)]
+    SHOP_A: [(PlatformMetric.TAOBAO_3MIN_RESPONSE_RATE, 0.78, 0.91, 260)],
+    SHOP_B: [(PlatformMetric.TAOBAO_3MIN_RESPONSE_RATE, 0.82, 0.84, 90)],
+    SHOP_C: [(PlatformMetric.PDD_3MIN_REPLY_RATE, 0.74, 0.86, 180)],
+    SHOP_D: [
+        (PlatformMetric.DOUYIN_AVG_RESPONSE_S, 48.0, 26.0, 300),
+        (PlatformMetric.DOUYIN_DISSATISFACTION_RATE, 0.031, 0.022, 300),
+        (PlatformMetric.DOUYIN_HELP_RATE, 0.012, 0.010, 300),
+        (PlatformMetric.DOUYIN_AFTERSALE_REVIEW_H, 19.5, 7.2, 25),
+    ],
+}
+
+
+def demo_platform_metrics(world: DemoWorld, *, days: int = 56) -> list[PlatformMetricSample]:
+    """平台后台的客服考核数据（合成）：每家店每天一条，接入前后各有一个水平，按星期有小幅起伏。
+    来源都是平台（MetricSource.PLATFORM），由 InMemoryPlatformMetricsSource 按平台、店铺返回。"""
+    today = world.now.astimezone(CST).date()
+    wobble = (0.0, 0.01, -0.01, 0.02, -0.02, 0.015, -0.005)
+    out: list[PlatformMetricSample] = []
+    for shop_id, curves in _DEMO_METRIC_CURVES.items():
+        for metric, before, after, size in curves:
+            for back in range(days, 0, -1):
+                day: date = today - timedelta(days=back)
+                level = after if back <= DEMO_GO_LIVE_DAYS_AGO else before
+                value = level * (1 + wobble[day.toordinal() % 7])
+                if level <= 1:
+                    value = min(value, 1.0)
+                out.append(
+                    PlatformMetricSample(
+                        shop_id=shop_id,
+                        metric=metric,
+                        day=day,
+                        value=round(value, 4),
+                        source=MetricSource.PLATFORM,
+                        sample_size=size,
+                        recorded_at=world.now,
+                    )
+                )
+    return out

@@ -47,8 +47,10 @@ from rodit.core.pii import BuyerRefHasher
 from rodit.core.ports import (
     AfterSaleActionPort,
     ImageTextExtractor,
+    ImageUnderstanding,
     ItemCatalog,
     PlatformAdapter,
+    PlatformMetricsSource,
     TokenProvider,
     TokenRefreshPort,
     ToolGateway,
@@ -168,6 +170,10 @@ class PlatformBindings:
     - parse_subscription：平台订购推送（原始 dict）→ SubscriptionEvent；不认识的推送返回 None。
     - llm_transport：大模型的出口（签名同 rodit.llm.openai_compat.Transport），平台要求经它报备的
       通道调用时注入；不给时用默认的 urllib 出口。
+    - vision：买家图片 / 售后凭证的理解（core.ports.ImageUnderstanding，平台云内的视觉模型，
+      §15 Phase 3），不给时没有图片理解。
+    - metrics_source：平台客服考核数据（core.ports.PlatformMetricsSource，§12.4），
+      platform 必须是本单元的平台；不给时商家报表只有商家登记和系统估算的数据。
     """
 
     tools: ToolGateway
@@ -180,6 +186,8 @@ class PlatformBindings:
     token_refresher: TokenRefreshPort | None = None
     parse_subscription: Callable[[dict[str, Any]], SubscriptionEvent | None] | None = None
     llm_transport: Transport | None = None
+    vision: ImageUnderstanding | None = None
+    metrics_source: PlatformMetricsSource | None = None
 
 
 BindingsFactory = Callable[[BindingContext], PlatformBindings]
@@ -237,6 +245,11 @@ def validate_bindings(
     refresher = bindings.token_refresher
     if refresher is not None and getattr(refresher, "platform", None) != platform:
         raise BindingError(f"令牌续期接口不属于本单元的平台 {platform.value}")
+    source = bindings.metrics_source
+    if source is not None and getattr(source, "platform", None) != platform:
+        raise BindingError(f"平台指标接口不属于本单元的平台 {platform.value}")
+    if bindings.vision is not None and not callable(getattr(bindings.vision, "analyze", None)):
+        raise BindingError("平台绑定的 vision 要实现 analyze(shop_id, image)")
     for name in ("parse_subscription", "llm_transport"):
         hook = getattr(bindings, name)
         if hook is not None and not callable(hook):
@@ -253,6 +266,8 @@ def validate_bindings(
                 bindings.token_refresher,
                 bindings.parse_subscription,
                 bindings.llm_transport,
+                bindings.vision,
+                bindings.metrics_source,
             )
             if obj is not None and is_mock(obj)
         ]
@@ -328,11 +343,17 @@ def demo_bindings(ctx: BindingContext) -> PlatformBindings:
     from rodit.app.demo import SUPPORTED_ACTIONS
     from rodit.testing.fakes import (
         FakeActionPort,
+        FakeImageUnderstanding,
         FakeSubscriptionParser,
         FakeTokenRefresher,
+        InMemoryPlatformMetricsSource,
         InMemoryToolGateway,
     )
-    from rodit.testing.fixtures import build_demo_world
+    from rodit.testing.fixtures import (
+        DEMO_IMAGE_FINDINGS,
+        build_demo_world,
+        demo_platform_metrics,
+    )
 
     world = build_demo_world(ctx.clock.now())
     tools = InMemoryToolGateway(world, ctx.platform)
@@ -353,6 +374,8 @@ def demo_bindings(ctx: BindingContext) -> PlatformBindings:
         shop_ids=lambda: shops,
         token_refresher=FakeTokenRefresher(ctx.platform, clock=ctx.clock),
         parse_subscription=FakeSubscriptionParser(ctx.platform),
+        vision=FakeImageUnderstanding(DEMO_IMAGE_FINDINGS),
+        metrics_source=InMemoryPlatformMetricsSource(demo_platform_metrics(world), ctx.platform),
     )
 
 

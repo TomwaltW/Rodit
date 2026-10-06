@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from datetime import date
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -37,13 +38,16 @@ from rodit.core.enums import (
     DecisionStage,
     DraftKind,
     EvidenceSource,
+    ImageKind,
     Intent,
     KnowledgeSource,
     KnowledgeStatus,
     LogisticsStatus,
+    MetricSource,
     Mode,
     OrderStatus,
     Platform,
+    PlatformMetric,
     QualityReviewStatus,
     RejectReason,
     ReviewAdvice,
@@ -54,6 +58,7 @@ from rodit.core.enums import (
     SignedDetail,
     SuggestionStatus,
 )
+from rodit.core.schedule import normalize_service_hours
 
 
 class _Model(BaseModel):
@@ -121,6 +126,33 @@ class OrderRef(_Model):
     order_id: str
 
 
+class ImageRef(_Model):
+    """买家发来的一张图片（§15 Phase 3 图片理解）。
+
+    ref 是平台给的图片标识（不透明的 ID / 平台云内的存储键），不是带签名或令牌的网址；
+    图片本身不出平台云，只交给平台云内的 ImageUnderstanding 实现。
+    """
+
+    ref: str = Field(min_length=1, max_length=200)
+
+
+class ImageFinding(_Model):
+    """一张图片的理解结果（core.ports.ImageUnderstanding，平台云内的境内视觉模型）。
+
+    - summary 给客服和大模型看（如"外包装一角压扁，内衬完好"），extracted_text 是图里的文字
+      （尺码截图里的"身高 165 体重 110 斤"）；两者都已过 core.pii.mask_pii（快递面单上的手机号、
+      地址不能往后传，§5.3）。
+    - 只是参考：质量问题、错漏发的判断仍由客服看凭证决定（§7.3.2 R5），引擎不据此承诺任何处理结果。
+    """
+
+    ref: str
+    kind: ImageKind
+    confidence: float = Field(ge=0.0, le=1.0)
+    summary: CleanText = ""
+    extracted_text: CleanText | None = None
+    provider: str = ""
+
+
 class StandardMessage(_Model):
     """标准会话消息（§8.3）。引擎只认这个格式，平台差异在接入层。
 
@@ -137,6 +169,8 @@ class StandardMessage(_Model):
     text: CleanText
     item_card: ItemRef | None = None
     order_card: OrderRef | None = None
+    # 买家这条消息里的图片（只发图时 text 为空串）；图片理解见 core.ports.ImageUnderstanding
+    images: list[ImageRef] = Field(default_factory=list, max_length=9)
     agent_id: str | None = None
     mode: Mode = Mode.ASSIST
     received_at: AwareDatetime
@@ -164,6 +198,19 @@ class ShopConfig(_Model):
     manager_ids: list[str] = Field(default_factory=list)  # 店长子账号（R6 必须店长确认）
     shadow_mode: bool = False  # 影子模式：生成但不展示（§13.4 上线第一阶段）
     auto_reply_enabled: bool = False  # 全自动总开关（后期，且需平台准入）
+    # 客服工作时间（附录 C 第 13 题），北京时间"HH:MM-HH:MM"，见 core.schedule；空表示没填
+    service_hours: list[str] = Field(default_factory=list)
+    # 全自动什么时候生效（§15 Phase 3 "先在非工作时间试行"）：off_hours 只在工作时间以外
+    # （没填工作时间时不自动）；always 全天。由我们评估后设置，商家不能改
+    auto_reply_schedule: Literal["off_hours", "always"] = "off_hours"
+    # 开了半自动的问题类型（§5.6、§13.4 "该类型原样采纳率 ≥ 90%"）：高置信度的推荐直接填进
+    # 客服输入框（SuggestionCard.prefill），客服按发送即可。由复核人员按门槛开启，商家不能改
+    semi_auto_intents: list[Intent] = Field(default_factory=list)
+
+    @field_validator("service_hours")
+    @classmethod
+    def _service_hours(cls, v: list[str]) -> list[str]:
+        return normalize_service_hours(v)
 
 
 SHOP_CONFIG_FIELDS = frozenset(ShopConfig.model_fields)
@@ -415,6 +462,25 @@ class LabeledSample(_Model):
     created_at: AwareDatetime
 
 
+class PlatformMetricSample(_Model):
+    """某店铺某天的一项平台客服考核指标（§12.4 "平台客服指标接入前后对比"、§15 Phase 2 商家报表）。
+
+    - value 的单位见 core.platform_metrics（比例是 0–1，时长是秒或小时）；
+    - 同一店铺、指标、日期、来源只有一条（重复写入覆盖）；不同来源可以并存，报表按
+      平台 > 商家登记 > 系统估算的优先级取；
+    - sample_size 是这个数背后的会话 / 售后单数（平台给了才有），太少时报表提示不可靠。
+    """
+
+    shop_id: str
+    metric: PlatformMetric
+    day: date
+    value: float = Field(ge=0.0)
+    source: MetricSource
+    sample_size: int | None = Field(default=None, ge=0)
+    recorded_by: str | None = None  # 商家登记时是登记人账号；平台 / 系统为空
+    recorded_at: AwareDatetime
+
+
 class QualityScores(_Model):
     """§13.2 回答质量评分：每个维度 0 / 1 / 2 分。"""
 
@@ -571,6 +637,7 @@ class AfterSaleInfo(_Model):
     created_at: AwareDatetime
     updated_at: AwareDatetime
     evidence_count: int = 0  # 买家上传的凭证（照片）数量
+    evidence_images: list[str] = Field(default_factory=list)  # 凭证图片的平台标识（ImageRef.ref）
     status_version: str = "0"  # 平台状态版本（如修改时间戳），用于幂等键和重读校验
     note: str | None = None  # 买家填写的说明；ToolGateway 实现负责先过 mask_pii
     fetched_at: AwareDatetime | None = None  # 从平台读取的时间
@@ -673,6 +740,8 @@ class ConversationContext(_Model):
     order: OrderInfo | None = None
     recent_orders: list[OrderInfo] = Field(default_factory=list)  # 该买家在本店的最近订单
     unresolved_turns: int = 0  # 买家连续表示没听懂 / 答非所问的轮数（§5.7）
+    # 当前买家消息里图片的理解结果（§15 Phase 3），按图片顺序；没有图片或图片理解不可用时为空
+    image_findings: list[ImageFinding] = Field(default_factory=list)
     now: AwareDatetime
 
     @property
@@ -841,6 +910,9 @@ class SuggestionCard(_Model):
     confidence: Confidence
     risk_hints: list[str] = Field(default_factory=list)
     qa_scores: dict[str, float] = Field(default_factory=dict)
+    # 半自动（§5.6、§13.4）：这条推荐可以直接填进客服输入框（店铺给该类型开了半自动、置信度达到
+    # routing.semi_auto_threshold、不是高风险、没有降级）。仍由客服按发送，不是自动发送
+    prefill: bool = False
 
 
 class EngineResult(_Model):
