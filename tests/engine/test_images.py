@@ -485,7 +485,8 @@ def test_expired_message_budget_skips_vision(kit: Kit):
 
 
 def test_images_block_auto_reply_and_transfer(kit: Kit):
-    kit.set_shop_config(SHOP_A, auto_reply_enabled=True)
+    # 全自动要在生效时段内：这里全天生效（engine.modes，非工作时间试行见 test_modes）
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True, auto_reply_schedule="always")
     kit.router.decide = make_route(Intent.SHIPPING_POLICY, confidence=0.97, auto_eligible=True)
     rig = Rig(kit)
     plain = rig.send("什么时候发货", mode=Mode.AUTO)
