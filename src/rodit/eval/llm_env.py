@@ -311,8 +311,8 @@ def _failure_hint(
         return f"密钥不对或没有权限：检查环境变量 {names.api_key} 的值"
     if status == 404:
         return (
-            f"接口地址或模型名不对：{names.base_url} 写到 /v1 这一级（客户端自己加 "
-            f"/chat/completions），{names.model} 用服务商当前的模型 ID"
+            f"接口地址或模型名不对：{names.base_url} 写服务文档给的 OpenAI 兼容地址（一般到 /v1 "
+            f"这一级，客户端自己加 /chat/completions），{names.model} 用服务商当前的模型 ID"
         )
     if _is_rejection(status):
         return (
@@ -321,7 +321,7 @@ def _failure_hint(
         )
     if kind == "egress":
         where = f"域名 {domain}" if domain else "模型服务的域名"
-        return f"出网被代理或网络策略拦下（CONNECT 被拒）：把{where}加进允许的域名，重试没有用"
+        return f"出网被代理或网络策略拦下（CONNECT 被拒）：把{where} 加进允许的域名，重试没有用"
     if kind == "dns":
         return f"解析不了域名：检查 {names.base_url} 的主机名和本机 DNS"
     if kind == "refused":

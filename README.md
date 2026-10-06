@@ -44,22 +44,70 @@ uv run python -m rodit.showcase --host 0.0.0.0       # 局域网投屏（没有�
 - **合规与部署**：每个平台云一个单元（§9.1）、个人信息打码的现场演示（§5.3）、话术硬规则、Jev 接口兼容。
 
 三个平台各一个演示单元（§9.1），第一次打开某个平台时回放近 5 周的合成历史（约 1.5 秒），「重置演示」重新生成。
-`--llm env` 用 `RODIT_LLM_*` 的真实大模型写回答（只允许本机地址；路由、质检、历史回放仍用离线替身），
-只在本地开发机上用。§11.5 质检拦截场景的第一稿是演示脚本写的（页面上有标注），拦截和重写是真实的质检和引擎。
+§11.5 质检拦截场景的第一稿是演示脚本写的（页面上有标注），拦截和重写是真实的质检和引擎。
 
 - 只认监听地址对应的 Host（防 DNS 重绑定）：默认用 http://127.0.0.1:8100/、http://localhost:8100/ 或
   http://[::1]:8100/ 打开；`--host` 指定了地址时只能用这个地址；`--host 0.0.0.0` / `::` 不限 Host。
   写操作的 Origin 和 Host 不一致（别的网站发来的跨站请求）返回 403。
 - 写操作（推荐反馈、售后确认、协商）带页面载入时演示单元的编号：别的窗口重置过或服务重启过时返回
   409 `stale_epoch`，页面提示并重新载入，重置前的卡片不会落到重置后编号相同的推荐上。
-- `--llm env` 时 `RODIT_LLM_*` 没设或格式不对就拒绝启动（退出码 2，提示里没有密钥）；「推荐出现时间」只算
-  演示时现发的消息（回放的历史是离线替身，不计入），还没有时显示「暂无真实大模型数据」。
 - 「平台话术违规」和上线门槛的合规扫描（`rodit.feedback.compliance`）用同一份词表，客服编辑时加的手机号、
   邮箱也算；「售后误操作」只展示写操作次数和防护措施，标「后续评估」（对错要人工复核）。
 
 演示默认用离线替身：路由用关键词规则、生成只复述依据、质检用启发式判断，所以能在没有大模型的
-环境里跑通"懂→找→写→判"全链路。设置 `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` / `RODIT_LLM_API_KEY`
-后改用 OpenAI 兼容接口的境内已备案模型（只在本地开发机上这样做，见下方"数据合规"）。
+环境里跑通"懂→找→写→判"全链路。
+
+#### 演示站接真实大模型
+
+`--llm env` 按 `RODIT_LLM_*` 接 OpenAI 兼容接口的境内大模型（D5）。数据仍全是合成的；只允许监听本机地址
+（别人连进来会花你的额度）。密钥只放本地 `.env`（已 gitignore）或云端环境的 API credentials，不进仓库、不进
+普通环境变量、不贴进对话。
+
+```bash
+# .env（本机）——以 DeepSeek 为例
+RODIT_LLM_BASE_URL=https://api.deepseek.com
+RODIT_LLM_MODEL=deepseek-flash
+RODIT_LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}   # DeepSeek 默认开思考，必须关
+RODIT_LLM_LOGPROBS=off                                   # 路由置信度按 3 次投票的占比算
+RODIT_LLM_API_KEY=…
+
+set -a; source .env; set +a
+uv run python -m rodit.showcase --selfcheck --llm env --latency relaxed   # 先自检：启动检查 + 每个场景
+uv run python -m rodit.showcase --llm env --latency relaxed               # 再开页面 http://127.0.0.1:8100/
+```
+
+云端会话里跑：API 凭据放环境设置的 API credentials，网络访问选 Custom、把模型服务的域名（如 `api.deepseek.com`）
+加进允许的域名，然后新开一个会话（改了凭据和网络都要新会话才生效）。
+
+| 参数 | 作用 |
+|---|---|
+| `--judge llm \| offline` | `--llm env` 时默认 `llm`：路由、质检也照生产组装（路由每条消息投票 3 次、质检 1 次，§6.4）；`offline` 只有生成用大模型 |
+| `--latency strict \| relaxed` | `strict`（默认）照配置：路由投票和模型质检每次 1 秒、生成 2.5 秒、整条 4.5 秒（§12.1）；大多数托管模型 1 秒内答不完，会大量退回关键词路由、质检不可用（页面标为降级）。`relaxed` 放宽为判断层每次 8 秒、生成 15 秒、整条 30 秒，页面和横幅写明「演示放宽了时间预算」 |
+| `--config YAML` | 换引擎配置（和评测同一个读取函数），如调投票次数、超时 |
+| `--selfcheck [--platform …\|all] [--json 文件\|-]` | 不起服务，逐个场景跑一遍：路由（哪个判断层、几票）、推荐、质检、降级、各环节耗时、调用次数和 token；汇总对照 §12.1。必查项（与模型措辞无关的行为，如站外交易走规则 1、投诉不给推荐、质检拦下的稿子不推荐、回放不调用大模型）全过退出码 0，有没过的 1，配置或启动检查不通 2；§12.2 的降级算"不适用"，不算没过 |
+
+启动检查（自检也做）：至多三个很小的请求——普通调用、JSON 模式、logprobs（只在大模型投票路由时检查）——
+结果打在启动横幅里。没过就退出码 2，按故障类型给中文诊断，只显示接口主机、不显示密钥：网络策略没放行（写明
+要放行的域名）、密钥（401）、权限（403）、地址或模型 ID（404）、参数不被接受（400）、思考模式没关、限流
+（429）、服务端（5xx）、超时、证书、域名解析，并写明改哪个开关：`RODIT_LLM_JSON_MODE=off`（不接受
+`response_format`）、`RODIT_LLM_LOGPROBS=off`（不接受 logprobs）、`RODIT_LLM_EXTRA_BODY`（关思考等服务商参数）。
+
+页面上写明什么是真的：页眉下和页脚是「真实大模型：<模型>（<主机>）· 判断层：大模型投票 / 关键词路由 + 大模型质检 /
+离线规则 · 时间预算：严格 / 放宽」；「AI 是怎么想的」显示每一票和失败原因、实际回答的判断层、降级原因、这条消息的
+真实调用次数和 token；数据看板的耗时只算演示时现发的消息。仍是替身或脚本的：回放的合成历史（不调模型）、§11.5
+的第一稿、图片理解和平台接口。
+
+服务商的 OpenAI 兼容设置（2026-10 按官方文档整理并复核；文档站和接口在开发沙箱里都访问不到，没有真机验证，
+首跑以启动检查为准）：
+
+| 服务商 | `RODIT_LLM_BASE_URL` | `RODIT_LLM_MODEL` | `RODIT_LLM_EXTRA_BODY` | logprobs | 备注 |
+|---|---|---|---|---|---|
+| DeepSeek（首选） | `https://api.deepseek.com` | `deepseek-flash` | `{"thinking":{"type":"disabled"}}` | 支持，建议 off | `deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 下线；JSON 模式偶尔返回空内容（该次按失败降级） |
+| 阿里云百炼 Qwen | `https://dashscope.aliyuncs.com/compatible-mode/v1`（或工作空间域名） | `qwen3.7-flash` | `{"enable_thinking":false}`（必须） | off | 内容安全拦截以 HTTP 400 `data_inspection_failed` 返回 |
+| 火山方舟 豆包 | `https://ark.cn-beijing.volces.com/api/v3` | `doubao-seed-2-0-mini-260428` | `{"thinking":{"type":"disabled"}}` | off（必须） | JSON 模式是 beta |
+| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4.7-flash` | `{"thinking":{"type":"disabled"}}` | off | 不要用 glm-5.3 系列（不能关思考） |
+
+Kimi（温度固定）、千帆（温度不能为 0）暂不支持：温度由客户端控制，`RODIT_LLM_EXTRA_BODY` 不能改。
 
 ### 用真实大模型评测
 
@@ -87,7 +135,8 @@ uv run python -m rodit.eval --llm env --baseline ~/rodit-evals/llm.json --tolera
   标准输出。
   `--baseline` 只比较两次都有的用例：类型准确率、路由、事实正确、合规满分率（全部和其中的测试集）任一项比基线低超过
   容差（默认 0，§13.5 指标不下降）时退出码为 1；配置错误（缺环境变量、连通性检查失败等）退出码为 2。
-- 跑之前先发一个几个 token 的连通性检查请求，地址、模型、密钥不对时直接报错。报告和日志里没有密钥，
+- 跑之前先做大模型能力检查（普通调用、JSON 模式、logprobs——只在大模型投票路由时查，至多三个小请求，打在标准错误）：
+  不通、或开着的 JSON 模式 / logprobs 被拒绝时退出码 2，并写明改哪个开关；超时、限流只提示。报告和日志里没有密钥，
   接口地址只显示主机名。`--seed` 只决定 `--limit` 抽哪几条，不发给模型（路由投票要靠采样的随机性，§6.4）。
 
 ## 生产组装需要的环境变量
@@ -169,6 +218,7 @@ compose 里三个服务：`db`（PostgreSQL 16；应用账号 `rodit_login` 非�
 | `RODIT_PLATFORM_BINDINGS` | | 平台云代码的绑定工厂 `包.模块:函数`（见下） |
 | `RODIT_MODE_C_ONLY` | `false` | 只部署模式 C（Phase 0，§8.1）：不需要平台绑定 |
 | `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` / `RODIT_LLM_TIMEOUT_S` | | 境内已备案大模型。也可以写在配置文件 `llm` 段：`base_url` 和 `model` 都写了才用配置文件，否则两项都取环境变量（启动检查、就绪检查、评测指纹同一条规则） |
+| `RODIT_LLM_EXTRA_BODY` / `RODIT_LLM_JSON_MODE` / `RODIT_LLM_LOGPROBS` | 空 / `on` / `on` | 服务商特有的请求参数（JSON 对象，如关思考 `{"thinking":{"type":"disabled"}}`；不能改客户端控制的字段、不能放像凭据的键或值，报错只给键名）、是否发 `response_format`、是否发 logprobs（off 时路由置信度按投票占比算）。和接口地址同一条规则：配置文件 `llm.extra_body` / `llm.json_mode` / `llm.logprobs` 只在 `llm.base_url` 和 `llm.model` 都写了时生效，此时这三个环境变量不看；不合法时拒绝启动，`/readyz` 报 `invalid_request_options`。评测指纹记这几项（`extra_body` 只记键名和 SHA-256） |
 | `RODIT_DB_STATEMENT_TIMEOUT_MS` / `RODIT_DB_LOCK_TIMEOUT_MS` | 2000 / 1000 | 请求事务的语句 / 等锁超时（§12.1、§12.2） |
 | `RODIT_CONFIG` | 镜像里 `/app/config/rodit.yaml` | 引擎配置 |
 | `RODIT_METRICS_PUBLIC` | `false` | `/metrics` 不要令牌（只在网络策略已经限制访问时用） |
