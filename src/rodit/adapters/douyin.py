@@ -17,12 +17,17 @@
         "nickname": "…"                         丢弃（§5.3）
       },
       "content": {
-        "type": "text",                         text / product / order；image、video 忽略；
+        "type": "text",                         text / product / order / image；video 忽略；
                                                 withdraw 撤回（withdraw_msg_id 是被撤回的消息）
-        "text": "…",
+        "text": "…",                            图片消息时是随图写的字（可以没有）
         "product_id": "i_d1", "sku_id": null,   商品卡片
         "order_id": "o_d001",                   订单卡片
-        "withdraw_msg_id": "…"
+        "withdraw_msg_id": "…",
+        "images": [                             图片消息（type=image，§15 Phase 3），可以多张：
+          {"uri": "img_…",                      平台图片标识（不透明 ID，平台云内的视觉模型
+                                                凭它取图）
+           "url": "https://…"}                  临时地址（可能带签名）：丢弃，不向后传
+        ]
       },
       "context": {"product_id": "…", "sku_id": "…", "order_id": "…"},
                                                 插件看到的当前商品 / 订单（消息没带卡片时用）
@@ -30,6 +35,8 @@
       "service_uid": "kf_d01",                  当前接待客服 → agent_id
       "source": "feige_plugin"
     }
+
+图片消息里没有一个合格的图片标识（只有网址等，见 base.image_ref）时整条忽略。
 """
 
 from __future__ import annotations
@@ -41,12 +48,14 @@ from rodit.adapters.base import (
     BaseMockAdapter,
     RawEvent,
     as_mapping,
+    caption,
     cst_from_epoch_s,
+    image_ref,
     opt_str,
 )
 from rodit.core.enums import Platform
 
-_BUYER_TYPES = frozenset({"text", "product", "order"})
+_BUYER_TYPES = frozenset({"text", "product", "order", "image"})
 
 
 class DouyinMockAdapter(BaseMockAdapter):
@@ -72,11 +81,19 @@ class DouyinMockAdapter(BaseMockAdapter):
                 kind="recall", recalled_msg_id=opt_str(content.get("withdraw_msg_id")), **common
             )
         if content_type not in _BUYER_TYPES:
-            return None  # 图片、视频：MVP 不处理（§1.4）
+            return None  # 视频等：不处理
         text_value = content.get("text")
         text = text_value if isinstance(text_value, str) else ""
+        images: tuple[object, ...] = ()
+        if content_type == "image":
+            images = _image_keys(content.get("images"))
+            if not images:
+                return None  # 没有可用的图片标识：照旧忽略
+            text = caption(text)
         role = opt_str(sender.get("role"))
         if role == "customer_service":
+            if content_type == "image":
+                return None  # 客服发的图片：会话记录只记文字
             return RawEvent(kind="agent", text=text, at=at, **common)
         if role != "customer":
             return None  # 系统提示等
@@ -97,5 +114,16 @@ class DouyinMockAdapter(BaseMockAdapter):
             agent_id=opt_str(raw.get("service_uid")),
             at=at,
             extension={"content_type": content_type, "source": opt_str(raw.get("source"))},
+            images=images,
             **common,
         )
+
+
+def _image_keys(value: Any) -> tuple[str, ...]:
+    """content.images → 合格的图片标识（只读 uri，url 不读）；格式不对抛 TypeError（整条忽略）。"""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise TypeError("content.images 应为列表")
+    keys = (image_ref(as_mapping(entry).get("uri")) for entry in value)
+    return tuple(k for k in keys if k is not None)

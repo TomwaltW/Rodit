@@ -14,6 +14,9 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    撤回（on_recall，应用层在撤回事件里调用）：被撤回的那条消息触发的 SHOWN 推荐改成 EXPIRED，
    返回会话里仍在展示的推荐卡片给侧边栏刷新（§5.3 撤回的消息不再进上下文）；
 4. 会话理解（engine.understanding.ConversationBuilder）→ ConversationContext；
+   买家图片（§15 Phase 3，engine.images.ImageReader）：消息一到就记下它的图片标识，会话理解之后识别
+   当前买家消息里的图片，结果放进 ctx.image_findings、描述接在当前买家消息后面（路由、检索、生成、
+   质检都看得到），给客服一条图片摘要提醒；识别失败、超时记降级 "vision"，照常往下走；
 5. 路由 → RouteDecision，按 core.pipeline.ACTION_PLANS[route.action] 执行：
    - 检索（KnowledgeUnavailable → 不推荐，§12.2）；
    - ANSWER / HIGH_RISK_ANSWER：证据包没有依据、没有澄清问题、也没有查不到的工具 → 不生成，
@@ -91,9 +94,10 @@ min_llm_remaining_s=latency.min_llm_remaining_s) 里处理（EngineConfig.latenc
 - "qa"           质检抛错 → 该草稿不推荐（没有验证过的文字不能推荐），保留已通过的
 - "budget"       时间预算不够，有步骤没做或草稿被丢掉（见上）
 - "tool:<kind>"  平台工具不可用：会话理解查订单（tool:order），或 EvidenceBundle.unavailable
+- "vision"       买家图片识别失败或超时（engine.images）→ 照常出推荐，提醒客服自己看图
 - "audit"        审计写入失败
 - "engine"       其他意外异常 → 不推荐
-和卡片内容有关的降级（decision、decision:qa、tool:*、storage、knowledge）会写进卡片的风险提示。
+和卡片内容有关的降级（decision、decision:qa、tool:*、storage、knowledge、vision）会写进卡片的风险提示。
 
 缺失知识（EngineResult.missing_knowledge）= 各证据包的 missing；没有依据、证据包又没说缺什么时记
 "knowledge:{intent}"。KnowledgeGap 只记知识类缺失（不记 core.evidence.MISSING_ORDER /
@@ -121,7 +125,7 @@ UNDERSTAND、ROUTE 各一条；RETRIEVE、GENERATE、QA 每次调用 / 每条分
 qa / total / since_received（LATENCY_KEYS），毫秒整数，没跑的环节为 0。分条并行时同一环节取各条里
 最长的（墙钟口径，和 total 对得上）；同一条里重写的几轮累加。各环节用 time.perf_counter 量墙钟耗时
 （单调时钟），不用注入的 Clock——Clock 只管业务时间戳（记录的 created_at 等）。
-understand 含店铺检查和会话理解；total 是整条消息从进入 handle 到出结果；since_received
+understand 含店铺检查、会话理解、图片识别；total 是整条消息从进入 handle 到出结果；since_received
 （core.audit.LATENCY_SINCE_RECEIVED）是从平台收到消息（交给 handle 的那条消息的 received_at）到
 出结果：Clock.now() − received_at，含排队、会话锁等待；时钟精度不够或两边时间对不齐时不小于 total。
 """
@@ -182,9 +186,11 @@ from rodit.core.pipeline import ACTION_PLANS, ActionPlan, risk_hint, soothe_with
 from rodit.core.ports import (
     AnswerGenerator,
     AuditSink,
+    Cache,
     ConversationRepository,
     EvidenceRetriever,
     FeedbackRepository,
+    ImageUnderstanding,
     KnowledgeRepository,
     QualityGate,
     Router,
@@ -206,6 +212,15 @@ from rodit.engine.concurrency import (
     background_scope,
     run_inline,
     run_ordered,
+)
+from rodit.engine.images import (
+    ALERT_VISION_FAILED,
+    DEGRADED_VISION,
+    MAX_IMAGES,
+    VISION_BUDGET_S,
+    ImageReader,
+    ImageReading,
+    describe_for_audit,
 )
 from rodit.engine.modes import RESULT_AUTO_GATE, resolve_mode
 from rodit.engine.semi_auto import prefill_blocker
@@ -399,6 +414,8 @@ class AssistEngine:
     monotonic：时间预算用的单调时钟（秒，core.budget.Deadline 的 now），测试可以注入假的；
     外层已经有截止时间时（调用方设的）要用同一个时钟。
     交给线程池的任务按店铺记在 BackgroundWork 里，wait_background 等某家店的全部做完（取消订购用）。
+    vision / image_cache：买家图片理解和记图片标识、识别结果的短时缓存（engine.images；单元组装时
+    传单元缓存，取消订购一并删除）；vision 为空时不识别，只提醒客服买家发了图片。
     """
 
     def __init__(
@@ -417,6 +434,10 @@ class AssistEngine:
         clock: Clock,
         gaps: FeedbackRepository | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        vision: ImageUnderstanding | None = None,
+        image_cache: Cache | None = None,
+        vision_budget_s: float = VISION_BUDGET_S,
+        max_images: int = MAX_IMAGES,
     ) -> None:
         self._config = config
         self._monotonic = monotonic
@@ -431,6 +452,14 @@ class AssistEngine:
         self._gaps = gaps
         self._builder = ConversationBuilder(knowledge, conversations, tools, config, clock)
         self._background = BackgroundWork()
+        self._images = ImageReader(
+            vision,
+            image_cache,
+            clock,
+            max_images=max_images,
+            budget_s=vision_budget_s,
+            monotonic=monotonic,
+        )
 
     @property
     def builder(self) -> ConversationBuilder:
@@ -471,7 +500,7 @@ class AssistEngine:
     # ------------------------------------------------------------ 主流程
 
     def _handle(self, run: _Run) -> EngineResult | None:
-        msg = run.msg
+        msg = incoming = run.msg
         if msg.role != Role.BUYER:
             return None
 
@@ -509,6 +538,7 @@ class AssistEngine:
             added = True
         if not added:
             return None
+        self._images.remember(msg)  # 同一 Turn 里后到的消息要用到这条的图片（engine.images）
         if shop is None:
             return self._finish(run, reason=shop_error)
         latest = self._newer_buyer_message(msg)
@@ -546,9 +576,10 @@ class AssistEngine:
         run.add_latency("understand", t)
         if ctx is None:
             return self._finish(run, reason=reason)
+        ctx, images = self._read_images(run, ctx, incoming)
         run.ctx = ctx
         run.mode = ctx.mode
-        self._audit(run, AuditAction.UNDERSTAND, _understand_detail(ctx, run.context_notes))
+        self._audit(run, AuditAction.UNDERSTAND, _understand_detail(ctx, run.context_notes, images))
         threshold = self._config.conversation.unresolved_turns_alert
         if ctx.unresolved_turns >= threshold:
             run.alerts.append(ALERT_UNRESOLVED.format(n=ctx.unresolved_turns))
@@ -598,6 +629,32 @@ class AssistEngine:
             auto_reply=auto_reply,
         )
 
+    # ------------------------------------------------------------ 买家图片（§15 Phase 3）
+
+    def _read_images(
+        self, run: _Run, ctx: ConversationContext, incoming: StandardMessage
+    ) -> tuple[ConversationContext, ImageReading | None]:
+        """识别当前买家消息里的图片（engine.images），耗时记在 understand 里。
+
+        识别失败、超时：记 vision 降级（写进卡片的风险提示），提醒客服自己看图，照常往下走；
+        这一步意外抛错也一样（上下文保持原样）。"""
+        t = time.perf_counter()
+        try:
+            ctx, reading = self._images.read(ctx, incoming)
+        except Exception as exc:  # noqa: BLE001 — 图片理解出任何问题都不影响出推荐（§12.2）
+            self._warn("vision", exc)
+            run.degrade(DEGRADED_VISION)
+            run.context_notes.append(DEGRADED_VISION)
+            run.alerts.append(ALERT_VISION_FAILED)
+            return ctx, None
+        finally:
+            run.add_latency("understand", t)
+        if reading.degraded:
+            run.degrade(DEGRADED_VISION)
+            run.context_notes.append(DEGRADED_VISION)
+        run.alerts.extend(reading.alerts)
+        return ctx, reading
+
     # ------------------------------------------------------------ 乱序（§8.3）
 
     def _newer_buyer_message(self, msg: StandardMessage) -> StandardMessage | None:
@@ -624,6 +681,8 @@ class AssistEngine:
                 if last.item_id
                 else None,
                 "order_card": OrderRef(order_id=last.order_ref) if last.order_ref else None,
+                # 记录里没有图片：那条消息的图片由 engine.images 按 msg_id 从缓存里找，不沿用 msg 的
+                "images": [],
                 "received_at": last.created_at,
             }
         )
@@ -681,6 +740,7 @@ class AssistEngine:
                 continue
             expired = True
         self._forget_recalled_text(shop_id, conversation_id, msg_id)
+        self._images.forget(shop_id, conversation_id, msg_id)
         if not expired:
             return None
         return [card_from_record(r) for r in remaining]
@@ -1405,8 +1465,10 @@ def _qa_reasons(qa: QAResult) -> list[str]:
     return rules or ["质检未通过"]
 
 
-def _understand_detail(ctx: ConversationContext, degraded: list[str]) -> dict[str, Any]:
-    return {
+def _understand_detail(
+    ctx: ConversationContext, degraded: list[str], images: ImageReading | None = None
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
         "msg_ids": list(ctx.current.msg_ids),
         "mode": str(ctx.mode),
         "history_turns": len(ctx.history),
@@ -1418,6 +1480,10 @@ def _understand_detail(ctx: ConversationContext, degraded: list[str]) -> dict[st
         "unresolved_turns": ctx.unresolved_turns,
         "degraded": list(degraded),
     }
+    if images is not None and images.total:
+        # 买家图片（§15 Phase 3）：只记张数和类型，不记识别出的文字（§5.3）
+        detail.update(describe_for_audit(images))
+    return detail
 
 
 def _route_detail(route: RouteDecision) -> dict[str, Any]:

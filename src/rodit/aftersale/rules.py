@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -73,6 +74,9 @@ class ReviewSuggestion(BaseModel):
     reason: str
     requires_manager: bool = False
     risk_flags: list[str] = Field(default_factory=list)
+    # R5 凭证的图片理解（aftersale.evidence_vision）：只有张数和类型，写进 aftersale.suggest 审计；
+    # 规则本身不填（规则不看图片），由审核助手在识别过凭证时补上
+    evidence_vision: dict[str, Any] | None = None
 
 
 def _signed_at(order: OrderInfo | None, trace: LogisticsTrace | None) -> datetime | None:
