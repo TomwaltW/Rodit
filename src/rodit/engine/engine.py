@@ -54,7 +54,7 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    全自动生效时段（engine.modes，§15 Phase 3 先在非工作时间试行）：消息是 AUTO、店铺开了全自动，
    但现在是客服工作时间（或没填工作时间）→ 生效模式是 ASSIST（路由也按智能辅助走），照常给推荐，
    并且 transfer_to_human=True（机器人接待的会话交给在岗客服，§12.2），engine.result 另加可选键
-   auto_gate（拦下原因，engine.modes.RESULT_AUTO_GATE）。
+   auto_gate（拦下原因，core.audit.RESULT_AUTO_GATE）。
    影子模式（§13.4）：mode=SHADOW，推荐只用于事后对比，app 层不得展示；不出 auto_reply、不转人工。
    影子记录每轮一套：乱序时重算最新一轮（run.late），这一轮（按最新买家消息的 msg_id）已经有
    SHADOW 记录就不再写第二套（事后对比不重复计数），结果照常返回（卡片没有 suggestion_id），
@@ -119,7 +119,8 @@ UNDERSTAND、ROUTE 各一条；RETRIEVE、GENERATE、QA 每次调用 / 每条分
 另有 "no_suggestion_reason"、"qa_checked"、"qa_reasons"、"transfer_to_human"；
 键的完整定义见 core.audit.ResultKey（常量 RESULT_DETAIL_KEYS，报表按同一份读）。
 超过时间预算时另加可选键 "budget_exceeded"（True，core.audit.OPTIONAL_RESULT_DETAIL_KEYS）；
-全自动不在生效时段被拦下时另加可选键 "auto_gate"（engine.modes.RESULT_AUTO_GATE）。
+全自动不在生效时段被拦下时另加可选键 "auto_gate"（core.audit.RESULT_AUTO_GATE，同在
+OPTIONAL_RESULT_DETAIL_KEYS 里）。
 
 耗时（EngineResult.latency_ms，§12.1、§12.4）：键固定为 understand / route / retrieve / generate /
 qa / total / since_received（LATENCY_KEYS），毫秒整数，没跑的环节为 0。分条并行时同一环节取各条里
@@ -146,6 +147,7 @@ from rodit.core.audit import (
     DEGRADED_BUDGET,
     DEGRADED_TENANT_ISOLATION,
     LATENCY_SINCE_RECEIVED,
+    RESULT_AUTO_GATE,
     RESULT_BUDGET_EXCEEDED,
     AuditAction,
     ResultKey,
@@ -222,7 +224,7 @@ from rodit.engine.images import (
     ImageReading,
     describe_for_audit,
 )
-from rodit.engine.modes import RESULT_AUTO_GATE, resolve_mode
+from rodit.engine.modes import resolve_mode
 from rodit.engine.semi_auto import prefill_blocker
 from rodit.engine.understanding import ConversationBuilder, ShopInactive
 

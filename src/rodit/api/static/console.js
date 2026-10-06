@@ -534,6 +534,8 @@
   function showIdentity(me) {
     $('whoami').hidden = false;
     $('identity').textContent = `${label(L.roles, me.role)} ${me.user_id} · 店铺 ${me.shop_id}`;
+    // 售后审核工作台只给客服、店长和商家（和售后审核接口的角色一致）：复核人员不显示这个链接
+    $('aftersale-link').hidden = !inGroup('human', me.role);
   }
 
   function enterApp() {
@@ -594,6 +596,7 @@
     $('app').hidden = true;
     $('whoami').hidden = true;
     $('identity').textContent = '';
+    $('aftersale-link').hidden = false; // 没登录时谁都可能用得上：照常显示
     $('login').hidden = false;
     $('token').focus();
   }

@@ -188,7 +188,9 @@ def test_pick_daily_prefers_platform_then_merchant_then_computed():
 
 
 def test_pick_daily_skips_non_finite_values():
-    daily = pick_daily([s(GO_LIVE, math.inf, source=P), s(GO_LIVE, 0.6, source=M)])
+    # 模型不收 inf / NaN（allow_inf_nan=False）；model_copy 不校验，读的时候照样兜底
+    bad = s(GO_LIVE, 0.9, source=P).model_copy(update={"value": math.inf})
+    daily = pick_daily([bad, s(GO_LIVE, 0.6, source=M)])
     assert daily[(TB, GO_LIVE)].value == 0.6  # 平台的数不是有限数：退到商家登记的
 
 

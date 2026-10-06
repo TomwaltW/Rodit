@@ -16,6 +16,7 @@ from rodit.core.audit import (
     DEGRADED_TENANT_ISOLATION,
     LATENCY_SINCE_RECEIVED,
     OPTIONAL_RESULT_DETAIL_KEYS,
+    RESULT_AUTO_GATE,
     RESULT_BUDGET_EXCEEDED,
     RESULT_DETAIL_KEYS,
     SYSTEM_EVENT_ACTIONS,
@@ -143,6 +144,10 @@ def test_new_audit_actions_and_constants():
         "COMPLIANCE_FLAG": "compliance.flag",
         "COMPLIANCE_REVIEWED": "compliance.reviewed",
         "EVAL_VERDICT": "eval.verdict",
+        # Phase 2 / 3（原来定义在 app.platform_metrics、feedback.rollout；取值不变，存量审计照读）
+        "PLATFORM_METRICS_SYNCED": "platform_metrics.synced",
+        "PLATFORM_METRICS_RECORDED": "platform_metrics.recorded",
+        "ROLLOUT_SEMI_AUTO": "shop.rollout_semi_auto",
     }
     for name, value in expected.items():
         assert AuditAction[name].value == value
@@ -153,9 +158,10 @@ def test_new_audit_actions_and_constants():
         "budget",
         "since_received",
     )
-    # 超时的可选键：不在每次都有的键里（正常的消息 detail 仍然正好是 RESULT_DETAIL_KEYS）
-    assert RESULT_BUDGET_EXCEEDED == "budget_exceeded"
-    assert OPTIONAL_RESULT_DETAIL_KEYS == (RESULT_BUDGET_EXCEEDED,)
+    # 可选键（超时、全自动被生效时段拦下）：不在每次都有的键里（正常的消息 detail 仍然正好是
+    # RESULT_DETAIL_KEYS）
+    assert (RESULT_BUDGET_EXCEEDED, RESULT_AUTO_GATE) == ("budget_exceeded", "auto_gate")
+    assert OPTIONAL_RESULT_DETAIL_KEYS == (RESULT_BUDGET_EXCEEDED, RESULT_AUTO_GATE)
     assert not set(OPTIONAL_RESULT_DETAIL_KEYS) & set(RESULT_DETAIL_KEYS)
 
 

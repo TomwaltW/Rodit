@@ -13,6 +13,7 @@
   /aftersale/aftersale.css（基础样式沿用 /assist/assist.css）。客服、店长、商家看待审核列表、
   批量跑规则、看详情和规则说明，确认执行（R6 店长确认、平台差异由接口把关）；
   复核人员只看到去控制台的提示。
+- 三个页面的页头互相链接；去售后审核工作台的链接登录后只给客服、店长、商家显示（复核人员用不了）。
 - 页面本身不含任何店铺数据，不需要鉴权；数据都由页面脚本带 Bearer 令牌调用 /v1 接口取
   （/v1/me 登录，/v1/shops/{shop_id}/... 取数、写入），鉴权、角色和串店检查都在接口上（§9.2）。
 - 令牌只放在 sessionStorage（关掉标签页就没了），不进 URL、不进日志；两个页面用同一个键，
@@ -202,6 +203,9 @@ DEGRADED_LABELS: dict[str, str] = {
     "engine": "问答引擎",
     "llm": "大模型",
     "tool": "平台接口",
+    "vision": "图片理解（没能识别买家的图片，请自己看图）",
+    "budget": "处理时间（超时，没做完的步骤已跳过）",
+    "tenant_isolation": "店铺隔离检查（已拦下，不给推荐）",
 }
 """降级标记（rodit.engine 模块文档）的中文名；"tool:<kind>" 按前缀 tool 显示。"""
 
@@ -285,7 +289,9 @@ CONFIG_FIELD_HINTS: dict[str, str] = {
     "suggestion_count": "每条买家消息最多给几条推荐（§5.4）",
     "aftersale_amount_limit": "超过这个金额的售后操作必须店长确认（R6，§7.3.2）",
     "manager_ids": "每行一个子账号；超额售后只认这里列出的店长",
-    "service_hours": "每行一个时段，如 09:00-23:00（北京时间，附录 C 第 13 题）",
+    "service_hours": (
+        "每行一个时段，如 09:00-23:00，也可以写「早9点到晚11点」（北京时间，附录 C 第 13 题）"
+    ),
     "auto_reply_schedule": "off_hours：只在客服工作时间以外自动回复；always：全天",
     "semi_auto_intents": "这些类型的高置信度推荐直接填进客服输入框，客服按发送即可",
 }

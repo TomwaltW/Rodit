@@ -16,6 +16,7 @@ from rodit.api.web import (
     ASSET_PREFIX,
     ASSETS,
     CONTENT_SECURITY_POLICY,
+    DEGRADED_LABELS,
     PAGE_PATHS,
     json_for_html,
     page_config,
@@ -348,10 +349,12 @@ def test_script_drops_responses_that_arrive_after_a_different_sign_in(api: Api):
 
 
 def test_assist_page_links_to_the_console_and_sends_reviewers_there(api: Api):
-    """页头有去商家控制台的链接；复核人员在这里登录只看到去控制台的提示，不显示话术助手
+    """页头有去商家控制台和售后审核工作台的链接；复核人员在这里登录只看到去控制台的提示，不显示话术助手
     （令牌留着，同一标签页打开控制台直接登录；页头显示是谁、有「退出」）。"""
     page = _parse(api.get("/assist").text)
-    assert [a["href"] for a in page.find("a") if a.get("class") == "page-link"] == ["console"]
+    links = [a for a in page.find("a") if a.get("class") == "page-link"]
+    assert [a["href"] for a in links] == ["console", "aftersale"]
+    assert links[1]["id"] == "aftersale-link" and "hidden" not in links[1]  # 登录前照常显示
     js = api.get(JS).text
     body = js.split("async function signIn(", 1)[1].split("\n  }\n", 1)[0]
     reviewer = body.split("REVIEWER_ROLES.includes(me.role)", 1)[1].split("return false;", 1)[0]
@@ -359,3 +362,23 @@ def test_assist_page_links_to_the_console_and_sends_reviewers_there(api: Api):
     assert "showIdentity(me);" in reviewer
     assert "href: 'console'" in reviewer and "enterApp" not in reviewer
     assert body.index("REVIEWER_ROLES.includes") < body.index("enterApp()")
+
+
+def test_every_engine_degraded_marker_has_a_label():
+    """推荐卡片上"部分能力降级"的中文名：引擎会写的降级标记都有（tool:<kind> 按前缀 tool 显示），
+    图片理解失败（engine.images）提醒客服自己看图。"""
+    from rodit.engine import engine as engine_module
+    from rodit.engine import images, understanding
+
+    markers = {
+        value
+        for module in (engine_module, images, understanding)
+        for name, value in vars(module).items()
+        if name.startswith("DEGRADED_") and isinstance(value, str)
+    }
+    assert {"vision", "budget", "tenant_isolation"} <= markers
+    for marker in markers:
+        key = "tool" if marker.startswith("tool:") else marker
+        assert DEGRADED_LABELS.get(key), marker
+    assert DEGRADED_LABELS["vision"].startswith("图片理解")
+    assert "看图" in DEGRADED_LABELS["vision"]

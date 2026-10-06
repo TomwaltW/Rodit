@@ -11,6 +11,7 @@ from datetime import date, timedelta
 
 import psycopg
 import pytest
+from pydantic import ValidationError
 
 from rodit.adapters.auth import AuthGuard
 from rodit.app.production import postgres_repos
@@ -52,6 +53,26 @@ def test_in_memory_repository_contract():
 
 def test_in_memory_cross_shop_isolation():
     contracts.check_platform_metrics_cross_shop_isolation(InMemoryPlatformMetricsRepository)
+
+
+def test_recorded_by_is_cleaned_by_the_model_and_stored_cleaned_in_memory():
+    """登记人账号是 CleanText：模型校验时就去掉 NUL 等控制字符，内存实现存的也是干净的
+    （和 PostgreSQL 实现一致，换实现时行为不变）。"""
+    row = _row(SHOP_A, source=MetricSource.MERCHANT, recorded_by="owner\x00_a\x07")
+    assert row.recorded_by == "owner_a"
+    repo = InMemoryPlatformMetricsRepository()
+    assert repo.upsert(row).recorded_by == "owner_a"
+    assert [r.recorded_by for r in repo.list(SHOP_A)] == ["owner_a"]
+    assert _row(SHOP_A).recorded_by is None  # 平台同步的没有登记人
+
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, math.nan, -0.1])
+def test_model_rejects_non_finite_or_negative_values(bad):
+    """value 只能是 0 及以上的有限数（allow_inf_nan=False，和库里的 CHECK 一致）：inf / NaN 进不了
+    模型，也就进不了任何一种仓储。"""
+    with pytest.raises(ValidationError):
+        _row(SHOP_A, value=bad)
+    assert _row(SHOP_A, value=0.0).value == 0.0
 
 
 # ================================================================ PostgreSQL
@@ -118,8 +139,8 @@ def test_pg_trainer_role_cannot_read_platform_metrics(db, truncate):
 @pytest.mark.pg
 @pytest.mark.parametrize("bad", [math.inf, math.nan, -1.0])
 def test_pg_rejects_non_finite_or_negative_values(db, truncate, bad):
-    """数值约束（迁移 6）：只能是 0 及以上的有限数。模型挡住了负数和 NaN，model_copy 不校验时
-    数据库兜底。"""
+    """数值约束（迁移 6）：只能是 0 及以上的有限数。模型挡住了负数、NaN 和无穷大，model_copy
+    不校验时数据库兜底。"""
     repo = PgPlatformMetricsRepository(db)
     with pytest.raises(psycopg.errors.CheckViolation):
         repo.upsert(_row(SHOP_A).model_copy(update={"value": bad}))

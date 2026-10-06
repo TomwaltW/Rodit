@@ -24,8 +24,8 @@
   set_semi_auto 按类型开关——开启只给复核人员（接口层按角色判断），要过门槛，没过时只能强制并写明
   原因；高风险类型（routing.high_risk、投诉）和不走规则 6 的类型（站外交易、其他）永远不能开；
   关闭商家和复核人员都可以，随时可以（安全方向）。只写 semi_auto_intents 一个键（仓储里原子地
-  读改写，同一进程里串行），写 shop.rollout_semi_auto 审计（谁、类型、门槛摘要、是否强制、
-  原因），审计写不进去就撤回。
+  读改写，同一进程里串行），写 shop.rollout_semi_auto 审计（AuditAction.ROLLOUT_SEMI_AUTO：谁、
+  类型、门槛摘要、是否强制、原因），审计写不进去就撤回。
 - 全自动生效时段（§15 Phase 3 先在非工作时间试行）：上线状态里带客服工作时间、生效时段、现在是不是
   工作时间、全自动现在生不生效（规则同 engine.modes）、下一次进出工作时间的时刻。只读：
   全自动总开关和生效时段都不能在这里改。
@@ -101,7 +101,6 @@ from rodit.feedback.rollout import (
     AUTO_PERIODS,
     MAX_INCIDENT_COUNT,
     SEMI_AUTO_BLOCKED_TEXT,
-    SEMI_AUTO_CHANGED,
     SEMI_AUTO_PERIODS,
     SHADOW_CONTEXT_MESSAGES,
     STAGE_LABELS,
@@ -764,7 +763,7 @@ class RolloutService:
                 self._audit(
                     shop_id,
                     operator,
-                    SEMI_AUTO_CHANGED,
+                    AuditAction.ROLLOUT_SEMI_AUTO,
                     {
                         "intent": target.value,
                         "enabled": enabled,

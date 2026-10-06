@@ -16,9 +16,8 @@
   （上线记录 shop.rollout_stage）> 店铺授权的开通时间（ShopAuth.granted_at，按 stamp 读，不解密
   令牌）> 未知（报表请商家填写）。
 - 写操作都在 processing(shop_id) 里做（和取消订购互斥，§8.4），进了闸门先确认店铺还在、没停用
-  （删完的店铺不会被写回来）；写完记审计（PLATFORM_METRICS_SYNCED / PLATFORM_METRICS_RECORDED：
-  指标、日期、条数、数值，没有买家数据）。这两个事件名应并入 core.audit.AuditAction（core 冻结期间
-  先定义在这里）。
+  （删完的店铺不会被写回来）；写完记审计（AuditAction.PLATFORM_METRICS_SYNCED /
+  PLATFORM_METRICS_RECORDED：指标、日期、条数、数值，没有买家数据）。
 - 系统估算（MetricSource.COMPUTED）不在这里产生：现有端口算不出和平台口径一致、接入前后可比的数。
   售后平均审核时长要"买家申请 → 商家第一次处理"的时间，平台只读接口只有售后单的创建时间和最后
   更新时间（之后的退款、退货都会刷新它），商家处理的时间只在我们的审核助手执行时留审计（接入后
@@ -70,10 +69,12 @@ logger = logging.getLogger(__name__)
 ShopGate = Callable[[str], AbstractContextManager[None]]
 """AssistService.processing：按店铺的读方闸门（和取消订购互斥）。"""
 
-PLATFORM_METRICS_SYNCED = "platform_metrics.synced"
-"""审计：从平台接口同步了一段日期的指标（范围、拉到 / 写入 / 跳过的条数、指标）。"""
-PLATFORM_METRICS_RECORDED = "platform_metrics.recorded"
-"""审计：商家登记了一天的一项指标（指标、日期、数值、样本量、是否覆盖了之前登记的）。"""
+PLATFORM_METRICS_SYNCED = AuditAction.PLATFORM_METRICS_SYNCED.value
+"""同 AuditAction.PLATFORM_METRICS_SYNCED（保留旧名字，新代码直接用 AuditAction）：从平台接口同步了
+一段日期的指标（范围、拉到 / 写入 / 跳过的条数、指标）。"""
+PLATFORM_METRICS_RECORDED = AuditAction.PLATFORM_METRICS_RECORDED.value
+"""同 AuditAction.PLATFORM_METRICS_RECORDED（保留旧名字，新代码直接用 AuditAction）：商家登记了一天
+的一项指标（指标、日期、数值、样本量、是否覆盖了之前登记的）。"""
 TENANT_STAGE_SYNC = "platform_metrics_sync"
 """tenant.violation 的 stage：平台指标接口返回了别的店铺的数据。"""
 
@@ -237,7 +238,7 @@ class PlatformMetricsService:
             self._audit(
                 shop_id,
                 who,
-                PLATFORM_METRICS_SYNCED,
+                AuditAction.PLATFORM_METRICS_SYNCED.value,
                 {
                     "since": since.isoformat(),
                     "until": until.isoformat(),
@@ -333,7 +334,7 @@ class PlatformMetricsService:
             self._audit(
                 shop_id,
                 actor,
-                PLATFORM_METRICS_RECORDED,
+                AuditAction.PLATFORM_METRICS_RECORDED.value,
                 {
                     "metric": m.value,
                     "day": day.isoformat(),

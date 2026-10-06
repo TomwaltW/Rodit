@@ -17,11 +17,11 @@ import pytest
 from rodit.app import AssistService
 from rodit.app.demo import build_demo_unit
 from rodit.app.rollout import SemiAutoGateNotPassed, auto_schedule
+from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
 from rodit.core.enums import Intent, Platform, SuggestionStatus
 from rodit.core.errors import ActionNotAllowed, ShopInactive
 from rodit.core.models import ShopConfig, SuggestionRecord
-from rodit.feedback.rollout import SEMI_AUTO_CHANGED
 from rodit.testing.fixtures import SHOP_A, SHOP_B
 
 S = SuggestionStatus
@@ -78,7 +78,7 @@ def overrides(service: AssistService, shop_id: str = SHOP_A) -> dict[str, Any]:
 
 
 def events(service: AssistService, shop_id: str = SHOP_A):
-    return service.unit.repos.audit.list_events(shop_id, action=SEMI_AUTO_CHANGED)
+    return service.unit.repos.audit.list_events(shop_id, action=AuditAction.ROLLOUT_SEMI_AUTO.value)
 
 
 # ================================================================ 开启（复核人员，按门槛）
@@ -397,7 +397,7 @@ def test_change_is_undone_when_its_audit_cannot_be_written(service: AssistServic
     calls = {"n": 0}
 
     def flaky(event):
-        if event.action == SEMI_AUTO_CHANGED and calls["n"] == 0:
+        if event.action == AuditAction.ROLLOUT_SEMI_AUTO.value and calls["n"] == 0:
             calls["n"] += 1
             raise RuntimeError("审计库连不上")
         return original(event)
@@ -410,3 +410,11 @@ def test_change_is_undone_when_its_audit_cannot_be_written(service: AssistServic
     change = ro.set_semi_auto(SHOP_A, SHIP, True, operator=REVIEWER, force=True, note="试行")
     assert change.changed and overrides(service)["semi_auto_intents"] == ["shipping_policy"]
     assert len(events(service)) == 1
+
+
+def test_semi_auto_audit_action_lives_in_core_and_old_name_is_an_alias():
+    """事件名已并入 core.audit.AuditAction.ROLLOUT_SEMI_AUTO，取值不变（存量审计照读）；
+    feedback.rollout.SEMI_AUTO_CHANGED 只是别名。"""
+    from rodit.feedback.rollout import SEMI_AUTO_CHANGED
+
+    assert SEMI_AUTO_CHANGED == AuditAction.ROLLOUT_SEMI_AUTO.value == "shop.rollout_semi_auto"

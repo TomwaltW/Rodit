@@ -468,16 +468,18 @@ class PlatformMetricSample(_Model):
     - value 的单位见 core.platform_metrics（比例是 0–1，时长是秒或小时）；
     - 同一店铺、指标、日期、来源只有一条（重复写入覆盖）；不同来源可以并存，报表按
       平台 > 商家登记 > 系统估算的优先级取；
-    - sample_size 是这个数背后的会话 / 售后单数（平台给了才有），太少时报表提示不可靠。
+    - sample_size 是这个数背后的会话 / 售后单数（平台给了才有），太少时报表提示不可靠；
+    - value 只能是 0 及以上的有限数（不收 inf / NaN，和库里 platform_metric 的 CHECK 一致）；
+      recorded_by 写进存储前去掉 NUL 等控制字符（PostgreSQL 的 TEXT 不接受 NUL）。
     """
 
     shop_id: str
     metric: PlatformMetric
     day: date
-    value: float = Field(ge=0.0)
+    value: float = Field(ge=0.0, allow_inf_nan=False)
     source: MetricSource
     sample_size: int | None = Field(default=None, ge=0)
-    recorded_by: str | None = None  # 商家登记时是登记人账号；平台 / 系统为空
+    recorded_by: CleanText | None = None  # 商家登记时是登记人账号；平台 / 系统为空
     recorded_at: AwareDatetime
 
 
@@ -718,9 +720,11 @@ class ConversationContext(_Model):
       必须先过 core.pii.mask_pii。
     - config 是店铺的生效配置（平台默认 → 类目默认 → 店铺覆盖），各步骤只读它，
       不读 shop 上的覆盖项。
-    - mode 是本条消息的生效模式：店铺开了影子模式就是 SHADOW；
-      消息是 AUTO 且店铺开了全自动才是 AUTO；
-      其余为 ASSIST（由 engine 决定，不直接信任接入层）。
+    - mode 是本条消息的生效模式（由 engine.modes 决定，不直接信任接入层）：店铺开了影子模式就是
+      SHADOW；消息是 AUTO、店铺开了全自动、并且此刻在全自动生效时段内才是 AUTO——生效时段看
+      config.auto_reply_schedule（默认 off_hours：只在 config.service_hours 客服工作时间以外，
+      没填工作时间或不知道处理时刻都不自动；always：全天），§15 Phase 3 先在非工作时间试行；
+      其余为 ASSIST（被生效时段拦下的全自动消息照常出推荐并转人工，engine.result 记 auto_gate）。
     - item / order 是指代理解之后的"当前商品 / 当前订单"。
     - candidate_item_ids 有多个且 item 为空时，说明商品不确定，需要澄清（§5.2.4）。
     """
@@ -821,7 +825,9 @@ class RouteDecision(_Model):
       route.model_copy(update={"intent": part.intent, "parts": [],
                                "action": ANSWER 或 HIGH_RISK_ANSWER})
       分别检索、生成、质检，每个 part 出一条推荐。
-    - auto_eligible：规则 6 命中、达到该类型的自动阈值、该类型已开放自动、店铺开了全自动、没有降级。
+    - auto_eligible：规则 6 命中、达到该类型的自动阈值、该类型已开放自动、店铺开了全自动、没有降级，
+      并且按生效模式算（ConversationContext.mode 是 AUTO；客服工作时间内被 engine.modes 退回智能
+      辅助的消息为 False），和引擎的生效模式总是一致。
     """
 
     action: RouteAction

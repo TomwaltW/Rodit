@@ -14,9 +14,9 @@
 
 被拦下（auto_gate 不为空）的消息由客服接管（§12.2 全自动 → 切回智能辅助、由客服接管；§5.7）：
 引擎照常出推荐，并转人工——模式 A 的会话在平台上是机器人接待，不转过去就没人回。
-engine.result 的 detail 另加可选键 auto_gate（RESULT_AUTO_GATE，只在被拦下时写；取值是上面的
-原因，不含买家原文）。路由的 auto_eligible 按生效模式算（routing.policy：模式不是 AUTO 时
-为 False），两边总是一致。
+engine.result 的 detail 另加可选键 auto_gate（core.audit.RESULT_AUTO_GATE，在
+OPTIONAL_RESULT_DETAIL_KEYS 里；只在被拦下时写，取值是上面的原因，不含买家原文）。
+路由的 auto_eligible 按生效模式算（routing.policy：模式不是 AUTO 时为 False），两边总是一致。
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from rodit.core.audit import RESULT_AUTO_GATE  # 契约在 core；这里照旧导出，原来的引用不用改
 from rodit.core.enums import Mode
 from rodit.core.models import ShopConfig
 from rodit.core.schedule import within_service_hours
@@ -40,11 +41,6 @@ AUTO_GATES: tuple[str, ...] = (
     AUTO_GATE_NO_SERVICE_HOURS,
     AUTO_GATE_UNKNOWN_TIME,
 )
-
-RESULT_AUTO_GATE = "auto_gate"
-"""engine.result detail 的可选键（str，取值见 AUTO_GATES）：消息是全自动、店铺也开了全自动，但不在
-全自动生效时段，退回智能辅助并转人工。只在被拦下时写；core.audit.OPTIONAL_RESULT_DETAIL_KEYS
-还没有这个键（契约在 core 冻结期间由引擎定义）。"""
 
 
 @dataclass(frozen=True)

@@ -14,8 +14,6 @@ from pydantic import SecretStr
 from rodit.app.demo import build_demo_unit
 from rodit.app.platform_metrics import (
     DEFAULT_SYNC_DAYS,
-    PLATFORM_METRICS_RECORDED,
-    PLATFORM_METRICS_SYNCED,
     TENANT_STAGE_SYNC,
     MetricsSourceMissing,
     PlatformMetricsService,
@@ -103,7 +101,7 @@ def test_sync_writes_platform_rows_for_the_default_range_and_audits():
     assert len(rows) == 56 and {r.source for r in rows} == {MetricSource.PLATFORM}
     assert all(r.recorded_by is None and r.recorded_at == service.unit.clock.now() for r in rows)
     assert all(r.sample_size == 260 for r in rows)
-    [event] = events(service, SHOP_A, PLATFORM_METRICS_SYNCED)
+    [event] = events(service, SHOP_A, AuditAction.PLATFORM_METRICS_SYNCED.value)
     assert event.actor == "kf_mgr"
     assert event.detail == {
         "since": result.since.isoformat(),
@@ -130,7 +128,9 @@ def test_sync_is_idempotent_and_leaves_merchant_entries_alone():
     merchant = [r for r in second if r.source == MetricSource.MERCHANT]
     assert [(r.day, r.value, r.recorded_by) for r in merchant] == [(day, 0.5, MERCHANT)]
     assert len(second) == 8  # 7 天平台数据 + 1 条商家登记
-    assert [e.actor for e in events(service, SHOP_A, PLATFORM_METRICS_SYNCED)] == ["system", "ops"]
+    assert [
+        e.actor for e in events(service, SHOP_A, AuditAction.PLATFORM_METRICS_SYNCED.value)
+    ] == ["system", "ops"]
 
 
 def test_sync_on_douyin_writes_all_four_metrics():
@@ -151,7 +151,7 @@ def test_sync_failure_writes_nothing():
     with pytest.raises(ToolUnavailable):
         metrics.sync(SHOP_A, actor="system")
     assert service.unit.repos.platform_metrics.list(SHOP_A) == []
-    assert events(service, SHOP_A, PLATFORM_METRICS_SYNCED) == []
+    assert events(service, SHOP_A, AuditAction.PLATFORM_METRICS_SYNCED.value) == []
 
 
 def test_sync_without_source_or_repository_is_a_clear_error():
@@ -221,7 +221,7 @@ def test_sync_rejects_rows_of_another_shop_and_writes_nothing():
     assert repo.list(SHOP_A) == [] and repo.list(SHOP_B) == []
     [violation] = events(service, SHOP_A, AuditAction.TENANT_VIOLATION.value)
     assert violation.detail == {"stage": TENANT_STAGE_SYNC}  # 只记在哪一步拦下的
-    assert events(service, SHOP_A, PLATFORM_METRICS_SYNCED) == []
+    assert events(service, SHOP_A, AuditAction.PLATFORM_METRICS_SYNCED.value) == []
 
 
 def test_sync_skips_bad_rows_one_by_one_and_counts_them():
@@ -255,7 +255,7 @@ def test_sync_skips_bad_rows_one_by_one_and_counts_them():
         (today - timedelta(days=6), 0.95, MetricSource.PLATFORM),
         (good, 0.9, MetricSource.PLATFORM),
     ]
-    [event] = events(service, SHOP_A, PLATFORM_METRICS_SYNCED)
+    [event] = events(service, SHOP_A, AuditAction.PLATFORM_METRICS_SYNCED.value)
     assert event.detail["skipped"] == result.skipped
 
 
@@ -277,7 +277,7 @@ def test_sync_needs_a_person_or_the_system(actor):
 def test_sync_actor_control_characters_are_removed():
     service, metrics = make()
     metrics.sync(SHOP_A, actor="kf\x00_mgr", days=1)
-    assert events(service, SHOP_A, PLATFORM_METRICS_SYNCED)[0].actor == "kf_mgr"
+    assert events(service, SHOP_A, AuditAction.PLATFORM_METRICS_SYNCED.value)[0].actor == "kf_mgr"
 
 
 def test_writes_happen_inside_the_processing_gate():
@@ -341,7 +341,7 @@ def test_record_writes_a_merchant_row_with_the_merchant_and_audits():
     assert result.changed and not result.replaced
     assert result.sample.source == MetricSource.MERCHANT and result.sample.recorded_by == MERCHANT
     assert service.unit.repos.platform_metrics.list(SHOP_A) == [result.sample]
-    [event] = events(service, SHOP_A, PLATFORM_METRICS_RECORDED)
+    [event] = events(service, SHOP_A, AuditAction.PLATFORM_METRICS_RECORDED.value)
     assert event.actor == MERCHANT
     assert event.detail == {
         "metric": "taobao_3min_response_rate",
@@ -361,7 +361,7 @@ def test_record_again_replaces_and_unchanged_is_a_no_op():
     assert again.changed and again.replaced and again.sample.recorded_by == "owner_a2"
     same = metrics.record(SHOP_A, metric=TB, day=day, value=0.82, merchant=MERCHANT)
     assert not same.changed and not same.replaced and same.sample.recorded_by == "owner_a2"
-    recorded = events(service, SHOP_A, PLATFORM_METRICS_RECORDED)
+    recorded = events(service, SHOP_A, AuditAction.PLATFORM_METRICS_RECORDED.value)
     assert [e.detail["previous_value"] for e in recorded] == [None, 0.8]  # 没变的不记
     # 平台同步的那一条另存，登记不覆盖它
     metrics.sync(SHOP_A, actor="system", days=1)
@@ -398,7 +398,7 @@ def test_record_validation_writes_nothing(kwargs, message):
     with pytest.raises(ValueError, match=message):
         metrics.record(SHOP_A, **args)
     assert service.unit.repos.platform_metrics.list(SHOP_A) == []
-    assert events(service, SHOP_A, PLATFORM_METRICS_RECORDED) == []
+    assert events(service, SHOP_A, AuditAction.PLATFORM_METRICS_RECORDED.value) == []
 
 
 def test_record_oldest_allowed_day_is_400_days_back():
@@ -528,3 +528,16 @@ def test_pdd_unit_reports_its_own_metric():
     report = metrics.report(SHOP_C, go_live=go_live)
     assert [c.metric for c in report.metrics] == [PlatformMetric.PDD_3MIN_REPLY_RATE]
     assert report.verdict == "improved"
+
+
+def test_audit_actions_live_in_core_and_old_names_are_aliases():
+    """两个事件名已并入 core.audit.AuditAction，取值不变（存量审计照读）；
+    模块里的旧名字只是别名。"""
+    from rodit.app import platform_metrics as module
+
+    assert module.PLATFORM_METRICS_SYNCED == AuditAction.PLATFORM_METRICS_SYNCED.value
+    assert module.PLATFORM_METRICS_RECORDED == AuditAction.PLATFORM_METRICS_RECORDED.value
+    assert (module.PLATFORM_METRICS_SYNCED, module.PLATFORM_METRICS_RECORDED) == (
+        "platform_metrics.synced",
+        "platform_metrics.recorded",
+    )

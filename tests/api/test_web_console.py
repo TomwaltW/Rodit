@@ -300,6 +300,11 @@ def test_refused_roles_see_who_is_signed_in_and_can_sign_out(api: Api, path: str
     assert "state.token = null;" in refused and "keepToken(token);" in refused
     assert "showIdentity(me);" in refused and "enterApp" not in refused
     assert "$('whoami').hidden = false;" in _functions(js, "")["showIdentity"]
+    # 去售后审核工作台的链接：登录后只给客服、店长、商家显示（复核人员用不了），退出后恢复显示
+    show = _functions(js, "")["showIdentity"]
+    group = "!HUMAN_ROLES.includes(me.role)" if "assist" in path else "!inGroup('human', me.role)"
+    assert f"$('aftersale-link').hidden = {group};" in show
+    assert "$('aftersale-link').hidden = false;" in _functions(js, "")["signOut"]
     # 退出按钮同时清掉错误区（拒绝时的提示）
     click = js.split("$('sign-out').addEventListener('click', () => {", 1)[1].split("});", 1)[0]
     assert [line.strip() for line in click.strip().splitlines()] == [
@@ -616,10 +621,10 @@ def test_console_controls_are_labelled(api: Api):
     assert html["lang"] == "zh-CN"
     assert any(a.get("role") == "alert" for _, a in page.tags)
     assert any(a.get("aria-live") == "polite" for _, a in page.tags)
-    # 两个页面互相有链接
-    assert {"href": "assist", "class": "page-link"}.items() <= next(
-        a for a in page.find("a") if a.get("class") == "page-link"
-    ).items()
+    # 页头链接到话术助手和售后审核工作台（售后审核的链接登录后只给客服、店长、商家显示）
+    links = [a for a in page.find("a") if a.get("class") == "page-link"]
+    assert [a["href"] for a in links] == ["assist", "aftersale"]
+    assert links[1]["id"] == "aftersale-link"
 
 
 def test_review_panel_warns_that_viewing_is_logged(api: Api):

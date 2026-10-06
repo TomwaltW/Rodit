@@ -9,10 +9,10 @@ from datetime import datetime, timedelta
 import pytest
 from api_support import Api, shop_snapshot
 
+from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
 from rodit.core.enums import Intent, SuggestionStatus
 from rodit.core.models import SuggestionRecord
-from rodit.feedback.rollout import SEMI_AUTO_CHANGED
 from rodit.testing.fixtures import SHOP_A, SHOP_B
 
 BASE = f"/v1/shops/{SHOP_A}"
@@ -48,7 +48,7 @@ def semi_auto_intents(api: Api, shop_id: str = SHOP_A) -> list[str] | None:
 
 
 def events(api: Api, shop_id: str = SHOP_A):
-    return api.unit.repos.audit.list_events(shop_id, action=SEMI_AUTO_CHANGED)
+    return api.unit.repos.audit.list_events(shop_id, action=AuditAction.ROLLOUT_SEMI_AUTO.value)
 
 
 # ================================================================ 开启：只有复核人员，按门槛

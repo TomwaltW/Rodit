@@ -14,7 +14,6 @@ import pytest
 
 from rodit.app import AssistService
 from rodit.app.demo import build_demo_unit
-from rodit.app.platform_metrics import PLATFORM_METRICS_SYNCED
 from rodit.core.audit import AuditAction
 from rodit.core.enums import MetricSource, Platform, ShopStatus
 from rodit.core.errors import StorageUnavailable
@@ -66,7 +65,9 @@ def test_sync_every_authorized_shop_through_serve_main(cli, capsys):
     out = capsys.readouterr().out
     assert f"{SHOP_A} " in out and f"{SHOP_B} " in out and "写入 7 条" in out
     for shop in (SHOP_A, SHOP_B):
-        [event] = service.unit.repos.audit.list_events(shop, action=PLATFORM_METRICS_SYNCED)
+        [event] = service.unit.repos.audit.list_events(
+            shop, action=AuditAction.PLATFORM_METRICS_SYNCED.value
+        )
         assert event.actor == "ops"
 
 
