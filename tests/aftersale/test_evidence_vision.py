@@ -37,7 +37,7 @@ from rodit.testing.fixtures import DEMO_IMAGE_FINDINGS, SHOP_A, SHOP_B, build_de
 PHONE = "13812345678"
 AS2009 = (
     "质量 / 破损 / 错漏发，买家已上传 3 张凭证：客服查看凭证后决定；"
-    "图片理解（仅供参考）：3 张凭证中 2 张显示破损（裙摆撕裂，线头外露；外包装压痕明显）"
+    "图片理解（仅供参考）：3 张凭证中 2 张显示破损（裤腿撕裂，线头外露；外包装压痕明显）"
 )
 
 
@@ -133,7 +133,7 @@ def test_partial_failure_and_unclear_images():
     _with_images(env, "as_2009", ["img_as2009_1", "img_blurry", "img_unreadable", "img_wrong"])
     review = env.asst.review(SHOP_A, "as_2009")
     assert review.reason.endswith(
-        "图片理解（仅供参考）：4 张凭证中 1 张显示破损（裙摆撕裂，线头外露），"
+        "图片理解（仅供参考）：4 张凭证中 1 张显示破损（裤腿撕裂，线头外露），"
         "1 张显示错发漏发（颜色不对）；1 张看不清；另有 1 张未能识别"
     )
 
@@ -191,7 +191,7 @@ def test_evidence_added_later_is_analyzed_on_refresh():
     review = env.asst.refresh(SHOP_A, "as_2004")
     assert review.state == ReviewState.CONFIRM
     assert review.reason.endswith(
-        "图片理解（仅供参考）：2 张凭证中 2 张显示破损（裙摆撕裂，线头外露；外包装压痕明显）"
+        "图片理解（仅供参考）：2 张凭证中 2 张显示破损（裤腿撕裂，线头外露；外包装压痕明显）"
     )
 
 

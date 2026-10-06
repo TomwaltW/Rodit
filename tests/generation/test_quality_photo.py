@@ -20,7 +20,7 @@ from rodit.qa import DefaultQualityGate
 from rodit.testing.fakes import FakeClock, FakeLLMClient, make_context
 
 CFG = GenerationConfig()
-DESCRIPTION = "【买家发来图片：破损（外包装一角压扁，裙摆有一处约 3 厘米的撕裂）】"
+DESCRIPTION = "【买家发来图片：破损（外包装一角压扁，裤腿有一处约 3 厘米的撕裂）】"
 LLM_TEXT = "亲，非常抱歉，麻烦您申请售后时上传照片哦"
 
 

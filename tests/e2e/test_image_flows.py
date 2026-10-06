@@ -32,9 +32,9 @@ from rodit.knowledge.retrieval import CLARIFY_PHOTO_ITEM_QUESTION
 from rodit.testing.fakes import make_context
 from rodit.testing.fixtures import RAW_BUYERS, SHOP_A, SHOP_D, build_demo_world
 
-DAMAGE = "【买家发来图片：破损（外包装一角压扁，裙摆有一处约 3 厘米的撕裂）】"
+DAMAGE = "【买家发来图片：破损（外包装一角压扁，裤腿有一处约 3 厘米的撕裂）】"
 DAMAGE_ALERT = (
-    "买家发来 1 张图片：破损（93%）——外包装一角压扁，裙摆有一处约 3 厘米的撕裂；"
+    "买家发来 1 张图片：破损（93%）——外包装一角压扁，裤腿有一处约 3 厘米的撕裂；"
     "仅供参考，以凭证为准"
 )
 SIGNED_URL = "https://img.alicdn.example.invalid/x.jpg?Signature=tok_secret_1"

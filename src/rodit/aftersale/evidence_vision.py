@@ -3,7 +3,7 @@
 
 R5 命中、售后单带凭证图片标识（AfterSaleInfo.evidence_images）、单元注入了 ImageUnderstanding 时，
 审核助手识别最多 MAX_EVIDENCE_IMAGES 张凭证，在建议理由后面加一句摘要，例如
-"图片理解（仅供参考）：3 张凭证中 2 张显示破损（裙摆撕裂，线头外露；外包装压痕明显）"。
+"图片理解（仅供参考）：3 张凭证中 2 张显示破损（裤腿撕裂，线头外露；外包装压痕明显）"。
 
 - 只是参考：不改命中的规则、建议和下一个状态（仍是客服查看凭证后决定），不据此自动同意或拒绝；
 - 并行识别（core.budget.submit_in_context，带上店铺范围），最多等 EVIDENCE_VISION_TIMEOUT_S 秒；

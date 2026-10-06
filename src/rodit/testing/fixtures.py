@@ -1074,7 +1074,7 @@ DEMO_IMAGE_FINDINGS: dict[str, dict[str, object]] = {
     "img_buyer_damage_1": {
         "kind": ImageKind.DAMAGE,
         "confidence": 0.93,
-        "summary": "外包装一角压扁，裙摆有一处约 3 厘米的撕裂",
+        "summary": "外包装一角压扁，裤腿有一处约 3 厘米的撕裂",
     },
     "img_buyer_size_1": {
         "kind": ImageKind.SIZE_REFERENCE,
@@ -1103,7 +1103,7 @@ DEMO_IMAGE_FINDINGS: dict[str, dict[str, object]] = {
     "img_as2009_1": {
         "kind": ImageKind.DAMAGE,
         "confidence": 0.91,
-        "summary": "裙摆撕裂，线头外露",
+        "summary": "裤腿撕裂，线头外露",
     },
     "img_as2009_2": {
         "kind": ImageKind.DAMAGE,

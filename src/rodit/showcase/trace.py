@@ -88,15 +88,11 @@ def gap_label(marker: str) -> str:
     return label
 
 
-EXTRA_DEGRADED_LABELS: dict[str, str] = {DEGRADED_VISION: "图片理解（没能识别，请客服自己看图）"}
-"""商家控制台的降级中文名里还没有的（图片理解是 §15 Phase 3 新加的）。"""
-
-
 def degraded_label(marker: str) -> str:
     if marker.startswith("tool:"):
         kind = marker.removeprefix("tool:")
         return f"{DEGRADED_LABELS['tool']}（{ev.TOOL_LABELS.get(kind, kind)}）"
-    return DEGRADED_LABELS.get(marker) or EXTRA_DEGRADED_LABELS.get(marker, marker)
+    return DEGRADED_LABELS.get(marker, marker)
 
 
 def card_view(card: SuggestionCard) -> dict[str, Any]:

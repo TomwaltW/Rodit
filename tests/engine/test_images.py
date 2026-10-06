@@ -39,9 +39,9 @@ from rodit.testing.fakes import FakeImageUnderstanding
 from rodit.testing.fixtures import CONV, DEMO_IMAGE_FINDINGS, SHOP_A, SHOP_B
 
 PHONE = "13812345678"
-DAMAGE = "【买家发来图片：破损（外包装一角压扁，裙摆有一处约 3 厘米的撕裂）】"
+DAMAGE = "【买家发来图片：破损（外包装一角压扁，裤腿有一处约 3 厘米的撕裂）】"
 DAMAGE_ALERT = (
-    "买家发来 1 张图片：破损（93%）——外包装一角压扁，裙摆有一处约 3 厘米的撕裂；"
+    "买家发来 1 张图片：破损（93%）——外包装一角压扁，裤腿有一处约 3 厘米的撕裂；"
     "仅供参考，以凭证为准"
 )
 
@@ -246,7 +246,8 @@ def test_multiple_images_cap(rig: Rig):
         "img_buyer_product_1",
     ]
     result = rig.send("", *refs)
-    assert [r for _, r in rig.vision.calls] == refs[:3]
+    # 三张图并行识别，调用的先后不固定：只核对识别的是前三张
+    assert sorted(r for _, r in rig.vision.calls) == sorted(refs[:3])
     assert [f.ref for f in rig.routed.image_findings] == refs[:3]
     assert ALERT_SKIPPED.format(n=5, k=3) in result.alerts
     assert rig.routed.current.text.startswith("【买家发来 5 张图片：破损（")
@@ -360,11 +361,11 @@ def test_unreadable_image_counts_as_failure(rig: Rig):
     result = rig.send("", "img_buyer_damage_1", "img_unreadable")
     assert result.degraded == [DEGRADED_VISION]
     assert rig.routed.current.text == (
-        "【买家发来 2 张图片：破损（外包装一角压扁，裙摆有一处约 3 厘米的撕裂）；"
+        "【买家发来 2 张图片：破损（外包装一角压扁，裤腿有一处约 3 厘米的撕裂）；"
         "另有 1 张未能识别】"
     )
     assert result.alerts[:2] == [
-        "买家发来 2 张图片：破损（93%）——外包装一角压扁，裙摆有一处约 3 厘米的撕裂；"
+        "买家发来 2 张图片：破损（93%）——外包装一角压扁，裤腿有一处约 3 厘米的撕裂；"
         "仅供参考，以凭证为准",
         ALERT_VISION_FAILED,
     ]

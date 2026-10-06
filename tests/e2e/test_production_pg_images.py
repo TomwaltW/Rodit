@@ -32,7 +32,7 @@ from rodit.testing.fixtures import DEMO_IMAGE_FINDINGS, SHOP_A, TEST_SALT, build
 pytestmark = pytest.mark.pg
 
 TOKEN_KEY = "rodit-e2e-token-key-synthetic-only"  # 只用于测试的合成密钥
-DAMAGE = "【买家发来图片：破损（外包装一角压扁，裙摆有一处约 3 厘米的撕裂）】"
+DAMAGE = "【买家发来图片：破损（外包装一角压扁，裤腿有一处约 3 厘米的撕裂）】"
 
 
 @pytest.fixture
@@ -138,7 +138,7 @@ def test_r5_evidence_summary_on_postgres(pg_service: AssistService):
     review = pg_service.review_aftersale(SHOP_A, "as_2009")
     assert review.matched_rules == ["R5"] and review.state == ReviewState.CONFIRM
     assert review.reason.endswith(
-        "图片理解（仅供参考）：3 张凭证中 2 张显示破损（裙摆撕裂，线头外露；外包装压痕明显）"
+        "图片理解（仅供参考）：3 张凭证中 2 张显示破损（裤腿撕裂，线头外露；外包装压痕明显）"
     )
     stored = pg_service.unit.repos.reviews.get(SHOP_A, "as_2009")
     assert stored is not None and stored.reason == review.reason

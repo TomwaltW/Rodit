@@ -9,6 +9,7 @@ import json
 import pytest
 from showcase_support import Showcase, build_showcase
 
+from rodit.api.web import DEGRADED_LABELS
 from rodit.core.enums import Platform
 from rodit.engine.images import ALERT_VISION_FAILED
 from rodit.showcase.app import API_PREFIX, page_config
@@ -152,7 +153,7 @@ def test_unreadable_image_degrades_and_still_answers_the_text(showcase: Showcase
     images = view["trace"]["images"]
     assert images["total"] == 1 and images["failed"] == 1 and images["findings"] == []
     assert images["degraded"] is True and ALERT_VISION_FAILED in images["alerts"]
-    assert "图片理解（没能识别，请客服自己看图）" in view["result"]["degraded"]
+    assert DEGRADED_LABELS["vision"] in view["result"]["degraded"]
     assert view["trace"]["understand"]["intent"] == "shipping_policy"
     [card] = _cards(view)
     assert any("图片没能识别" in h for h in card["risk_hints"])
@@ -261,7 +262,7 @@ def test_r5_card_shows_the_evidence_image_summary(showcase: Showcase, platform):
     assert review["suggestion"] == "manual"
     assert review["reason_main"] == "质量 / 破损 / 错漏发，买家已上传 3 张凭证：客服查看凭证后决定"
     assert review["vision_summary"] == (
-        "3 张凭证中 2 张显示破损（裙摆撕裂，线头外露；外包装压痕明显）"
+        "3 张凭证中 2 张显示破损（裤腿撕裂，线头外露；外包装压痕明显）"
     )
     assert (
         review["reason"]
