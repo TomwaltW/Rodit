@@ -18,7 +18,8 @@
 
 每个判断层的指标：
 - 问题类型准确率：预测在期望类型或可接受的备选类型里算对（和 rodit.eval.scoring 一致）；
-  调用失败按错算（另给"答出的准确率"）；总体、dev / test、按问题类型；macro-F1；主要误判；
+  调用失败按错算（另给"答出的准确率"）；总体、dev / test、按问题类型；macro-F1（同样按"算对"
+  口径：答了可接受的备选类型时真实类型记成预测的类型）；主要误判；
 - §6.6 规则 2 / 规则 3 与用例路由标注的一致率：评测集没有逐条的"要人工""情绪等级"标注，这里用
   用例允许的路由结果推出代理标注（need_human_label / emotion_label），只取说得清的用例；
   要人工按 routing.need_human（投票制按票数粒度换算，同线上）、情绪按 routing.emotion_escalate；
@@ -29,9 +30,12 @@
   校准（§13.1 测试集不参与调参），再在测试集上看这个阈值的准确率和覆盖率；
 - 耗时 P50 / P95（每次 decide 的墙钟时间）、失败 / 超时 / 拒绝发送、token 用量（判断层报告了才有）。
 
-§6.3 结论：Jev 对比本次跑的境内方案里准确率最高的那个（同分取 ECE 更低的），只看测试集：
+§6.3 结论：Jev 对比本次跑的境内路由方案（§6.4 的境内大模型、路由分类器；关键词规则只是兜底，
+不作对照）里准确率最高的那个（同分取 ECE 更低的），只看测试集：
 条件 4"中文测试集上准确率和概率校准达到境内方案的水平"满足 = Jev 准确率 ≥ 境内 − 容差
 （--accuracy-tolerance，默认 1 个百分点）且 ECE ≤ 境内 + 容差（--ece-tolerance，默认 0.02）；
+境内只跑了关键词规则（默认的 --jev env 没加 --llm env / --classifier）、或 --limit 抽样时，
+条件 4 判"无法判定"，数字照列只作参考；
 条件 1–3（境内部署、运营主体和数据处理协议、平台报备）这里判断不了，写"需人工确认"。
 本命令只发送合成数据，结论只作选型依据，不授权 Jev 进入生产链路（§6.2）。
 
@@ -123,6 +127,10 @@ Add = Callable[[str], None]
 RULES, CLASSIFIER, INCLOUD_LLM, JEV = "rules", "classifier", "incloud_llm", "jev"
 PROVIDER_ORDER = (RULES, CLASSIFIER, INCLOUD_LLM, JEV)
 SLOW_PROVIDERS = frozenset({INCLOUD_LLM, JEV})  # 联网的判断层：逐条显示进度
+# §6.3 条件 4 的"境内方案"：§6.4 的境内路由方案（MVP 的平台云内大模型、数据攒够后的路由分类器）；
+# 关键词规则只是兜底、置信度没有校准过（rodit.decision.rules），不作对照
+VERDICT_BASELINES = (CLASSIFIER, INCLOUD_LLM)
+BASELINE_HINT = "条件 4 需要对照境内大模型或分类器（--llm env / --classifier）"
 ASSIST_PRECISION = 0.90  # §13.3 智能辅助
 AUTO_PRECISION = 0.98  # §13.3 全自动
 ACCURACY_TOLERANCE = 0.01  # §6.3 条件 4：准确率不低于境内方案 1 个百分点以上
@@ -579,7 +587,8 @@ class _Model(BaseModel):
 
 class IntentRow(_Model):
     """按真实类型：n 条里答对 correct 条（accuracy，失败按错算）；预测为该类型 n_pred 条，
-    其中答对的比例 precision；f1 = 2·P·R/(P+R)，R 即 accuracy。"""
+    其中答对的比例 precision；f1 = 2·P·R/(P+R)，R 按"算对"口径（见 intent_scores；没有答成
+    备选类型时即 accuracy），这个类型的用例全都答成了备选类型时 f1 为 None。"""
 
     label: str
     n: int
@@ -750,42 +759,50 @@ def calibration_of(samples: Sequence[Sample], *, bins: int = ECE_BINS) -> Calibr
 def intent_scores(
     rows: Sequence[tuple[Intent, frozenset[Intent], Intent | None]],
 ) -> tuple[dict[str, IntentRow], float | None]:
-    """rows：(真实类型, 算对的类型, 预测类型或 None)。返回按类型的表现（枚举顺序）和 macro-F1
-    （真实或预测里出现过的类型的 F1 平均；没有预测的类型 F1 记 0）。"""
-    n_true = Counter[Intent]()
-    n_pred = Counter[Intent]()
+    """rows：(真实类型, 算对的类型, 预测类型或 None)。返回按类型的表现（枚举顺序）和 macro-F1。
+
+    准确率按用例的真实类型；F1 按"算对"口径：预测在可接受的类型里时真实类型记成预测的类型
+    （同 samples_of），一条答对的用例只给预测的类型记一次命中，不会因为答的是备选类型而同时
+    拉低真实类型（有真实没预测）和预测类型（有预测没真实）的 F1。macro-F1 是这个口径下真实或
+    预测里出现过的类型的 F1 平均（只出现在一边的 F1 记 0）；用例全都答成备选类型的类型不计 F1。"""
+    n_true = Counter[Intent]()  # 按用例的真实类型（准确率）
     hit_true = Counter[Intent]()
-    hit_pred = Counter[Intent]()
+    n_eff = Counter[Intent]()  # 按算对口径的真实类型（F1 的召回）
+    n_pred = Counter[Intent]()
+    hits = Counter[Intent]()  # 预测为该类型且算对
     for true, ok, pred in rows:
         n_true[true] += 1
-        if pred is None:
-            continue
-        n_pred[pred] += 1
-        if pred in ok:
+        if pred is not None:
+            n_pred[pred] += 1
+        if pred is not None and pred in ok:
             hit_true[true] += 1
-            hit_pred[pred] += 1
+            n_eff[pred] += 1
+            hits[pred] += 1
+        else:
+            n_eff[true] += 1
     table: dict[str, IntentRow] = {}
     f1s: list[float] = []
     for intent in Intent:
         if not (n_true[intent] or n_pred[intent]):
             continue
-        recall = hit_true[intent] / n_true[intent] if n_true[intent] else None
-        precision = hit_pred[intent] / n_pred[intent] if n_pred[intent] else None
-        if recall is None or precision is None:
-            f1 = 0.0
-        elif precision + recall == 0:
-            f1 = 0.0
-        else:
-            f1 = 2 * precision * recall / (precision + recall)
-        f1s.append(f1)
+        accuracy = hit_true[intent] / n_true[intent] if n_true[intent] else None
+        precision = hits[intent] / n_pred[intent] if n_pred[intent] else None
+        f1: float | None = None
+        if n_eff[intent] or n_pred[intent]:
+            recall = hits[intent] / n_eff[intent] if n_eff[intent] else None
+            if recall is None or precision is None or precision + recall == 0:
+                f1 = 0.0
+            else:
+                f1 = 2 * precision * recall / (precision + recall)
+            f1s.append(f1)
         table[intent.value] = IntentRow(
             label=INTENT_LABELS[intent],
             n=n_true[intent],
             correct=hit_true[intent],
-            accuracy=None if recall is None else round(recall, 4),
+            accuracy=None if accuracy is None else round(accuracy, 4),
             n_pred=n_pred[intent],
             precision=None if precision is None else round(precision, 4),
-            f1=round(f1, 4),
+            f1=None if f1 is None else round(f1, 4),
         )
     return table, (round(sum(f1s) / len(f1s), 4) if f1s else None)
 
@@ -1059,7 +1076,7 @@ class JevVerdict(_Model):
     split: str | None = None  # 判定用的数据（test；没有测试集时为本次跑的部分，只作参考）
     n: int = 0
     jev: str | None = None
-    domestic: str | None = None  # 对照的境内方案（本次准确率最高的）
+    domestic: str | None = None  # 对照的境内方案（本次准确率最高的；只有规则时是规则，只作参考）
     jev_accuracy: float | None = None
     domestic_accuracy: float | None = None
     jev_ece: float | None = None
@@ -1068,7 +1085,7 @@ class JevVerdict(_Model):
     ece_tolerance: float
     accuracy_ok: bool | None = None
     ece_ok: bool | None = None
-    partial: bool = False  # --limit 抽样
+    partial: bool = False  # --limit 抽样：不下结论
     reasons: list[str] = Field(default_factory=list)
     conditions: list[ConditionStatus] = Field(default_factory=list)
     synthetic_only: str = SYNTHETIC_NOTICE
@@ -1102,7 +1119,9 @@ def jev_verdict(
     ece_tolerance: float = ECE_TOLERANCE,
     partial: bool = False,
 ) -> JevVerdict:
-    """§6.3 条件 4：Jev 对比本次准确率最高的境内方案（同分取 ECE 低的），只看测试集。"""
+    """§6.3 条件 4：Jev 对比本次准确率最高的境内路由方案（VERDICT_BASELINES，同分取 ECE 低的），
+    只看测试集。只对照了关键词规则、或 partial（--limit 抽样）时判"无法判定"，数字和
+    accuracy_ok / ece_ok 照列，只作参考。"""
     base: dict[str, Any] = {
         "accuracy_tolerance": accuracy_tolerance,
         "ece_tolerance": ece_tolerance,
@@ -1117,11 +1136,12 @@ def jev_verdict(
             **base,
         )
     domestic = [r for r in reports if r.info.kind == "domestic"]
+    baselines = [r for r in domestic if r.info.name in VERDICT_BASELINES]
     base["jev"] = jev.info.name
     if not domestic:
         return JevVerdict(
             status="undetermined",
-            reasons=["没有境内方案对照：--providers 至少再加一个 rules / classifier / incloud_llm"],
+            reasons=[f"没有境内方案对照：{BASELINE_HINT}"],
             conditions=_conditions("undetermined"),
             **base,
         )
@@ -1146,7 +1166,8 @@ def jev_verdict(
             -(s.ece if s.ece is not None else math.inf),
         )
 
-    best = max(domestic, key=rank)  # 同分时保持 PROVIDER_ORDER 里靠前的
+    # 对照 §6.4 的境内路由方案；只跑了关键词规则时拿规则算出数字作参考，但不下结论
+    best = max(baselines or domestic, key=rank)  # 同分时保持 PROVIDER_ORDER 里靠前的
     js, ds = _verdict_score(jev, "test"), _verdict_score(best, "test")
     base.update(
         split="test",
@@ -1157,47 +1178,50 @@ def jev_verdict(
         jev_ece=js.ece,
         domestic_ece=ds.ece,
     )
-    reasons: list[str] = []
+    inconclusive: list[str] = []  # 不下结论的原因（放在最前面）；数字照列，只作参考
+    if not baselines:
+        inconclusive.append(
+            f"本次只有关键词规则作境内对照：规则只是兜底、置信度没有校准过（§6.4），{BASELINE_HINT}；"
+            f"下面对照 {best.info.name} 的数字只作参考"
+        )
     if partial:
-        reasons.append("部分评测（--limit 抽样）：测试集不全，结论只作参考")
+        inconclusive.append("部分评测（--limit 抽样）：测试集不全，条件 4 不下结论，数字只作参考")
+    reasons: list[str] = []
     if jev.failures.failures or jev.failures.refused:
         reasons.append(
             f"Jev 有 {jev.failures.failures} 条调用失败（超时 {jev.failures.timeouts}）、"
             f"{jev.failures.refused} 条拒绝发送，都按答错计"
         )
+    status: Literal["met", "unmet", "undetermined"]
+    accuracy_ok: bool | None
+    ece_ok: bool | None
     if js.answered == 0 or js.ece is None:
         reasons.insert(0, "Jev 在测试集上没有答出任何用例，校准无从比较")
-        return JevVerdict(
-            status="unmet",
-            accuracy_ok=False,
-            ece_ok=False,
-            reasons=reasons,
-            conditions=_conditions("unmet"),
-            **base,
-        )
-    if ds.accuracy is None or ds.ece is None:
+        status, accuracy_ok, ece_ok = "unmet", False, False
+    elif ds.accuracy is None or ds.ece is None:
         reasons.insert(0, f"境内方案 {best.info.name} 在测试集上没有答出任何用例，无从对照")
-        return JevVerdict(
-            status="undetermined", reasons=reasons, conditions=_conditions("undetermined"), **base
+        status, accuracy_ok, ece_ok = "undetermined", None, None
+    else:
+        assert js.accuracy is not None
+        accuracy_ok = js.accuracy >= ds.accuracy - accuracy_tolerance - EPS
+        ece_ok = js.ece <= ds.ece + ece_tolerance + EPS
+        acc_line = (
+            f"准确率 Jev {_pct(js.accuracy)}，境内最好的 {best.info.name} {_pct(ds.accuracy)}"
+            f"（容差 {accuracy_tolerance * 100:g} 个百分点）→ {'达到' if accuracy_ok else '没达到'}"
         )
-    assert js.accuracy is not None
-    accuracy_ok = js.accuracy >= ds.accuracy - accuracy_tolerance - EPS
-    ece_ok = js.ece <= ds.ece + ece_tolerance + EPS
-    acc_line = (
-        f"准确率 Jev {_pct(js.accuracy)}，境内最好的 {best.info.name} {_pct(ds.accuracy)}"
-        f"（容差 {accuracy_tolerance * 100:g} 个百分点）→ {'达到' if accuracy_ok else '没达到'}"
-    )
-    ece_line = (
-        f"ECE Jev {_num(js.ece)}，{best.info.name} {_num(ds.ece)}（容差 {ece_tolerance:g}）"
-        f"→ {'达到' if ece_ok else '没达到'}"
-    )
-    reasons[:0] = [acc_line, ece_line]
-    status = "met" if accuracy_ok and ece_ok else "unmet"
+        ece_line = (
+            f"ECE Jev {_num(js.ece)}，{best.info.name} {_num(ds.ece)}（容差 {ece_tolerance:g}）"
+            f"→ {'达到' if ece_ok else '没达到'}"
+        )
+        reasons[:0] = [acc_line, ece_line]
+        status = "met" if accuracy_ok and ece_ok else "unmet"
+    if inconclusive:
+        status = "undetermined"
     return JevVerdict(
         status=status,
         accuracy_ok=accuracy_ok,
         ece_ok=ece_ok,
-        reasons=reasons,
+        reasons=inconclusive + reasons,
         conditions=_conditions(status),
         **base,
     )
@@ -1623,7 +1647,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--jev",
         choices=["env"],
         help="env：环境变量 RODIT_JEV_BASE_URL / RODIT_JEV_API_KEY（RODIT_JEV_TIMEOUT_S、"
-        "RODIT_JEV_MODEL 可选）配置的 Jev，只发合成数据",
+        "RODIT_JEV_MODEL 可选）配置的 Jev，只发合成数据；§6.3 条件 4 要同时给 --llm env 或 "
+        "--classifier 作境内对照",
     )
     parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
     parser.add_argument("--limit", type=_positive_int, help="随机抽 N 条（按 --seed，可复现）")

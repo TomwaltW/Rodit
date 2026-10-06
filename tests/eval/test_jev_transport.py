@@ -338,6 +338,31 @@ def test_usage_is_taken_out_of_the_response_and_accumulated(key):
     assert transport.usage_totals() == (150, 5, 2)
 
 
+@pytest.mark.parametrize(
+    ("usage", "totals"),
+    [
+        ({"input_tokens": float("inf"), "output_tokens": 3}, (0, 3, 1)),
+        ({"input_tokens": float("nan")}, (0, 0, 0)),
+        ({"prompt_tokens": float("-inf"), "completion_tokens": float("nan")}, (0, 0, 0)),
+    ],
+)
+def test_non_finite_usage_is_ignored_and_the_answer_is_kept(key, usage, totals):
+    """json.loads 收 Infinity / NaN：用量不是有限数时当作没报告，不能让一个好的回答变成异常。"""
+    raw = json.dumps(_jev_body(usage=usage)).encode()
+    assert b"Infinity" in raw or b"NaN" in raw
+    transport = _transport(_Opener(_Resp(raw)))
+    assert transport(PAYLOAD) == _jev_body()
+    assert transport.usage_totals() == totals
+    provider = JevProvider(transport, JevConditions(), purpose="offline_eval")
+    from rodit.core.decision import DecisionRequest
+
+    state = {"synthetic": True, "messages": [{"role": "buyer", "text": "在吗"}]}
+    response = provider.decide(
+        DecisionRequest(model=ROUTER_MODEL, state=state, questions=ROUTER_QUESTIONS)
+    )
+    assert response.choice(Q_INTENT).choice == "size_advice"
+
+
 def test_other_unknown_fields_are_left_for_jev_provider_to_reject(key):
     """格式变了（多了不认识的字段）照样交给 JevProvider，由它按"判断层不可用"报错。"""
     opener = _Opener(_Resp(json.dumps(_jev_body(debug={"trace": 1})).encode()))

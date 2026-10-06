@@ -246,13 +246,42 @@ def test_intent_scores_and_macro_f1_by_hand():
     table, macro = intent_scores(rows)
     assert list(table) == ["product_spec", "size_advice", "stock"]  # 枚举顺序
     a, b, c = table["product_spec"], table["size_advice"], table["stock"]
+    # 准确率按用例的真实类型：第 4 条（真实 B、答了可接受的 A）算 B 答对
     assert (a.n, a.correct, a.accuracy, a.n_pred, a.precision) == (2, 1, 0.5, 2, 1.0)
-    assert a.f1 == round(2 * 0.5 * 1.0 / 1.5, 4)
     assert (b.n, b.correct, b.accuracy, b.n_pred, b.precision) == (2, 2, 1.0, 2, 0.5)
-    assert b.f1 == round(2 * 1.0 * 0.5 / 1.5, 4)
+    # F1 按算对口径（同 samples_of）：第 4 条的真实类型记成 A，只算 A 的一个 TP
+    # A：TP 2（第 1、4 条）、真实 3 条、预测 2 条 → R 2/3、P 1；B：TP 1、真实 1 条、预测 2 条
+    assert a.f1 == round(2 * 1.0 * (2 / 3) / (1.0 + 2 / 3), 4) == 0.8
+    assert b.f1 == round(2 * 0.5 * 1.0 / 1.5, 4)
     assert (c.n, c.correct, c.accuracy, c.n_pred, c.precision, c.f1) == (1, 0, 0.0, 0, None, 0.0)
-    assert macro == round((2 / 3 + 2 / 3 + 0) / 3, 4)
+    assert macro == round((0.8 + 2 / 3 + 0) / 3, 4)
     assert intent_scores([]) == ({}, None)
+
+
+def test_macro_f1_does_not_penalise_acceptable_alternatives():
+    """答了可接受的备选类型是答对：不能让两个类型各缺一半（真实那边没有预测、预测那边没有真实）。"""
+    A, B = Intent.PRODUCT_SPEC, Intent.SIZE_ADVICE  # noqa: N806
+    table, macro = intent_scores([(B, frozenset({B, A}), A)])
+    assert macro == 1.0
+    assert (table["product_spec"].precision, table["product_spec"].f1) == (1.0, 1.0)
+    b = table["size_advice"]
+    assert (b.n, b.correct, b.accuracy, b.n_pred, b.f1) == (1, 1, 1.0, 0, None)  # 不计 F1
+
+
+def test_macro_f1_is_perfect_when_every_answer_is_acceptable(all_cases):
+    """有备选类型的用例全都答备选类型（都算对）：准确率和 macro-F1 都是 1。"""
+    with_alt = [c for c in all_cases if len(c.ok_intents) > 1]
+    assert len(with_alt) >= 5
+
+    def alternative(c: CompareCase) -> Intent:
+        return next(i for i in Intent if i in c.ok_intents and i != c.expected)
+
+    outcomes = [
+        cmp.CaseOutcome(case_id=c.id, intent=alternative(c), confidence=0.9) for c in with_alt
+    ]
+    score = cmp.split_score(with_alt, outcomes)
+    assert score.accuracy == 1.0
+    assert score.macro_f1 == 1.0
 
 
 def test_samples_record_acceptable_predictions_as_correct(all_cases):
@@ -810,7 +839,10 @@ def test_verdict_unmet_on_accuracy_or_calibration_with_numbers():
     ],
 )
 def test_verdict_tolerances(jev_acc, jev_ece, acc_tol, ece_tol, status):
-    reports = [_report("rules", "domestic", 0.92, 0.04), _report("jev", "jev", jev_acc, jev_ece)]
+    reports = [
+        _report("classifier", "domestic", 0.92, 0.04),
+        _report("jev", "jev", jev_acc, jev_ece),
+    ]
     v = jev_verdict(reports, accuracy_tolerance=acc_tol, ece_tolerance=ece_tol)
     assert v.status == status
     assert (v.accuracy_tolerance, v.ece_tolerance) == (acc_tol, ece_tol)
@@ -818,22 +850,23 @@ def test_verdict_tolerances(jev_acc, jev_ece, acc_tol, ece_tol, status):
 
 def test_verdict_best_domestic_ties_go_to_lower_ece():
     reports = [
-        _report("rules", "domestic", 0.90, 0.10),
-        _report("classifier", "domestic", 0.90, 0.03),
+        _report("classifier", "domestic", 0.90, 0.10),
+        _report("incloud_llm", "domestic", 0.90, 0.03),
         _report("jev", "jev", 0.90, 0.06),
     ]
     v = jev_verdict(reports)
-    assert v.domestic == "classifier" and v.status == "unmet" and v.ece_ok is False
+    assert v.domestic == "incloud_llm" and v.status == "unmet" and v.ece_ok is False
 
 
 def test_verdict_edge_cases():
-    domestic = _report("rules", "domestic", 0.8, 0.05)
+    domestic = _report("classifier", "domestic", 0.8, 0.05)
     assert jev_verdict([domestic]).status == "not_run"
     alone = jev_verdict([_report("jev", "jev", 0.9, 0.01)])
     assert alone.status == "undetermined" and "境内方案" in alone.reasons[0]
+    assert "--llm env" in alone.reasons[0] and "--classifier" in alone.reasons[0]
     dev_only = jev_verdict(
         [
-            _report("rules", "domestic", 0.8, 0.05, splits=("dev",)),
+            _report("classifier", "domestic", 0.8, 0.05, splits=("dev",)),
             _report("jev", "jev", 0.9, 0.01, splits=("dev",)),
         ]
     )
@@ -842,26 +875,83 @@ def test_verdict_edge_cases():
     dead = jev_verdict([domestic, _report("jev", "jev", 0.0, None, answered=0, failures=50)])
     assert dead.status == "unmet" and "没有答出" in dead.reasons[0]
     assert any("50 条调用失败" in r for r in dead.reasons)
-    partial = jev_verdict([domestic, _report("jev", "jev", 0.9, 0.04)], partial=True)
-    assert partial.status == "met" and partial.partial
-    assert any("部分评测" in r for r in partial.reasons)
+
+
+def test_verdict_from_a_limit_sample_is_undetermined_but_keeps_the_numbers():
+    """--limit 抽样（可能只抽到一两条测试集用例）不下结论，满足、未满足都不判；数字照列作参考。"""
+    domestic = _report("incloud_llm", "domestic", 0.92, 0.04)
+    good = jev_verdict([domestic, _report("jev", "jev", 0.93, 0.03)], partial=True)
+    assert good.status == "undetermined" and good.partial
+    assert good.conditions[-1].status == "undetermined"
+    assert good.accuracy_ok is True and good.ece_ok is True
+    assert (good.domestic, good.jev_accuracy, good.domestic_accuracy) == ("incloud_llm", 0.93, 0.92)
+    assert "部分评测" in good.reasons[0]
+    assert any("93.0%" in r and "92.0%" in r for r in good.reasons)
+    bad = jev_verdict([domestic, _report("jev", "jev", 0.5, 0.3)], partial=True)
+    assert bad.status == "undetermined" and (bad.accuracy_ok, bad.ece_ok) == (False, False)
+    dead = jev_verdict(
+        [domestic, _report("jev", "jev", 0.0, None, answered=0, failures=50)], partial=True
+    )
+    assert dead.status == "undetermined" and dead.conditions[-1].status == "undetermined"
+
+
+def test_verdict_needs_the_in_cloud_llm_or_classifier_as_baseline():
+    """§6.4：境内路由方案是平台云内大模型和路由分类器，关键词规则只是兜底（置信度没有校准过），
+    只对照规则时条件 4 无法判定（数字照列作参考）。"""
+    rules = _report("rules", "domestic", 0.80, 0.05)
+    v = jev_verdict([rules, _report("jev", "jev", 0.95, 0.01)])
+    assert v.status == "undetermined" and v.conditions[-1].status == "undetermined"
+    assert "境内大模型或分类器" in v.reasons[0] and "--llm env" in v.reasons[0]
+    assert v.domestic == "rules" and v.accuracy_ok is True and v.ece_ok is True
+    # 规则和分类器都跑了：只拿分类器对照（规则准确率再高、校准再差也不作对照）
+    v = jev_verdict(
+        [
+            _report("rules", "domestic", 0.95, 0.30),
+            _report("classifier", "domestic", 0.90, 0.02),
+            _report("jev", "jev", 0.95, 0.30),
+        ]
+    )
+    assert v.domestic == "classifier" and v.status == "unmet"
+    assert v.accuracy_ok is True and v.ece_ok is False
 
 
 def test_condition_labels_match_jev_conditions():
     assert list(CONDITION_LABELS) == list(JevConditions.model_fields)
 
 
+def _classifier_baseline(compare_cases: Iterable[CompareCase]) -> ProviderSpec:
+    """假的路由分类器：id 以 1 结尾的答错，置信度对的 0.95、错的 0.6。"""
+    return _spec(
+        Scripted(
+            compare_cases,
+            name="classifier",
+            wrong=lambda c: c.id.endswith("1"),
+            confidence=lambda c, wrong: 0.6 if wrong else 0.95,
+        ),
+        "classifier",
+    )
+
+
 def test_verdict_both_ways_end_to_end(all_cases):
-    """完整跑一遍：Jev 好的时候判满足，校准差 / 准确率低的时候判未满足（都对照关键词规则）。"""
-    good = compare(all_cases, [rules_spec(), jev_spec(JevScript(all_cases))])
+    """完整跑一遍：Jev 好的时候判满足，校准差 / 准确率低的时候判未满足（对照路由分类器）；
+    只有关键词规则作对照时无法判定。"""
+    rules_only = compare(all_cases, [rules_spec(), jev_spec(JevScript(all_cases))])
+    assert rules_only.verdict.status == "undetermined"
+    assert rules_only.verdict.domestic == "rules" and rules_only.verdict.n == 66
+    rules_test = rules_only.providers[0].by_split["test"]
+    assert rules_only.verdict.domestic_accuracy == rules_test.accuracy
+
+    good = compare(
+        all_cases,
+        [rules_spec(), _classifier_baseline(all_cases), jev_spec(JevScript(all_cases))],
+    )
     assert good.verdict.status == "met"
-    assert good.verdict.domestic == "rules" and good.verdict.n == 66
-    rules_test = good.providers[0].by_split["test"]
-    assert good.verdict.domestic_accuracy == rules_test.accuracy
+    assert good.verdict.domestic == "classifier" and good.verdict.n == 66
+    assert good.verdict.domestic_accuracy == good.providers[1].by_split["test"].accuracy
     assert good.verdict.jev_accuracy == 1.0 and good.verdict.jev_ece == 0.0
 
     overconfident = JevScript(all_cases, confidence=lambda c, wrong: 0.3)  # 全对却只给 0.3
-    bad_cal = compare(all_cases, [rules_spec(), jev_spec(overconfident)])
+    bad_cal = compare(all_cases, [_classifier_baseline(all_cases), jev_spec(overconfident)])
     assert bad_cal.verdict.status == "unmet"
     assert bad_cal.verdict.accuracy_ok is True and bad_cal.verdict.ece_ok is False
 
@@ -870,16 +960,31 @@ def test_verdict_both_ways_end_to_end(all_cases):
         wrong=lambda c: c.id[0] in "abcdefghijklmnopqrs",  # 大部分答错
         confidence=lambda c, wrong: 0.0 if wrong else 1.0,  # 校准完美
     )
-    low_acc = compare(all_cases, [rules_spec(), jev_spec(sloppy)])
+    low_acc = compare(all_cases, [_classifier_baseline(all_cases), jev_spec(sloppy)])
     assert low_acc.verdict.status == "unmet"
     assert low_acc.verdict.accuracy_ok is False and low_acc.verdict.ece_ok is True
+
+
+def test_verdict_with_limit_is_undetermined_end_to_end(all_cases):
+    """compare(limit=...)：抽样跑（哪怕 Jev 全对）也不判满足。"""
+    sample = [c for c in all_cases if c.split == "test"][:1]
+    report = compare(
+        sample,
+        [_classifier_baseline(all_cases), jev_spec(JevScript(all_cases))],
+        split="test",
+        limit=1,
+    )
+    v = report.verdict
+    assert v.partial and v.n == 1 and v.jev_accuracy == 1.0
+    assert v.status == "undetermined" and v.conditions[-1].status == "undetermined"
+    assert "：无法判定" in render_text(report) and "：满足" not in render_text(report)
 
 
 # ================================================================ 报告
 
 
 def test_text_report_sections_and_notices(small):
-    report = compare(small, [rules_spec(), jev_spec(JevScript(small))])
+    report = compare(small, [rules_spec(), _classifier_baseline(small), jev_spec(JevScript(small))])
     text = render_text(report)
     for needle in (
         "Rodit 判断层离线对比",
@@ -1035,11 +1140,33 @@ def test_cli_jev_env_with_injected_transport(all_cases, no_jev_env):
     transport = JevScript(all_cases)
     code, out, err = _run(["--jev", "env"], jev_factory=lambda: (transport, None))
     assert code == 0, err
-    assert "  - jev：" in out and "：满足" in out
+    # 默认只有关键词规则作境内对照：条件 4 无法判定，提示加 --llm env / --classifier
+    assert "  - jev：" in out and "chinese_eval_passed" in out
+    assert "：无法判定" in out and "：满足" not in out
+    assert "境内大模型或分类器（--llm env / --classifier）" in out
     first = transport.payloads[0]
     assert first["state"]["messages"] == [{"role": "buyer", "text": "在吗"}]  # 连通性检查
     assert first["state"]["synthetic"] is True
     assert len(transport.payloads) == 1 + 324
+    # 再加上境内大模型（--llm env）：对照它判定
+    code, out, err = _run(
+        ["--llm", "env", "--jev", "env", "--json"],
+        client_factory=lambda: _llm(all_cases),
+        jev_factory=lambda: (JevScript(all_cases), None),
+    )
+    assert code == 0, err
+    data = json.loads(out)
+    assert [p["info"]["name"] for p in data["providers"]] == ["rules", "incloud_llm", "jev"]
+    assert data["verdict"]["domestic"] == "incloud_llm" and data["verdict"]["status"] == "met"
+    # --limit 抽样：不下结论
+    code, out, err = _run(
+        ["--llm", "env", "--jev", "env", "--limit", "40", "--json"],
+        client_factory=lambda: _llm(all_cases),
+        jev_factory=lambda: (JevScript(all_cases), None),
+    )
+    assert code == 0, err
+    verdict = json.loads(out)["verdict"]
+    assert verdict["partial"] is True and verdict["status"] == "undetermined"
     sent: list[dict[str, Any]] = []
 
     def broken(payload: dict[str, Any]) -> dict[str, Any]:
