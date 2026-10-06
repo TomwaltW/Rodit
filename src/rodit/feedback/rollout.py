@@ -96,9 +96,9 @@ SEMI_AUTO_PERIODS = 2  # 半自动看最近几个完整周（§13.4 没写几周
 SEMI_AUTO_MIN_AS_IS = 0.9  # §13.4 半自动："该类型原样采纳率 ≥ 90%"
 SEMI_AUTO_MIN_GROUPS = 10  # 每个类型每周至少这么多推荐组
 
-SEMI_AUTO_CHANGED = "shop.rollout_semi_auto"
-"""审计动作：复核人员开启 / 商家或复核人员关闭某个类型的半自动（谁、类型、门槛摘要、是否强制、
-原因）。core.audit.AuditAction 冻结期间先定义在这里，合并后应加进 AuditAction。"""
+SEMI_AUTO_CHANGED = AuditAction.ROLLOUT_SEMI_AUTO.value
+"""同 AuditAction.ROLLOUT_SEMI_AUTO（保留旧名字，新代码直接用 AuditAction）：复核人员开启 / 商家或
+复核人员关闭某个类型的半自动（谁、类型、门槛摘要、是否强制、原因）。"""
 
 SEMI_AUTO_HIGH_RISK = "high_risk"
 """不能开半自动的原因：高风险类型（routing.high_risk、投诉；§6.6 规则 4，要由人把关）。"""

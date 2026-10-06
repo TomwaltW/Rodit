@@ -13,10 +13,10 @@ import pytest
 from api_support import TOKENS, Api
 from test_web_browser import NODE, _run_smoke
 
+from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
 from rodit.core.enums import Intent, SuggestionStatus
 from rodit.core.models import SuggestionRecord
-from rodit.feedback.rollout import SEMI_AUTO_CHANGED
 from rodit.testing.fixtures import AGENT, SHOP_A
 
 SCRIPT = Path(__file__).with_name("web_semiauto_smoke.cjs")
@@ -70,7 +70,7 @@ def test_semi_auto_and_schedule_in_a_real_browser(api: Api):
     assert shop is not None
     assert shop.config_overrides["semi_auto_intents"] == ["size_advice", "invoice_gift"]
     assert shop.config_overrides["service_hours"] == ["09:00-12:00", "13:30-22:00"]
-    events = repos.audit.list_events(SHOP_A, action=SEMI_AUTO_CHANGED)
+    events = repos.audit.list_events(SHOP_A, action=AuditAction.ROLLOUT_SEMI_AUTO.value)
     assert [
         (e.actor, e.detail["intent"], e.detail["enabled"], e.detail["forced"]) for e in events
     ] == [

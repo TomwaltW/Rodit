@@ -61,6 +61,9 @@ class AuditAction(StrEnum):
     TENANT_VIOLATION = "tenant.violation"
     # 上线节奏（§13.4）：复核人员登记的平台违规通知、买家投诉（周、条数，不记原文）
     ROLLOUT_INCIDENT = "shop.rollout_incident"
+    # 半自动（§5.6、§13.4）：复核人员开启 / 商家或复核人员关闭某个类型（谁、类型、门槛摘要、
+    # 是否强制、原因；不记原文）
+    ROLLOUT_SEMI_AUTO = "shop.rollout_semi_auto"
     # 合规扫描（§13.4）：实际发出去的文字里疑似违规（规则 ID、推荐 / 消息 ID，不记原文）
     COMPLIANCE_FLAG = "compliance.flag"
     # 复核人员确认 / 标记误报一条疑似违规（规则名、推荐 / 消息 ID、备注，不记原文）
@@ -74,6 +77,10 @@ class AuditAction(StrEnum):
     REVIEW_ACTION = "aftersale.action"
     # 大模型用量（§12.4 每个店铺的模型成本）
     LLM_USAGE = "llm.usage"
+    # 平台客服指标（§12.4 接入前后对比）：从平台接口同步（范围、拉到 / 写入 / 跳过的条数、指标）、
+    # 商家登记一天的一项指标（指标、日期、数值、样本量、是否覆盖）；没有买家数据
+    PLATFORM_METRICS_SYNCED = "platform_metrics.synced"
+    PLATFORM_METRICS_RECORDED = "platform_metrics.recorded"
 
 
 class ResultKey(StrEnum):
@@ -102,7 +109,12 @@ RESULT_BUDGET_EXCEEDED = "budget_exceeded"
 （LatencyConfig.message_budget_s）。只在超时的时候写，正常的消息 detail 仍然正好是
 RESULT_DETAIL_KEYS；degraded 里同时有 DEGRADED_BUDGET。报表按这个常量读，没有这个键就是没超时。"""
 
-OPTIONAL_RESULT_DETAIL_KEYS: tuple[str, ...] = (RESULT_BUDGET_EXCEEDED,)
+RESULT_AUTO_GATE = "auto_gate"
+"""engine.result detail 的可选键（str，取值见 engine.modes.AUTO_GATES）：消息是全自动、店铺也开了
+全自动，但不在全自动生效时段（ShopConfig.auto_reply_schedule / service_hours，§15 Phase 3 先在
+非工作时间试行），退回智能辅助并转人工。只在被拦下时写，取值是拦下原因（不含买家原文）。"""
+
+OPTIONAL_RESULT_DETAIL_KEYS: tuple[str, ...] = (RESULT_BUDGET_EXCEEDED, RESULT_AUTO_GATE)
 """engine.result detail 里可能出现、但不是每次都有的键。"""
 
 SYSTEM_EVENT_ACTIONS: frozenset[str] = frozenset(

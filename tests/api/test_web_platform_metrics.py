@@ -21,7 +21,7 @@ from test_web_browser import NODE, _run_smoke
 from test_web_page import _config
 
 from rodit.api.web import CONSOLE_ASSET_PREFIX, CONSOLE_PAGE_PATHS, console_page_config
-from rodit.app.platform_metrics import PLATFORM_METRICS_RECORDED, PLATFORM_METRICS_SYNCED
+from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
 from rodit.core.enums import MetricSource, Platform
 from rodit.core.platform_metrics import metric_labels
@@ -99,8 +99,9 @@ def test_platform_metrics_section_in_a_real_browser(api: Api):
     assert (merchant.day, merchant.value, merchant.sample_size) == (record_day, 0.935, 240)
     assert merchant.recorded_by == "owner_a"
     audit = api.unit.repos.audit
-    [synced] = audit.list_events(SHOP_A, action=PLATFORM_METRICS_SYNCED)
+    [synced] = audit.list_events(SHOP_A, action=AuditAction.PLATFORM_METRICS_SYNCED.value)
     assert synced.actor == MANAGER
-    assert [e.actor for e in audit.list_events(SHOP_A, action=PLATFORM_METRICS_RECORDED)] == [
-        "owner_a"
-    ]  # 和已登记的一样的那次没有写
+    assert [
+        e.actor
+        for e in audit.list_events(SHOP_A, action=AuditAction.PLATFORM_METRICS_RECORDED.value)
+    ] == ["owner_a"]  # 和已登记的一样的那次没有写

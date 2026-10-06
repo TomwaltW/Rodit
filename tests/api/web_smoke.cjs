@@ -83,6 +83,8 @@ async function main() {
     await page.locator('#notice summary').filter({ hasText: '个人信息委托处理协议' }).waitFor();
     check(await page.getByText('不做任何自动抓取').isVisible(), '登录前展开合规提示');
     check((await page.locator('#platform-name').textContent()) === '淘宝', '平台名');
+    const links = await page.locator('a.page-link').evaluateAll((as) => as.map((a) => a.getAttribute('href')));
+    check(JSON.stringify(links) === JSON.stringify(['console', 'aftersale']), '页头链接到控制台和售后审核工作台');
     steps.push('page');
 
     // ---------------------------------------------------------------- 登录：错误令牌、平台对接令牌、客服
@@ -95,6 +97,7 @@ async function main() {
     await page.locator('#identity').filter({ hasText: '客服' }).waitFor();
     check(await page.locator('#error').isHidden(), '登录后清掉错误');
     check(await page.locator('#console').isHidden(), '客服看不到店铺数据');
+    check(await page.locator('#aftersale-link').isVisible(), '客服：页头有去售后审核的链接');
     check(!(await page.locator('#notice').evaluate((d) => d.open)), '登录后收起须知');
     check(await page.getByText('个人信息委托处理协议').isVisible(), '协议要求一直可见');
     await page.locator('#item option', { hasText: '法式碎花连衣裙' }).waitFor({ state: 'attached' });

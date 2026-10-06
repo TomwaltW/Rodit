@@ -16,7 +16,13 @@ from typing import Any
 import pytest
 from engine_support import Kit, make_route
 
-from rodit.core.audit import RESULT_DETAIL_KEYS, AuditAction, InMemoryAuditSink
+from rodit.core import audit as core_audit
+from rodit.core.audit import (
+    OPTIONAL_RESULT_DETAIL_KEYS,
+    RESULT_DETAIL_KEYS,
+    AuditAction,
+    InMemoryAuditSink,
+)
 from rodit.core.clock import CST
 from rodit.core.config import RoutingConfig
 from rodit.core.enums import Intent, Mode, RouteAction
@@ -193,6 +199,10 @@ def test_in_service_hours_falls_back_to_assist_and_transfers(kit: Kit) -> None:
     detail = result_detail(kit)
     assert detail[RESULT_AUTO_GATE] == AUTO_GATE_SERVICE_HOURS
     assert set(detail) == {*RESULT_DETAIL_KEYS, RESULT_AUTO_GATE}
+    # 可选键在 core 的契约里（报表、指标按 core.audit 读），引擎用的就是这一个常量
+    assert RESULT_AUTO_GATE is core_audit.RESULT_AUTO_GATE
+    assert RESULT_AUTO_GATE in OPTIONAL_RESULT_DETAIL_KEYS
+    assert set(detail) <= {*RESULT_DETAIL_KEYS, *OPTIONAL_RESULT_DETAIL_KEYS}
     assert detail["transfer_to_human"] is True
     [understand] = kit.events(AuditAction.UNDERSTAND)
     assert understand.detail["mode"] == "assist"

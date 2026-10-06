@@ -10,7 +10,7 @@ from datetime import date, timedelta
 import pytest
 from api_support import CALLERS, Api
 
-from rodit.app.platform_metrics import PLATFORM_METRICS_RECORDED, PLATFORM_METRICS_SYNCED
+from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
 from rodit.core.enums import MetricSource, PlatformMetric, ShopStatus
 from rodit.core.models import PlatformMetricSample
@@ -56,13 +56,17 @@ def test_manager_and_merchant_can_sync(api: Api, who: str):
     assert body["metrics"] == ["taobao_3min_response_rate"]
     assert body["until"] == (today(api) - timedelta(days=1)).isoformat()
     assert len(rows(api)) == 7 and rows(api, SHOP_B) == []
-    [event] = api.unit.repos.audit.list_events(SHOP_A, action=PLATFORM_METRICS_SYNCED)
+    [event] = api.unit.repos.audit.list_events(
+        SHOP_A, action=AuditAction.PLATFORM_METRICS_SYNCED.value
+    )
     assert event.actor == CALLERS[who].user_id  # 操作人取自令牌对应的身份
 
 
 def test_sync_actor_is_the_caller(api: Api):
     assert api.post(SYNC, "merchant_a").status_code == 200
-    [event] = api.unit.repos.audit.list_events(SHOP_A, action=PLATFORM_METRICS_SYNCED)
+    [event] = api.unit.repos.audit.list_events(
+        SHOP_A, action=AuditAction.PLATFORM_METRICS_SYNCED.value
+    )
     assert event.actor == "owner_a" and event.detail["written"] == 56
 
 
@@ -93,7 +97,10 @@ def test_sync_when_the_platform_is_down_writes_nothing(api: Api):
     assert r.status_code == 503 and r.json()["error"] == "metrics_source_unavailable"
     assert "什么都没有写" in r.json()["message"]
     assert rows(api) == []
-    assert api.unit.repos.audit.list_events(SHOP_A, action=PLATFORM_METRICS_SYNCED) == []
+    assert (
+        api.unit.repos.audit.list_events(SHOP_A, action=AuditAction.PLATFORM_METRICS_SYNCED.value)
+        == []
+    )
 
 
 def test_sync_without_authorization_is_refused(api: Api):
@@ -129,7 +136,9 @@ def test_merchant_records_a_value_and_the_recorder_comes_from_the_token(api: Api
     [stored] = rows(api)
     assert stored.value == 0.93 and stored.sample_size == 250
     assert stored.source == MetricSource.MERCHANT and stored.recorded_by == "owner_a"
-    [event] = api.unit.repos.audit.list_events(SHOP_A, action=PLATFORM_METRICS_RECORDED)
+    [event] = api.unit.repos.audit.list_events(
+        SHOP_A, action=AuditAction.PLATFORM_METRICS_RECORDED.value
+    )
     assert event.actor == "owner_a" and event.detail["value"] == 0.93
     again = api.post(ROWS, "merchant_a", json=record_body(api)).json()
     assert again["changed"] is False
