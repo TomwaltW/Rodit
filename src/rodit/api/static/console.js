@@ -2513,6 +2513,427 @@
     );
   }
 
+  // ================================================================ 平台客服指标 · 接入前后对比（§12.4、§1.3）
+  //
+  // 报表页的一节（页面模板里没有，启动时由 initPlatformMetrics 建好）：接入日期 + 每段天数 → 每项指标
+  // 接入前 / 接入后的均值、变化（↑↓，按指标的好坏方向标绿 / 红）、数据来源、口径说明，和按周的柱状图
+  // （SVG，createElementNS 画，文字一律 textContent）；「同步平台数据」给店长、商家，「登记」只给商家。
+  // 接入日期：输入框里是用户填的才作为 go_live 发给接口；没填时用报表给的（上线记录 / 开通授权），
+  // 报表也不知道时先按 28 天前算并提示填写。
+
+  const PM_SPECS = CONFIG.platform_metrics || {};
+  const PM_DEFAULT_WINDOW = 28;
+  const PM_WINDOWS = [14, 28, 56];
+  const PM_UNIT_TEXT = { ratio: '%', seconds: '秒', hours: '小时' };
+  const PM_SOURCES = { platform: '平台数据', merchant: '商家登记', computed: '系统估算' };
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const pmSyncCtx = sharedCtx('pm-sync');
+  const pmRecordCtx = sharedCtx('pm-record-submit');
+
+  /** 本平台考核的指标（页面配置里的定义，按服务端的顺序）。 */
+  function pmMetrics() {
+    return Object.entries(PM_SPECS).filter(([, spec]) => spec && spec.platform === CONFIG.platform);
+  }
+
+  /** 服务端的今天往前 days 天（东八区的 YYYY-MM-DD）。 */
+  function pmDaysAgo(days) {
+    return fmtDate(new Date(Date.now() + (state.clockSkew || 0) - days * 86400000));
+  }
+
+  /** 一项指标的数值：比例显示成百分数，时长带单位。 */
+  function pmValue(unit, value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+    if (unit === 'ratio') return pct(value);
+    return `${num(value)} ${PM_UNIT_TEXT[unit] || ''}`.trim();
+  }
+
+  /** 变化量：比例按百分点，时长带单位；带正负号。 */
+  function pmDelta(unit, delta) {
+    if (typeof delta !== 'number' || !Number.isFinite(delta)) return '—';
+    const sign = delta > 0 ? '+' : delta < 0 ? '−' : '';
+    const size = Math.abs(delta);
+    if (unit === 'ratio') return `${sign}${Math.round(size * 1000) / 10} 个百分点`;
+    return `${sign}${num(size)} ${PM_UNIT_TEXT[unit] || ''}`.trim();
+  }
+
+  function pmSources(sources) {
+    const parts = Object.entries(sources || {}).map(([s, days]) => `${label(PM_SOURCES, s)} ${days} 天`);
+    return parts.length ? parts.join('、') : '没有数据';
+  }
+
+  function pmWindowCell(stats, unit) {
+    return h('td', null, [
+      h('span', { className: 'pm-value' }, pmValue(unit, stats && stats.mean)),
+      h('span', { className: 'pm-sub' }, stats ? pmSources(stats.sources) : '—'),
+    ]);
+  }
+
+  function pmChangeCell(m) {
+    const cls = m.direction === 'improved' ? 'good' : m.direction === 'worse' ? 'bad' : '';
+    const arrow = typeof m.delta === 'number' && m.delta !== 0 ? (m.delta > 0 ? '↑ ' : '↓ ') : '';
+    const rel = m.relative_change;
+    const relative =
+      typeof rel === 'number' && Number.isFinite(rel)
+        ? `（${rel > 0 ? '+' : rel < 0 ? '−' : ''}${pct(Math.abs(rel))}）`
+        : '';
+    return h('td', null, [
+      m.direction === 'insufficient'
+        ? h('span', { className: 'muted' }, '—')
+        : h('span', { className: `pm-change ${cls}`.trim() }, `${arrow}${pmDelta(m.unit, m.delta)}${relative}`),
+      h('span', { className: `pm-sub pm-dir ${cls}`.trim() }, m.direction_label || ''),
+    ]);
+  }
+
+  // ---------------------------------------------------------------- 按周的柱状图（SVG）
+
+  function svgEl(tag, attrs, children) {
+    const node = document.createElementNS(SVG_NS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) {
+      if (value !== undefined && value !== null) node.setAttribute(key, String(value));
+    }
+    for (const child of [].concat(children || [])) {
+      if (child === null || child === undefined) continue;
+      node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    }
+    return node;
+  }
+
+  /** 坐标轴上限取整到好读的数（1、1.2、1.5、2、2.5、3、4、5、6、8 乘以 10 的幂）；比例最多到 100%。 */
+  function pmNiceMax(max, unit) {
+    if (!(max > 0)) return unit === 'ratio' ? 1 : 1;
+    const mag = 10 ** Math.floor(Math.log10(max));
+    const step = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find((f) => f * mag >= max * 1.0001) || 10;
+    const nice = step * mag;
+    return unit === 'ratio' ? Math.min(nice, 1) : nice;
+  }
+
+  /** 柱子：数据端 4px 圆角、基线端方角（高度不够时退成矩形）。 */
+  function pmBarPath(x, y, w, base) {
+    const r = Math.min(4, w / 2, base - y);
+    if (r <= 0.5) return `M${x},${base}V${y}H${x + w}V${base}Z`;
+    return (
+      `M${x},${base}V${y + r}A${r},${r} 0 0 1 ${x + r},${y}` +
+      `H${x + w - r}A${r},${r} 0 0 1 ${x + w},${y + r}V${base}Z`
+    );
+  }
+
+  function pmWeekName(p) {
+    return p.phase === 'before' ? `接入前第 ${-p.index} 周` : `接入后第 ${p.index + 1} 周`;
+  }
+
+  /** 一项指标按周的柱状图：接入前灰、接入后蓝，接入日一条竖线；悬停 / 读屏看每周的值。 */
+  function pmChart(m) {
+    const weeks = Array.isArray(m.weekly) ? m.weekly : [];
+    if (!weeks.length) return null;
+    const W = 320;
+    const H = 132;
+    const top = 18;
+    const bottom = 24;
+    const left = 4;
+    const right = 4;
+    const base = H - bottom;
+    const slot = (W - left - right) / weeks.length;
+    const bar = Math.min(24, Math.max(6, slot - 8));
+    const values = weeks.map((p) => (typeof p.mean === 'number' ? p.mean : 0));
+    const yMax = pmNiceMax(Math.max(...values, 0), m.unit);
+    const yOf = (v) => base - (v / yMax) * (base - top);
+    const before = weeks.filter((p) => p.phase === 'before').length;
+    const summary =
+      `${m.label}按周均值：接入前 ${pmValue(m.unit, m.before && m.before.mean)}，` +
+      `接入后 ${pmValue(m.unit, m.after && m.after.mean)}`;
+    const nodes = [
+      svgEl('title', null, summary),
+      svgEl('line', { class: 'pm-grid', x1: left, x2: W - right, y1: top, y2: top }),
+      svgEl('text', { class: 'pm-tick', x: left, y: top - 5 }, pmValue(m.unit, yMax)),
+    ];
+    weeks.forEach((p, i) => {
+      const x = left + i * slot + (slot - bar) / 2;
+      const has = typeof p.mean === 'number' && Number.isFinite(p.mean);
+      const text = `${pmWeekName(p)}（${p.start} – ${p.end}）：${has ? pmValue(m.unit, p.mean) : '没有数据'}，${p.days} 天有数据`;
+      // 命中区域比柱子大（整个格子），悬停 / 读屏都能看到这一周的值
+      nodes.push(
+        svgEl('g', { class: `pm-week ${p.phase}` }, [
+          svgEl('title', null, text),
+          svgEl('rect', { class: 'pm-hit', x: left + i * slot, y: top, width: slot, height: base - top }),
+          has ? svgEl('path', { class: `pm-bar ${p.phase}`, d: pmBarPath(x, yOf(p.mean), bar, base) }) : null,
+        ]),
+      );
+    });
+    // 接入日：接入前最后一周和接入后第一周之间
+    if (before > 0 && before < weeks.length) {
+      const x = left + before * slot;
+      nodes.push(svgEl('line', { class: 'pm-golive', x1: x, x2: x, y1: top - 14, y2: base }));
+      nodes.push(svgEl('text', { class: 'pm-tick', x: x + 3, y: top - 5 }, '接入'));
+    }
+    nodes.push(svgEl('line', { class: 'pm-axis', x1: left, x2: W - right, y1: base, y2: base }));
+    if (before > 0) {
+      nodes.push(svgEl('text', { class: 'pm-tick', x: left + (before * slot) / 2, y: H - 6, 'text-anchor': 'middle' }, '接入前'));
+    }
+    if (before < weeks.length) {
+      const mid = left + before * slot + ((weeks.length - before) * slot) / 2;
+      nodes.push(svgEl('text', { class: 'pm-tick', x: mid, y: H - 6, 'text-anchor': 'middle' }, '接入后'));
+    }
+    const chart = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': summary, focusable: 'false' }, nodes);
+    return h('figure', { className: 'pm-chart' }, [
+      chart,
+      h('figcaption', { className: 'pm-legend' }, [
+        h('span', { className: 'pm-key before', 'aria-hidden': 'true' }),
+        '接入前（每周均值）',
+        h('span', { className: 'pm-key after', 'aria-hidden': 'true' }),
+        '接入后',
+      ]),
+    ]);
+  }
+
+  // ---------------------------------------------------------------- 报表
+
+  /** 报表页的「平台客服指标」：接入日期默认用报表给的，不知道时先按 28 天前算（见上）。 */
+  async function loadPlatformMetrics() {
+    const me = state.me;
+    const run = nextRun('pm');
+    const box = $('platform-metrics');
+    loading(box);
+    const input = $('pm-go-live');
+    input.max = pmDaysAgo(0);
+    const typed = input.dataset.auto ? '' : input.value;
+    const windowDays = $('pm-window').value;
+    try {
+      let report = await api('GET', shopPath('reports/platform-metrics', { go_live: typed, window_days: windowDays }));
+      if (state.me !== me || !latest('pm', run)) return; // 期间换了日期或换人登录：以后一次为准
+      let guessed = false;
+      if (report && !report.go_live && !typed) {
+        const fallback = pmDaysAgo(PM_DEFAULT_WINDOW);
+        report = await api('GET', shopPath('reports/platform-metrics', { go_live: fallback, window_days: windowDays }));
+        if (state.me !== me || !latest('pm', run)) return;
+        guessed = true;
+      }
+      if (report && report.go_live && !typed) {
+        input.value = report.go_live;
+        input.dataset.auto = 'yes'; // 不是用户填的：下次刷新照样让服务端决定
+      }
+      renderPlatformMetrics(report, guessed);
+    } catch (err) {
+      if (state.me !== me || !latest('pm', run)) return;
+      if (err.code === 'platform_metrics_unavailable') {
+        put(box, h('p', { className: 'muted' }, '本单元没有开通平台客服指标的对比。'));
+        return;
+      }
+      loadFailed(box, '平台客服指标', err);
+    }
+  }
+
+  function renderPlatformMetrics(report, guessed) {
+    const box = $('platform-metrics');
+    if (!report) {
+      put(box, h('p', { className: 'muted' }, '没有数据。'));
+      return;
+    }
+    const metrics = Array.isArray(report.metrics) ? report.metrics : [];
+    const good = report.verdict === 'improved';
+    const bad = report.verdict === 'worse' || report.verdict === 'mixed';
+    const goLive = guessed
+      ? `接入日期未知（没有上线记录，授权也没有开通时间）：先按 ${report.go_live} 计算，请在上面填写实际的接入日期。`
+      : `接入日期 ${report.go_live || '未知'}（${report.go_live_label || ''}）`;
+    const windows =
+      report.before_start && report.after_end
+        ? `接入前 ${report.before_start} – ${report.before_end}，接入后 ${report.after_start} – ${report.after_end}（各 ${report.window_days} 天，接入当天算接入后）`
+        : '';
+    const rows = metrics.map((m) =>
+      h('tr', null, [
+        h('th', { scope: 'row' }, [
+          h('span', { className: 'pm-value' }, m.label),
+          h('span', { className: 'pm-sub' }, m.higher_is_better ? '越高越好' : '越低越好'),
+        ]),
+        pmWindowCell(m.before, m.unit),
+        pmWindowCell(m.after, m.unit),
+        pmChangeCell(m),
+      ]),
+    );
+    const details = metrics.map((m) =>
+      h('div', { className: 'pm-metric' }, [
+        h('h4', null, m.label),
+        pmChart(m),
+        h('p', { className: 'hint' }, `口径：${m.note}`),
+        Array.isArray(m.flag_notes) && m.flag_notes.length
+          ? h('ul', { className: 'pm-flags' }, m.flag_notes.map((t) => h('li', null, t)))
+          : null,
+      ]),
+    );
+    put(
+      box,
+      h('p', { className: 'headline' }, [
+        h('strong', { className: good ? 'good' : bad ? 'bad' : null }, report.verdict_label || report.verdict),
+        report.reliable ? '' : metrics.length ? '（有可靠性提示，仅供参考）' : '',
+      ]),
+      h('p', { className: guessed ? 'notice pm-guess' : 'hint' }, goLive),
+      windows ? h('p', { className: 'hint' }, windows) : null,
+      metrics.length ? table('平台客服指标接入前后对比', ['指标', '接入前', '接入后', '变化'], rows, true) : null,
+      Array.isArray(report.notes) && report.notes.length
+        ? h('ul', { className: 'pm-notes' }, report.notes.map((t) => h('li', null, t)))
+        : null,
+      details,
+    );
+  }
+
+  /** 报表页：采纳率、质检（统计范围）和平台客服指标（接入日期）各自加载。 */
+  function loadReportsTab() {
+    loadReports();
+    loadPlatformMetrics();
+  }
+
+  // ---------------------------------------------------------------- 同步、登记
+
+  async function syncPlatformMetrics() {
+    const me = state.me;
+    const status = $('pm-status');
+    await busy(pmSyncCtx, [$('pm-sync')], async () => {
+      setStatus(status, '正在从平台同步最近 56 天的数据…', 'muted');
+      try {
+        const r = await api('POST', shopPath('platform-metrics/sync'));
+        if (state.me !== me) return;
+        const skipped = Object.values(r.skipped || {}).reduce((a, b) => a + b, 0);
+        const message =
+          `同步完成：${r.since} – ${r.until}，写入 ${r.written} 条` + (skipped ? `，跳过 ${skipped} 条` : '');
+        setStatus(status, message, 'ok');
+        announce(message);
+        loadPlatformMetrics();
+      } catch (err) {
+        if (state.me !== me) return;
+        if (err.code === 'metrics_source_not_configured') {
+          setStatus(status, `${err.message}（下面「登记」）`, 'warn');
+          return;
+        }
+        reportFailure(status, '同步没有完成：', err);
+      }
+    });
+  }
+
+  function pmRecordUnit() {
+    const spec = PM_SPECS[$('pm-metric').value];
+    const unit = spec ? spec.unit : 'ratio';
+    $('pm-value-unit').textContent = unit === 'ratio' ? '%（如 91.5）' : PM_UNIT_TEXT[unit] || '';
+    $('pm-value').max = unit === 'ratio' ? '100' : unit === 'seconds' ? '86400' : '720';
+    return unit;
+  }
+
+  async function recordPlatformMetric(event) {
+    event.preventDefault();
+    const me = state.me;
+    const status = $('pm-record-status');
+    if (!isMerchant()) return;
+    const metric = $('pm-metric').value;
+    const day = $('pm-day').value;
+    const raw = $('pm-value').value.trim();
+    const sizeRaw = $('pm-size').value.trim();
+    const unit = pmRecordUnit();
+    let value = Number(raw);
+    if (!metric || !day || !raw || !Number.isFinite(value) || value < 0) {
+      setStatus(status, '请选指标、日期，并填写 0 以上的数值。', 'error');
+      return;
+    }
+    if (unit === 'ratio') value = Math.round(value * 1000) / 100000; // 页面上填百分数，接口收 0–1
+    const body = { metric, day, value };
+    if (sizeRaw) {
+      const size = Number(sizeRaw);
+      if (!Number.isInteger(size) || size < 0) {
+        setStatus(status, '样本量是 0 以上的整数（可以不填）。', 'error');
+        return;
+      }
+      body.sample_size = size;
+    }
+    await busy(pmRecordCtx, [$('pm-record-submit')], async () => {
+      try {
+        const r = await api('POST', shopPath('platform-metrics'), body);
+        if (state.me !== me) return;
+        const what = `${label(Object.fromEntries(pmMetrics().map(([k, s]) => [k, s.label])), metric)} ${day}`;
+        const message = !r.changed ? `${what}：和已登记的一样，没有改动` : r.replaced ? `已更新 ${what}` : `已登记 ${what}`;
+        setStatus(status, message, 'ok');
+        announce(message);
+        $('pm-value').value = '';
+        $('pm-size').value = '';
+        loadPlatformMetrics();
+      } catch (err) {
+        if (state.me !== me) return;
+        reportFailure(status, '登记没有完成：', err);
+      }
+    });
+  }
+
+  /** 在报表页加上「平台客服指标」一节（启动时建一次；内容随登录加载、退出时清空）。 */
+  function initPlatformMetrics() {
+    const panel = $('panel-reports');
+    if (!panel) return;
+    const windowSelect = h('select', { id: 'pm-window' });
+    for (const days of PM_WINDOWS) {
+      const option = h('option', { value: String(days) }, `各 ${days} 天`);
+      if (days === PM_DEFAULT_WINDOW) option.defaultSelected = true;
+      windowSelect.append(option);
+    }
+    const goLive = h('input', { id: 'pm-go-live', type: 'date', autocomplete: 'off' });
+    goLive.addEventListener('input', () => delete goLive.dataset.auto);
+    const form = h('form', { id: 'pm-form', className: 'inline-form pm-form', novalidate: true }, [
+      field('pm-go-live', '接入日期', goLive),
+      field('pm-window', '对比天数', windowSelect),
+      h('button', { type: 'submit', id: 'pm-compare', className: 'secondary' }, '按接入日期对比'),
+    ]);
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      if (state.me) loadPlatformMetrics();
+    });
+    form.addEventListener('reset', () => delete goLive.dataset.auto);
+    const sync = h('button', { type: 'button', id: 'pm-sync' }, '同步平台数据');
+    sync.addEventListener('click', () => {
+      if (state.me) syncPlatformMetrics();
+    });
+
+    const metric = h('select', { id: 'pm-metric' });
+    for (const [key, spec] of pmMetrics()) metric.append(h('option', { value: key }, spec.label));
+    metric.addEventListener('change', pmRecordUnit);
+    const value = h('input', { id: 'pm-value', type: 'number', inputmode: 'decimal', min: '0', step: 'any' });
+    const record = h('form', { id: 'pm-record-form', novalidate: true }, [
+      h('div', { className: 'field-row' }, [
+        field('pm-metric', '指标', metric),
+        field('pm-day', '日期', h('input', { id: 'pm-day', type: 'date', autocomplete: 'off' })),
+      ]),
+      h('div', { className: 'field-row' }, [
+        h('div', { className: 'field' }, [
+          h('label', { for: 'pm-value' }, ['数值 ', h('span', { id: 'pm-value-unit', className: 'muted' })]),
+          value,
+        ]),
+        field(
+          'pm-size',
+          '样本量（可不填）',
+          h('input', { id: 'pm-size', type: 'number', inputmode: 'numeric', min: '0', step: '1' }),
+        ),
+      ]),
+      h('button', { type: 'submit', id: 'pm-record-submit' }, '登记'),
+      h('p', { id: 'pm-record-status', className: 'status', role: 'status' }),
+    ]);
+    record.addEventListener('submit', recordPlatformMetric);
+
+    panel.append(
+      h('section', { className: 'pm-section', 'aria-labelledby': 'pm-title' }, [
+        h('h3', { id: 'pm-title' }, '平台客服指标 · 接入前后对比'),
+        h(
+          'p',
+          { className: 'hint' },
+          '平台考核商家客服的指标，接入智能辅助前后各看一段（§12.4）。同一天优先用平台数据，其次商家登记；' +
+            '数据来自平台云内的接口，也可以从平台后台抄录登记。',
+        ),
+        form,
+        h('div', { className: 'actions tight' }, [sync]),
+        h('p', { id: 'pm-status', className: 'status', role: 'status' }),
+        h('div', { id: 'platform-metrics', className: 'pm-report', 'data-dyn': true }),
+        h('details', { id: 'pm-record', className: 'subpanel', 'data-write': true, hidden: true }, [
+          h('summary', null, '登记平台后台的数据'),
+          h('p', { className: 'hint' }, '从平台后台抄录某一天的数；同一指标同一天再登记会覆盖之前登记的（平台同步的数另存）。'),
+          record,
+        ]),
+      ]),
+    );
+    pmRecordUnit();
+  }
+
   // ================================================================ 启动
 
   const LOADERS = {
@@ -2522,7 +2943,7 @@
     config: loadConfig,
     rollout: loadRollout,
     review: loadReviewTab,
-    reports: loadReports,
+    reports: loadReportsTab,
   };
 
   /** 正显示的页签原地刷新（stale）：不关掉正在编辑的表单。没列出的页签直接重新加载。 */
@@ -2561,6 +2982,7 @@
     if (LIMITS.answer) $('faq-answer').maxLength = LIMITS.answer;
     if (LIMITS.sample_size_max) $('review-size').max = String(LIMITS.sample_size_max);
     $('review-size').defaultValue = String(LIMITS.sample_size || 50); // 表单 reset 后回到默认条数
+    initPlatformMetrics(); // 报表页的「平台客服指标」一节（§12.4）
 
     $('login-form').addEventListener('submit', (event) => {
       event.preventDefault();

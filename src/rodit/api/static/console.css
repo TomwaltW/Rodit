@@ -565,3 +565,197 @@ progress {
     padding: 0.45rem 0.6rem;
   }
 }
+
+/* ---------------------------------------------------------------- 报表：平台客服指标 · 接入前后对比（§12.4） */
+
+/* 接入前是对照（灰，退后），接入后是重点（蓝）；接入日一条竖线、下面的图例和表格是颜色以外的区分。
+   深色模式用另一组颜色（按深色背景单独核对过对比度和色觉差异） */
+:root {
+  --pm-before: #7a8496;
+  --pm-after: #1d5bb8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --pm-before: #6b7486;
+    --pm-after: #5b93f0;
+  }
+}
+
+.pm-section {
+  margin-top: 1.75rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.25rem;
+}
+
+.pm-section input[type="date"] {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  font: inherit;
+  font-size: 1rem;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.6rem;
+  min-height: 2.75rem;
+}
+
+.pm-form {
+  align-items: flex-end;
+  margin-top: 0.5rem;
+}
+
+.pm-form .field {
+  margin-bottom: 0;
+}
+
+.pm-form input[type="date"] {
+  width: 11rem;
+}
+
+.pm-report {
+  margin-top: 0.75rem;
+}
+
+.pm-value,
+.pm-sub {
+  display: block;
+}
+
+.pm-sub {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.pm-change {
+  display: block;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.pm-change.good,
+.pm-dir.good {
+  color: var(--ok);
+}
+
+.pm-change.bad,
+.pm-dir.bad {
+  color: var(--danger);
+}
+
+.pm-notes,
+.pm-flags {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+  font-size: 0.875rem;
+}
+
+.pm-flags {
+  color: var(--warn);
+}
+
+.pm-metric {
+  margin-top: 1rem;
+}
+
+.pm-chart {
+  margin: 0.25rem 0;
+  max-width: 28rem;
+}
+
+.pm-chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.pm-chart text {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.pm-grid,
+.pm-axis {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.pm-golive {
+  stroke: var(--muted);
+  stroke-width: 1;
+}
+
+.pm-hit {
+  fill: transparent;
+}
+
+.pm-bar.before {
+  fill: var(--pm-before);
+}
+
+.pm-bar.after {
+  fill: var(--pm-after);
+}
+
+.pm-week:hover .pm-bar {
+  opacity: 0.75;
+}
+
+.pm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.4rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.pm-key {
+  display: inline-block;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 2px;
+}
+
+.pm-key.after {
+  margin-left: 0.6rem;
+}
+
+.pm-key.before {
+  background: var(--pm-before);
+}
+
+.pm-key.after {
+  background: var(--pm-after);
+}
+
+@media (max-width: 36rem) {
+  .pm-form .field {
+    flex: 1 1 100%;
+  }
+
+  .pm-form input[type="date"] {
+    width: 100%;
+  }
+}
+
+@media (forced-colors: active) {
+  .pm-bar.before {
+    fill: GrayText;
+  }
+
+  .pm-bar.after {
+    fill: Highlight;
+  }
+
+  .pm-key.before {
+    background: GrayText;
+  }
+
+  .pm-key.after {
+    background: Highlight;
+  }
+}

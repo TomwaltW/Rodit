@@ -28,6 +28,7 @@ RELEASED_SHA256 = {
     3: "254848388c403503c430f4dd79bd5df1b22feb57858060aa16c2d2ea7bdadf39",
     4: "9b8387a668d5ffe74618b2dd0f165861c2581de087385b2406935e14cd93df8a",
     5: "dda73ec62288557e43c76065fe2df968944fdd4909629198a7dfae42b4dacf09",
+    6: "89a4769ee4744a242bcd3bc3c97dfe0d7f8648bf182a3da80a193675620910eb",
 }
 """已发布迁移脚本的 SHA-256。新增版本时在这里补一行；已有的行不能改。"""
 
@@ -265,7 +266,7 @@ def test_v5_upgrades_a_v4_database_with_auth_and_is_rerunnable(make_database, mo
             " VALUES (NULL, 'system', 'llm.usage', '{}', %s)",
             (now,),
         )
-    assert Database(dsn).migrate() == [5]
+    assert Database(dsn).migrate() == [m.version for m in MIGRATIONS if m.version >= 5]
     assert Database(dsn).migrate() == []
     db = Database(dsn)
     repo = PgShopAuthRepository(db, encryption_key=key)

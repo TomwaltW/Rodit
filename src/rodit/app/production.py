@@ -44,6 +44,7 @@ from rodit.storage import (
     PgConversationRepository,
     PgFeedbackRepository,
     PgKnowledgeRepository,
+    PgPlatformMetricsRepository,
     PgQualityReviewRepository,
     PgShopAuthRepository,
     PgSuggestionRepository,
@@ -94,6 +95,7 @@ def postgres_repos(db: Database, *, clock: Clock, token_env: str = "RODIT_TOKEN_
         auth=PgShopAuthRepository.from_env(db, env_name=token_env),
         audit=PgAuditLog(db),
         quality_reviews=PgQualityReviewRepository(db),
+        platform_metrics=PgPlatformMetricsRepository(db),  # §12.4 平台指标接入前后对比（迁移 6）
     )
 
 
