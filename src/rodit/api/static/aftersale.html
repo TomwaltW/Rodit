@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Rodit 售后审核工作台</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assist/assist.css">
+<link rel="stylesheet" href="aftersale/aftersale.css">
+<script id="rodit-config" type="application/json">__RODIT_PAGE_CONFIG__</script>
+<script src="aftersale/aftersale.js" defer></script>
+</head>
+<body class="aftersale-page">
+<a class="skip-link" href="#main">跳到正文</a>
+<header class="topbar">
+  <h1>Rodit 售后审核 <span class="subtitle"><span id="platform-name">平台单元</span> · 规则给建议，客服确认后执行</span></h1>
+  <div class="topbar-end">
+    <nav class="page-links" aria-label="其他页面">
+      <a class="page-link" href="assist">话术助手</a>
+      <a class="page-link" href="console">商家控制台</a>
+    </nav>
+    <div id="whoami" class="whoami" hidden>
+      <span id="identity"></span>
+      <button type="button" id="sign-out" class="secondary">退出</button>
+    </div>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <noscript><p class="error">这个页面需要启用 JavaScript。</p></noscript>
+  <div id="error" class="error" role="alert" tabindex="-1" hidden></div>
+  <p id="live" class="visually-hidden" aria-live="polite"></p>
+
+  <section id="login" class="panel" aria-labelledby="login-title">
+    <h2 id="login-title">登录</h2>
+    <form id="login-form" novalidate>
+      <div class="field">
+        <label for="token">访问令牌</label>
+        <input id="token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="token-hint">
+        <p id="token-hint" class="hint">客服、店长、商家用自己的令牌登录。令牌只保存在本标签页（sessionStorage），关闭标签页即失效，不会出现在网址里。</p>
+      </div>
+      <button type="submit" id="login-button">登录</button>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <!-- ============================================================ 概况（§2.1 售后平均审核时长） -->
+    <section id="summary" class="panel" aria-labelledby="summary-title">
+      <div class="section-head">
+        <h2 id="summary-title">概况</h2>
+        <form id="stats-form" class="inline-form" novalidate>
+          <label for="stats-range">统计范围</label>
+          <select id="stats-range">
+            <option value="7">近 7 天</option>
+            <option value="30">近 30 天</option>
+            <option value="">全部</option>
+          </select>
+        </form>
+      </div>
+      <div id="stats" data-dyn></div>
+      <p id="platform-note" class="platform-note"></p>
+    </section>
+
+    <div class="desk">
+      <!-- ============================================================ 待审核列表 -->
+      <section id="queue-panel" class="panel queue-panel" aria-labelledby="queue-title">
+        <div class="section-head">
+          <h2 id="queue-title">待审核</h2>
+          <div class="actions tight">
+            <button type="button" id="run-rules" aria-describedby="run-rules-hint">拉取并跑规则</button>
+            <button type="button" id="queue-refresh" class="secondary">刷新列表</button>
+          </div>
+        </div>
+        <p id="run-rules-hint" class="hint">拉取平台上待审核、还没跑规则的售后单，按申请时间从早到晚跑 R1–R8（§7.3.2）。只读平台，不执行任何操作。</p>
+        <p id="run-status" class="status" role="status" data-dyn></p>
+        <form id="queue-filter" class="filters" novalidate>
+          <div class="field">
+            <label for="filter-state">审核状态</label>
+            <select id="filter-state"><option value="">未结束</option></select>
+          </div>
+          <div class="field">
+            <label for="filter-status">平台状态</label>
+            <select id="filter-status"><option value="">全部</option></select>
+          </div>
+          <div class="field">
+            <label for="filter-rule">命中规则</label>
+            <select id="filter-rule"><option value="">全部</option></select>
+          </div>
+        </form>
+        <p id="queue-summary" class="hint" data-dyn></p>
+        <ul id="queue" class="queue" aria-labelledby="queue-title" data-dyn></ul>
+      </section>
+
+      <!-- ============================================================ 详情 -->
+      <section id="detail-panel" class="panel detail-panel" aria-labelledby="detail-title" tabindex="-1">
+        <div class="section-head">
+          <h2 id="detail-title">售后单详情</h2>
+        </div>
+        <p id="detail-status" class="status" role="status" data-dyn></p>
+        <div id="detail" data-dyn></div>
+        <p id="detail-empty" class="muted">在列表里选一张售后单。</p>
+      </section>
+    </div>
+  </div>
+
+  <!-- ============================================================ 确认执行（§4.1 原则 3：写操作必须由人确认） -->
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-rule">
+    <h2 id="confirm-title">确认执行</h2>
+    <p id="confirm-rule" class="confirm-rule"></p>
+    <dl id="confirm-facts" class="stats"></dl>
+    <div id="refuse-fields" hidden>
+      <div class="field" id="reason-code-field">
+        <label for="reason-code">拒绝原因码</label>
+        <input id="reason-code" type="text" autocomplete="off" spellcheck="false" aria-describedby="reason-code-hint">
+        <p id="reason-code-hint" class="hint">抖店拒绝必须传拒绝原因码（以抖店开放平台的原因码为准）。</p>
+      </div>
+      <div class="field">
+        <label for="reason-text">拒绝说明（选填）</label>
+        <textarea id="reason-text" rows="2" aria-describedby="reason-text-hint"></textarea>
+        <p id="reason-text-hint" class="hint">会打码后留痕；不要写买家手机号、地址。</p>
+      </div>
+    </div>
+    <p id="confirm-status" class="status" role="status"></p>
+    <div class="actions">
+      <button type="button" id="confirm-go">确认执行</button>
+      <button type="button" id="confirm-cancel" class="secondary">取消</button>
+    </div>
+  </dialog>
+</main>
+</body>
+</html>

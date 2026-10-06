@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from api_routes import CORE_ROUTES, Route
+from api_routes_aftersale import ROUTES as AFTERSALE_ROUTES
 from api_routes_console import ROUTES as CONSOLE_ROUTES
 from api_routes_rollout import ROUTES as ROLLOUT_ROUTES
 from starlette.exceptions import StarletteDeprecationWarning
@@ -87,7 +88,7 @@ def build_api(platform: Platform = Platform.TAOBAO, *, raise_server_exceptions: 
     return Api(TestClient(app, raise_server_exceptions=raise_server_exceptions), service)
 
 
-SHOP_ROUTES: tuple[Route, ...] = CORE_ROUTES + CONSOLE_ROUTES + ROLLOUT_ROUTES
+SHOP_ROUTES: tuple[Route, ...] = CORE_ROUTES + CONSOLE_ROUTES + ROLLOUT_ROUTES + AFTERSALE_ROUTES
 """全部店铺范围的路由（§9.2 串店测试要覆盖每一个）。"""
 
 EVENTS_PATH = "/v1/platform/B/events"
