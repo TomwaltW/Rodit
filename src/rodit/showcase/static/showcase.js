@@ -857,7 +857,9 @@
     result.alerts.forEach((a) => alerts.appendChild(el('p', { cls: 'alert' + (a.indexOf('仅供参考') >= 0 ? ' alert-image' : ''), text: a })));
     const note = view.trace && view.trace.simulated_note;
     simulated.hidden = !note;
-    simulated.textContent = note ? note + '（§11.5）：第一稿被质检拦下，下面是重写后通过的回答' : '';
+    let outcome = '第一稿被质检拦下，下面是重写后通过的回答';
+    if (note && !view.trace.simulated_rewrite_passed) outcome = '第一稿被质检拦下；重写稿没有通过质检（或质检不可用），这次不推荐大模型的回答';
+    simulated.textContent = note ? note + '（§11.5）：' + outcome : '';
     if (result.suggestions.length) {
       result.suggestions.forEach((card) => box.appendChild(suggestionCard(card, result)));
     } else {
@@ -1148,10 +1150,46 @@
     ]);
     const provider = el('p', {
       cls: 'small muted',
-      text: '判断层：' + u.provider_label + (u.questions_ver ? '（题目版本 ' + u.questions_ver + '）' : '') + (u.degraded ? ' · 已降级为关键词规则' : ''),
+      text: '判断层：' + u.provider_label + (u.questions_ver ? '（题目版本 ' + u.questions_ver + '）' : '') + (u.degraded && !u.fallback ? ' · 已降级为关键词规则' : ''),
     });
-    const head = u.intent_label + ' · 置信度 ' + pct(u.confidence, 0) + (u.high_risk ? ' · 高风险类型' : '');
-    return traceStep('懂', '懂问题', head, [imageBox, el('div', { cls: 'trace-grid' }, [probs, gauges]), rule, provider]);
+    // 判断层投票失败、退回关键词规则时把原因说清楚（§12.2）
+    const fallback = u.fallback ? el('p', { cls: 'notice notice-danger fallback-note', text: '降级：' + u.fallback }) : null;
+    const head = u.intent_label + ' · 置信度 ' + pct(u.confidence, 0) + (u.high_risk ? ' · 高风险类型' : '') + (u.degraded ? ' · 降级' : '');
+    return traceStep('懂', '懂问题', head, [imageBox, fallback, voteBox(u.judge, '路由'), el('div', { cls: 'trace-grid' }, [probs, gauges]), rule, provider]);
+  }
+
+  /** 一次大模型判断的每一票：每题各选项几票、是否题几票"是"、打分题每票几分、哪几票失败。 */
+  function voteBox(judge, what) {
+    if (!judge) return null;
+    const limit = judge.timeout_s ? '，每次限时 ' + judge.timeout_s + ' 秒' : '';
+    const box = el('div', { cls: 'trace-box vote-box' }, [
+      el('h4', { text: what + '：' + judge.provider_label + ' · ' + judge.answered + '/' + judge.samples + ' 次有回答' + limit + ' · ' + ms(judge.latency_ms) }),
+    ]);
+    judge.questions.forEach((q) => {
+      let values = [];
+      if (q.type === 'choice') values = q.counts.map((c) => el('span', { cls: 'badge', text: c.label + ' ×' + c.votes }));
+      else if (q.type === 'noul') values = [el('span', { cls: 'badge', text: '是 ' + q.yes + ' 票 / 否 ' + q.no + ' 票' + (q.p.length === 1 ? '（p = ' + q.p[0] + '）' : '') })];
+      else if (q.type === 'score') values = q.values.map((v) => el('span', { cls: 'badge', text: String(v) }));
+      else values = [el('span', { cls: 'small muted', text: '没有有效票' })];
+      box.appendChild(el('div', { cls: 'vote-row' }, [el('span', { cls: 'row-label small', text: q.label }), el('span', { cls: 'vote-values' }, values)]));
+    });
+    if (judge.errors.length) {
+      box.appendChild(el('p', { cls: 'small risk', text: '失败的调用：' + judge.errors.map((e) => e.label + (e.count > 1 ? ' ×' + e.count : '')).join('、') }));
+    }
+    if (judge.samples > 1) {
+      box.appendChild(el('p', { cls: 'small muted', text: judge.probability_source === 'logprobs' ? '问题类型的概率取接口给的选项概率（logprobs）的平均' : '概率按有效票的占比算（这个接口没给能用的选项概率）' }));
+    }
+    return box;
+  }
+
+  /** 这条消息的真实大模型调用（按用途）。离线时没有。 */
+  function llmCallsBox(llm) {
+    if (!llm) return null;
+    const rows = llm.by_purpose.map((r) => r.label + ' ' + r.calls + ' 次' + (r.failed ? '（失败 ' + r.failed + '）' : '') + '，最慢 ' + ms(r.max_ms));
+    return el('p', {
+      cls: 'small muted',
+      text: '真实大模型调用（' + llm.model + '）：' + (rows.length ? rows.join('；') : '这条没有调用') + ' · token 输入 ' + llm.input_tokens + ' / 输出 ' + llm.output_tokens,
+    });
   }
 
   function findStep(parts) {
@@ -1216,7 +1254,9 @@
         });
       });
     });
-    return traceStep('写', '写回答', 'FAQ / 模板能答的不调大模型；大模型只根据依据写（§5.4）', children);
+    const chain = CONFIG.chain || {};
+    const who = chain.real ? '大模型草稿由真实大模型 ' + chain.model + ' 生成' : '大模型草稿由离线替身写（只复述依据）';
+    return traceStep('写', '写回答', 'FAQ / 模板能答的不调大模型；大模型只根据依据写（§5.4）· ' + who, children);
   }
 
   function judgeStep(parts) {
@@ -1232,6 +1272,7 @@
           ]),
           el('p', { cls: 'check-text', text: c.text }),
         ]);
+        if (c.unavailable) node.appendChild(el('p', { cls: 'notice notice-danger fallback-note', text: '降级：' + c.unavailable }));
         const hits = el('ul', { cls: 'check-list' });
         c.hard_hits.forEach((h) => hits.appendChild(el('li', { cls: h.blocking ? '' : 'ok', text: h.label + '：' + h.detail + (h.blocking ? '' : '（自动修正）') })));
         if (!c.hard_hits.length) hits.appendChild(el('li', { cls: 'ok', text: '硬规则：站外引流、绝对化用语、禁用词、数字一致性都没有命中' }));
@@ -1253,6 +1294,8 @@
             ])
           );
         });
+        const votes = voteBox(c.judge, '模型质检');
+        if (votes) node.appendChild(votes);
         children.push(node);
       });
     });
@@ -1271,7 +1314,7 @@
     return traceStep('兜', '兜底', '拿不准的交给人（§5.7）', children);
   }
 
-  function latencyStep(lat) {
+  function latencyStep(lat, llm) {
     const total = Math.max(1, lat.stages.reduce((sum, s) => sum + s.ms, 0));
     const stack = el('div', { cls: 'latency-stack', attrs: { role: 'img', 'aria-label': '各环节耗时占比' } });
     const legend = el('div', { cls: 'latency-legend' });
@@ -1289,8 +1332,14 @@
       el('span', { cls: 'row-value', text: ms(e2e) }),
     ]);
     const sub = (lat.within_target ? '✓ ' : '✗ ') + '从收到消息到出推荐 ' + ms(e2e) + '，目标 P95 ≤ 5 秒（§12.1）';
-    const note = CONFIG.offline ? el('p', { cls: 'small muted', text: '离线替身不联网，耗时是毫秒级；接真实大模型后路由 ≤ 1 秒、生成 ≤ 2.5 秒、质检 ≤ 1 秒。' }) : null;
-    return traceStep('时', '耗时', sub, [stack, legend, el('div', { cls: 'trace-box' }, [meter]), note]);
+    let note = null;
+    if (CONFIG.offline) {
+      note = el('p', { cls: 'small muted', text: '离线替身不联网，耗时是毫秒级；接真实大模型后路由 ≤ 1 秒、生成 ≤ 2.5 秒、质检 ≤ 1 秒。' });
+    } else {
+      const budget = '这条消息的时间预算 ' + lat.budget_s + ' 秒' + (CONFIG.chain.route_by_llm ? '、路由每次调用限时 ' + lat.route_timeout_s + ' 秒' : '');
+      note = el('p', { cls: 'small ' + (lat.relaxed ? 'risk' : 'muted'), text: '真实大模型实测。' + (lat.relaxed ? (CONFIG.chain.relaxed_note || '') + '：' + budget : '时间预算按生产（§12.1）：' + budget) });
+    }
+    return traceStep('时', '耗时', sub, [stack, legend, el('div', { cls: 'trace-box' }, [meter]), note, llmCallsBox(llm)]);
   }
 
   function renderTrace(view) {
@@ -1303,7 +1352,7 @@
       writeStep(t.parts, t.simulated_note),
       judgeStep(t.parts),
       fallbackStep(t.fallback),
-      latencyStep(t.latency),
+      latencyStep(t.latency, t.llm),
     ]);
     body.appendChild(steps);
   }
@@ -1946,7 +1995,22 @@
 
   // ================================================================ 启动
 
-  $('footer-text').textContent = CONFIG.footer;
+  function renderChain() {
+    // 这次演示用的是什么（真实大模型 / 离线替身、判断层、时间预算）：页眉下一条、页脚一行
+    const chain = CONFIG.chain || {};
+    $('footer-text').textContent = CONFIG.footer;
+    if (!chain.real) return;
+    $('chain-badge').textContent = chain.badge;
+    const relaxed = $('chain-relaxed');
+    relaxed.hidden = !chain.relaxed_note;
+    relaxed.textContent = chain.relaxed_note || '';
+    $('chain-strip').hidden = false;
+    const footerBadge = $('footer-badge');
+    footerBadge.textContent = chain.badge;
+    footerBadge.hidden = false;
+  }
+
+  renderChain();
   renderPlatformSwitch();
   applyPlatform();
   window.addEventListener('hashchange', onHashChange);

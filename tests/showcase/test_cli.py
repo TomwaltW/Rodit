@@ -7,6 +7,7 @@ import io
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from llm_stub import StubLLM
 
 from rodit.showcase.__main__ import DEFAULT_HOST, DEFAULT_PORT, EXIT_USAGE, is_loopback, main
 from rodit.testing.fakes import FakeLLMClient
@@ -95,19 +96,24 @@ def test_llm_env_misconfigured_exits_2():
 
 
 def test_env_factory_reads_the_environment(monkeypatch):
-    """真的 --llm env：用 rodit.eval.llm_env 的检查（没配密钥时报错，不打印密钥）。"""
-    monkeypatch.setenv("RODIT_LLM_BASE_URL", "http://127.0.0.1:9/v1")
-    monkeypatch.setenv("RODIT_LLM_MODEL", "demo-model")
-    monkeypatch.delenv("RODIT_LLM_API_KEY", raising=False)
-    out = io.StringIO()
-    run = _Run()
-    code = main(["--llm", "env"], out, run=run)
-    assert code == EXIT_USAGE and "RODIT_LLM_API_KEY" in out.getvalue()
-    monkeypatch.setenv("RODIT_LLM_API_KEY", "synthetic-test-key")
-    out = io.StringIO()
-    code = main(["--llm", "env"], out, run=run)
-    assert code == 0 and "demo-model" in out.getvalue()
-    assert "synthetic-test-key" not in out.getvalue()
+    """真的 --llm env：用 rodit.eval.llm_env 的检查（没配密钥时报错，不打印密钥）；配好了先对
+    本机的模型替身（tests/showcase/llm_stub.py）做启动检查，过了才起服务。"""
+    with StubLLM(model="demo-model") as stub:
+        monkeypatch.setenv("RODIT_LLM_BASE_URL", stub.base_url)
+        monkeypatch.setenv("RODIT_LLM_MODEL", "demo-model")
+        monkeypatch.delenv("RODIT_LLM_API_KEY", raising=False)
+        out = io.StringIO()
+        run = _Run()
+        code = main(["--llm", "env"], out, run=run)
+        assert code == EXIT_USAGE and "RODIT_LLM_API_KEY" in out.getvalue()
+        assert stub.count() == 0
+        monkeypatch.setenv("RODIT_LLM_API_KEY", stub.api_key)
+        out = io.StringIO()
+        code = main(["--llm", "env"], out, run=run)
+        assert code == 0 and "demo-model" in out.getvalue()
+        assert stub.api_key not in out.getvalue()
+        assert stub.count("preflight") == 1 and stub.count("probe") == 1
+        assert run.calls  # 检查过了才起服务
 
 
 @pytest.mark.parametrize("argv", [["--port", "70000"], ["--port", "-1"]])

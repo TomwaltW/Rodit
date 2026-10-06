@@ -177,17 +177,20 @@ def same_origin(origin: str, host: str | None, scheme: str) -> bool:
 
 
 def page_config(hub: ShowcaseHub) -> dict[str, Any]:
-    """写进页面数据块的配置：平台、中文名、长度上限。都是服务端常量，没有店铺数据。"""
+    """写进页面数据块的配置：平台、中文名、长度上限，以及这次演示用的链路（真实大模型的模型名和
+    接口主机、判断层、时间预算，见 showcase.realchain.ChainInfo；没有密钥、没有接口路径）。
+    都是服务端常量，没有店铺数据。"""
     return {
         "default_platform": hub.default_platform.value,
         "offline": hub.offline,
+        "chain": hub.chain.view(),
         "max_text_chars": MAX_TEXT_CHARS,
         "max_chat_images": MAX_CHAT_IMAGES,
         "images": tiles_config(),
         "no_image_reason": NO_IMAGE_REASON,
         "e2e_target_ms": E2E_TARGET_MS,
         "synthetic_label": SYNTHETIC_LABEL,
-        "footer": FOOTER_TEXT,
+        "footer": FOOTER_TEXT if hub.offline else hub.chain.footer(),
         "platforms": [
             {
                 "id": p.value,

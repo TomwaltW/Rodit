@@ -1,0 +1,415 @@
+"""本地的 OpenAI 兼容大模型替身（只给测试用，不联网）。
+
+StubLLM 在 127.0.0.1 的随机端口上起一个 ThreadingHTTPServer，实现 POST {base}/chat/completions：
+检查 Bearer 密钥，按请求内容认出用途，回一个"像样"的回答，格式就是 rodit 的解析器要的那种：
+
+- 判断层（system 是 rodit.decision.llm.SYSTEM_PROMPT）：从提示词里取出 state（JSON）和问的题，
+  - 路由（有 intent 题）：用关键词规则（rodit.decision.RuleProvider）认问题类型，每一票选概率最高的
+    类型；多个问题时追问 second_intent 答第二名；需要人工、多问题按 0.5 答"是 / 否"并给 p；
+  - 质检（有 grounded 题）：用启发式判断（rodit.app.offline.HeuristicQAJudge）给每题答"是 / 否"
+    和 p，语气打 3 分；
+- 生成（用户消息里有【依据】）：{"answer": 依据里的一句话, "evidence_ids": [...],
+  "need_clarify": false}（复述依据，写法同演示站离线替身 rodit.showcase.llm）；
+- 连通性检查（rodit.eval.llm_env.preflight）回 OK；演示站的 JSON 模式探测回 {"ok": true}。
+
+usage 按字数估 token。logprobs：
+- logprobs="tokens"：把输出切成小段当 token（JSON 模式下第一个有内容的 token 是键名，选项概率
+  用不上——真实接口的样子）；
+- logprobs="option"：路由请求的第一个 token 就是选中的问题类型，候选里还有第二名（让选项概率真的
+  用上）；
+- 默认（None）：不返回 logprobs。
+
+可以按用途（route / qa / generate / preflight / probe / "*"）设延迟（delay）和注入失败（fail）：
+401 / 403 / 404 / 400 / 400_response_format（请求带 response_format 才拒）/ 400_logprobs（请求带
+logprobs 才拒）/ 429 / 500 / timeout（睡够 timeout_sleep_s 秒再回）/ malformed（200 但响应体不是
+JSON）/ not_json（200，内容不是 JSON）/ content_filter（finish_reason=content_filter）/ no_choices。
+times 为空时一直失败，否则失败这么多次后恢复。
+
+requests 记下每个请求（用途、状态码、请求体），测试据此核对：回放历史没有请求、路由一次请求
+vote_samples 次、请求里没有密钥以外的认证信息等。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+from rodit.app.offline import HeuristicQAJudge
+from rodit.core.decision import ChoiceAnswer, DecisionRequest, NoulAnswer, ScoreAnswer
+from rodit.core.ports import LLMMessage, LLMRequest
+from rodit.core.questions import (
+    NO_SECOND_INTENT,
+    QA_MODEL,
+    QA_QUESTIONS,
+    ROUTER_MODEL,
+    ROUTER_QUESTIONS,
+)
+from rodit.decision import RuleProvider
+from rodit.decision.llm import SYSTEM_PROMPT
+from rodit.showcase.llm import ShowcaseLLM
+from rodit.showcase.preflight import PROBE_MARK
+
+STUB_KEY = "stub-test-key-0000"
+"""测试用的假密钥（不是任何服务的真实密钥）。"""
+
+_STATE = re.compile(r"## 状态（state）\n(?P<state>.*?)\n\n## 问题\n", re.S)
+_QUESTION = re.compile(r"^### (?P<key>[a-z_]+)（", re.M)
+
+PURPOSES = ("route", "qa", "generate", "preflight", "probe", "other")
+
+
+@dataclass
+class StubRequest:
+    purpose: str
+    status: int
+    body: dict[str, Any]
+    authorization: str | None
+
+
+@dataclass
+class _Failure:
+    kind: str
+    times: int | None  # None：一直失败
+
+
+@dataclass
+class StubLLM:
+    """见模块说明。用 with StubLLM() as stub: 起停；stub.base_url 是 http://127.0.0.1:<端口>/v1。"""
+
+    api_key: str = STUB_KEY
+    model: str = "stub-chat"
+    base_path: str = "/v1"
+    logprobs: str | None = None
+    timeout_sleep_s: float = 3.0
+    requests: list[StubRequest] = field(default_factory=list)
+    _delays: dict[str, float] = field(default_factory=dict)
+    _failures: dict[str, list[_Failure]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _server: ThreadingHTTPServer | None = None
+    _thread: threading.Thread | None = None
+
+    # ---------------------------------------------------------------- 起停
+
+    def start(self) -> StubLLM:
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                stub._handle(self)
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        self._server = server
+        # 轮询间隔短一点：测试结束 shutdown 不用等默认的 0.5 秒
+        self._thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+
+    def __enter__(self) -> StubLLM:
+        return self.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None, "替身还没有启动"
+        return int(self._server.server_address[1])
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}{self.base_path}"
+
+    # ---------------------------------------------------------------- 配置
+
+    def delay(self, purpose: str, seconds: float) -> None:
+        with self._lock:
+            self._delays[purpose] = seconds
+
+    def fail(self, purpose: str, kind: str, times: int | None = None) -> None:
+        with self._lock:
+            self._failures.setdefault(purpose, []).append(_Failure(kind, times))
+
+    def reset(self) -> None:
+        with self._lock:
+            self._delays.clear()
+            self._failures.clear()
+            self.requests.clear()
+
+    def count(self, purpose: str | None = None) -> int:
+        with self._lock:
+            return sum(1 for r in self.requests if purpose is None or r.purpose == purpose)
+
+    def bodies(self, purpose: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return [r.body for r in self.requests if r.purpose == purpose]
+
+    # ---------------------------------------------------------------- 处理
+
+    def _failure_for(self, purpose: str, body: dict[str, Any]) -> str | None:
+        with self._lock:
+            for key in (purpose, "*"):
+                for f in self._failures.get(key, []):
+                    if f.times is not None and f.times <= 0:
+                        continue
+                    if f.kind == "400_response_format" and "response_format" not in body:
+                        continue
+                    if f.kind == "400_logprobs" and not body.get("logprobs"):
+                        continue
+                    if f.times is not None:
+                        f.times -= 1
+                    return f.kind
+        return None
+
+    def _record(self, purpose: str, status: int, body: dict[str, Any], auth: str | None) -> None:
+        with self._lock:
+            self.requests.append(StubRequest(purpose, status, body, auth))
+
+    def _handle(self, h: BaseHTTPRequestHandler) -> None:
+        try:
+            length = int(h.headers.get("Content-Length") or 0)
+            raw = h.rfile.read(length)
+            auth = h.headers.get("Authorization")
+            if h.path != f"{self.base_path}/chat/completions":
+                self._record("other", 404, {}, auth)
+                return _send(h, 404, {"error": {"type": "not_found", "code": "unknown_url"}})
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                self._record("other", 400, {}, auth)
+                return _send(h, 400, {"error": {"type": "invalid_request_error"}})
+            purpose = purpose_of(body)
+            if auth != f"Bearer {self.api_key}":
+                self._record(purpose, 401, body, auth)
+                # 真实服务的错误消息里常带密钥片段：客户端不能把 message 带出去
+                return _send(
+                    h,
+                    401,
+                    {
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "invalid_api_key",
+                            "message": f"Incorrect API key provided: {(auth or '')[-8:]}",
+                        }
+                    },
+                )
+            failure = self._failure_for(purpose, body)
+            with self._lock:
+                delay = self._delays.get(purpose, self._delays.get("*", 0.0))
+            if delay:
+                time.sleep(delay)
+            status = _FAILURE_STATUS.get(failure or "", 200)
+            self._record(purpose, status, body, auth)
+            if failure == "timeout":
+                time.sleep(self.timeout_sleep_s)
+            elif failure == "malformed":
+                return _send_raw(h, 200, b"<html>not json</html>", "text/html")
+            elif failure in _FAILURE_BODIES:
+                return _send(h, status, _FAILURE_BODIES[failure])
+            text = self._answer(purpose, body)
+            if failure == "not_json":
+                text = "我认为这是尺码问题，建议选 M 码。"
+            return _send(h, 200, self._completion(purpose, body, text, failure))
+        except (BrokenPipeError, ConnectionResetError):  # 客户端已经超时走了
+            return None
+
+    def _completion(
+        self, purpose: str, body: dict[str, Any], text: str, failure: str | None
+    ) -> dict[str, Any]:
+        if failure == "no_choices":
+            return {"object": "chat.completion", "model": self.model}
+        prompt_chars = sum(len(str(m.get("content", ""))) for m in body.get("messages", []))
+        choice: dict[str, Any] = {
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "content_filter" if failure == "content_filter" else "stop",
+        }
+        if body.get("logprobs") and self.logprobs:
+            choice["logprobs"] = self._logprobs(purpose, text)
+        return {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion",
+            "model": self.model,
+            "choices": [choice],
+            "usage": {
+                "prompt_tokens": max(1, prompt_chars // 2),
+                "completion_tokens": max(1, len(text) // 2),
+                "total_tokens": max(1, prompt_chars // 2) + max(1, len(text) // 2),
+            },
+        }
+
+    def _logprobs(self, purpose: str, text: str) -> dict[str, Any]:
+        if self.logprobs == "option" and purpose == "route":
+            first = _route_ranking(text)
+            top = [{"token": opt, "logprob": lp} for opt, lp in first]
+            return {
+                "content": [{"token": first[0][0], "logprob": first[0][1], "top_logprobs": top}]
+            }
+        tokens = [text[i : i + 3] for i in range(0, len(text), 3)]
+        return {
+            "content": [
+                {"token": t, "logprob": -0.05, "top_logprobs": [{"token": t, "logprob": -0.05}]}
+                for t in tokens
+            ]
+        }
+
+    # ---------------------------------------------------------------- 回答
+
+    def _answer(self, purpose: str, body: dict[str, Any]) -> str:
+        messages = body.get("messages", [])
+        if purpose == "preflight":
+            return "OK"
+        if purpose == "probe":
+            return '{"ok": true}'
+        if purpose == "route":
+            return json.dumps(route_answer(_user(messages)), ensure_ascii=False)
+        if purpose == "qa":
+            return json.dumps(qa_answer(_user(messages)), ensure_ascii=False)
+        if purpose == "generate":
+            request = LLMRequest(
+                purpose="generate",
+                messages=[LLMMessage(role=m["role"], content=m["content"]) for m in messages],
+            )
+            return ShowcaseLLM().complete(request).text
+        return "好的"
+
+
+_FAILURE_STATUS = {
+    "401": 401,
+    "403": 403,
+    "404": 404,
+    "400": 400,
+    "400_response_format": 400,
+    "400_logprobs": 400,
+    "429": 429,
+    "500": 500,
+}
+_FAILURE_BODIES: dict[str, dict[str, Any]] = {
+    "401": {"error": {"type": "authentication_error", "code": "invalid_api_key"}},
+    "403": {"error": {"type": "permission_denied", "code": "model_not_allowed"}},
+    "404": {"error": {"type": "not_found", "code": "model_not_found"}},
+    "400": {"error": {"type": "invalid_request_error", "code": "invalid_parameter"}},
+    "400_response_format": {
+        "error": {"type": "invalid_request_error", "code": "response_format_unsupported"}
+    },
+    "400_logprobs": {"error": {"type": "invalid_request_error", "code": "logprobs_unsupported"}},
+    "429": {"error": {"type": "rate_limit_error", "code": "rate_limit_exceeded"}},
+    "500": {"error": {"type": "server_error", "code": "internal_error"}},
+}
+
+
+def _send(h: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+    _send_raw(
+        h, status, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json"
+    )
+
+
+def _send_raw(h: BaseHTTPRequestHandler, status: int, data: bytes, content_type: str) -> None:
+    h.send_response(status)
+    h.send_header("Content-Type", content_type)
+    h.send_header("Content-Length", str(len(data)))
+    h.end_headers()
+    h.wfile.write(data)
+
+
+def _user(messages: list[dict[str, Any]]) -> str:
+    users = [str(m.get("content", "")) for m in messages if m.get("role") == "user"]
+    return users[-1] if users else ""
+
+
+def purpose_of(body: dict[str, Any]) -> str:
+    """按请求内容认用途（rodit 不把 purpose 发给模型服务）。"""
+    messages = body.get("messages") or []
+    text = "\n".join(str(m.get("content", "")) for m in messages)
+    system = next((str(m.get("content", "")) for m in messages if m.get("role") == "system"), "")
+    if PROBE_MARK in text:
+        return "probe"
+    if "连通性检查" in text:
+        return "preflight"
+    if system == SYSTEM_PROMPT:
+        user = _user(messages)
+        if "### intent（" in user:
+            return "route"
+        if "### grounded（" in user:
+            return "qa"
+        return "other"
+    if "【依据】" in text:
+        return "generate"
+    return "other"
+
+
+def _state_and_questions(user: str) -> tuple[dict[str, Any], list[str]]:
+    m = _STATE.search(user)
+    state = json.loads(m.group("state")) if m else {}
+    return state, _QUESTION.findall(user)
+
+
+def _yes_no(p: float) -> dict[str, Any]:
+    return {"answer": "是" if p > 0.5 else "否", "p": round(p, 2)}
+
+
+def route_answer(user: str) -> dict[str, Any]:
+    """一票路由答案：关键词规则认类型，每题照规则的结果答（见模块说明）。"""
+    state, asked = _state_and_questions(user)
+    request = DecisionRequest(model=ROUTER_MODEL, state=state, questions=ROUTER_QUESTIONS)
+    answers = RuleProvider().decide(request).answers
+    out: dict[str, Any] = {}
+    intent = answers["intent"]
+    assert isinstance(intent, ChoiceAnswer)
+    ranked = sorted(intent.probabilities.items(), key=lambda kv: -kv[1])
+    multi = answers["multi_intent"]
+    assert isinstance(multi, NoulAnswer)
+    for key in asked:
+        if key == "intent":
+            out[key] = {"choice": intent.choice}
+        elif key == "second_intent":
+            second = next(
+                (o for o, p in ranked if o != intent.choice and p >= 0.15), NO_SECOND_INTENT
+            )
+            out[key] = {"choice": second if multi.noul > 0.5 else NO_SECOND_INTENT}
+        elif isinstance(a := answers.get(key), NoulAnswer):
+            out[key] = _yes_no(a.noul)
+        elif isinstance(a, ScoreAnswer):
+            out[key] = {"score": round(a.score)}
+    return out
+
+
+def _route_ranking(text: str) -> list[tuple[str, float]]:
+    """logprobs="option"：选中的类型 logprob -0.2，再给一个候选 -1.8（让概率和票数不一样）。"""
+    chosen = json.loads(text).get("intent", {}).get("choice", "other")
+    other = "other" if chosen != "other" else "greeting"
+    return [(chosen, -0.2), (other, -1.8)]
+
+
+def qa_answer(user: str) -> dict[str, Any]:
+    """一票质检答案：启发式判断（数字核对、依据外的承诺、站外引流），语气 3 分。"""
+    state, asked = _state_and_questions(user)
+    request = DecisionRequest(model=QA_MODEL, state=state, questions=dict(QA_QUESTIONS))
+    answers = HeuristicQAJudge().decide(request).answers
+    out: dict[str, Any] = {}
+    for key in asked:
+        a = answers.get(key)
+        if isinstance(a, NoulAnswer):
+            out[key] = _yes_no(a.noul)
+        elif isinstance(a, ScoreAnswer):
+            out[key] = {"score": round(a.score)}
+    return out
+
+
+__all__ = ["PURPOSES", "STUB_KEY", "StubLLM", "StubRequest", "purpose_of", "qa_answer"]

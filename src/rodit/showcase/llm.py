@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from rodit.core.enums import INTENT_LABELS, Intent
 from rodit.core.ports import LLMClient, LLMRequest, LLMResponse
 from rodit.decision.keywords import INTENT_KEYWORDS
+from rodit.showcase.realchain import ReplaySwitch
 
 SCRIPTED_PROMISE = "亲，明天一定能到哦！"
 """§11.5 第 3 步：大模型写出的、依据里没有的承诺（演示用）。"""
@@ -197,27 +198,29 @@ def _arrival_retry(prompt: str) -> tuple[str, list[str]] | None:
 
 
 class ShowcaseLLM:
-    """演示站的生成客户端（见模块说明）。inner 为空时离线。线程安全：分条并行生成时会被同时调用。"""
+    """演示站的生成客户端（见模块说明）。inner 为空时离线。线程安全：分条并行生成时会被同时调用。
 
-    def __init__(self, inner: LLMClient | None = None) -> None:
+    switch 是回放开关（showcase.realchain.ReplaySwitch），和判断层共用一个：回放期间生成、
+    路由、质检都离线。"""
+
+    def __init__(
+        self, inner: LLMClient | None = None, *, switch: ReplaySwitch | None = None
+    ) -> None:
         self.inner = inner
         self.offline = inner is None
         self.model = OFFLINE_MODEL if inner is None else f"showcase+{getattr(inner, 'model', '')}"
+        self.switch = switch or ReplaySwitch()
         self._lock = threading.Lock()
-        self._replaying = False
         self.scripted = 0  # 写过几次没有依据的承诺（页面据此加说明）
 
     @contextmanager
     def replay(self) -> Iterator[None]:
         """回放历史数据期间一律离线（只在组装演示单元时用，那时还没有别的请求）。"""
-        self._replaying = True
-        try:
+        with self.switch.replaying():
             yield
-        finally:
-            self._replaying = False
 
     def complete(self, request: LLMRequest) -> LLMResponse:
-        offline = self.inner is None or self._replaying
+        offline = self.inner is None or self.switch.on
         if request.purpose != "generate":
             if offline:
                 raise ValueError("演示站的离线替身只处理生成请求（路由、质检用规则和启发式判断）")

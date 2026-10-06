@@ -15,7 +15,9 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from rodit.core.config import EngineConfig
 from rodit.core.enums import Platform
+from rodit.eval.llm_env import client_from_env
 from rodit.showcase.app import create_showcase_app
 from rodit.showcase.state import ShowcaseHub
 from rodit.testing.fakes import FakeClock
@@ -109,6 +111,28 @@ def build_showcase(*, history: bool = False) -> Showcase:
     return Showcase(hub=hub, client=client, clock=clock)
 
 
+def build_real_showcase(
+    *,
+    judge: str = "llm",
+    latency: str = "strict",
+    history: bool = False,
+    config: EngineConfig | None = None,
+) -> Showcase:
+    """接"真实大模型"的演示站：RODIT_LLM_* 要先指向本机的模型替身（conftest 的 stub_env），
+    客户端是真实的 OpenAICompatibleClient（rodit.eval.llm_env.client_from_env），走真实的 HTTP。"""
+    clock = FakeClock(NOW)
+    hub = ShowcaseHub(
+        clock=clock,
+        llm=client_from_env(),
+        judge=judge,  # type: ignore[arg-type]
+        latency=latency,  # type: ignore[arg-type]
+        config=config,
+        history_seed=20260928 if history else None,
+    )
+    client = TestClient(create_showcase_app(hub), base_url="http://127.0.0.1")
+    return Showcase(hub=hub, client=client, clock=clock)
+
+
 def walk(value: Any) -> Iterator[Any]:
     """JSON 里的所有值（递归）。"""
     yield value
@@ -129,6 +153,7 @@ __all__ = [
     "NOW",
     "RAW_BUYER",
     "Showcase",
+    "build_real_showcase",
     "build_showcase",
     "json_text",
     "walk",

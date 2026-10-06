@@ -9,6 +9,11 @@ route / retrieve / generate / check 套一层：照原样调用、照原样返�
 后面的图片描述（§15 Phase 3），不记买家原文。
 不改业务代码，也不改变引擎的任何行为；没有正在记录的消息时（如历史数据回放）什么都不记。
 
+接真实大模型时另记两样（showcase.realchain）：每次大模型判断的 JudgeRecord（每票的答案、失败原因），
+挂到发起它的那次路由 / 质检上（判断在发起它的线程里做完，用线程局部变量对上）；每次真实大模型调用的
+LLMCall（用途、成败、耗时、token；投票、分条生成在线程池里调用，按消息汇总，不分到哪一步；调用开始时
+绑定到当时正在处理的消息，到截止时间没返回、在后台跑完的调用不会记到下一条消息上）。
+
 只在演示站里用。记下来的东西里有买家原文所在的上下文对象，不往外传：trace.py 只取需要展示的字段。
 """
 
@@ -24,6 +29,7 @@ from typing import Any
 
 from rodit.core.enums import Intent
 from rodit.core.models import Draft, EvidenceBundle, ImageFinding, QAResult
+from rodit.showcase.realchain import JudgeRecord, LLMCall
 
 _IMAGE_DESCRIPTION = re.compile(r"【买家发来[^】]*】$")
 """引擎接在买家消息后面的图片描述（engine.images.describe 的写法）。"""
@@ -47,14 +53,17 @@ class Check:
     intent: Intent
     draft: Draft
     result: QAResult
+    judge: JudgeRecord | None = None  # 这次质检的大模型判断（接真实大模型时）
 
 
 @dataclass
 class Routed:
-    """路由看到的买家图片：识别结果（按图片顺序，已打码）和接在买家消息后面的描述。"""
+    """路由看到的买家图片：识别结果（按图片顺序，已打码）和接在买家消息后面的描述；
+    judge 是这次路由的大模型投票（接真实大模型时；判断层不调大模型时为 None）。"""
 
     image_findings: list[ImageFinding]
     image_description: str | None
+    judge: JudgeRecord | None = None
 
 
 @dataclass
@@ -65,6 +74,8 @@ class Recording:
     retrievals: list[Retrieval] = field(default_factory=list)
     generations: list[Generation] = field(default_factory=list)
     checks: list[Check] = field(default_factory=list)
+    judges: list[JudgeRecord] = field(default_factory=list)
+    llm_calls: list[LLMCall] = field(default_factory=list)
 
 
 class Recorder:
@@ -73,6 +84,7 @@ class Recorder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._current: Recording | None = None
+        self._local = threading.local()  # 当前线程最近一次大模型判断（挂到路由 / 质检上）
 
     @contextmanager
     def recording(self) -> Iterator[Recording]:
@@ -92,6 +104,29 @@ class Recorder:
             if self._current is not None:
                 getattr(self._current, kind).append(item)
 
+    def add_judge(self, record: JudgeRecord) -> None:
+        """SwitchableLLMProvider 的 observer：记下判断，并留给本线程正在做的路由 / 质检。"""
+        self._local.judge = record
+        self._add("judges", record)
+
+    def llm_call_sink(self) -> Callable[[LLMCall], None] | None:
+        """ObservedLLM 每次调用开始时取：绑定到这时正在记录的消息（没有时返回 None，不记）。"""
+        with self._lock:
+            recording = self._current
+        if recording is None:
+            return None
+
+        def sink(call: LLMCall) -> None:
+            with self._lock:
+                recording.llm_calls.append(call)
+
+        return sink
+
+    def _take_judge(self) -> JudgeRecord | None:
+        record = getattr(self._local, "judge", None)
+        self._local.judge = None
+        return record
+
     def attach(self, unit: Any) -> None:
         """给单元的 router / retriever / generator / gate 套上记录（只套一次）。"""
         if getattr(unit, "_showcase_recorder", None) is not None:
@@ -106,6 +141,7 @@ class Recorder:
                 Routed(
                     list(getattr(ctx, "image_findings", []) or []),
                     found.group(0) if found else None,
+                    self._take_judge(),
                 ),
             )
 
@@ -125,20 +161,28 @@ class Recorder:
             )
 
         def on_check(result: QAResult, ctx: Any, route: Any, draft: Draft, evidence: Any) -> None:
-            self._add("checks", Check(route.intent, draft, result))
+            self._add("checks", Check(route.intent, draft, result, self._take_judge()))
 
-        _wrap(router, "route", on_route)
+        _wrap(router, "route", on_route, before=self._take_judge)
         _wrap(retriever, "retrieve", on_retrieve)
         _wrap(generator, "generate", on_generate)
-        _wrap(gate, "check", on_check)
+        _wrap(gate, "check", on_check, before=self._take_judge)
         unit._showcase_recorder = self
 
 
-def _wrap(obj: Any, name: str, observe: Callable[..., None]) -> None:
+def _wrap(
+    obj: Any,
+    name: str,
+    observe: Callable[..., None],
+    *,
+    before: Callable[[], Any] | None = None,
+) -> None:
     original = getattr(obj, name)
 
     @functools.wraps(original)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if before is not None:
+            before()  # 清掉本线程上一次留下的判断，免得挂错
         result = original(*args, **kwargs)
         observe(result, *args, **kwargs)
         return result
