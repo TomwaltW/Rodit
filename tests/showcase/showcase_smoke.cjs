@@ -303,10 +303,25 @@ async function main() {
     await page.locator('.sg-card[data-prefill="true"] .badge-prefill').filter({ hasText: '可直接发送' }).waitFor();
     steps.push('platform-switch');
 
+    // 页面载入后演示被重置过（别的窗口、服务重启）：旧卡片上的操作带着旧 epoch，服务端 409，
+    // 页面提示并重新载入，不会落到重置后同编号的推荐上
+    const reset = await page.request.post(`${BASE}/showcase/api/reset`, { data: { platform: 'pdd' } });
+    check(reset.ok(), '接口重置');
+    const known = problems.length;
+    const stale = page.locator('.sg-card[data-status="shown"]').first();
+    await stale.locator('button[data-action="rejected"]').click();
+    await stale.locator('button[data-reason="other"]').click();
+    await page.locator('#toast').filter({ hasText: '这次操作没有执行' }).waitFor();
+    await page.waitForFunction(() => !document.querySelector('.conv-btn .badge-ok')); // 会话列表重新载入
+    check((await page.locator('.sg-card').count()) === 0, '重新载入后没有旧卡片');
+    // 浏览器把 409 响应记成一条控制台错误：这一步预期之内，其他问题照常算
+    problems.splice(known).filter((p) => !p.includes('409')).forEach((p) => problems.push(p));
+    steps.push('stale-epoch');
+
     // 重置演示（只重置当前平台）
     await page.locator('#reset').click();
     await page.locator('#dialog-ok').click();
-    await page.locator('#toast').filter({ hasText: '已重置' }).waitFor();
+    await page.locator('#toast').filter({ hasText: '回到初始状态' }).waitFor();
     await page.locator('.conv-btn[data-scenario="size"]').waitFor();
     check((await page.locator('.conv-btn[data-scenario="size"] .badge-ok').count()) === 0, '重置后会话清空');
     steps.push('reset');

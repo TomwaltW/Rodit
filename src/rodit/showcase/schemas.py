@@ -17,6 +17,8 @@ MAX_BODY_BYTES = 16 * 1024
 
 PLATFORM_PATTERN = r"^[a-z]{1,16}$"
 ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+EPOCH_PATTERN = r"^[0-9a-f]{16}$"
+"""演示单元的 epoch（PlatformDemo.epoch）：写操作必须带上页面载入时拿到的。"""
 
 
 class _Request(BaseModel):
@@ -47,6 +49,7 @@ class ChatRequest(_Request):
 
 class FeedbackRequest(_Request):
     platform: str = Field(pattern=PLATFORM_PATTERN)
+    epoch: str = Field(pattern=EPOCH_PATTERN)
     suggestion_id: int = Field(ge=1, le=2**31 - 1)
     action: Literal["sent", "edited", "rejected"]
     text: str | None = Field(default=None, min_length=1, max_length=MAX_TEXT_CHARS)
@@ -55,6 +58,7 @@ class FeedbackRequest(_Request):
 
 class ConfirmRequest(_Request):
     platform: str = Field(pattern=PLATFORM_PATTERN)
+    epoch: str = Field(pattern=EPOCH_PATTERN)
     action: AfterSaleAction
     expected_status_version: str = Field(pattern=r"^[0-9A-Za-z._:-]{1,64}$")
     reason_code: str | None = Field(default=None, pattern=r"^[a-z_]{1,32}$")
@@ -62,6 +66,7 @@ class ConfirmRequest(_Request):
 
 class NegotiateRequest(_Request):
     platform: str = Field(pattern=PLATFORM_PATTERN)
+    epoch: str = Field(pattern=EPOCH_PATTERN)
     done: bool = False
 
 
@@ -74,6 +79,7 @@ class ResetRequest(_Request):
 
 
 __all__ = [
+    "EPOCH_PATTERN",
     "ID_PATTERN",
     "MAX_CHAT_IMAGES",
     "MAX_BODY_BYTES",

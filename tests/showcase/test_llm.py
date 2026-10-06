@@ -167,9 +167,51 @@ def test_hub_with_a_real_llm_replays_history_offline():
     assert hub.offline is False
     demo = hub.get(Platform.TAOBAO)
     assert demo.history.messages > 200 and real.calls == []
-    client = TestClient(create_showcase_app(hub))
+    client = TestClient(create_showcase_app(hub), base_url="http://127.0.0.1")
     view = client.post("/showcase/api/chat", json={"platform": "taobao", "scenario": "size"}).json()
     assert real.calls and all(c.purpose == "generate" for c in real.calls)
     assert view["result"]["suggestions"][0]["text"] == "亲，尺码建议 M 哦"
     page = client.get("/").text
     assert '"offline":false' in page
+
+
+def _target(client: TestClient, key: str) -> dict:
+    data = client.get("/showcase/api/overview", params={"platform": "taobao"}).json()
+    return next(t for t in data["targets"] if t["key"] == key)
+
+
+def test_real_llm_latency_counts_only_live_messages():
+    """--llm env：回放的几百条历史用离线替身（毫秒级），不能算进"真实大模型实测"的 P95。
+    还没有演示时的消息时显示"暂无真实大模型数据"；有了以后只按演示时的消息算。"""
+    real = FakeLLMClient(
+        handler=lambda req: {
+            "answer": "亲，尺码建议 M 哦",
+            "evidence_ids": [],
+            "need_clarify": False,
+        }
+    )
+    hub = ShowcaseHub(clock=FakeClock(NOW), llm=real)
+    client = TestClient(create_showcase_app(hub), base_url="http://127.0.0.1")
+    latency = _target(client, "latency")
+    assert latency["value"] is None and latency["ok"] is None
+    assert "暂无真实大模型数据" in latency["note"]
+    board = client.get("/showcase/api/dashboard", params={"platform": "taobao"}).json()
+    assert board["kpis"]["e2e_p95_ms"] is None and board["kpis"]["messages"] > 200
+    assert board["latency"]["live_only"] is True and board["latency"]["messages"] == 0
+    view = client.post("/showcase/api/chat", json={"platform": "taobao", "scenario": "size"}).json()
+    e2e = view["trace"]["latency"]["since_received_ms"]
+    latency = _target(client, "latency")
+    assert latency["value"] == e2e and latency["ok"] is True
+    assert "真实大模型实测" in latency["note"] and "1 条" in latency["note"]
+    board = client.get("/showcase/api/dashboard", params={"platform": "taobao"}).json()
+    assert board["latency"]["messages"] == 1 and board["latency"]["e2e"]["p95"] == e2e
+
+
+def test_offline_latency_keeps_the_offline_caveat():
+    hub = ShowcaseHub(clock=FakeClock(NOW))
+    client = TestClient(create_showcase_app(hub), base_url="http://127.0.0.1")
+    latency = _target(client, "latency")
+    assert latency["value"] is not None and "离线替身" in latency["note"]
+    assert "真实大模型实测" not in latency["note"]
+    board = client.get("/showcase/api/dashboard", params={"platform": "taobao"}).json()
+    assert board["latency"]["live_only"] is False

@@ -6,6 +6,7 @@ import io
 
 import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from rodit.showcase.__main__ import DEFAULT_HOST, DEFAULT_PORT, EXIT_USAGE, is_loopback, main
 from rodit.testing.fakes import FakeLLMClient
@@ -139,3 +140,57 @@ def test_bad_arguments_exit_2(argv, capsys):
 )
 def test_is_loopback(host, expected):
     assert is_loopback(host) is expected
+
+
+@pytest.mark.parametrize(
+    ("host", "url"),
+    [
+        ("127.0.0.1", "http://127.0.0.1:8100/"),
+        ("localhost", "http://localhost:8100/"),
+        ("127.0.0.2", "http://127.0.0.2:8100/"),
+        ("::1", "http://[::1]:8100/"),
+        ("0.0.0.0", "http://127.0.0.1:8100/"),
+        ("::", "http://[::1]:8100/"),  # 监听 :: 只收 IPv6（asyncio 设了 IPV6_V6ONLY）
+        ("192.168.1.20", "http://192.168.1.20:8100/"),
+        ("fd00::20", "http://[fd00::20]:8100/"),
+    ],
+)
+def test_printed_url_matches_the_host(host: str, url: str):
+    code, text, run = _run(["--host", host, "--port", "8100"])
+    assert code == 0 and f"打开：{url}" in text
+    assert run.calls[0][1]["host"] == host
+
+
+def test_app_only_accepts_hosts_for_its_bind_address():
+    """监听地址交给应用：只监听本机时，Host 是别的域名（DNS 重绑定）的请求被拒；局域网演示不限。"""
+    _, _, run = _run([])
+    app = run.calls[0][0]
+    assert TestClient(app, base_url="http://rebind.example:8100").get("/").status_code == 400
+    assert TestClient(app, base_url="http://localhost:8100").get("/").status_code == 200
+    _, _, run = _run(["--host", "0.0.0.0"])
+    lan = run.calls[0][0]
+    assert TestClient(lan, base_url="http://192.168.1.20:8100").get("/").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RODIT_LLM_TIMEOUT_S", "abc"),
+        ("RODIT_LLM_TIMEOUT_S", "-5"),
+        ("RODIT_LLM_BASE_URL", "llm.example/v1"),  # 没有 http:// 或 https://
+    ],
+)
+def test_llm_env_with_malformed_settings_exits_2(monkeypatch, name: str, value: str):
+    """RODIT_LLM_* 格式不对（超时不是正数、地址没有协议）：拒绝启动、退出码 2，不抛异常、
+    不打印密钥。"""
+    monkeypatch.setenv("RODIT_LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("RODIT_LLM_MODEL", "demo-model")
+    monkeypatch.setenv("RODIT_LLM_API_KEY", "synthetic-test-key")
+    monkeypatch.setenv(name, value)
+    out = io.StringIO()
+    run = _Run()
+    code = main(["--llm", "env"], out, run=run)
+    assert code == EXIT_USAGE and run.calls == []
+    text = out.getvalue()
+    assert "拒绝启动" in text and "RODIT_LLM_" in text
+    assert "synthetic-test-key" not in text

@@ -26,6 +26,7 @@ NOW = DEFAULT_NOW + timedelta(minutes=3, seconds=20)
 
 BUYER_REF = re.compile(r"\bb_[0-9a-f]{24}\b")
 RAW_BUYER = re.compile(r"(?:tb|dy|pdd)_demo_buyer_\d+")
+WRITE_PATHS = re.compile(r"/showcase/api/(?:feedback|aftersales/[^/]+/(?:confirm|negotiate))$")
 
 
 @dataclass
@@ -43,9 +44,22 @@ class Showcase:
         return r
 
     def post(self, path: str, body: Any = None, **kwargs: Any):
+        """写操作（推荐反馈、售后确认、协商）没带 epoch 时带上当前单元的（像刚载入的页面）；
+        测过期、缺 epoch 的自己在 body 里给，或直接用 client。"""
+        if isinstance(body, dict) and "epoch" not in body and WRITE_PATHS.search(path):
+            epoch = self.epoch(body.get("platform"))
+            if epoch is not None:
+                body = {**body, "epoch": epoch}
         r = self.client.post(path, json=body, **kwargs)
         self.responses.append(r.text)
         return r
+
+    def epoch(self, platform: Any) -> str | None:
+        """当前演示单元的 epoch（不认识的平台返回 None）。"""
+        try:
+            return self.hub.get(Platform(platform)).epoch
+        except ValueError:
+            return None
 
     def chat(
         self,
@@ -90,7 +104,9 @@ def build_showcase(*, history: bool = False) -> Showcase:
     """history=False 时不回放历史（组装只要零点几秒），看板只有演示里的操作。"""
     clock = FakeClock(NOW)
     hub = ShowcaseHub(clock=clock, history_seed=20260928 if history else None)
-    return Showcase(hub=hub, client=TestClient(create_showcase_app(hub)), clock=clock)
+    # 演示站默认只认本机地址的 Host（防 DNS 重绑定，见 showcase.app）
+    client = TestClient(create_showcase_app(hub), base_url="http://127.0.0.1")
+    return Showcase(hub=hub, client=client, clock=clock)
 
 
 def walk(value: Any) -> Iterator[Any]:

@@ -5,7 +5,10 @@
 
 - 采纳率按推荐组算（一条买家消息、一个问题类型一组，组里有一条被发送就算采纳；§13.4 门槛同口径）；
 - 端到端耗时用 engine.result 的 since_received（从收到消息到出推荐，§12.1 口径）；离线替身下是
-  毫秒级，接真实大模型后看各环节目标；
+  毫秒级（含回放的合成历史），接真实大模型（--llm env）时只算演示时的消息（PlatformDemo.live_since
+  之后；回放历史用的是离线替身，不算"真实大模型实测"），还没有时显示"暂无真实大模型数据"；
+- 售后误操作（§1.3"不错误地同意或拒绝售后"）对错要人工复核，审计里算不出来：概览只写执行了几次
+  写操作和防护措施，状态是"后续评估"，不写死 0 / 达标；
 - 平台客服指标的接入前后对比（§12.4）：用商家报表同一个服务（rodit.app.platform_metrics 的
   PlatformMetricsService.report，口径见 rodit.feedback.platform_metrics）。数据是演示单元组装时
   从平台指标接口（合成数据）同步进单元仓储的最近 8 周（showcase.state）；接入日按演示设定填写：
@@ -24,11 +27,18 @@ from typing import Any
 from rodit.api.web import HARD_RULE_LABELS
 from rodit.core.audit import AuditAction
 from rodit.core.clock import CST
-from rodit.core.config import QAGateConfig
 from rodit.core.enums import INTENT_LABELS, Intent, RejectReason, SuggestionStatus
 from rodit.core.lexicon import find_absolute_terms, find_off_platform_in_answer
 from rodit.core.models import SuggestionRecord
+from rodit.core.pii import CONTACT_MASK, EMAIL_MASK, PHONE_MASK, mask_pii
 from rodit.feedback import REJECT_REASON_LABELS, adoption_report, qa_report
+from rodit.feedback.compliance import (
+    RULE_ABSOLUTE,
+    RULE_BANNED,
+    RULE_OFF_PLATFORM,
+    ComplianceRules,
+    scan_text,
+)
 from rodit.feedback.platform_metrics import MetricComparison, PlatformMetricsReport
 from rodit.showcase.labels import E2E_TARGET_MS, LATENCY_STAGES
 from rodit.showcase.seed import HISTORY_DAYS, history_start
@@ -46,31 +56,45 @@ def _rate(value: float | None) -> float | None:
     return None if value is None else round(value, 4)
 
 
-def _terms(text: str, qa: QAGateConfig, banned: Sequence[str]) -> set[str]:
-    """一段文字里的违规用词：站外引流、绝对化用语、店铺禁用词（§5.5 硬规则同一份词表）。"""
-    norm = unicodedata.normalize("NFKC", text or "").lower()
-    found = set(find_off_platform_in_answer(text or ""))
-    found |= set(
-        find_absolute_terms(
-            text or "", terms=qa.absolute_terms, exceptions=qa.absolute_term_exceptions
+_CONTACT_PLACEHOLDERS = (PHONE_MASK, CONTACT_MASK, EMAIL_MASK)
+
+
+def _hits(text: str, rules: ComplianceRules) -> set[str]:
+    """一段文字的违规命中：生产的合规扫描（feedback.compliance.scan_text）命中的规则名，再细到具体
+    用词（规则名:用词）。站外引流、绝对化用语、店铺禁用词和质检硬规则同一份词表；存下来的文字做过
+    个人信息最小化，遮住的手机号、联系方式、邮箱占位符也算站外引流（和 scan_text 同一条规则）。"""
+    text = text or ""
+    norm = unicodedata.normalize("NFKC", text).lower()
+    found = set(scan_text(text, rules))
+    found |= {f"{RULE_OFF_PLATFORM}:{t}" for t in find_off_platform_in_answer(text)}
+    found |= {f"{RULE_OFF_PLATFORM}:{p}" for p in _CONTACT_PLACEHOLDERS if p in text}
+    found |= {
+        f"{RULE_ABSOLUTE}:{t}"
+        for t in find_absolute_terms(
+            text, terms=rules.absolute_terms, exceptions=rules.absolute_term_exceptions
         )
-    )
-    found |= {w for w in banned if w and unicodedata.normalize("NFKC", w).lower() in norm}
+    }
+    found |= {
+        f"{RULE_BANNED}:{w}"
+        for w in rules.banned_words
+        if unicodedata.normalize("NFKC", w).lower() in norm
+    }
     return found
 
 
-def violations(
-    records: Sequence[SuggestionRecord], qa: QAGateConfig, banned: Sequence[str] = ()
-) -> int:
-    """发出去的推荐里的平台话术违规条数（§1.3 目标为 0）。
+def violations(records: Sequence[SuggestionRecord], rules: ComplianceRules) -> int:
+    """发出去的推荐里的平台话术违规条数（§1.3 目标为 0）。rules 用 ComplianceRules.from_config
+    （EngineConfig.qa_gate + 店铺的生效配置），和上线门槛的合规扫描同一份词表。
 
     原样发送的推荐都过了质检（硬规则在有依据原文的情况下判，"桑蚕丝 100%" 这种如实的成分标注放行）；
-    客服编辑后发送的，查编辑时新加进去的违规用词（原文里没有、编辑后才有的）。"""
+    客服编辑后发送的，查编辑时新加进去的违规（原文里没有、编辑后才有的规则或用词）。edited_text
+    存的是个人信息最小化之后的文字（客服加的手机号、邮箱变成了占位符），原文也按同样的方式遮一遍
+    再比。"""
     count = 0
     for r in records:
         if r.status != SuggestionStatus.EDITED_SENT or not r.edited_text:
             continue
-        if _terms(r.edited_text, qa, banned) - _terms(r.text, qa, banned):
+        if _hits(r.edited_text, rules) - _hits(mask_pii(r.text), rules):
             count += 1
     return count
 
@@ -206,7 +230,13 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
         overall = adoption.overall
         by_intent = sorted(adoption.by_intent.values(), key=lambda s: (-s.groups, s.label))
         intent_total = sum(qa.intent_counts.values())
-        latency = qa.latency_ms
+        live_only = not demo.llm.offline
+        timed = (
+            qa_report(demo.unit.repos.audit, demo.shop_id, since=demo.live_since)
+            if live_only
+            else qa
+        )
+        latency = timed.latency_ms
         e2e = latency.get("since_received") or latency.get("total")
         candidates = len(demo.service.pending_candidates(demo.shop_id))
         gap_records = demo.unit.repos.feedback.list_gaps(demo.shop_id)
@@ -226,10 +256,12 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
                 "e2e_p50_ms": e2e.p50 if e2e else None,
                 "e2e_p95_ms": e2e.p95 if e2e else None,
                 "e2e_target_ms": E2E_TARGET_MS,
+                "e2e_note": _latency_note(live_only, timed.messages),
                 "violations": violations(
                     records,
-                    demo.config.qa_gate,
-                    demo.unit.shop_config(demo.shop_id).banned_words,
+                    ComplianceRules.from_config(
+                        demo.config.qa_gate, demo.unit.shop_config(demo.shop_id)
+                    ),
                 ),
                 "pending_candidates": candidates,
                 "knowledge_gaps": gaps,
@@ -296,6 +328,9 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
                 "e2e": {"p50": e2e.p50 if e2e else None, "p95": e2e.p95 if e2e else None},
                 "target_ms": E2E_TARGET_MS,
                 "offline": demo.llm.offline,
+                "live_only": live_only,
+                "messages": timed.messages,
+                "note": _latency_note(live_only, timed.messages),
             },
             "platform_metrics": _platform_metrics(demo),
             "loop": {
@@ -309,6 +344,20 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
                 "labels_by_source": dict(Counter(sample.source for sample in labels)),
             },
         }
+
+
+def _latency_note(live_only: bool, messages: int) -> str:
+    """耗时的口径说明（看板和概览共用）。"""
+    if not live_only:
+        return "离线替身实测（含回放的合成历史）；接真实大模型按 §12.1 各环节目标"
+    if not messages:
+        return (
+            "暂无真实大模型数据：在工作台以买家身份发几条消息后再看（回放的历史用离线替身，不计入）"
+        )
+    return (
+        f"真实大模型实测：演示时的 {messages} 条消息（回放的历史用离线替身，不计入；"
+        "路由、质检仍是离线替身）"
+    )
 
 
 def _metric_note(metrics: dict[str, Any]) -> str:
@@ -326,7 +375,7 @@ def overview(demo: PlatformDemo) -> dict[str, Any]:
         actions = demo.unit.repos.audit.list_events(
             demo.shop_id, action=AuditAction.REVIEW_ACTION.value
         )
-    executed = [e for e in actions if e.detail.get("ok") is True]
+    executed = [e for e in actions if e.detail.get("ok") is True and not e.detail.get("duplicate")]
     return {
         "platform": demo.platform.value,
         "synthetic": SYNTHETIC_LABEL,
@@ -347,10 +396,8 @@ def overview(demo: PlatformDemo) -> dict[str, Any]:
                 "target": "≤ 5 秒",
                 "value": kpis["e2e_p95_ms"],
                 "unit": "ms",
-                "ok": kpis["e2e_p95_ms"] is not None and kpis["e2e_p95_ms"] <= E2E_TARGET_MS,
-                "note": "离线替身实测；接真实大模型按 §12.1 各环节目标"
-                if demo.llm.offline
-                else "真实大模型实测",
+                "ok": None if kpis["e2e_p95_ms"] is None else kpis["e2e_p95_ms"] <= E2E_TARGET_MS,
+                "note": kpis["e2e_note"],
             },
             {
                 "key": "violations",
@@ -374,10 +421,12 @@ def overview(demo: PlatformDemo) -> dict[str, Any]:
                 "key": "aftersale",
                 "label": "售后误操作",
                 "target": "0",
-                "value": 0,
-                "unit": "count",
-                "ok": True,
-                "note": f"售后写操作 {len(executed)} 次，全部由店长确认、执行前重读状态",
+                # 同意 / 拒绝得对不对要人工复核（上线后），审计里算不出来：不写死 0 / 达标
+                "value": f"已执行 {len(executed)} 次写操作",
+                "unit": "text",
+                "ok": None,
+                "note": "同意 / 拒绝得对不对要人工复核，演示里不做复核；防护：只给建议、"
+                "店长确认才执行、执行前重读平台状态、幂等键防重复（§7.3.2）",
             },
             {
                 "key": "accuracy",

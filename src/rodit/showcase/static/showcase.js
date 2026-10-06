@@ -181,9 +181,10 @@
   // ================================================================ 接口
 
   class ApiError extends Error {
-    constructor(status, message) {
+    constructor(status, message, code) {
       super(message);
       this.status = status;
+      this.code = code || null;
     }
   }
 
@@ -208,7 +209,7 @@
     }
     if (!response.ok) {
       const message = (data && data.message) || '请求失败（HTTP ' + response.status + '）';
-      throw new ApiError(response.status, message);
+      throw new ApiError(response.status, message, data && data.error);
     }
     return data;
   }
@@ -246,6 +247,27 @@
 
   function fail(err) {
     toast(err && err.message ? err.message : String(err), true);
+  }
+
+  /** 忘掉一个平台在页面上的数据（重置后、或发现演示单元已经重建过时重新载入）。 */
+  function forgetPlatform(platform) {
+    delete state.scenarios[platform];
+    delete state.aftersales[platform];
+    delete state.active[platform];
+    delete state.selected[platform];
+    Object.keys(state.results).forEach((k) => {
+      if (k.indexOf(platform + ':') === 0) delete state.results[k];
+    });
+  }
+
+  /** 写操作带的 epoch 过期（页面载入后演示被重置、或服务重启过）：这次操作没有执行，
+   *  重新载入当前页面的数据。返回 true 表示已处理。 */
+  function staleDemo(err, platform) {
+    if (!err || err.code !== 'stale_epoch') return false;
+    forgetPlatform(platform);
+    toast('演示已重置过（别的窗口点了重置，或服务重启了）：这次操作没有执行，已重新载入最新数据', true);
+    if (platform === state.platform) loadRoute();
+    return true;
   }
 
   // ================================================================ 浮动提示（图表）
@@ -988,7 +1010,9 @@
     const platform = state.platform;
     const s = activeScenario();
     try {
-      const body = { platform, suggestion_id: card.suggestion_id, action };
+      // 带上这张卡片载入时演示单元的 epoch（重置前的卡片不会落到重置后同编号的推荐上）
+      const epoch = s && s.latest && s.latest.epoch ? s.latest.epoch : state.scenarios[platform].epoch;
+      const body = { platform, suggestion_id: card.suggestion_id, action, epoch };
       if (extra.text) body.text = extra.text;
       if (extra.reason) body.reason = extra.reason;
       if (action !== 'rejected' && state.scenarios[platform].access === 'C' && navigator.clipboard) {
@@ -1006,6 +1030,7 @@
       if (out.labeled && action === 'rejected') message += ' · 进判断层标注集';
       toast(message);
     } catch (err) {
+      if (staleDemo(err, platform)) return;
       fail(err);
     }
     if (platform !== state.platform) return;
@@ -1477,7 +1502,7 @@
   async function runConfirm(item, action, version, reasonCode) {
     const platform = state.platform;
     try {
-      const body = { platform, action, expected_status_version: version };
+      const body = { platform, action, expected_status_version: version, epoch: state.aftersales[platform].epoch };
       if (reasonCode) body.reason_code = reasonCode;
       const out = await api('/aftersales/' + encodeURIComponent(item.aftersale_id) + '/confirm', { method: 'POST', body });
       const before = out.reread.before;
@@ -1504,6 +1529,7 @@
       state.selected[platform] = item.aftersale_id;
       renderAftersales();
     } catch (err) {
+      if (staleDemo(err, platform)) return;
       fail(err);
     }
   }
@@ -1523,7 +1549,8 @@
     if (!answer) return;
     const platform = state.platform;
     try {
-      const out = await api('/aftersales/' + encodeURIComponent(item.aftersale_id) + '/negotiate', { method: 'POST', body: { platform, done } });
+      const body = { platform, done, epoch: state.aftersales[platform].epoch };
+      const out = await api('/aftersales/' + encodeURIComponent(item.aftersale_id) + '/negotiate', { method: 'POST', body });
       toast(done ? '协商有结果，回到待客服确认' : '已进入协商中');
       if (platform !== state.platform) return;
       const data = state.aftersales[platform];
@@ -1531,6 +1558,7 @@
       state.selected[platform] = item.aftersale_id;
       renderAftersales();
     } catch (err) {
+      if (staleDemo(err, platform)) return;
       fail(err);
     }
   }
@@ -1588,7 +1616,7 @@
     kpis.appendChild(kpiTile('原样采纳率', pct(k.as_is_rate), '客服原样发送的比例', '半自动的门槛是 ≥ 90%（§13.4）', { value: k.as_is_rate || 0, mark: 0.9 }));
     kpis.appendChild(kpiTile('处理的买家消息', num(k.messages), '近 5 周 + 演示操作', '待商家审核的候选知识 ' + num(k.pending_candidates) + ' 条'));
     kpis.appendChild(kpiTile('质检拦截率', pct(k.interception_rate), '按消息算（§12.4）', '拦下后带原因重写，或不推荐'));
-    kpis.appendChild(kpiTile('推荐出现 P95', ms(k.e2e_p95_ms), '目标 ≤ 5 秒（§12.1）', 'P50 ' + ms(k.e2e_p50_ms), { value: (k.e2e_p95_ms || 0) / k.e2e_target_ms, mark: 1 }));
+    kpis.appendChild(kpiTile('推荐出现 P95', ms(k.e2e_p95_ms), '目标 ≤ 5 秒（§12.1）', 'P50 ' + ms(k.e2e_p50_ms) + (CONFIG.offline ? '' : ' · ' + k.e2e_note), { value: (k.e2e_p95_ms || 0) / k.e2e_target_ms, mark: 1 }));
     kpis.appendChild(kpiTile('发出去的违规', num(k.violations), '目标 0（§1.3）', '提醒商家补的知识 ' + num(k.knowledge_gaps) + ' 处'));
     weeklyChart($('chart-weekly'), d.weekly, k.adoption_target);
     hbars(
@@ -1751,8 +1779,10 @@
     const holder = el('div');
     box.appendChild(holder);
     hbars(holder, rows, { max });
-    const within = (lat.e2e.p95 || 0) <= lat.target_ms;
-    box.appendChild(el('p', { cls: 'small ' + (within ? 'muted' : 'risk'), text: (within ? '✓ 端到端 P95 ' : '✗ 端到端 P95 ') + ms(lat.e2e.p95) + '，目标 ≤ 5 秒。' + (lat.offline ? '离线替身不联网；接真实大模型后按 §12.1 各环节目标核对。' : '') }));
+    const has = lat.e2e.p95 !== null && lat.e2e.p95 !== undefined;
+    const within = has && lat.e2e.p95 <= lat.target_ms;
+    const mark = has ? (within ? '✓ ' : '✗ ') : '';
+    box.appendChild(el('p', { cls: 'small ' + (within || !has ? 'muted' : 'risk'), text: mark + '端到端 P95 ' + ms(lat.e2e.p95) + '，目标 ≤ 5 秒。' + (lat.offline ? '离线替身不联网；接真实大模型后按 §12.1 各环节目标核对。' : lat.note) }));
   }
 
   const VERDICT_CLS = { improved: 'badge-ok', worse: 'badge-danger', mixed: 'badge-warn', unchanged: '', insufficient: 'badge-warn', no_go_live: 'badge-warn' };
@@ -1906,13 +1936,7 @@
     try {
       state.loaded[platform] = false;
       await withLoading(platform, () => api('/reset', { method: 'POST', body: { platform } }));
-      delete state.scenarios[platform];
-      delete state.aftersales[platform];
-      delete state.active[platform];
-      delete state.selected[platform];
-      Object.keys(state.results).forEach((k) => {
-        if (k.indexOf(platform + ':') === 0) delete state.results[k];
-      });
+      forgetPlatform(platform);
       toast('已重置：' + PLATFORMS[platform].name + '演示回到初始状态');
       loadRoute();
     } catch (err) {

@@ -11,7 +11,8 @@ from showcase_support import BUYER_REF, NOW, RAW_BUYER, Showcase, build_showcase
 
 from rodit.core.config import EngineConfig
 from rodit.core.enums import AfterSaleStatus, Intent, Platform, SuggestionStatus
-from rodit.core.models import SuggestionRecord
+from rodit.core.models import ShopConfig, SuggestionRecord
+from rodit.feedback.compliance import ComplianceRules
 from rodit.showcase.app import API_PREFIX
 from rodit.showcase.dashboard import violations
 from rodit.showcase.schemas import MAX_BODY_BYTES, MAX_TEXT_CHARS
@@ -510,6 +511,30 @@ def test_overview_targets(showcase: Showcase):
     assert data["build_ms"] >= 0
 
 
+def test_aftersale_mistakes_are_not_claimed_as_met(showcase: Showcase):
+    """§1.3 售后误操作 = 0 是"不错误地同意或拒绝售后"：对错要人工复核，审计里算不出来。概览不写死
+    0 / 达标，写执行了几次写操作和防护措施，状态是"后续评估"（ok 为 None）。"""
+
+    def target() -> dict:
+        data = showcase.get(f"{API}/overview", platform="taobao").json()
+        return next(t for t in data["targets"] if t["key"] == "aftersale")
+
+    before = target()
+    assert before["ok"] is None and before["unit"] == "text"
+    assert before["value"] == "已执行 0 次写操作"
+    assert "人工复核" in before["note"] and "重读" in before["note"]
+    item = showcase.aftersale("taobao", "as_2001")
+    body = {
+        "platform": "taobao",
+        "action": "agree_refund",
+        "expected_status_version": item["status_version"],
+    }
+    assert showcase.post(f"{API}/aftersales/as_2001/confirm", body).status_code == 200
+    assert showcase.post(f"{API}/aftersales/as_2001/confirm", body).json()["duplicate"] is True
+    after = target()
+    assert after["ok"] is None and after["value"] == "已执行 1 次写操作"  # 幂等重复不算
+
+
 def test_mask_demo(showcase: Showcase):
     r = showcase.post(
         f"{API}/mask",
@@ -543,6 +568,92 @@ def test_reset_rebuilds_the_platform(showcase: Showcase):
     douyin = showcase.get(f"{API}/scenarios", platform="douyin").json()["scenarios"]
     assert next(s for s in douyin if s["id"] == "size")["bubbles"]
     assert showcase.post(f"{API}/reset", {"platform": "jd"}).status_code == 404
+
+
+EPOCH = re.compile(r"^[0-9a-f]{16}$")
+
+
+def test_epoch_is_returned_and_changes_on_reset(showcase: Showcase):
+    """每次组装演示单元有一个新的编号（epoch）：页面载入时拿到，写操作带回来。"""
+    scenarios = showcase.get(f"{API}/scenarios", platform="taobao").json()
+    epoch = scenarios["epoch"]
+    assert EPOCH.match(epoch)
+    assert showcase.aftersales("taobao")["epoch"] == epoch
+    view = showcase.chat("taobao", "size")
+    assert view["epoch"] == epoch
+    latest = showcase.get(f"{API}/scenarios", platform="taobao").json()["scenarios"]
+    assert next(s for s in latest if s["id"] == "size")["latest"]["epoch"] == epoch
+    assert showcase.get(f"{API}/scenarios", platform="douyin").json()["epoch"] != epoch
+    reset = showcase.post(f"{API}/reset", {"platform": "taobao"}).json()
+    assert EPOCH.match(reset["epoch"]) and reset["epoch"] != epoch
+    assert showcase.get(f"{API}/scenarios", platform="taobao").json()["epoch"] == reset["epoch"]
+
+
+def test_feedback_from_before_a_reset_is_refused(showcase: Showcase):
+    """重置后回放是确定的，推荐编号会重复：重置前载入的卡片（旧 epoch）点发送，不能落到重置后
+    同一个编号的另一条推荐上，返回 409，提示刷新。"""
+    old_epoch = showcase.get(f"{API}/scenarios", platform="taobao").json()["epoch"]
+    [old_card] = showcase.chat("taobao", "invoice")["result"]["suggestions"]
+    showcase.post(f"{API}/reset", {"platform": "taobao"})
+    view = showcase.chat("taobao", "invoice")
+    [card] = view["result"]["suggestions"]
+    assert card["suggestion_id"] == old_card["suggestion_id"]  # 编号重复了
+    body = {
+        "platform": "taobao",
+        "suggestion_id": old_card["suggestion_id"],
+        "action": "sent",
+        "epoch": old_epoch,
+    }
+    r = showcase.post(f"{API}/feedback", body)
+    assert r.status_code == 409
+    assert r.json() == {"error": "stale_epoch", "message": "演示已重置，请刷新页面"}
+    demo = showcase.hub.get(Platform.TAOBAO)
+    record = demo.unit.repos.suggestions.get(demo.shop_id, card["suggestion_id"])
+    assert record is not None and record.status == SuggestionStatus.SHOWN
+    r = showcase.post(f"{API}/feedback", {**body, "epoch": view["epoch"]})
+    assert r.status_code == 200 and r.json()["status"] == "sent"
+
+
+def test_aftersale_actions_from_before_a_reset_are_refused(showcase: Showcase):
+    data = showcase.aftersales("taobao")
+    item = next(i for i in data["items"] if i["aftersale_id"] == "as_2001")
+    showcase.post(f"{API}/reset", {"platform": "taobao"})
+    confirm = {
+        "platform": "taobao",
+        "action": "agree_refund",
+        "expected_status_version": item["status_version"],
+        "epoch": data["epoch"],
+    }
+    r = showcase.post(f"{API}/aftersales/as_2001/confirm", confirm)
+    assert r.status_code == 409 and r.json()["error"] == "stale_epoch"
+    negotiate = {"platform": "taobao", "epoch": data["epoch"]}
+    r = showcase.post(f"{API}/aftersales/as_2007/negotiate", negotiate)
+    assert r.status_code == 409 and r.json()["error"] == "stale_epoch"
+    demo = showcase.hub.get(Platform.TAOBAO)
+    assert demo.unit.action_port.calls == []
+    review = demo.unit.repos.reviews.get(demo.shop_id, "as_2007")
+    assert review is None or review.state.value != "negotiate"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/feedback", {"platform": "taobao", "suggestion_id": 1, "action": "sent"}),
+        (
+            "/aftersales/as_2001/confirm",
+            {"platform": "taobao", "action": "agree_refund", "expected_status_version": "1"},
+        ),
+        ("/aftersales/as_2007/negotiate", {"platform": "taobao"}),
+    ],
+)
+@pytest.mark.parametrize("epoch", [None, "", "XYZ", "0" * 17])
+def test_write_requests_need_a_valid_epoch(
+    showcase: Showcase, path: str, body: dict, epoch: str | None
+):
+    if epoch is not None:
+        body = {**body, "epoch": epoch}
+    r = showcase.client.post(f"{API}{path}", json=body)
+    assert r.status_code == 422 and r.json()["error"] == "invalid"
 
 
 def test_platforms_are_built_lazily_and_once(showcase: Showcase):
@@ -607,10 +718,41 @@ def test_violations_count_what_the_agent_added_when_editing(showcase: Showcase):
     assert target["value"] == 1 and target["ok"] is False
 
 
+@pytest.mark.parametrize(
+    "added",
+    [
+        " 有问题打我电话 13812345678",  # 合成的手机号
+        " 也可以发邮件到 demo_buyer@example.com",  # 合成的邮箱
+        " 加我微信 abc12345 细聊",
+    ],
+)
+def test_contact_details_added_when_editing_are_violations(showcase: Showcase, added: str):
+    """编辑时加进去的手机号、邮箱、微信号：存下来的 edited_text 做过个人信息最小化（变成
+    [手机号]、[邮箱]、[联系方式] 占位符），占位符也算站外引流（和 feedback.compliance 的合规扫描
+    同一条规则）。"""
+    view = showcase.chat("taobao", "invoice")
+    [card] = view["result"]["suggestions"]
+    r = showcase.feedback("taobao", card["suggestion_id"], "edited", text=card["text"] + added)
+    assert r.status_code == 200, r.text
+    demo = showcase.hub.get(Platform.TAOBAO)
+    record = demo.unit.repos.suggestions.get(demo.shop_id, card["suggestion_id"])
+    assert record is not None and record.edited_text
+    assert "13812345678" not in record.edited_text and "example.com" not in record.edited_text
+    assert showcase.dashboard("taobao")["kpis"]["violations"] == 1
+    overview = showcase.get(f"{API}/overview", platform="taobao").json()
+    target = next(t for t in overview["targets"] if t["key"] == "violations")
+    assert target["value"] == 1 and target["ok"] is False
+
+
+def _rules(banned: tuple[str, ...] = ()) -> ComplianceRules:
+    return ComplianceRules.from_config(
+        EngineConfig().qa_gate, ShopConfig(banned_words=list(banned))
+    )
+
+
 def test_composition_label_is_not_a_violation():
     """推荐原文里如实的成分标注（"桑蚕丝 100%"，质检有依据时放行）不算；
-    编辑时加的"最"、店铺禁用词算。"""
-    qa = EngineConfig().qa_gate
+    编辑时加的"最"、店铺禁用词、遮掉的手机号算。"""
     base = {
         "shop_id": "s_1001",
         "conversation_id": "c",
@@ -625,5 +767,8 @@ def test_composition_label_is_not_a_violation():
         SuggestionRecord(text=silk, edited_text=silk + "，全网最好", status=edited, **base),
         SuggestionRecord(text=silk, edited_text=silk + "，假一赔十", status=edited, **base),
     ]
-    assert violations(records, qa) == 1  # 只有"最"是编辑时加进去的
-    assert violations(records, qa, banned=["假一赔十"]) == 2  # 店铺禁用词
+    assert violations(records, _rules()) == 1  # 只有"最"是编辑时加进去的
+    assert violations(records, _rules(("假一赔十",))) == 2  # 店铺禁用词
+    # 存下来的编辑文字做过个人信息最小化：遮掉的手机号也是编辑时新加的站外引流
+    phone = SuggestionRecord(text=silk, edited_text=silk + "，打 [手机号]", status=edited, **base)
+    assert violations([*records, phone], _rules()) == 2

@@ -12,6 +12,10 @@ PlatformDemo 是一个平台的演示：
   （rodit.app.rollout.set_semi_auto，门槛没过时强制开启并写明原因，留审计）；系统从平台指标接口
   （合成数据）同步最近 8 周的客服考核数据（rodit.app.platform_metrics，数据看板的接入前后对比用）。
 
+每次组装有一个随机的编号 epoch（/scenarios、/chat、/aftersales、/reset 返回）：回放是确定的，重置或
+服务重启后推荐编号会重复，页面在写操作（推荐反馈、售后确认、协商）里带上载入时的 epoch，对不上就
+返回 409（stale_epoch，"演示已重置，请刷新页面"），重置前的卡片不会落到重置后同一个编号的推荐上。
+
 ShowcaseHub 管三个平台：第一次用到某个平台时组装（各平台互不等待），重置时整个重建。
 """
 
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import secrets
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -103,6 +108,9 @@ CONSECUTIVE_GAP_MS = 200
 """淘宝一次发几张图（每张一条消息）时，相邻两条的发送时间间隔：远小于合并连发的窗口（§5.3），
 先发的时间在前，合并后图片的顺序和买家发的一样。"""
 
+STALE_EPOCH_MESSAGE = "演示已重置，请刷新页面"
+"""写操作带的 epoch 和当前演示单元对不上（页面是重置或服务重启之前载入的）。"""
+
 AFTERSALE_WINDOW_DAYS = 7
 """售后审核页列出最近几天申请的售后单（更早的是 R7 用到的历史售后）。"""
 
@@ -126,9 +134,11 @@ CANDIDATE_SKIPPED_LABELS: dict[str, str] = {
 
 
 class ShowcaseError(Exception):
-    """演示站接口的错误：status 是 HTTP 状态码，message 给页面显示。"""
+    """演示站接口的错误：status 是 HTTP 状态码，message 给页面显示；code 是错误代码（为空时按
+    状态码取，见 showcase.app）。"""
 
     status = 400
+    code: str | None = None
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
@@ -141,6 +151,12 @@ class NotFound(ShowcaseError):
 
 class Conflict(ShowcaseError):
     status = 409
+
+
+class StaleDemo(Conflict):
+    """页面载入之后演示单元重建过（重置、服务重启）：epoch 对不上。"""
+
+    code = "stale_epoch"
 
 
 class Invalid(ShowcaseError):
@@ -184,6 +200,7 @@ class PlatformDemo:
         history_seed: int | None = 20260928,
     ) -> None:
         started = time.perf_counter()
+        self.epoch = secrets.token_hex(8)
         self.platform = platform
         self.profile = PROFILES[platform]
         self.shop_id = self.profile.shop_id
@@ -220,6 +237,10 @@ class PlatformDemo:
                     send=self._send_history,
                     apply=self._apply_history,
                 )
+        # 演示时的操作从这一刻起（含）：比回放历史的最后一刻晚 1 微秒，回放的审计都早于它；tick()
+        # 不会把时钟拨到它之前。接真实大模型（--llm env）时看板的耗时只按这之后的消息算（回放用的是
+        # 离线替身，毫秒级）
+        self.live_since = self.clock.now() + timedelta(microseconds=1)
         # 抖店演示店在合成数据里是影子模式（§13.4）：演示里切到智能辅助，推荐才看得见
         self._update_shop({"shadow_mode": False})
         self.semi_auto = self._enable_semi_auto()
@@ -231,6 +252,11 @@ class PlatformDemo:
             self.history.messages,
             self.build_ms,
         )
+
+    def check_epoch(self, epoch: str) -> None:
+        """写操作带回来的 epoch 要是这次组装的（见模块说明），否则 409。"""
+        if epoch != self.epoch:
+            raise StaleDemo(STALE_EPOCH_MESSAGE)
 
     # ================================================================ 内部
 
@@ -272,8 +298,8 @@ class PlatformDemo:
         return PlatformMetricsService(self.unit, self.service.processing)
 
     def tick(self) -> datetime:
-        """把单元时钟拨到真实的当前时间（只往前走）。"""
-        now = max(self.clock.now(), self._real_clock.now())
+        """把单元时钟拨到真实的当前时间（只往前走，不早于 live_since）。"""
+        now = max(self.clock.now(), self._real_clock.now(), self.live_since)
         self.clock.set(now)
         return now
 
@@ -556,6 +582,7 @@ class PlatformDemo:
                 "at": now.isoformat(),
             }
             view = {
+                "epoch": self.epoch,
                 "scenario": scenario.id,
                 "message": buyer_bubble,
                 "result": self._result_view(result),
@@ -926,8 +953,10 @@ __all__ = [
     "Invalid",
     "NotFound",
     "PlatformDemo",
+    "STALE_EPOCH_MESSAGE",
     "ShowcaseError",
     "ShowcaseHub",
+    "StaleDemo",
     "demo_config",
     "minute_floor",
 ]
