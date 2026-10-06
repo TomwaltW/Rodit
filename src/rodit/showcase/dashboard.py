@@ -41,6 +41,7 @@ from rodit.feedback.compliance import (
 )
 from rodit.feedback.platform_metrics import MetricComparison, PlatformMetricsReport
 from rodit.showcase.labels import E2E_TARGET_MS, LATENCY_STAGES
+from rodit.showcase.realchain import RELAXED_NOTE
 from rodit.showcase.seed import HISTORY_DAYS, history_start
 from rodit.showcase.state import PlatformDemo
 from rodit.showcase.trace import gap_label
@@ -256,7 +257,7 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
                 "e2e_p50_ms": e2e.p50 if e2e else None,
                 "e2e_p95_ms": e2e.p95 if e2e else None,
                 "e2e_target_ms": E2E_TARGET_MS,
-                "e2e_note": _latency_note(live_only, timed.messages),
+                "e2e_note": _latency_note(live_only, timed.messages, demo),
                 "violations": violations(
                     records,
                     ComplianceRules.from_config(
@@ -330,7 +331,7 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
                 "offline": demo.llm.offline,
                 "live_only": live_only,
                 "messages": timed.messages,
-                "note": _latency_note(live_only, timed.messages),
+                "note": _latency_note(live_only, timed.messages, demo),
             },
             "platform_metrics": _platform_metrics(demo),
             "loop": {
@@ -346,18 +347,20 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
         }
 
 
-def _latency_note(live_only: bool, messages: int) -> str:
-    """耗时的口径说明（看板和概览共用）。"""
+def _latency_note(live_only: bool, messages: int, demo: PlatformDemo | None = None) -> str:
+    """耗时的口径说明（看板和概览共用）。接真实大模型时写明判断层是大模型投票还是离线规则，
+    放宽了时间预算的写明（showcase.realchain.RELAXED_NOTE）。"""
     if not live_only:
         return "离线替身实测（含回放的合成历史）；接真实大模型按 §12.1 各环节目标"
     if not messages:
         return (
             "暂无真实大模型数据：在工作台以买家身份发几条消息后再看（回放的历史用离线替身，不计入）"
         )
-    return (
-        f"真实大模型实测：演示时的 {messages} 条消息（回放的历史用离线替身，不计入；"
-        "路由、质检仍是离线替身）"
-    )
+    judge = demo.chain.judge_sentence if demo is not None else "路由、质检仍是离线替身"
+    note = f"真实大模型实测：演示时的 {messages} 条消息（回放的历史用离线替身，不计入；{judge}）"
+    if demo is not None and demo.chain.real and demo.chain.relaxed:
+        note += f"；{RELAXED_NOTE}"
+    return note
 
 
 def _metric_note(metrics: dict[str, Any]) -> str:

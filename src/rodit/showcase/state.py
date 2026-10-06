@@ -2,7 +2,10 @@
 
 PlatformDemo 是一个平台的演示：
 - 单元用 rodit.app.demo.build_demo_unit 组装（内存仓储、模拟适配器、合成数据），生成换成演示站的
-  ShowcaseLLM（见 showcase.llm），路由用关键词规则、质检用启发式判断（离线替身，不联网）；
+  ShowcaseLLM（见 showcase.llm）；默认路由用关键词规则、质检用启发式判断（离线替身，不联网）；
+- 接真实大模型（llm 不为空）时生成走真实大模型；judge="llm" 时路由、质检也照生产组装
+  （config.decision → build_decision_provider，大模型投票，见 showcase.realchain），回放历史期间
+  一律离线（ReplaySwitch，判断层和生成共用一个开关）；每次真实调用、每次大模型判断都记进过程记录；
 - 单元的时钟是 FakeClock：组装时停在演示世界的"现在"（启动时间取整到分钟），回放历史时拨到过去，
   之后每次请求先拨到真实的当前时间（只往前走），推荐记录、审计的时间和真实时间一致；
 - 同一个平台的请求串行处理（每个平台一把锁）：过程记录、按条数切审计都依赖这一点；
@@ -82,6 +85,16 @@ from rodit.showcase.labels import (
     REVIEW_STATE_LABELS,
 )
 from rodit.showcase.llm import SIMULATED_NOTE, ShowcaseLLM
+from rodit.showcase.realchain import (
+    ChainInfo,
+    JudgeMode,
+    LatencyMode,
+    ObservedLLM,
+    ReplaySwitch,
+    build_judges,
+    chain_config,
+    chain_info,
+)
 from rodit.showcase.recorder import Recorder
 from rodit.showcase.scenarios import Scenario, get_scenario, scenarios_for
 from rodit.showcase.seed import Feedback, HistoryMessage, HistorySummary, replay_history
@@ -163,9 +176,9 @@ class Invalid(ShowcaseError):
     status = 422
 
 
-def demo_config() -> EngineConfig:
-    """离线替身的配置：判断层用规则（和 rodit.app.demo 离线演示一致）。"""
-    config = EngineConfig()
+def demo_config(base: EngineConfig | None = None) -> EngineConfig:
+    """离线判断层的配置：判断层用规则（和 rodit.app.demo 离线演示一致）。"""
+    config = base or EngineConfig()
     return config.model_copy(
         update={"decision": config.decision.model_copy(update={"provider": ProviderName.RULES})}
     )
@@ -198,8 +211,13 @@ class PlatformDemo:
         clock: Clock,
         llm: LLMClient | None = None,
         history_seed: int | None = 20260928,
+        config: EngineConfig | None = None,
+        judge: JudgeMode = "offline",
+        latency: LatencyMode = "strict",
     ) -> None:
         started = time.perf_counter()
+        if judge == "llm" and llm is None:
+            raise ValueError("判断层用大模型投票（judge=llm）需要真实大模型（llm）")
         self.epoch = secrets.token_hex(8)
         self.platform = platform
         self.profile = PROFILES[platform]
@@ -207,18 +225,35 @@ class PlatformDemo:
         self.now = now
         self._real_clock = clock
         self.world = build_world(platform, now)
-        self.llm = ShowcaseLLM(llm)
-        self.config = demo_config()
+        self.judge: JudgeMode = judge
+        self.config = chain_config(config, judge=judge, latency=latency)
+        self.chain: ChainInfo = chain_info(llm, self.config, judge=judge, latency=latency)
+        self.recorder = Recorder()
+        self.switch = ReplaySwitch()  # 回放期间生成、路由、质检都离线（见模块说明）
+        self.observed: ObservedLLM | None = (
+            ObservedLLM(llm, self.switch, self.recorder.llm_call_sink) if llm is not None else None
+        )
+        self.llm = ShowcaseLLM(self.observed, switch=self.switch)
+        route_provider, qa_provider = RuleProvider(), HeuristicQAJudge()
+        if judge == "llm":
+            assert self.observed is not None
+            route_provider, qa_provider = build_judges(
+                self.config,
+                self.observed,
+                self.switch,
+                offline_route=route_provider,
+                offline_qa=qa_provider,
+                observer=self.recorder.add_judge,
+            )
         self.unit = build_demo_unit(
             platform,
             world=self.world,
             config=self.config,
             llm=self.llm,
-            route_provider=RuleProvider(),
-            qa_provider=HeuristicQAJudge(),
+            route_provider=route_provider,
+            qa_provider=qa_provider,
         )
         self.clock = self.unit.clock  # FakeClock（build_demo_unit 组装的）
-        self.recorder = Recorder()
         self.recorder.attach(self.unit)
         self.service = AssistService(self.unit)
         self.lock = threading.RLock()
@@ -245,6 +280,10 @@ class PlatformDemo:
         self._update_shop({"shadow_mode": False})
         self.semi_auto = self._enable_semi_auto()
         self.metrics_sync = self._sync_platform_metrics()
+        # 回放期间真实大模型一次都不该被调到（ObservedLLM 拦下的次数也算进来，应为 0）
+        self.replay_llm_calls = (
+            self.observed.calls + self.observed.blocked_during_replay if self.observed else 0
+        )
         self.build_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
             "演示单元 %s 组装完成：回放 %d 条历史消息，用时 %d ms",
@@ -574,6 +613,7 @@ class PlatformDemo:
                 decisions=audit.list_decisions(self.shop_id)[decisions_before:],
                 events=audit.list_events(self.shop_id)[events_before:],
                 simulated_note=note,
+                chain=self.chain,
             )
             buyer_bubble = {
                 "role": "buyer",
@@ -905,12 +945,25 @@ class ShowcaseHub:
         history_seed: int | None = 20260928,
         default_platform: Platform = Platform.TAOBAO,
         factory: Callable[..., PlatformDemo] = PlatformDemo,
+        config: EngineConfig | None = None,
+        judge: JudgeMode = "offline",
+        latency: LatencyMode = "strict",
     ) -> None:
+        """llm 是真实大模型客户端（为空时离线替身）；config 是 --config 读进来的引擎配置（为空用
+        默认值）；judge / latency 见 showcase.realchain。"""
+        if judge == "llm" and llm is None:
+            raise ValueError("判断层用大模型投票（judge=llm）需要真实大模型（llm）")
         self.clock = clock or SystemClock()
         self.llm = llm
         self.history_seed = history_seed
         self.default_platform = default_platform
         self._factory = factory
+        self.base_config = config
+        self.judge: JudgeMode = judge
+        self.latency: LatencyMode = latency
+        self.chain = chain_info(
+            llm, chain_config(config, judge=judge, latency=latency), judge=judge, latency=latency
+        )
         self._demos: dict[Platform, PlatformDemo] = {}
         self._build_locks = {p: threading.Lock() for p in Platform}
 
@@ -925,6 +978,9 @@ class ShowcaseHub:
             clock=self.clock,
             llm=self.llm,
             history_seed=self.history_seed,
+            config=self.base_config,
+            judge=self.judge,
+            latency=self.latency,
         )
 
     def get(self, platform: Platform) -> PlatformDemo:

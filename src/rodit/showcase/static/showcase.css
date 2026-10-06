@@ -690,6 +690,68 @@ main:focus {
   padding: 18px 24px;
 }
 
+/* 接真实大模型时（--llm env）：页眉下面一条说明这次演示用的是什么，页脚再写一遍 */
+.chain-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 12px;
+  padding: 5px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--info-bg);
+  color: var(--info);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.chain-badge,
+.chain-relaxed {
+  overflow-wrap: anywhere;
+}
+
+.chain-relaxed {
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.footer-badge {
+  margin: 0 0 4px;
+  color: var(--fg-2);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* 判断层投票（每一票选了什么、哪几票失败） */
+.vote-box {
+  margin-top: 10px;
+}
+
+.vote-row {
+  display: grid;
+  grid-template-columns: minmax(84px, 9em) minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  padding: 2px 0;
+}
+
+.vote-row .row-label {
+  color: var(--fg-2);
+}
+
+.vote-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.fallback-note {
+  margin: 8px 0 0;
+}
+
 /* ================================================================ 产品概览 */
 
 .hero {

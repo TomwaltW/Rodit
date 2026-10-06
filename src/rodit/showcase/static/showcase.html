@@ -41,6 +41,10 @@
       <button type="button" id="reset" class="btn btn-quiet btn-small">重置演示</button>
     </div>
   </div>
+  <div id="chain-strip" class="chain-strip" role="note" hidden>
+    <span id="chain-badge" class="chain-badge"></span>
+    <span id="chain-relaxed" class="chain-relaxed" hidden></span>
+  </div>
 </header>
 
 <main id="main" tabindex="-1">
@@ -436,6 +440,7 @@
 </main>
 
 <footer class="site-footer">
+  <p id="footer-badge" class="footer-badge" hidden></p>
   <p id="footer-text">演示站使用合成数据和离线大模型替身；生产部署在各平台云内（方案 §9.1）</p>
 </footer>
 
