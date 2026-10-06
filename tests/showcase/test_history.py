@@ -86,6 +86,7 @@ def test_history_gives_a_believable_dashboard(seeded: Showcase, platform):
     assert d["loop"]["labels"] > 0 and d["loop"]["top_gaps"]
     metrics = d["platform_metrics"]
     assert metrics["metrics"] and all(m["improved"] for m in metrics["metrics"])
+    assert metrics["verdict"] == "improved"
     assert metrics["go_live"] == go_live_at(WORLD_NOW).date().isoformat()
 
 

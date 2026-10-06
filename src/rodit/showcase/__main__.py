@@ -116,6 +116,10 @@ def main(
             f"  · 工作台的回答用真实大模型（{getattr(llm, 'model', '')}）；路由、质检仍是离线替身",
             file=out,
         )
+    print(
+        "  · 买家图片是合成的占位图块，图片理解用合成数据的替身（演示站没有任何真实图片）",
+        file=out,
+    )
     print("  · 售后写操作调用的是模拟的平台接口，不会动任何真实订单", file=out)
     if not loopback:
         print(

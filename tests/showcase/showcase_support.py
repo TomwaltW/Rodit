@@ -47,10 +47,18 @@ class Showcase:
         self.responses.append(r.text)
         return r
 
-    def chat(self, platform: Platform | str, scenario: str, text: str | None = None) -> dict:
+    def chat(
+        self,
+        platform: Platform | str,
+        scenario: str,
+        text: str | None = None,
+        images: list[str] | None = None,
+    ) -> dict:
         body: dict[str, Any] = {"platform": str(platform), "scenario": scenario}
         if text is not None:
             body["text"] = text
+        if images is not None:
+            body["images"] = images
         r = self.post("/showcase/api/chat", body)
         assert r.status_code == 200, r.text
         return r.json()

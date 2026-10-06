@@ -491,6 +491,8 @@ def test_dashboard_shape(showcase: Showcase):
         "douyin_aftersale_review_h",
     ]
     assert all(m["improved"] for m in metrics)
+    assert d["platform_metrics"]["verdict"] == "improved"  # 商家报表同一个服务（§12.4）
+    assert all(len(m["weekly"]) == 8 for m in metrics)
     response = metrics[0]
     assert response["before"] > response["after"] and response["higher_is_better"] is False
 

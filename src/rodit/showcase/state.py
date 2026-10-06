@@ -6,8 +6,11 @@ PlatformDemo 是一个平台的演示：
 - 单元的时钟是 FakeClock：组装时停在演示世界的"现在"（启动时间取整到分钟），回放历史时拨到过去，
   之后每次请求先拨到真实的当前时间（只往前走），推荐记录、审计的时间和真实时间一致；
 - 同一个平台的请求串行处理（每个平台一把锁）：过程记录、按条数切审计都依赖这一点；
-- 买家消息按平台走真实的接入方式：淘宝、抖店是模式 B 插件事件（模拟适配器的原始格式），
-  拼多多是模式 C 独立话术助手（§8.1）。
+- 买家消息按平台走真实的接入方式：淘宝、抖店是模式 B 插件事件（模拟适配器的原始格式，买家图片
+  也按各平台的图片消息格式），拼多多是模式 C 独立话术助手（§8.1，只有文字）；
+- 组装好之后（回放历史之后）照生产的路径做两件事：复核人员给演示店铺开半自动
+  （rodit.app.rollout.set_semi_auto，门槛没过时强制开启并写明原因，留审计）；系统从平台指标接口
+  （合成数据）同步最近 8 周的客服考核数据（rodit.app.platform_metrics，数据看板的接入前后对比用）。
 
 ShowcaseHub 管三个平台：第一次用到某个平台时组装（各平台互不等待），重置时整个重建。
 """
@@ -18,14 +21,19 @@ import itertools
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import partial
 from typing import Any
 
+from rodit.adapters.base import PREFILL_ACCESS
 from rodit.aftersale import AFTERSALE_STATUS_LABELS, history, last_result, was_negotiated
+from rodit.aftersale.evidence_vision import SUMMARY_PREFIX
 from rodit.app.demo import build_demo_unit, taobao_event
 from rodit.app.offline import HeuristicQAJudge
+from rodit.app.platform_metrics import PlatformMetricsService, SyncResult
+from rodit.app.rollout import SemiAutoChange, SemiAutoGateNotPassed
 from rodit.app.service import AssistService
 from rodit.core.clock import CST, Clock, SystemClock
 from rodit.core.config import EngineConfig
@@ -54,10 +62,14 @@ from rodit.showcase.data import (
     AGENT_ID,
     OPERATOR,
     PROFILES,
+    REVIEWER,
+    SEMI_AUTO_INTENTS,
+    SEMI_AUTO_NOTE,
     SHOP_SETTINGS,
     build_world,
     raw_buyer_id,
 )
+from rodit.showcase.images import DEMO_IMAGE_REFS, IMAGE_PLATFORMS, NO_IMAGE_REASON, tile_view
 from rodit.showcase.labels import (
     AFTERSALE_RULE_TEXTS,
     REFUSE_REASON_CODES,
@@ -84,8 +96,12 @@ from rodit.tools.logistics import STATUS_LABELS as LOGISTICS_STATUS_LABELS
 
 logger = logging.getLogger(__name__)
 
-BUYER = "BUYER"
-"""工作台里各场景的买家（合成；订单 o_1002 等都是这位买家的）。"""
+IMAGE_PLACEHOLDER = "[图片]"
+"""淘宝图片消息里平台放的占位文字（接入层不当作买家说的话）。"""
+
+CONSECUTIVE_GAP_MS = 200
+"""淘宝一次发几张图（每张一条消息）时，相邻两条的发送时间间隔：远小于合并连发的窗口（§5.3），
+先发的时间在前，合并后图片的顺序和买家发的一样。"""
 
 AFTERSALE_WINDOW_DAYS = 7
 """售后审核页列出最近几天申请的售后单（更早的是 R7 用到的历史售后）。"""
@@ -206,6 +222,8 @@ class PlatformDemo:
                 )
         # 抖店演示店在合成数据里是影子模式（§13.4）：演示里切到智能辅助，推荐才看得见
         self._update_shop({"shadow_mode": False})
+        self.semi_auto = self._enable_semi_auto()
+        self.metrics_sync = self._sync_platform_metrics()
         self.build_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
             "演示单元 %s 组装完成：回放 %d 条历史消息，用时 %d ms",
@@ -220,6 +238,39 @@ class PlatformDemo:
         if self.unit.repos.knowledge.update_shop_config(self.shop_id, changes) is None:
             raise RuntimeError(f"演示店铺 {self.shop_id} 不在单元里")
 
+    def _enable_semi_auto(self) -> dict[Intent, SemiAutoChange]:
+        """复核人员给演示店铺开半自动（§5.6、§13.4；走 rodit.app.rollout.set_semi_auto，写审计）：
+        先按门槛开；门槛没过（合成历史每类每周只有几组推荐）时强制开启，并在审计里写明原因。"""
+        rollout = self.service.rollout
+        out: dict[Intent, SemiAutoChange] = {}
+        for intent in SEMI_AUTO_INTENTS:
+            try:
+                change = rollout.set_semi_auto(
+                    self.shop_id, intent, True, operator=REVIEWER, role="reviewer"
+                )
+            except SemiAutoGateNotPassed:
+                change = rollout.set_semi_auto(
+                    self.shop_id,
+                    intent,
+                    True,
+                    operator=REVIEWER,
+                    role="reviewer",
+                    force=True,
+                    note=SEMI_AUTO_NOTE,
+                )
+            out[intent] = change
+        return out
+
+    def _sync_platform_metrics(self) -> SyncResult | None:
+        """系统从平台指标接口同步最近 8 周的客服考核数据（§12.4；合成数据，操作人 system）。
+        单元没有指标接口或仓储时不同步（看板显示没有数据）。"""
+        if self.unit.metrics_source is None or self.unit.repos.platform_metrics is None:
+            return None
+        return self.metrics_service().sync(self.shop_id, actor="system")
+
+    def metrics_service(self) -> PlatformMetricsService:
+        return PlatformMetricsService(self.unit, self.service.processing)
+
     def tick(self) -> datetime:
         """把单元时钟拨到真实的当前时间（只往前走）。"""
         now = max(self.clock.now(), self._real_clock.now())
@@ -229,40 +280,73 @@ class PlatformDemo:
     def _msg_id(self, prefix: str) -> str:
         return f"{prefix}-{self.platform.value}-{next(self._seq):06d}"
 
-    def _send(
+    def _sends(
         self,
         conversation_id: str,
         text: str,
         *,
+        images: Sequence[str] = (),
         item_id: str | None,
         order_id: str | None,
         buyer: str,
-        msg_id: str,
-    ) -> EngineResult | None:
-        """按平台的接入方式交给 AssistService：模式 B 插件事件 / 模式 C 话术助手（§8.1）。"""
+        msg_prefix: str,
+    ) -> list[Callable[[], EngineResult | None]]:
+        """一条买家消息按平台的接入方式（§8.1）变成交给 AssistService 的调用：按顺序调用，最后一个
+        的结果就是这条消息的处理结果。
+
+        - 淘宝（模式 B 千牛插件事件）：文字是一条 text 消息；每张图片各是一条 image 消息
+          （pic_key），买家写的字作为最后一张图的附带文字，前几张是平台的占位文字"[图片]"。
+          同一时刻连发的几条由引擎合并成一轮处理（§5.3），前几条各自的推荐在最后一条到达时过期；
+        - 抖店（模式 B 飞鸽插件事件）：一条消息，图片在 content.images（只给 uri），文字在
+          content.text；图片消息的商品 / 订单取插件看到的当前会话（context）；
+        - 拼多多（模式 C 话术助手）：只有文字（发图片在 chat 里就拒绝了）。"""
         at = self.clock.now()
         if self.platform == Platform.TAOBAO:
-            raw = taobao_event(
-                text,
-                msg_id=msg_id,
-                session_id=conversation_id,
-                buyer=buyer,
-                item_id=item_id,
-                order_id=order_id,
-                seller_id=self.shop_id,
-                send_time_ms=int(at.timestamp() * 1000),
-            )
-            return self.service.handle_event("B", raw, expected_shop_id=self.shop_id)
+
+            def taobao(content: str, pic: str | None = None, earlier: int = 0) -> dict[str, Any]:
+                sent = at - timedelta(milliseconds=CONSECUTIVE_GAP_MS * earlier)
+                raw = taobao_event(
+                    content,
+                    msg_id=self._msg_id(msg_prefix),
+                    session_id=conversation_id,
+                    buyer=buyer,
+                    item_id=item_id,
+                    order_id=order_id,
+                    seller_id=self.shop_id,
+                    send_time_ms=int(sent.timestamp() * 1000),
+                )
+                if pic is not None:
+                    raw.update(msg_type="image", pic_key=pic)
+                return raw
+
+            if images:
+                last = len(images) - 1
+                raws = [
+                    taobao(IMAGE_PLACEHOLDER, ref, last - i) for i, ref in enumerate(images[:-1])
+                ]
+                raws.append(taobao(text or IMAGE_PLACEHOLDER, images[-1]))
+            else:
+                raws = [taobao(text)]
+            return [
+                partial(self.service.handle_event, "B", raw, expected_shop_id=self.shop_id)
+                for raw in raws
+            ]
         if self.platform == Platform.DOUYIN:
             content: dict[str, Any] = {"type": "text", "text": text}
+            context: dict[str, Any] = {}
+            if images:
+                content = {"type": "image", "text": text, "images": [{"uri": r} for r in images]}
+                card = context  # 图片消息不带卡片：用插件看到的当前商品 / 订单
+            else:
+                card = content
             if item_id:
-                content["product_id"] = item_id
+                card["product_id"] = item_id
             if order_id:
-                content["order_id"] = order_id
-            raw = {
+                card["order_id"] = order_id
+            raw: dict[str, Any] = {
                 "shop_id": self.shop_id,
                 "conversation_short_id": conversation_id,
-                "server_message_id": msg_id,
+                "server_message_id": self._msg_id(msg_prefix),
                 "sender": {
                     "role": "customer",
                     "uid": raw_buyer_id(self.platform, buyer),
@@ -273,25 +357,33 @@ class PlatformDemo:
                 "service_uid": AGENT_ID,
                 "source": "feige_plugin",
             }
-            return self.service.handle_event("B", raw, expected_shop_id=self.shop_id)
-        return self.service.ask_standalone(
-            shop_id=self.shop_id,
-            session_id=conversation_id,
-            question=text,
-            item_id=item_id,
-            agent_id=AGENT_ID,
-            request_id=msg_id,
-        )
+            if context:
+                raw["context"] = context
+            return [partial(self.service.handle_event, "B", raw, expected_shop_id=self.shop_id)]
+        if images:  # chat 已经挡掉了；这里再兜一次，不把图片悄悄丢掉
+            raise Invalid(NO_IMAGE_REASON)
+        return [
+            partial(
+                self.service.ask_standalone,
+                shop_id=self.shop_id,
+                session_id=conversation_id,
+                question=text,
+                item_id=item_id,
+                agent_id=AGENT_ID,
+                request_id=self._msg_id(msg_prefix),
+            )
+        ]
 
     def _send_history(self, conversation_id: str, msg: HistoryMessage) -> EngineResult | None:
-        return self._send(
+        [send] = self._sends(
             conversation_id,
             msg.text,
             item_id=msg.item_id,
             order_id=msg.order_id,
             buyer=msg.buyer,
-            msg_id=self._msg_id("hist"),
+            msg_prefix="hist",
         )
+        return send()
 
     def _apply_history(self, fb: Feedback) -> None:
         self._feedback(fb.suggestion_id, fb.action, fb.text, fb.reason, fb.true_intent)
@@ -390,6 +482,7 @@ class PlatformDemo:
             "title": s.title,
             "section": s.section,
             "text": s.text_for(self.platform),
+            "images": [tile_view(r) for r in s.images],
             "intent": s.intent.value,
             "intent_label": intent_label(s.intent),
             "expect": s.expect_for(self.platform),
@@ -399,14 +492,27 @@ class PlatformDemo:
             "latest": conv.latest if conv else None,
         }
 
-    def chat(self, scenario_id: str, text: str | None = None) -> dict[str, Any]:
-        """买家在 scenario_id 这个会话里说一句话（text 为空时说场景预设的话），返回处理结果
-        和过程。"""
+    def chat(
+        self,
+        scenario_id: str,
+        text: str | None = None,
+        images: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """买家在 scenario_id 这个会话里发一条消息，返回处理结果和过程。text、images 都为空时发
+        场景预设的话和图片；给了任何一个就只发给的（只发图片、不带文字也可以）。图片只能是固定的
+        合成标识，只有模式 B 的平台能发（拼多多模式 C 拒绝，§8.1）。"""
         scenario = get_scenario(self.platform, scenario_id)
         if scenario is None:
             raise NotFound(f"{self.profile.workbench}没有这个演示会话：{scenario_id}")
-        text = (text if text is not None else scenario.text_for(self.platform)).strip()
-        if not text:
+        if text is None and images is None:
+            text, images = scenario.text_for(self.platform), scenario.images
+        text = (text or "").strip()
+        refs = list(images or ())
+        if refs and self.platform not in IMAGE_PLATFORMS:
+            raise Invalid(NO_IMAGE_REASON)
+        if any(r not in DEMO_IMAGE_REFS for r in refs) or len(set(refs)) != len(refs):
+            raise Invalid("只能发演示用的合成图片，同一张不能重复")
+        if not text and not refs:
             raise Invalid("买家的话不能为空")
         with self.lock:
             now = self.tick()
@@ -414,20 +520,23 @@ class PlatformDemo:
             if conv is None:
                 conv = ConversationState(scenario, f"sc-{scenario.id}")
                 self.conversations[scenario.id] = conv
+            sends = self._sends(
+                conv.conversation_id,
+                text,
+                images=refs,
+                item_id=scenario.item_id,
+                order_id=scenario.order_id,
+                buyer=scenario.buyer,
+                msg_prefix="live",
+            )
+            for send in sends[:-1]:
+                send()  # 淘宝的多张图片：前几张各是一条图片消息，和最后一条合并成一轮（见 _sends）
             audit = self.unit.repos.audit
             decisions_before = len(audit.list_decisions(self.shop_id))
             events_before = len(audit.list_events(self.shop_id))
             scripted_before = self.llm.scripted
-            msg_id = self._msg_id("live")
             with self.recorder.recording() as recording:
-                result = self._send(
-                    conv.conversation_id,
-                    text,
-                    item_id=scenario.item_id,
-                    order_id=scenario.order_id,
-                    buyer=BUYER,
-                    msg_id=msg_id,
-                )
+                result = sends[-1]()
             if result is None:
                 raise Conflict("这条消息没有被处理（重复消息）")
             note = SIMULATED_NOTE if self.llm.scripted > scripted_before else None
@@ -440,7 +549,12 @@ class PlatformDemo:
                 events=audit.list_events(self.shop_id)[events_before:],
                 simulated_note=note,
             )
-            buyer_bubble = {"role": "buyer", "text": mask_pii(text), "at": now.isoformat()}
+            buyer_bubble = {
+                "role": "buyer",
+                "text": mask_pii(text) if text else "",
+                "images": [tile_view(r) for r in refs],
+                "at": now.isoformat(),
+            }
             view = {
                 "scenario": scenario.id,
                 "message": buyer_bubble,
@@ -451,6 +565,16 @@ class PlatformDemo:
             conv.latest = view
             return view
 
+    def _input_prefill(self, conversation_id: str) -> int | None:
+        """模式 B 插件这一刻填进客服输入框的推荐编号（适配器的 sidebar_payload.input_prefill，
+        §5.6 半自动）；模式 C 没有平台输入框，返回 None。"""
+        if self.profile.access not in PREFILL_ACCESS:
+            return None
+        adapter = self.unit.adapters.get(self.platform, self.profile.access)
+        payload = adapter.sidebar_payload(self.shop_id, conversation_id)
+        prefill = payload.input_prefill if payload is not None else None
+        return prefill.suggestion_id if prefill is not None else None
+
     def _result_view(self, result: EngineResult) -> dict[str, Any]:
         route = result.route
         return {
@@ -458,6 +582,10 @@ class PlatformDemo:
             "intent": route.intent.value if route else None,
             "intent_label": intent_label(route.intent) if route else None,
             "suggestions": [card_view(c) for c in result.suggestions],
+            # 半自动（§5.6）：模式 B 插件把带 prefill 的那条填进客服输入框（input）；
+            # 模式 C 没有平台输入框，只标"可直接发送"（copy）
+            "prefill_mode": "input" if self.profile.access in PREFILL_ACCESS else "copy",
+            "input_prefill": self._input_prefill(result.conversation_id),
             "alerts": list(result.alerts),
             "no_suggestion_reason": result.no_suggestion_reason,
             "missing_knowledge": [
@@ -598,6 +726,8 @@ class PlatformDemo:
                 None,
             )
         result = last_result(review)
+        # R5 的凭证图片理解（§15 Phase 3）接在理由后面（aftersale.evidence_vision）：页面上单独显示
+        reason_main, sep, vision_summary = (review.reason or "").partition("；" + SUMMARY_PREFIX)
         return {
             "aftersale_id": review.aftersale_id,
             "order_id": info.order_id if info else None,
@@ -609,6 +739,7 @@ class PlatformDemo:
             "amount": str(info.amount) if info else None,
             "created_at": info.created_at.isoformat() if info else None,
             "evidence_count": info.evidence_count if info else 0,
+            "evidence_images": [tile_view(r) for r in info.evidence_images] if info else [],
             "buyer_note": mask_pii(info.note) if info and info.note else None,
             "platform_status": review.platform_status.value,
             "platform_status_label": AFTERSALE_STATUS_LABELS[review.platform_status],
@@ -624,6 +755,8 @@ class PlatformDemo:
                 if review.suggestion
                 else None,
                 "reason": review.reason,
+                "reason_main": reason_main if sep else review.reason,
+                "vision_summary": vision_summary if sep else None,
                 "requires_manager": review.requires_manager,
                 "risk_flags": list(review.risk_flags),
                 "confirmed_by": review.confirmed_by,

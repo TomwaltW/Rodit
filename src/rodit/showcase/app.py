@@ -5,8 +5,8 @@
   （rodit.api.web.SECURITY_HEADERS：严格 CSP，只允许同源脚本、样式和请求，不允许内联脚本、
   内联样式、被别的页面嵌入）；页面不引用任何外部地址（CDN、字体），平台云内网也能打开；
 - 演示站没有登录：所有数据都是合成的，没有令牌、没有真实店铺；
-- 接口的输入都按 showcase.schemas 校验（不认识的字段拒绝，文字最多 500 字，请求体最大 16 KiB，
-  不带 Content-Length 的分块上传拒绝）；
+- 接口的输入都按 showcase.schemas 校验（不认识的字段拒绝，文字最多 500 字，买家图片只收固定的
+  合成标识、最多 3 张，请求体最大 16 KiB，不带 Content-Length 的分块上传拒绝）；
   不认识的平台返回 404，输入不合法返回 422，操作和当前状态冲突（如推荐已经处理过、售后单状态
   变了）返回 409，错误都是 {"error": 代码, "message": 中文说明}；
 - 返回的数据里没有买家标识（buyer_ref）、买家昵称：工作台的买家只按场景称呼。
@@ -37,12 +37,19 @@ from rodit.core.pii import (
 from rodit.feedback import REJECT_REASON_LABELS
 from rodit.showcase.dashboard import SYNTHETIC_LABEL, dashboard, overview
 from rodit.showcase.data import PROFILES
+from rodit.showcase.images import (
+    IMAGE_PLATFORMS,
+    MAX_CHAT_IMAGES,
+    NO_IMAGE_REASON,
+    tiles_config,
+)
 from rodit.showcase.labels import (
     AFTERSALE_RULE_TEXTS,
     E2E_TARGET_MS,
     REVIEW_STATE_LABELS,
     STATE_STRIP,
 )
+from rodit.showcase.rollout import rollout_view
 from rodit.showcase.schemas import (
     ID_PATTERN,
     MAX_BODY_BYTES,
@@ -103,6 +110,9 @@ def page_config(hub: ShowcaseHub) -> dict[str, Any]:
         "default_platform": hub.default_platform.value,
         "offline": hub.offline,
         "max_text_chars": MAX_TEXT_CHARS,
+        "max_chat_images": MAX_CHAT_IMAGES,
+        "images": tiles_config(),
+        "no_image_reason": NO_IMAGE_REASON,
         "e2e_target_ms": E2E_TARGET_MS,
         "synthetic_label": SYNTHETIC_LABEL,
         "footer": FOOTER_TEXT,
@@ -116,6 +126,7 @@ def page_config(hub: ShowcaseHub) -> dict[str, Any]:
                 "access": PROFILES[p].access,
                 "access_label": PROFILES[p].access_label,
                 "accent": PROFILES[p].accent,
+                "can_send_images": p in IMAGE_PLATFORMS,
             }
             for p in Platform
         ],
@@ -187,17 +198,21 @@ def build_api_router(hub: ShowcaseHub) -> APIRouter:
     @router.get("/scenarios")
     def get_scenarios(platform: str = platform_query) -> dict[str, Any]:
         demo = demo_for(platform)
+        can_send_images = demo.platform in IMAGE_PLATFORMS
         return {
             "platform": demo.platform.value,
             "access": demo.profile.access,
             "access_label": demo.profile.access_label,
             "shop_name": demo.profile.shop_name,
+            "can_send_images": can_send_images,
+            "no_image_reason": None if can_send_images else NO_IMAGE_REASON,
             "scenarios": demo.scenario_list(),
+            "rollout": rollout_view(demo),
         }
 
     @router.post("/chat")
     def post_chat(body: ChatRequest) -> dict[str, Any]:
-        return demo_for(body.platform).chat(body.scenario, body.text)
+        return demo_for(body.platform).chat(body.scenario, body.text, body.images)
 
     @router.post("/feedback")
     def post_feedback(body: FeedbackRequest) -> dict[str, Any]:

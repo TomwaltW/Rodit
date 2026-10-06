@@ -8,8 +8,9 @@ from showcase_support import Showcase
 
 from rodit.core.enums import Platform
 from rodit.showcase.llm import SCRIPTED_PROMISE, SIMULATED_NOTE
-from rodit.showcase.scenarios import ORDER_PLATFORMS, SCENARIOS, scenarios_for
+from rodit.showcase.scenarios import IMAGE_PLATFORMS, ORDER_PLATFORMS, SCENARIOS, scenarios_for
 from rodit.showcase.trace import gap_label
+from rodit.testing.fixtures import RAW_BUYERS
 
 ALL = [(p, s.id) for p in Platform for s in scenarios_for(p)]
 
@@ -26,13 +27,17 @@ def _evidence_ids(view: dict) -> set[str]:
 
 def test_scenario_sets_per_platform():
     ids = {p: [s.id for s in scenarios_for(p)] for p in Platform}
-    assert len(SCENARIOS) == 11
+    assert len(SCENARIOS) == 15
     assert ids[Platform.TAOBAO] == ids[Platform.DOUYIN] == [s.id for s in SCENARIOS]
-    # 拼多多只能做模式 C（§8.1）：查不到订单，带订单卡片的物流、签收场景不出现
+    # 拼多多只能做模式 C（§8.1）：查不到订单、收不到图片，带订单卡片和图片的场景不出现
     assert "logistics" not in ids[Platform.PDD] and "not_received" not in ids[Platform.PDD]
-    assert ORDER_PLATFORMS == {Platform.TAOBAO, Platform.DOUYIN}
+    assert not [i for i in ids[Platform.PDD] if i.startswith("photo_")]
+    assert "ship_quick" in ids[Platform.PDD]
+    assert ORDER_PLATFORMS == IMAGE_PLATFORMS == {Platform.TAOBAO, Platform.DOUYIN}
     for s in SCENARIOS:
         assert s.section.startswith("§") and s.expect and s.title
+        assert s.text or s.images  # 只发图片的场景没有文字
+        assert s.buyer in RAW_BUYERS
 
 
 @pytest.mark.parametrize(("platform", "scenario"), ALL)
@@ -53,7 +58,7 @@ def test_every_scenario_runs_through_the_engine(showcase: Showcase, platform, sc
         "qa",
     ]
     assert latency["target_ms"] == 5000 and latency["within_target"] is True
-    assert view["message"]["text"]
+    assert view["message"]["text"] or view["message"]["images"]  # 只发图片时没有文字
 
 
 @pytest.mark.parametrize("platform", list(Platform))

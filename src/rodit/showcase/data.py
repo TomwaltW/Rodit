@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from rodit.core.enums import KnowledgeStatus, Platform, PolicyKey
+from rodit.core.enums import Intent, KnowledgeStatus, Platform, PolicyKey
 from rodit.core.pii import hash_buyer_id
 from rodit.testing.fixtures import (
     MANAGER,
@@ -100,8 +100,22 @@ SHOP_SETTINGS: dict[str, Any] = {
     "manager_ids": [MANAGER],
     "aftersale_amount_limit": "500",
     "suggestion_count": 2,
+    # 客服工作时间（附录 C 第 13 题），和店铺政策"客服在线时间 9:00–23:00"一致；
+    # 全自动开启后只在这之外生效（§15 Phase 3 先在非工作时间试行），演示店铺没开全自动
+    "service_hours": ["09:00-23:00"],
 }
 """三家演示店铺统一的店铺配置（经 KnowledgeRepository.update_shop_config 写入，§9.3）。"""
+
+REVIEWER = "qa_reviewer"
+"""开半自动的复核人员（合成账号；§13.4 半自动由复核人员按门槛开启）。"""
+
+SEMI_AUTO_INTENTS: tuple[Intent, ...] = (Intent.SHIPPING_POLICY, Intent.INVOICE_GIFT)
+"""演示店铺开了半自动的问题类型（§5.6）：店铺政策、FAQ 能答的低风险问题。"""
+
+SEMI_AUTO_NOTE = (
+    "演示站：为展示半自动直接开启；合成历史每类每周只有几组推荐，达不到 §13.4 的样本量和原样采纳率"
+)
+"""强制开启半自动时写进审计的原因（门槛没过时 rodit.app.rollout 要求写明）。"""
 
 # 复制到抖店 / 拼多多时，快递政策和 FAQ 回答里要跟着换的文字（和各店自己的政策一致）
 _FAQ_SWAPS: dict[Platform, tuple[tuple[str, str], ...]] = {
@@ -236,6 +250,9 @@ __all__ = [
     "AGENT_ID",
     "OPERATOR",
     "PROFILES",
+    "REVIEWER",
+    "SEMI_AUTO_INTENTS",
+    "SEMI_AUTO_NOTE",
     "SHOP_SETTINGS",
     "ShopProfile",
     "build_world",

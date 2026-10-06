@@ -1377,9 +1377,15 @@ main:focus {
 
 .composer {
   display: flex;
+  flex-direction: column;
   gap: 8px;
   padding: 12px;
   border-top: 1px solid var(--border);
+}
+
+.composer-row {
+  display: flex;
+  gap: 8px;
   align-items: flex-end;
 }
 
@@ -2695,6 +2701,564 @@ textarea:disabled {
   }
 }
 
+/* ================================================================ 上线节奏（§13.4、§15） */
+
+.rollout {
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.rollout-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.rollout-head::-webkit-details-marker {
+  display: none;
+}
+
+.rollout-head::after {
+  content: "展开 ▾";
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: var(--accent-text);
+}
+
+.rollout[open] > .rollout-head {
+  margin-bottom: 10px;
+}
+
+.rollout[open] > .rollout-head::after {
+  content: "收起 ▴";
+}
+
+.rollout-head h2 {
+  font-size: 0.98rem;
+}
+
+.rollout-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  counter-reset: none;
+}
+
+.rollout-step {
+  position: relative;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 0.83rem;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+}
+
+.rollout-step + .rollout-step::before {
+  content: "→";
+  position: absolute;
+  left: -10px;
+  top: 12px;
+  width: 10px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.rollout-step.is-current {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.rollout-step.is-partial {
+  background: var(--info-bg);
+  border-color: color-mix(in srgb, var(--info) 30%, var(--border));
+}
+
+.rollout-step.is-unavailable {
+  opacity: 0.72;
+  border-style: dashed;
+}
+
+.rollout-step-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.rollout-step-head strong {
+  font-size: 0.92rem;
+}
+
+.rollout-no {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--surface-3);
+  color: var(--fg-2);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.rollout-step.is-current .rollout-no {
+  background: var(--accent-strong);
+  color: #ffffff;
+}
+
+.rollout-step.is-done .rollout-no {
+  background: var(--ok);
+  color: var(--surface);
+}
+
+.rollout-text {
+  color: var(--fg-2);
+}
+
+.rollout-detail {
+  color: var(--fg);
+}
+
+.rollout-forced {
+  color: var(--warn);
+}
+
+/* ================================================================ 合成图片的占位图块（§15 Phase 3） */
+
+.img-tile {
+  --tile: var(--muted);
+  --tile-bg: var(--surface-3);
+  position: relative;
+  display: inline-grid;
+  grid-template-rows: auto auto;
+  justify-items: center;
+  align-content: center;
+  gap: 4px;
+  width: 132px;
+  min-height: 96px;
+  padding: 10px 8px;
+  border-radius: 10px;
+  border: 1px dashed color-mix(in srgb, var(--tile) 55%, transparent);
+  background: linear-gradient(135deg, var(--tile-bg), var(--surface));
+  color: var(--tile);
+  text-align: center;
+  line-height: 1.35;
+  vertical-align: top;
+}
+
+.img-tile::after {
+  content: "合成";
+  position: absolute;
+  right: 6px;
+  top: 5px;
+  font-size: 0.62rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.tile-icon {
+  width: 30px;
+  height: 30px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.img-tile-title {
+  font-size: 0.8rem;
+  font-weight: 650;
+  color: var(--fg);
+}
+
+.img-tile-caption {
+  font-size: 0.7rem;
+  color: var(--fg-2);
+}
+
+.img-tile-sm {
+  width: 84px;
+  min-height: 64px;
+  padding: 8px 4px 6px;
+  gap: 2px;
+}
+
+.img-tile-sm .tile-icon {
+  width: 22px;
+  height: 22px;
+}
+
+.img-tile-sm .img-tile-title {
+  font-size: 0.7rem;
+}
+
+.img-tile-sm::after {
+  display: none;
+}
+
+.img-damage {
+  --tile: var(--danger);
+  --tile-bg: var(--danger-bg);
+}
+
+.img-size {
+  --tile: var(--info);
+  --tile-bg: var(--info-bg);
+}
+
+.img-wrong {
+  --tile: var(--warn);
+  --tile-bg: var(--warn-bg);
+}
+
+.img-logistics {
+  --tile: var(--ok);
+  --tile-bg: var(--ok-bg);
+}
+
+.img-product {
+  --tile: var(--accent-text);
+  --tile-bg: var(--accent-soft);
+}
+
+.img-blur .tile-icon {
+  filter: blur(1.2px);
+}
+
+.img-evidence {
+  --tile: var(--fg-2);
+  --tile-bg: var(--surface-2);
+}
+
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.msg-agent .msg-images {
+  justify-content: flex-end;
+}
+
+/* 输入框：发图片 */
+
+.composer-image-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.image-picker {
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  animation: msg-in 0.18s ease both;
+}
+
+.picker-head {
+  font-size: 0.82rem;
+  margin-bottom: 8px;
+}
+
+.picker-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 8px;
+}
+
+.picker-tile {
+  display: grid;
+  gap: 4px;
+  justify-items: stretch;
+  padding: 4px;
+  border: 2px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.picker-tile .img-tile {
+  width: 100%;
+}
+
+.picker-tile:hover {
+  background: var(--surface);
+}
+
+.picker-tile[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.picker-check {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.picker-tile[aria-pressed="true"] .picker-check {
+  color: var(--accent-text);
+  font-weight: 700;
+}
+
+.composer-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pending-image {
+  position: relative;
+  display: inline-flex;
+}
+
+.pending-remove {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.composer-note {
+  font-size: 0.8rem;
+  color: var(--muted);
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.alert-image {
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.alert-image::before {
+  content: "图";
+  background: var(--info);
+  font-size: 0.66rem;
+}
+
+/* 半自动（§5.6）：已填进客服输入框 */
+
+.sg-card.is-prefill[data-status="shown"] {
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+  border-left-color: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 14%, transparent);
+}
+
+.prefill-banner {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--ok-bg);
+}
+
+.badge-prefill {
+  justify-self: start;
+  background: var(--ok);
+  color: var(--surface);
+}
+
+.prefill-hint {
+  font-size: 0.78rem;
+  color: var(--fg-2);
+}
+
+/* 过程面板：图片理解 */
+
+.trace-images {
+  margin-bottom: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.trace-images h4 {
+  margin-bottom: 0;
+}
+
+.finding-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.finding-body {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.finding-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.finding-summary {
+  color: var(--fg);
+}
+
+.finding-ocr {
+  font-size: 0.83rem;
+}
+
+.finding-ocr-text {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  margin-right: 4px;
+}
+
+.finding-desc code {
+  display: inline;
+  white-space: normal;
+  line-height: 1.7;
+}
+
+.finding-alert {
+  color: var(--fg-2);
+}
+
+/* 售后：凭证的图片理解 */
+
+.as-vision {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--info) 30%, var(--border));
+  background: var(--info-bg);
+  font-size: 0.86rem;
+}
+
+.as-vision-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.as-vision-tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.as-vision-text {
+  font-weight: 600;
+  color: var(--fg);
+}
+
+/* 看板：平台指标的总体结论和按周序列 */
+
+.verdict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin-bottom: 12px;
+}
+
+.verdict .badge {
+  font-size: 0.82rem;
+  padding: 3px 10px;
+}
+
+.delta-flat {
+  background: var(--surface-3);
+  color: var(--fg-2);
+}
+
+.weekly-wrap {
+  display: grid;
+  gap: 2px;
+}
+
+.weekly-bars {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.weekly-bars .wbar {
+  fill: var(--series);
+  cursor: default;
+}
+
+.weekly-bars .wbar.is-before {
+  fill: var(--series-muted);
+}
+
+.weekly-bars .wbar:hover,
+.weekly-bars .wbar:focus-visible {
+  opacity: 0.8;
+  outline: none;
+  stroke: var(--focus);
+  stroke-width: 2;
+}
+
+.weekly-bars .axis-line {
+  stroke: var(--axis);
+  stroke-width: 1;
+}
+
+.weekly-bars .axis-text {
+  fill: var(--muted);
+  font-size: 11px;
+  font-family: var(--font);
+}
+
+.weekly-bars .golive-line {
+  stroke: var(--fg-2);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.weekly-bars .golive-text {
+  fill: var(--fg-2);
+  font-size: 11px;
+  font-family: var(--font);
+}
+
 /* ================================================================ 响应式 */
 
 @media (max-width: 1240px) {
@@ -2727,6 +3291,12 @@ textarea:disabled {
 @media (max-width: 1000px) {
   .workbench {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .rollout-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .rollout-step + .rollout-step::before {
+    display: none;
   }
   .wb-list {
     grid-column: 1 / -1;
@@ -2853,6 +3423,21 @@ textarea:disabled {
     width: 36px;
     height: 36px;
   }
+  .rollout-steps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .composer-image-btn span {
+    display: none;
+  }
+  .img-tile {
+    width: 112px;
+  }
+  .picker-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .finding-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2872,5 +3457,8 @@ textarea:disabled {
   .meter-fill,
   .latency-seg {
     background: CanvasText;
+  }
+  .weekly-bars .wbar {
+    fill: CanvasText;
   }
 }

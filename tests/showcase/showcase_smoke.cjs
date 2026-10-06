@@ -107,7 +107,7 @@ async function main() {
     // ---------------------------------------------------------------- 工作台：尺码咨询 → 推荐 + 过程
     await page.getByRole('link', { name: '进入智能辅助工作台' }).click();
     await page.locator('#page-workbench').waitFor();
-    check((await page.locator('#mode-label').textContent()).includes('千牛'), '模式 B 千牛');
+    await page.locator('#mode-label').filter({ hasText: '千牛' }).waitFor(); // 等 /scenarios 返回（第一次要组装单元）
     await page.locator('.conv-btn[data-scenario="size"]').click();
     const card = page.locator('.sg-card').first();
     await card.waitFor();
@@ -171,6 +171,57 @@ async function main() {
     check((await next.locator('textarea').inputValue()).includes('L'), '第二轮推荐 L 码');
     steps.push('typing');
 
+    // ---------------------------------------------------------------- 半自动 + 上线节奏
+    check(!(await page.locator('#rollout').isHidden()), '上线节奏');
+    check((await page.locator('#rollout .rollout-step').count()) === 4, '上线节奏四步');
+    check((await page.locator('#rollout .rollout-step[data-step="assist"]').getAttribute('aria-current')) === 'step', '当前是智能辅助');
+    const rolloutText = await page.locator('#rollout').textContent();
+    check(rolloutText.includes('发货与快递') && rolloutText.includes('强制开启'), `已开半自动的类型：${rolloutText}`);
+    check(rolloutText.includes('09:00-23:00') && rolloutText.includes('工作时间以外试行'), '全自动先在非工作时间试行');
+    await page.locator('.conv-btn[data-scenario="ship_quick"]').click();
+    const quick = page.locator('.sg-card[data-prefill="true"]').first();
+    await quick.waitFor();
+    check((await quick.locator('.badge-prefill').textContent()) === '半自动：已填入输入框，按发送即可', '半自动徽标');
+    check((await quick.locator('.prefill-banner').getAttribute('data-prefill')) === 'input', '填进输入框');
+    await shot(page, 'workbench-prefill');
+    await quick.locator('button[data-action="sent"]').click();
+    await page.locator('.msg-agent .bubble').filter({ hasText: '48 小时' }).waitFor();
+    check((await page.locator('.sg-card .sg-done').first().textContent()).includes('已原样发送'), '半自动仍由客服发送');
+    steps.push('prefill');
+
+    // ---------------------------------------------------------------- 买家图片（§15 Phase 3）
+    await page.locator('.conv-btn[data-scenario="photo_damage"]').click();
+    await page.locator('.msg-buyer .img-tile[data-ref="img_buyer_damage_1"]').waitFor();
+    const photo = page.locator('.sg-card').first();
+    await photo.waitFor();
+    check((await photo.locator('textarea').inputValue()).includes('您发来的照片我们看到了'), '照片模板');
+    check((await page.locator('#ai-alerts .alert-image').count()) === 1, '图片摘要提醒');
+    await page.locator('#trace .trace-images').waitFor();
+    const imagesText = await page.locator('#trace .trace-images').textContent();
+    check(imagesText.includes('破损') && imagesText.includes('93%') && imagesText.includes('【买家发来图片：破损'), `识别结果：${imagesText}`);
+    await shot(page, 'workbench-image');
+    await page.locator('.conv-btn[data-scenario="photo_logistics"]').click();
+    await page.locator('#trace .finding-ocr-text').waitFor();
+    check((await page.locator('#trace .finding-ocr-text').textContent()).includes('[手机号]'), '图中文字已打码');
+    check(!(await page.locator('#page-workbench').textContent()).includes('13812345678'), '页面上没有手机号原文');
+    // 自己选图发：在问面料和发货的会话里（商品卡片是那条连衣裙），只发一张身高体重截图
+    await page.locator('.conv-btn[data-scenario="ship_time"]').click();
+    await page.locator('.msg-buyer .bubble').filter({ hasText: '多久能发货' }).waitFor();
+    await page.locator('#composer-image').click();
+    await page.locator('#image-picker').waitFor();
+    check((await page.locator('#image-picker .picker-tile').count()) === 6, '可选的合成图片');
+    await page.locator('.picker-tile[data-ref="img_buyer_size_1"]').click();
+    check((await page.locator('.picker-tile[data-ref="img_buyer_size_1"]').getAttribute('aria-pressed')) === 'true', '选中图片');
+    await page.locator('#composer-images .img-tile[data-ref="img_buyer_size_1"]').waitFor();
+    await page.locator('#composer-send').click();
+    await page.locator('.msg-buyer .img-tile[data-ref="img_buyer_size_1"]').waitFor();
+    const sized = page.locator('.sg-card[data-status="shown"]').first();
+    await sized.waitFor();
+    check((await sized.locator('textarea').inputValue()).includes('M'), '截图里的身高体重 → M 码');
+    check((await page.locator('#composer-images .img-tile').count()) === 0, '发完清空待发图片');
+    check(await page.locator('#image-picker').isHidden(), '发完收起选择框');
+    steps.push('image');
+
     // ---------------------------------------------------------------- 售后审核：确认 → 重读 + 幂等
     await page.getByRole('navigation', { name: '主导航' }).getByRole('link', { name: '售后审核助手' }).click();
     const r2 = page.locator('.as-card[data-id="as_2001"]');
@@ -196,6 +247,12 @@ async function main() {
     await dialog.waitFor();
     await page.locator('#dialog-cancel').click();
     check((await r3.locator('.as-result').count()) === 0, '取消就不执行');
+    // R5 质量问题单：凭证图片理解的摘要（只是参考）
+    const vision = page.locator('.as-card[data-id="as_2009"] .as-vision');
+    check((await vision.textContent()).includes('3 张凭证中 2 张显示破损'), '凭证图片理解');
+    check((await vision.textContent()).includes('凭证图片 3 张'), '凭证张数');
+    check((await vision.locator('.img-tile').count()) === 3, '凭证占位图块');
+    check((await page.locator('#aftersale-desk-note').textContent()).includes('/aftersale'), '生产工作台说明');
     await shot(page, 'aftersale');
     steps.push('aftersale');
 
@@ -207,6 +264,10 @@ async function main() {
     check((await page.locator('#chart-intents .hbar').count()) >= 8, '问题分布');
     check((await page.locator('#chart-metrics .metric').count()) >= 1, '平台指标');
     check((await page.locator('#chart-metrics .delta-good').count()) >= 1, '接入后改善');
+    check((await page.locator('#chart-metrics .verdict').textContent()).includes('较接入前改善'), '总体结论');
+    check((await page.locator('#chart-metrics .weekly-bars .wbar').count()) === 8, '按周序列（前后各 4 周）');
+    await page.locator('#chart-metrics .weekly-bars .wbar.is-after').first().hover();
+    check((await page.locator('#chart-tip').textContent()).includes('接入后'), '按周的悬停提示');
     check((await page.locator('#page-dashboard').textContent()).includes('演示数据（合成）'), '合成数据标注');
     await page.locator('#chart-weekly .hit').first().hover();
     check(await page.locator('#chart-tip').isVisible(), '悬停提示');
@@ -218,7 +279,7 @@ async function main() {
     await page.locator('#mask-run').click();
     await page.locator('#mask-output mark').first().waitFor();
     const masked = await page.locator('#mask-output').textContent();
-    check(!masked.includes('13812345678') && masked.includes('[手机号]') && masked.includes('o_1002'), `打码：${masked}`);
+    check(!masked.includes('13912345678') && masked.includes('[手机号]') && masked.includes('o_1002'), `打码：${masked}`);
     check((await page.locator('.unit').count()) === 3, '三个平台单元');
     await shot(page, 'compliance');
     steps.push('compliance');
@@ -235,6 +296,11 @@ async function main() {
     await page.locator('.conv-btn[data-scenario="size"]').click();
     await page.locator('.sg-card').first().waitFor();
     check((await page.locator('.sg-card button[data-action="sent"]').first().textContent()) === '复制并标记已发送', '模式 C 按钮');
+    check(await page.locator('#composer-image').isDisabled(), '模式 C 不能发图片');
+    check((await page.locator('#composer-note').textContent()).includes('模式 C'), '说明为什么不能发图片');
+    check((await page.locator('.conv-btn[data-scenario="photo_damage"]').count()) === 0, '拼多多没有图片场景');
+    await page.locator('.conv-btn[data-scenario="invoice"]').click();
+    await page.locator('.sg-card[data-prefill="true"] .badge-prefill').filter({ hasText: '可直接发送' }).waitFor();
     steps.push('platform-switch');
 
     // 重置演示（只重置当前平台）
@@ -260,6 +326,12 @@ async function main() {
         await phone.locator('#trace-toggle').click();
         await phone.locator('#trace').waitFor();
         await shot(phone, 'phone-workbench');
+        await noHorizontalScroll(phone, '手机 工作台');
+        await phone.locator('.conv-btn[data-scenario="photo_size"]').click();
+        await phone.locator('#trace .trace-images').waitFor();
+        await phone.locator('#composer-image').click();
+        await phone.locator('#image-picker').waitFor();
+        await shot(phone, 'phone-workbench-image');
       }
       await noHorizontalScroll(phone, `手机 ${route}`);
     }
