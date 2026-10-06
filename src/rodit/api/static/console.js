@@ -1821,6 +1821,8 @@
         : null,
       currentGates(s).map((g) => (g.gate ? gateTable(g.gate, g.title) : null)),
       evidenceSection(s.evidence),
+      autoScheduleSection(s.auto_schedule),
+      semiAutoSection(s.semi_auto),
     ];
 
     const sh = s.shadow || {};
@@ -2080,6 +2082,192 @@
     setStatus(ui.status, '', '');
     $(titleId).focus();
     announce('门槛没过，没有切换');
+  }
+
+  // ---------------------------------------------------------------- 全自动生效时段（§15 Phase 3）、半自动（§5.6、§13.4）
+
+  const SCHEDULE_TEXT = { off_hours: '只在客服工作时间以外', always: '全天' };
+  const AUTO_GATE_TEXT = {
+    service_hours: '现在是客服工作时间，机器人接待的会话转给在岗客服',
+    no_service_hours: '店铺没填客服工作时间，不知道客服在不在，先不自动回复',
+    unknown_time: '不知道现在的时间，先不自动回复',
+  };
+  const SEMI_BLOCKED_TEXT = { high_risk: '高风险类型，不能开', not_answer: '不走推荐回答，不能开' };
+  const semiAuto = { message: null }; // 开关成功后，刷新上线状态时显示的结果
+
+  /** 全自动什么时候生效：只读（总开关和生效时段由我们评估后调整，工作时间由商家在设置页填）。 */
+  function autoScheduleSection(a) {
+    if (!a) return null;
+    const hours = Array.isArray(a.service_hours) ? a.service_hours : [];
+    let now = '没填客服工作时间';
+    if (a.in_service_hours === true) now = '客服工作时间内';
+    else if (a.in_service_hours === false) now = '客服工作时间外';
+    let auto = '没开（全自动要平台准入，由我们评估后开启）';
+    if (a.auto_reply_enabled) {
+      auto = a.auto_active_now
+        ? '生效：机器人接待的高置信度、低风险问题会自动回复'
+        : `暂停：${label(AUTO_GATE_TEXT, a.auto_gate)}`;
+    }
+    return [
+      h('h3', null, '全自动生效时段（§15 Phase 3：先在非工作时间试行）'),
+      h('dl', { className: 'stats', id: 'auto-schedule' }, [
+        statRow('全自动总开关', a.auto_reply_enabled ? '开' : '关'),
+        statRow('生效时段', label(SCHEDULE_TEXT, a.auto_reply_schedule)),
+        statRow(`客服工作时间（${a.timezone || '北京时间'}）`, hours.length ? hours.join('、') : '没填'),
+        statRow('现在', now),
+        statRow('全自动现在', auto),
+        statRow('下一次进出工作时间', a.next_switch_at ? fmtTime(a.next_switch_at) : '—'),
+      ]),
+      h('p', { className: 'hint' }, '客服工作时间由商家在「设置」页填写；全自动的开关和生效时段由我们评估后调整，这里只能查看。'),
+    ];
+  }
+
+  /** 门槛里每一周的原样采纳率和推荐组数（feedback.rollout.semi_auto_gate 的 period_N 条件）。 */
+  function gateWeeks(gate) {
+    const checks = gate && Array.isArray(gate.checks) ? gate.checks : [];
+    const weeks = checks.filter((c) => /^period_\d+\./.test(String(c.name)));
+    if (!weeks.length) return '还没有数据';
+    return weeks.map((c, i) => `第 ${i + 1} 周 ${pct(c.value)}（${c.detail || '—'}）`).join('；');
+  }
+
+  /** 半自动（按问题类型）：开了的类型、门槛；复核人员能开（门槛没过要强制并写原因），商家和复核人员能关。 */
+  function semiAutoSection(sa) {
+    if (!sa) return null;
+    const role = state.me ? state.me.role : null;
+    const canEnable = inGroup('reviewer', role);
+    const canDisable = inGroup('stage_shadow', role); // 关闭（安全方向）：商家、复核人员
+    const status = h('p', { className: 'status', role: 'status', tabindex: '-1', id: 'semi-auto-status' });
+    const panel = h('div', { className: 'entry-panel' });
+    const ui = { ctx: { busy: false }, status, panel, buttons: [] };
+    const intents = Array.isArray(sa.intents) ? sa.intents : [];
+    const shown = intents.filter((r) => r.allowed || r.enabled);
+    const blocked = intents.filter((r) => !r.allowed && !r.enabled);
+    const rows = shown.map((r) => semiAutoRow(r, ui, canEnable, canDisable));
+    const enabled = Array.isArray(sa.enabled) ? sa.enabled : [];
+    const nodes = [
+      h('h3', null, '半自动（§5.6：高置信度的推荐直接填进客服输入框，客服按发送即可）'),
+      h('p', { className: 'hint' }, [
+        `开启条件（§13.4）：该类型最近 ${num(sa.periods)} 个完整周每周至少 ${num(sa.min_groups)} 个推荐组、`,
+        `原样采纳率都 ≥ ${pct(sa.min_as_is)}；开了以后问题类型置信度 ≥ ${pct(sa.threshold)}、`,
+        '没有提醒和降级的推荐才填进输入框，仍由客服看过再发。',
+      ]),
+      h('p', { id: 'semi-auto-enabled' }, `已开半自动：${enabled.length ? enabled.map((i) => label(L.intents, i)).join('、') : '没有'}`),
+      table('各问题类型的半自动', ['问题类型', '状态', '门槛（原样采纳率）', '操作'], rows, true),
+      blocked.length
+        ? h('p', { className: 'hint' }, `不能开半自动：${blocked.map((r) => `${label(L.intents, r.intent)}（${label(SEMI_BLOCKED_TEXT, r.blocked_reason)}）`).join('、')}`)
+        : null,
+      !canEnable && !canDisable ? h('p', { className: 'muted' }, '半自动由复核人员按门槛开启，商家可以关闭。') : null,
+      !canEnable && canDisable ? h('p', { className: 'hint' }, '商家可以关闭某个类型的半自动；开启由复核人员确认门槛后操作。') : null,
+      panel,
+      status,
+    ];
+    if (semiAuto.message) {
+      setStatus(status, semiAuto.message, 'ok');
+      semiAuto.message = null;
+      window.setTimeout(() => status.focus(), 0);
+    }
+    return h('div', { className: 'semi-auto', id: 'semi-auto' }, nodes);
+  }
+
+  function semiAutoRow(r, ui, canEnable, canDisable) {
+    const name = label(L.intents, r.intent);
+    let current;
+    if (r.enabled && !r.allowed) current = h('span', { className: 'badge bad' }, '已开（不该开，请关闭）');
+    else current = h('span', { className: r.enabled ? 'badge ok' : 'badge' }, r.enabled ? '已开' : '没开');
+    let gate = label(SEMI_BLOCKED_TEXT, r.blocked_reason);
+    if (r.gate) {
+      gate = [
+        h('span', { className: r.gate.passed ? 'badge ok' : 'badge bad' }, r.gate.passed ? '达到' : '没达到'),
+        ' ',
+        gateWeeks(r.gate),
+      ];
+    }
+    let action = '—';
+    if (r.enabled && canDisable) {
+      const button = h('button', { type: 'button', className: 'secondary', 'aria-label': `关闭「${name}」的半自动` }, '关闭');
+      button.addEventListener('click', () => postSemiAuto({ intent: r.intent, enabled: false }, { ...ui, name, controls: ui.buttons }));
+      ui.buttons.push(button);
+      action = button;
+    } else if (!r.enabled && r.allowed && canEnable) {
+      const button = h('button', { type: 'button', 'aria-label': `开启「${name}」的半自动` }, '开启');
+      button.addEventListener('click', () => postSemiAuto({ intent: r.intent, enabled: true }, { ...ui, name, controls: ui.buttons }));
+      ui.buttons.push(button);
+      action = button;
+    }
+    return h('tr', { 'data-intent': r.intent }, [
+      h('th', { scope: 'row' }, name),
+      h('td', null, current),
+      h('td', { className: 'wrap' }, gate),
+      h('td', null, action),
+    ]);
+  }
+
+  async function postSemiAuto(body, ui) {
+    const me = state.me;
+    clearError();
+    await busy(ui.ctx, ui.controls, async () => {
+      try {
+        const change = await api('POST', shopPath('rollout/semi-auto'), body);
+        if (state.me !== me) return;
+        const what = change.enabled ? '开启' : '关闭';
+        semiAuto.message = change.changed
+          ? `已${what}「${ui.name}」的半自动${change.forced ? '（门槛没达到，强制开启，原因已记入审计）' : ''}。`
+          : `「${ui.name}」的半自动本来就是${change.enabled ? '开' : '关'}着的，没有改动。`;
+        announce(semiAuto.message);
+        await loadRollout(true);
+      } catch (err) {
+        if (state.me !== me) return;
+        if (err.status === 409 && err.code === 'gate_not_passed' && err.data && err.data.gate) {
+          showSemiAutoForce(err.data, body, ui);
+          return;
+        }
+        reportFailure(ui.status, '没有改：', err);
+      }
+    });
+  }
+
+  /** 开半自动的门槛没过（409）：显示门槛结果，复核人员可以写明原因后强制开启。 */
+  function showSemiAutoForce(data, body, ui) {
+    const titleId = uid('semi-fail');
+    const noteId = uid('semi-note');
+    const note = h('textarea', { id: noteId, rows: '2', maxlength: String(LIMITS.note) });
+    const force = h('button', { type: 'submit', className: 'danger' }, '强制开启');
+    const cancel = h('button', { type: 'button', className: 'secondary' }, '取消');
+    const close = () => {
+      ui.panel.replaceChildren();
+      const row = $('semi-auto') && $('semi-auto').querySelector(`tr[data-intent="${body.intent}"] button`);
+      if (row) row.focus();
+    };
+    cancel.addEventListener('click', close);
+    const form = h('form', { className: 'entry-form', novalidate: true }, [
+      field(noteId, `强制开启「${ui.name}」半自动的原因（必填，记入审计）`, note, '比如：原样采纳率接近门槛、已人工抽查过这类推荐。'),
+      h('div', { className: 'actions tight' }, [force, cancel]),
+    ]);
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const text = note.value.trim();
+      if (!text) {
+        setStatus(ui.status, '强制开启要写明原因。', 'error');
+        note.focus();
+        return;
+      }
+      postSemiAuto({ ...body, force: true, note: text }, { ...ui, controls: [...ui.buttons, force, cancel] });
+    });
+    form.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+      }
+    });
+    const box = h('div', { className: 'gate-failure', role: 'group', 'aria-labelledby': titleId }, [
+      h('p', { id: titleId, className: 'warnings-title', tabindex: '-1' }, `门槛没过，没有开启：${data.message || ''}`),
+      gateTable(data.gate, `半自动 · ${ui.name}`),
+      form,
+    ]);
+    ui.panel.replaceChildren(box);
+    setStatus(ui.status, '', '');
+    $(titleId).focus();
+    announce('门槛没过，没有开启半自动');
   }
 
   // ================================================================ 每周复核（§13.5，按 §13.2 打分）

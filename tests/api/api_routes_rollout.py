@@ -14,6 +14,13 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/v1/shops/{shop}/rollout/status", roles=ROLLOUT_READ),
     Route("GET", "/v1/shops/{shop}/rollout/shadow", roles=ROLLOUT_READ),
     Route("POST", "/v1/shops/{shop}/rollout/stage", {"stage": "shadow"}, STAGE),
+    # 关闭半自动：商家、复核人员；开启只有复核人员（路由内再判）
+    Route(
+        "POST",
+        "/v1/shops/{shop}/rollout/semi-auto",
+        {"intent": "shipping_policy", "enabled": False},
+        STAGE,
+    ),
     Route(
         "POST",
         "/v1/shops/{shop}/rollout/incidents",

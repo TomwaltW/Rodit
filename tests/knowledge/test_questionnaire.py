@@ -97,6 +97,7 @@ def test_apply_full_questionnaire():
         "banned_words": ["假一赔十", "全网最低", "最便宜"],
         "tone": "亲切",
         "salutation": "亲",
+        "service_hours": ["09:00-23:00"],  # 第 13 题看得懂：同时写进店铺配置（北京时间）
     }
     # 补丁能直接作为店铺覆盖项，生效配置里能看到
     shop = Shop(id="s_new", platform=Platform.TAOBAO, category="女装", config_overrides=patch)
@@ -127,7 +128,7 @@ def test_split_policy_answer(qid, answer, expected):
 def test_blank_and_partial_answers():
     entries, patch = apply_questionnaire("s_new", {7: "  ", 13: "9 点到 22 点"}, DEFAULT_NOW)
     assert [(e.key, e.value) for e in entries] == [("service_hours", "9 点到 22 点")]
-    assert patch == {}
+    assert patch == {"service_hours": ["09:00-22:00"]}
 
 
 def test_invalid_input():

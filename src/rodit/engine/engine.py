@@ -37,6 +37,10 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    - 店铺在 ShopConfig.disabled_intents 里关闭的问题类型，回答类路由（含分条）不推荐。
 6. 推荐卡片（engine.cards，§5.6）写 SuggestionRecord（SHOWN；影子模式 SHADOW），
    question_text = mask_pii(当前买家消息)，回填 SuggestionCard.suggestion_id；
+   半自动（engine.semi_auto，§5.6、§13.4）：智能辅助下第一张卡片满足条件时 prefill=True
+   （店铺开了这个类型的半自动、规则 6 的正常回答、置信度够、卡片为高、没有提醒和降级），
+   客服仍要按发送；记录写不进去（没有推荐编号）时去掉 prefill。SUGGEST 审计另加 prefill
+   （打了 prefill 的推荐编号，只在有时写）；
 7. 全自动（§5.6、§12.2、§12.3）：以下全部满足才出 auto_reply——
    ctx.mode == AUTO、ctx.config.auto_reply_enabled、route.auto_eligible、不是分条推荐、
    第一张卡片通过质检且置信度为高、卡片没有风险提示、结果没有提醒（含连续没听懂）、
@@ -44,6 +48,10 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
    auto_reply = 第一张卡片、文本前加 generation.auto_reply_prefix（AI 生成内容标识，
    整个系统只在这里加）。不满足时退回智能辅助（照常给推荐），并且 transfer_to_human=True——
    §5.7 全自动模式下质检不通过、依据不足、投诉等都要转人工，§12.2 全自动出故障由客服接管。
+   全自动生效时段（engine.modes，§15 Phase 3 先在非工作时间试行）：消息是 AUTO、店铺开了全自动，
+   但现在是客服工作时间（或没填工作时间）→ 生效模式是 ASSIST（路由也按智能辅助走），照常给推荐，
+   并且 transfer_to_human=True（机器人接待的会话交给在岗客服，§12.2），engine.result 另加可选键
+   auto_gate（拦下原因，engine.modes.RESULT_AUTO_GATE）。
    影子模式（§13.4）：mode=SHADOW，推荐只用于事后对比，app 层不得展示；不出 auto_reply、不转人工。
    影子记录每轮一套：乱序时重算最新一轮（run.late），这一轮（按最新买家消息的 msg_id）已经有
    SHADOW 记录就不再写第二套（事后对比不重复计数），结果照常返回（卡片没有 suggestion_id），
@@ -106,7 +114,8 @@ UNDERSTAND、ROUTE 各一条；RETRIEVE、GENERATE、QA 每次调用 / 每条分
 - "missing"     list[str]   同 EngineResult.missing_knowledge
 另有 "no_suggestion_reason"、"qa_checked"、"qa_reasons"、"transfer_to_human"；
 键的完整定义见 core.audit.ResultKey（常量 RESULT_DETAIL_KEYS，报表按同一份读）。
-超过时间预算时另加可选键 "budget_exceeded"（True，core.audit.OPTIONAL_RESULT_DETAIL_KEYS）。
+超过时间预算时另加可选键 "budget_exceeded"（True，core.audit.OPTIONAL_RESULT_DETAIL_KEYS）；
+全自动不在生效时段被拦下时另加可选键 "auto_gate"（engine.modes.RESULT_AUTO_GATE）。
 
 耗时（EngineResult.latency_ms，§12.1、§12.4）：键固定为 understand / route / retrieve / generate /
 qa / total / since_received（LATENCY_KEYS），毫秒整数，没跑的环节为 0。分条并行时同一环节取各条里
@@ -198,7 +207,9 @@ from rodit.engine.concurrency import (
     run_inline,
     run_ordered,
 )
-from rodit.engine.understanding import ConversationBuilder, ShopInactive, effective_mode
+from rodit.engine.modes import RESULT_AUTO_GATE, resolve_mode
+from rodit.engine.semi_auto import prefill_blocker
+from rodit.engine.understanding import ConversationBuilder, ShopInactive
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +350,8 @@ class _Run:
     mode: Mode = Mode.ASSIST
     # 消息是 AUTO、但店铺 / 配置读不出来、生效模式无从判断：按全自动兜底转人工（§12.2）
     auto_unverified: bool = False
+    # 消息是 AUTO、店铺开了全自动，但不在全自动生效时段（engine.modes）：退回智能辅助并转人工
+    auto_gate: str | None = None
     # 乱序：本条晚到，改为重新处理会话里最新的买家消息（run.msg 已换成那条），不出 auto_reply
     late: bool = False
     ctx: ConversationContext | None = None
@@ -478,7 +491,8 @@ class AssistEngine:
         if shop is not None:
             # 先定生效模式：后面任何一步失败，影子模式的结果也不能被展示
             try:
-                run.mode = effective_mode(msg.mode, self._builder.shop_config(shop))
+                decided = resolve_mode(msg.mode, self._builder.shop_config(shop), self._clock.now())
+                run.mode, run.auto_gate = decided.mode, decided.auto_gate
             except Exception as exc:  # noqa: BLE001 — 配置算不出来时会话理解会再失败一次
                 self._warn("shop_config", exc)
                 run.auto_unverified = msg.mode == Mode.AUTO
@@ -513,6 +527,7 @@ class AssistEngine:
         try:
             understanding = self._builder.build_with_notes(msg, shop=shop)
             ctx = understanding.context
+            run.auto_gate = understanding.auto_gate  # 和 ctx.mode 同一时刻判断的
             for code in understanding.degraded:
                 run.degrade(code)
                 run.context_notes.append(code)
@@ -570,7 +585,7 @@ class AssistEngine:
         units = self._run_units(run, ctx, units, plan)
         self._record_gaps(run, ctx, units)
 
-        scored = self._cards(run, units)
+        scored = self._semi_auto(run, ctx, route, plan, units, self._cards(run, units))
         cards = self._persist(
             run, ctx, [(c, d) for c, d, _ in scored], confidences=[x for _, _, x in scored]
         )
@@ -1090,18 +1105,20 @@ class AssistEngine:
             except Exception as exc:  # noqa: BLE001 — 记录失败也照常展示推荐
                 self._warn("suggestion", exc)
                 run.degrade(DEGRADED_STORAGE)
+                # 半自动：没有推荐编号，客服按发送后记不了反馈——不填进输入框
+                card = card.model_copy(update={"prefill": False})
             out.append((card, draft))
-        self._audit(
-            run,
-            AuditAction.SUGGEST,
-            {
-                "suggestion_ids": [c.suggestion_id for c, _ in out],
-                "count": len(out),
-                "status": str(status),
-                "intents": [str(c.intent) for c, _ in out],
-                "kinds": [str(c.kind) for c, _ in out],
-            },
-        )
+        detail: dict[str, Any] = {
+            "suggestion_ids": [c.suggestion_id for c, _ in out],
+            "count": len(out),
+            "status": str(status),
+            "intents": [str(c.intent) for c, _ in out],
+            "kinds": [str(c.kind) for c, _ in out],
+        }
+        prefilled = [c.suggestion_id for c, _ in out if c.prefill]
+        if prefilled:  # 可选键：半自动填进输入框的推荐（§5.6）
+            detail["prefill"] = prefilled
+        self._audit(run, AuditAction.SUGGEST, detail)
         return out
 
     def _shadow_turn_recorded(self, run: _Run) -> bool:
@@ -1115,6 +1132,41 @@ class AssistEngine:
             self._warn("shadow_check", exc)
             return False
         return any(r.msg_id == msg.msg_id for r in records)
+
+    # ------------------------------------------------------------ 半自动（§5.6、§13.4）
+
+    def _semi_auto(
+        self,
+        run: _Run,
+        ctx: ConversationContext,
+        route: RouteDecision,
+        plan: ActionPlan,
+        units: list[_Unit],
+        scored: list[tuple[SuggestionCard, Draft, float]],
+    ) -> list[tuple[SuggestionCard, Draft, float]]:
+        """第一张卡片满足半自动的条件（engine.semi_auto）时打上 prefill，最多一张。
+        分条推荐（每条一张卡片）不打。"""
+        if not scored or plan.per_part or len(units) != 1 or not units[0].passed:
+            return scored
+        unit = units[0]
+        card, draft, confidence = scored[0]
+        passed_draft, qa = unit.passed[0]
+        if passed_draft is not draft:  # 第一张卡片就是这一条第一份通过的草稿
+            return scored
+        blocker = prefill_blocker(
+            mode=ctx.mode,
+            config=ctx.config,
+            routing=self._config.routing,
+            route=route,
+            card=card,
+            draft=draft,
+            qa=qa,
+            alerts=[*run.alerts, *unit.alerts, *unit.bundle.alerts],
+            degraded=run.degraded,
+        )
+        if blocker is not None:
+            return scored
+        return [(card.model_copy(update={"prefill": True}), draft, confidence), *scored[1:]]
 
     # ------------------------------------------------------------ 全自动（§5.6、§12.2、§12.3）
 
@@ -1232,6 +1284,7 @@ class AssistEngine:
         transfer = not shadow and (
             (route is not None and route.action == RouteAction.TRANSFER_HUMAN)
             or (auto and auto_reply is None)
+            or run.auto_gate is not None  # 不在全自动生效时段：交给在岗客服（engine.modes）
         )
         ctx = run.ctx
         result = EngineResult(
@@ -1271,7 +1324,9 @@ class AssistEngine:
             msg_ids=[run.msg.msg_id],
             mode=run.mode,
             no_suggestion_reason=REASON_ENGINE,
-            transfer_to_human=run.mode == Mode.AUTO or run.auto_unverified,
+            transfer_to_human=(
+                run.mode == Mode.AUTO or run.auto_unverified or run.auto_gate is not None
+            ),
             degraded=list(run.degraded),
             latency_ms=run.latency_ms(now),
         )
@@ -1299,6 +1354,8 @@ class AssistEngine:
         detail = {str(k): v for k, v in detail.items()}
         if DEGRADED_BUDGET in result.degraded:  # 可选键：只在超过时间预算时写
             detail[RESULT_BUDGET_EXCEEDED] = True
+        if run.auto_gate is not None:  # 可选键：全自动不在生效时段，退回智能辅助（engine.modes）
+            detail[RESULT_AUTO_GATE] = run.auto_gate
         self._audit(run, AuditAction.RESULT, detail)
 
     # ------------------------------------------------------------ 留痕

@@ -448,7 +448,9 @@ def test_effective_config_layers(kit: Kit) -> None:
     [
         ({}, Mode.ASSIST, Mode.ASSIST),
         ({}, Mode.AUTO, Mode.ASSIST),  # 店铺没开全自动：不信任接入层
-        ({"auto_reply_enabled": True}, Mode.AUTO, Mode.AUTO),
+        ({"auto_reply_enabled": True, "auto_reply_schedule": "always"}, Mode.AUTO, Mode.AUTO),
+        # 默认只在客服工作时间以外全自动；没填工作时间就不自动（engine.modes）
+        ({"auto_reply_enabled": True}, Mode.AUTO, Mode.ASSIST),
         ({"auto_reply_enabled": True}, Mode.ASSIST, Mode.ASSIST),
         ({"auto_reply_enabled": True, "shadow_mode": True}, Mode.AUTO, Mode.SHADOW),
         ({}, Mode.SHADOW, Mode.ASSIST),

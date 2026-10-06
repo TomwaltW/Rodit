@@ -20,6 +20,15 @@
   （feedback.compliance，代理指标，单独一条）：扫描命中是候选，复核人员逐条确认或标记误报
   （review_compliance，写 compliance.reviewed：推荐 / 消息 ID、结论、规则名、备注，不记文字），
   确认的违规才算不通过、没确认的列为 unchecked。查看上线状态只读这些，不写任何东西。
+- 半自动（§5.6、§13.4 "该类型原样采纳率 ≥ 90%"）：上线状态里带各类型的门槛和开了的类型；
+  set_semi_auto 按类型开关——开启只给复核人员（接口层按角色判断），要过门槛，没过时只能强制并写明
+  原因；高风险类型（routing.high_risk、投诉）和不走规则 6 的类型（站外交易、其他）永远不能开；
+  关闭商家和复核人员都可以，随时可以（安全方向）。只写 semi_auto_intents 一个键（仓储里原子地
+  读改写，同一进程里串行），写 shop.rollout_semi_auto 审计（谁、类型、门槛摘要、是否强制、
+  原因），审计写不进去就撤回。
+- 全自动生效时段（§15 Phase 3 先在非工作时间试行）：上线状态里带客服工作时间、生效时段、现在是不是
+  工作时间、全自动现在生不生效（规则同 engine.modes）、下一次进出工作时间的时刻。只读：
+  全自动总开关和生效时段都不能在这里改。
 写操作开始前先确认店铺还在（取消订购删掉店铺后不会把样本、审计、配置写回来）。
 """
 
@@ -44,11 +53,14 @@ from rodit.core.models import (
     QualityReview,
     QualityScores,
     Shop,
+    ShopConfig,
     SuggestionRecord,
     strip_control_chars,
 )
 from rodit.core.ports import AuditLog
+from rodit.core.schedule import within_service_hours
 from rodit.decision.classifier import ClassifierProvider
+from rodit.engine.modes import auto_gate
 from rodit.eval.fingerprint import current_fingerprint, test_set_evidence
 from rodit.feedback.acceptance import ShopAcceptanceInput, message_latencies
 from rodit.feedback.compliance import (
@@ -88,9 +100,13 @@ from rodit.feedback.rollout import (
     ASSIST_PERIODS,
     AUTO_PERIODS,
     MAX_INCIDENT_COUNT,
+    SEMI_AUTO_BLOCKED_TEXT,
+    SEMI_AUTO_CHANGED,
+    SEMI_AUTO_PERIODS,
     SHADOW_CONTEXT_MESSAGES,
     STAGE_LABELS,
     SWITCHABLE_STAGES,
+    AutoSchedule,
     IncidentEntry,
     IncidentKind,
     RolloutEvidence,
@@ -101,14 +117,18 @@ from rodit.feedback.rollout import (
     gate_summary,
     incident_detail,
     incident_total,
+    next_service_switch,
     parse_incidents,
     rollout_status,
+    semi_auto_blocked,
+    semi_auto_gate,
     shadow_comparison,
     shadow_gate,
     shadow_reviews,
     shadow_window,
     stage_of,
     week_windows,
+    weekly_adoption,
 )
 from rodit.feedback.service import minimize_text
 
@@ -126,6 +146,10 @@ MSG_AUTO_ENABLED = (
 )
 MSG_FORCE_NOTE = "强制切换要写明原因（note）"
 MSG_STAGE = "只能切换到影子模式（shadow）或智能辅助（assist）；全自动的开关不在这里"
+MSG_SEMI_AUTO_GATE = (
+    "这个类型还没达到开半自动的门槛（§13.4：原样采纳率 ≥ 90%）；确需开启请强制并写明原因"
+)
+MSG_SEMI_AUTO_FORCE_NOTE = "强制开启半自动要写明原因（note）"
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +162,28 @@ class RolloutGateNotPassed(ActionNotAllowed):
         self.gate = gate
 
 
+class SemiAutoGateNotPassed(ActionNotAllowed):
+    """某个类型开半自动的门槛没过、又没有强制开启（接口层返回 409 和门槛结果）。"""
+
+    def __init__(self, gate: GateResult) -> None:
+        super().__init__(MSG_SEMI_AUTO_GATE)
+        self.gate = gate
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class SemiAutoChange(_Model):
+    """一次半自动开关的结果。changed=False 表示本来就是这样（没有写任何东西）。"""
+
+    shop_id: str
+    intent: Intent
+    enabled: bool
+    changed: bool
+    forced: bool = False  # 门槛没过、强制开启
+    gate: GateResult | None = None  # 开启时的门槛结果
+    semi_auto_intents: list[Intent] = Field(default_factory=list)  # 改完之后开了的类型
 
 
 class StageChange(_Model):
@@ -330,6 +374,20 @@ def rollout_evidence(
     )
 
 
+def auto_schedule(config: ShopConfig, now: datetime) -> AutoSchedule:
+    """全自动生效时段的展示（§15 Phase 3）：生效规则和引擎同一份（engine.modes.auto_gate）。"""
+    gate = auto_gate(config, now) if config.auto_reply_enabled else None
+    return AutoSchedule(
+        auto_reply_enabled=config.auto_reply_enabled,
+        auto_reply_schedule=config.auto_reply_schedule,
+        service_hours=list(config.service_hours),
+        in_service_hours=within_service_hours(config.service_hours, now),
+        auto_active_now=config.auto_reply_enabled and gate is None,
+        auto_gate=gate,
+        next_switch_at=next_service_switch(config.service_hours, now),
+    )
+
+
 def acceptance_input(
     repos: Repos, config: EngineConfig, shop: Shop, *, since: datetime, until: datetime
 ) -> ShopAcceptanceInput:
@@ -397,6 +455,8 @@ class RolloutService:
         self._processing = processing
         # 同一进程内同一时间只有一个抽样在算"已抽中 → 补多少"（两个复核人同时点抽样不会多抽）
         self._sample_lock = threading.Lock()
+        # 半自动的类型列表是读改写：同一进程里串行，两个人同时开不同的类型不会丢掉一个
+        self._semi_auto_lock = threading.Lock()
 
     # ================================================================ 公共
 
@@ -505,6 +565,7 @@ class RolloutService:
                 now,
                 loaded_classifier_sha256=unit_classifier_sha256(self.unit),
             ),
+            auto_schedule=auto_schedule(config, now),
         )
 
     def shadow(
@@ -630,6 +691,110 @@ class RolloutService:
                 changed=True,
                 forced=forced,
                 gate=gate,
+            )
+
+    # ================================================================ 半自动（§5.6、§13.4）
+
+    def _semi_auto_gate(self, shop_id: str, intent: Intent, now: datetime) -> GateResult:
+        """和 status().semi_auto 同一口径（截至上一个完整周的最近 SEMI_AUTO_PERIODS 周）。"""
+        since = week_windows(now, SEMI_AUTO_PERIODS)[0][1]
+        records = self._records(shop_id, since=since)
+        return semi_auto_gate(weekly_adoption(records, now, weeks=SEMI_AUTO_PERIODS), intent)
+
+    def set_semi_auto(
+        self,
+        shop_id: str,
+        intent: Intent | str,
+        enabled: bool,
+        *,
+        operator: str,
+        force: bool = False,
+        note: str | None = None,
+        role: str | None = None,
+    ) -> SemiAutoChange:
+        """开 / 关某个类型的半自动（§5.6、§13.4）。谁能开由接口层按角色判断（只有复核人员能开，
+        商家和复核人员都能关）。
+
+        开启：高风险类型和不走规则 6 的类型抛 ActionNotAllowed（409，强制也不行）；门槛没过时
+        force=False 抛 SemiAutoGateNotPassed（409，配置不变），force=True 必须写原因（note，否则
+        ValueError，不看门槛先检查），照常开启并在审计里记 forced。关闭不看门槛、不看 force。
+        已经是目标状态时什么都不写。
+        """
+        target = Intent(intent)
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 要是 true / false")
+        operator = _require_person(operator, "操作人")
+        clean_note = _clean_note(note)
+        force = bool(force) and enabled
+        if force and clean_note is None:
+            raise ValueError(MSG_SEMI_AUTO_FORCE_NOTE)
+        if enabled:
+            blocked = semi_auto_blocked(target, self.unit.config.routing)
+            if blocked is not None:
+                raise ActionNotAllowed(SEMI_AUTO_BLOCKED_TEXT[blocked])
+        repo = self.unit.repos.knowledge
+        with self._processing(shop_id), self._semi_auto_lock:
+            shop = self._shop(shop_id)
+            config = effective_shop_config(self.unit.config, shop)
+            current = list(config.semi_auto_intents)
+            if (target in current) == enabled:
+                return SemiAutoChange(
+                    shop_id=shop_id,
+                    intent=target,
+                    enabled=enabled,
+                    changed=False,
+                    semi_auto_intents=current,
+                )
+            gate: GateResult | None = None
+            forced = False
+            if enabled:
+                gate = self._semi_auto_gate(shop_id, target, self.unit.clock.now())
+                if not gate.passed:
+                    if not force:
+                        raise SemiAutoGateNotPassed(gate)
+                    forced = True
+            wanted = {*current, target} if enabled else set(current) - {target}
+            updated = [i for i in Intent if i in wanted]  # 按问题类型的顺序存
+            # 只写 semi_auto_intents 一个键（仓储里原子地读改写）：商家同时改别的配置不会互相覆盖
+            previous_override = shop.config_overrides.get("semi_auto_intents")
+            values = [i.value for i in updated]
+            if repo.update_shop_config(shop_id, {"semi_auto_intents": values}) is None:
+                raise ShopInactive(shop_id)
+            try:
+                self._audit(
+                    shop_id,
+                    operator,
+                    SEMI_AUTO_CHANGED,
+                    {
+                        "intent": target.value,
+                        "enabled": enabled,
+                        "role": role,
+                        "forced": forced,
+                        "force_requested": force,
+                        "gate": gate_summary(gate) if gate is not None else None,
+                        "note": clean_note,  # 强制开启的原因（已做个人信息最小化）
+                        "intents": values,
+                    },
+                )
+            except Exception:
+                # 审计写不进去就撤回（覆盖项恢复原样，None 删掉键回到默认）：开关必须留痕
+                try:
+                    repo.update_shop_config(shop_id, {"semi_auto_intents": previous_override})
+                except Exception as undo_error:  # noqa: BLE001 — 撤回失败只记日志，原异常照抛
+                    logger.error(
+                        "半自动开关的审计没写成，撤回也失败（店铺 %s，%s）",
+                        shop_id,
+                        type(undo_error).__name__,
+                    )
+                raise
+            return SemiAutoChange(
+                shop_id=shop_id,
+                intent=target,
+                enabled=enabled,
+                changed=True,
+                forced=forced,
+                gate=gate,
+                semi_auto_intents=updated,
             )
 
     # ================================================================ 平台违规、投诉登记（§13.4）
@@ -912,11 +1077,16 @@ __all__ = [
     "IncidentList",
     "IncidentRecord",
     "ReviewList",
+    "MSG_SEMI_AUTO_FORCE_NOTE",
+    "MSG_SEMI_AUTO_GATE",
     "RolloutGateNotPassed",
     "RolloutService",
+    "SemiAutoChange",
+    "SemiAutoGateNotPassed",
     "ShadowComparison",
     "StageChange",
     "acceptance_input",
+    "auto_schedule",
     "compliance_reviews",
     "compliance_weeks",
     "eval_evidence",

@@ -24,6 +24,13 @@
   config.routing.auto_threshold 列出的类型各跑 intent_gate(min_periods=4)，每周至少
   AUTO_MIN_GROUPS 个推荐组；投诉 = 复核人员按周登记的投诉（最近 4 周，口径同平台违规），
   没登记全时列为 unchecked。开不开由平台准入和人工决定，这里只报告。
+- 半自动（按类型，§13.4 "该类型原样采纳率 ≥ 90%"、§5.6）：可以开的类型（不是高风险、投诉、
+  站外交易、其他）各跑 intent_gate：截至上一个完整周的最近 SEMI_AUTO_PERIODS 周（方案没写几周，
+  默认和智能辅助一样看 2 周），每周至少 SEMI_AUTO_MIN_GROUPS 个推荐组、原样采纳率都 ≥ 90%；
+  不看投诉（半自动仍由客服按发送）。开不开由复核人员决定（rodit.app.rollout.set_semi_auto：
+  门槛没过要强制并写原因，高风险类型永远不能开），这里只报告；报告里带当前开了的类型。
+- 全自动生效时段（§15 Phase 3 先在非工作时间试行）：AutoSchedule 只是展示（工作时间、生效时段、
+  现在是不是工作时间、下一次进出工作时间的时刻），由组装层按 engine.modes 算好传进来。
 - 复核人员的登记（shop.rollout_incident）：每条是某一周的总数，同一类型、同一周再登记以最后一次为准
   （改错用）；没有也要登记 0，门槛才算检查过。0 要在那一周结束之后登记（或结束后再登记一次确认）
   才算：周中登记的 0 只说明到登记时还没有，平台通知常常滞后（provisional_zero）。本周的登记
@@ -36,7 +43,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
@@ -51,6 +58,7 @@ from rodit.core.models import (
     StoredMessage,
     SuggestionRecord,
 )
+from rodit.core.schedule import SERVICE_TZ, parse_service_hours, within_service_hours
 from rodit.feedback.compliance import ComplianceSummary, pending_reason
 from rodit.feedback.metrics import (
     AdoptionReport,
@@ -84,6 +92,23 @@ ASSIST_MIN_GROUPS = 20  # 每周至少这么多推荐组，采纳率才算数
 AUTO_MIN_GROUPS = 10  # 每个类型每周至少这么多推荐组
 SHADOW_MATCH_THRESHOLD = 0.5
 SHADOW_CONTEXT_MESSAGES = 500  # 影子对比时每个会话最多读的消息数（最近的）
+SEMI_AUTO_PERIODS = 2  # 半自动看最近几个完整周（§13.4 没写几周，默认同智能辅助的 2 周）
+SEMI_AUTO_MIN_AS_IS = 0.9  # §13.4 半自动："该类型原样采纳率 ≥ 90%"
+SEMI_AUTO_MIN_GROUPS = 10  # 每个类型每周至少这么多推荐组
+
+SEMI_AUTO_CHANGED = "shop.rollout_semi_auto"
+"""审计动作：复核人员开启 / 商家或复核人员关闭某个类型的半自动（谁、类型、门槛摘要、是否强制、
+原因）。core.audit.AuditAction 冻结期间先定义在这里，合并后应加进 AuditAction。"""
+
+SEMI_AUTO_HIGH_RISK = "high_risk"
+"""不能开半自动的原因：高风险类型（routing.high_risk、投诉；§6.6 规则 4，要由人把关）。"""
+SEMI_AUTO_NOT_ANSWER = "not_answer"
+"""不能开半自动的原因：这类问题不走规则 6 的推荐（站外交易是标准话术，其他没有可答的内容）。"""
+SEMI_AUTO_BLOCKED_TEXT: dict[str, str] = {
+    SEMI_AUTO_HIGH_RISK: "高风险类型（§6.6 规则 4）不能开半自动：推荐要由客服看过风险提示再发",
+    SEMI_AUTO_NOT_ANSWER: "这类问题不走规则 6 的推荐（站外交易是标准话术，其他没有可答的内容）",
+}
+_NOT_ANSWER_INTENTS = frozenset({Intent.OFF_PLATFORM, Intent.OTHER})
 
 
 class _Model(BaseModel):
@@ -461,6 +486,140 @@ def auto_intent_gates(
     }
 
 
+# ================================================================ 半自动（§13.4、§5.6）
+
+
+def semi_auto_blocked(intent: Intent, routing: RoutingConfig) -> str | None:
+    """这个类型能不能开半自动：能 → None；不能 → 原因（SEMI_AUTO_HIGH_RISK、SEMI_AUTO_NOT_ANSWER）。
+    和引擎打 prefill 时的检查（engine.semi_auto）同一个口径：高风险类型取自 routing.high_risk。"""
+    intent = Intent(intent)
+    if intent in routing.high_risk or intent == Intent.COMPLAINT:
+        return SEMI_AUTO_HIGH_RISK
+    if intent in _NOT_ANSWER_INTENTS:
+        return SEMI_AUTO_NOT_ANSWER
+    return None
+
+
+def semi_auto_gate(
+    weekly: Sequence[AdoptionReport], intent: Intent, *, min_groups: int = SEMI_AUTO_MIN_GROUPS
+) -> GateResult:
+    """某个类型能不能开半自动：weekly 的最后 SEMI_AUTO_PERIODS 份周报里，这个类型每周至少
+    min_groups 个推荐组、原样采纳率（按推荐组）都 ≥ 90%（§13.4）。不看投诉：半自动仍由客服按发送，
+    投诉是全自动门槛的条件。"""
+    intent = Intent(intent)
+    gate = intent_gate(
+        list(weekly)[-SEMI_AUTO_PERIODS:],
+        intent,
+        min_as_is=SEMI_AUTO_MIN_AS_IS,
+        min_periods=SEMI_AUTO_PERIODS,
+        min_samples=min_groups,
+    )
+    return gate.model_copy(
+        update={
+            "stage": f"semi_auto:{intent.value}",
+            "unchecked": [n for n in gate.unchecked if n != "complaints"],
+        }
+    )
+
+
+class SemiAutoIntent(_Model):
+    """一个问题类型的半自动状态：开没开、能不能开（不能开的原因）、门槛结果（能开的类型才有）。"""
+
+    intent: Intent
+    enabled: bool
+    allowed: bool
+    blocked_reason: str | None = None  # SEMI_AUTO_HIGH_RISK / SEMI_AUTO_NOT_ANSWER
+    gate: GateResult | None = None
+
+
+class SemiAutoStatus(_Model):
+    """半自动（§5.6、§13.4）：店铺开了哪些类型、填进输入框的置信度门槛、各类型的门槛结果。"""
+
+    enabled: list[Intent] = Field(default_factory=list)  # ShopConfig.semi_auto_intents
+    threshold: float  # routing.semi_auto_threshold：问题类型置信度达到它才填进输入框
+    min_as_is: float = SEMI_AUTO_MIN_AS_IS
+    periods: int = SEMI_AUTO_PERIODS
+    min_groups: int = SEMI_AUTO_MIN_GROUPS
+    intents: list[SemiAutoIntent] = Field(default_factory=list)  # 按 Intent 的顺序，全部类型
+
+
+def semi_auto_status(
+    weekly: Sequence[AdoptionReport],
+    config: ShopConfig,
+    routing: RoutingConfig,
+    *,
+    min_groups: int = SEMI_AUTO_MIN_GROUPS,
+) -> SemiAutoStatus:
+    enabled = set(config.semi_auto_intents)
+    rows: list[SemiAutoIntent] = []
+    for intent in Intent:
+        blocked = semi_auto_blocked(intent, routing)
+        rows.append(
+            SemiAutoIntent(
+                intent=intent,
+                enabled=intent in enabled,
+                allowed=blocked is None,
+                blocked_reason=blocked,
+                gate=None
+                if blocked is not None
+                else semi_auto_gate(weekly, intent, min_groups=min_groups),
+            )
+        )
+    return SemiAutoStatus(
+        enabled=[i for i in Intent if i in enabled],
+        threshold=routing.semi_auto_threshold,
+        min_groups=min_groups,
+        intents=rows,
+    )
+
+
+# ================================================================ 全自动生效时段（§15 Phase 3）
+
+
+SERVICE_TZ_LABEL = "北京时间（UTC+8）"
+
+
+class AutoSchedule(_Model):
+    """全自动什么时候生效（§15 Phase 3 "先在非工作时间试行"）。只是展示：全自动总开关、生效时段由
+    我们评估后设置，商家不能改；客服工作时间商家在设置页填（附录 C 第 13 题）。
+
+    auto_active_now：机器人接待的消息现在会不会全自动回复（总开关开着、在生效时段里）；
+    auto_gate：总开关开着、现在却不全自动的原因（engine.modes 的拦下原因）；
+    next_switch_at：下一次进入或离开客服工作时间的时刻（没填工作时间、全天都是工作时间时为空）。"""
+
+    auto_reply_enabled: bool
+    auto_reply_schedule: Literal["off_hours", "always"]
+    service_hours: list[str] = Field(default_factory=list)
+    timezone: str = SERVICE_TZ_LABEL
+    in_service_hours: bool | None = None
+    auto_active_now: bool = False
+    auto_gate: str | None = None
+    next_switch_at: AwareDatetime | None = None
+
+
+def next_service_switch(lines: Sequence[str], now: datetime) -> datetime | None:
+    """now 之后第一次进入或离开客服工作时间的时刻（北京时间的整分钟）；没填时段、或者
+    时段首尾相接一直在工作时间里时返回 None。"""
+    windows = parse_service_hours(lines)
+    if not windows:
+        return None
+    current = within_service_hours(lines, now)
+    local = now.astimezone(SERVICE_TZ)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    boundaries = sorted(
+        {
+            midnight + timedelta(days=day, minutes=minute)
+            for day in (0, 1, 2)
+            for w in windows
+            for minute in (w.start, w.end)
+        }
+    )
+    for at in boundaries:
+        if at > now and within_service_hours(lines, at) != current:
+            return at
+    return None
+
+
 # ================================================================ 影子对比（§13.4 第一阶段）
 
 
@@ -648,6 +807,8 @@ class RolloutStatus(_Model):
     intent_gates: dict[Intent, GateResult] = Field(default_factory=dict)
     latest_quality: QualityReport | None = None  # 最近一个有样本的周期的复核报表
     evidence: RolloutEvidence | None = None  # 测试集、平台违规、投诉、合规扫描的依据（没有文字）
+    semi_auto: SemiAutoStatus | None = None  # 半自动：开了的类型、各类型的门槛（§13.4）
+    auto_schedule: AutoSchedule | None = None  # 全自动生效时段（§15 Phase 3）
 
 
 def _unchecked(
@@ -679,16 +840,19 @@ def rollout_status(
     platform_violations: int | None = None,
     complaints: int | None = None,
     evidence: RolloutEvidence | None = None,
+    auto_schedule: AutoSchedule | None = None,
     min_scored: int = DEFAULT_MIN_SCORED,
     assist_min_groups: int = ASSIST_MIN_GROUPS,
     auto_min_groups: int = AUTO_MIN_GROUPS,
+    semi_auto_min_groups: int = SEMI_AUTO_MIN_GROUPS,
 ) -> RolloutStatus:
     """汇总上线状态。records 要覆盖最近 4 个完整周和影子窗口（shadow_since 起、不设上限）；
     shadow 是影子窗口内的对比（shadow_comparison）；reviews 是影子窗口涉及周期的复核样本。
 
     evidence 给了时，测试集、平台违规、投诉取自它（覆盖 test_set_passed / platform_violations /
     complaints），并加上合规扫描一条（复核人员确认的违规；只有没确认的疑似违规时是 unchecked）；
-    没法检查的条件带上原因。"""
+    没法检查的条件带上原因。半自动的各类型门槛（semi_auto）和当前开了的类型一并报告；
+    auto_schedule（全自动生效时段）由调用方算好传进来，原样放进结果。"""
     stage = stage_of(config)
     reasons: dict[str, str | None] = {}
     test_set_detail: str | None = None
@@ -753,6 +917,8 @@ def rollout_status(
         intent_gates=i_gates,
         latest_quality=latest_quality,
         evidence=evidence,
+        semi_auto=semi_auto_status(weekly, config, routing, min_groups=semi_auto_min_groups),
+        auto_schedule=auto_schedule,
     )
 
 
@@ -766,10 +932,19 @@ __all__ = [
     "MAX_INCIDENT_COUNT",
     "SHADOW_CONTEXT_MESSAGES",
     "SHADOW_MATCH_THRESHOLD",
+    "SEMI_AUTO_BLOCKED_TEXT",
+    "SEMI_AUTO_CHANGED",
+    "SEMI_AUTO_HIGH_RISK",
+    "SEMI_AUTO_MIN_AS_IS",
+    "SEMI_AUTO_MIN_GROUPS",
+    "SEMI_AUTO_NOT_ANSWER",
+    "SEMI_AUTO_PERIODS",
+    "SERVICE_TZ_LABEL",
     "SHADOW_WEEKS",
     "STAGE_LABELS",
     "SWITCHABLE_STAGES",
     "UNCHECKED_LABELS",
+    "AutoSchedule",
     "IncidentEntry",
     "IncidentKind",
     "IncidentTotal",
@@ -777,6 +952,8 @@ __all__ = [
     "RolloutEvidence",
     "RolloutStage",
     "RolloutStatus",
+    "SemiAutoIntent",
+    "SemiAutoStatus",
     "ShadowSummary",
     "TestSetEvidence",
     "UncheckedCondition",
@@ -787,9 +964,13 @@ __all__ = [
     "gate_summary",
     "incident_detail",
     "incident_total",
+    "next_service_switch",
     "parse_incidents",
     "provisional_zero",
     "rollout_status",
+    "semi_auto_blocked",
+    "semi_auto_gate",
+    "semi_auto_status",
     "shadow_comparison",
     "shadow_gate",
     "shadow_reviews",
