@@ -6,8 +6,11 @@
 - 采纳率按推荐组算（一条买家消息、一个问题类型一组，组里有一条被发送就算采纳；§13.4 门槛同口径）；
 - 端到端耗时用 engine.result 的 since_received（从收到消息到出推荐，§12.1 口径）；离线替身下是
   毫秒级，接真实大模型后看各环节目标；
-- 平台客服指标的接入前后对比（§12.4）：从平台指标接口（Unit.metrics_source，合成数据）读最近 8 周，
-  按 fixtures.DEMO_GO_LIVE_DAYS_AGO（接入那天）分成前后两段取平均。
+- 平台客服指标的接入前后对比（§12.4）：用商家报表同一个服务（rodit.app.platform_metrics 的
+  PlatformMetricsService.report，口径见 rodit.feedback.platform_metrics）。数据是演示单元组装时
+  从平台指标接口（合成数据）同步进单元仓储的最近 8 周（showcase.state）；接入日按演示设定填写：
+  fixtures.DEMO_GO_LIVE_DAYS_AGO 天前（和回放历史切到智能辅助是同一天）。每项指标给出接入前后
+  均值、变化、是否变好、按周序列，另有总体结论（§1.3 "较接入前改善"）。
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ import unicodedata
 from collections import Counter
 from collections.abc import Sequence
 from datetime import timedelta
-from statistics import fmean
 from typing import Any
 
 from rodit.api.web import HARD_RULE_LABELS
@@ -26,8 +28,8 @@ from rodit.core.config import QAGateConfig
 from rodit.core.enums import INTENT_LABELS, Intent, RejectReason, SuggestionStatus
 from rodit.core.lexicon import find_absolute_terms, find_off_platform_in_answer
 from rodit.core.models import SuggestionRecord
-from rodit.core.platform_metrics import PLATFORM_METRIC_SPECS, metrics_for
 from rodit.feedback import REJECT_REASON_LABELS, adoption_report, qa_report
+from rodit.feedback.platform_metrics import MetricComparison, PlatformMetricsReport
 from rodit.showcase.labels import E2E_TARGET_MS, LATENCY_STAGES
 from rodit.showcase.seed import HISTORY_DAYS, history_start
 from rodit.showcase.state import PlatformDemo
@@ -36,9 +38,6 @@ from rodit.testing.fixtures import DEMO_GO_LIVE_DAYS_AGO
 
 ADOPTION_TARGET = 0.6
 """§1.3 推荐采纳率 ≥ 60%（智能辅助的核心指标）。"""
-
-METRIC_DAYS = 56
-"""平台客服指标看最近几天（接入前后各 4 周）。"""
 
 SYNTHETIC_LABEL = "演示数据（合成）"
 
@@ -103,41 +102,85 @@ def _weeks(demo: PlatformDemo, records: Sequence[SuggestionRecord]) -> list[dict
     return out
 
 
+def _metric_view(m: MetricComparison) -> dict[str, Any]:
+    return {
+        "metric": m.metric.value,
+        "label": m.label,
+        "unit": m.unit,
+        "higher_is_better": m.higher_is_better,
+        "note": m.note,
+        "before": None if m.before.mean is None else round(m.before.mean, 4),
+        "after": None if m.after.mean is None else round(m.after.mean, 4),
+        "delta": m.delta,
+        "relative_change": m.relative_change,
+        "direction": m.direction,
+        "direction_label": m.direction_label,
+        "improved": m.direction == "improved",
+        "days_before": m.before.days,
+        "days_after": m.after.days,
+        "sample_before": m.before.sample_size,
+        "sample_after": m.after.sample_size,
+        "weighted": m.before.weighted and m.after.weighted,
+        "reliable": m.reliable,
+        "flag_notes": list(m.flag_notes),
+        "weekly": [
+            {
+                "index": w.index,
+                "phase": w.phase,
+                "start": w.start.isoformat(),
+                "end": w.end.isoformat(),
+                "days": w.days,
+                "mean": None if w.mean is None else round(w.mean, 4),
+            }
+            for w in m.weekly
+        ],
+    }
+
+
+def platform_report(demo: PlatformDemo) -> PlatformMetricsReport:
+    """接入前后对比报表（商家报表同一个服务；接入日按演示设定填写，见模块说明）。"""
+    today = demo.clock.now().astimezone(CST).date()
+    go_live = demo.now.astimezone(CST).date() - timedelta(days=DEMO_GO_LIVE_DAYS_AGO)
+    return demo.metrics_service().report(demo.shop_id, go_live=min(go_live, today))
+
+
 def _platform_metrics(demo: PlatformDemo) -> dict[str, Any]:
-    today = demo.now.astimezone(CST).date()
-    go_live = today - timedelta(days=DEMO_GO_LIVE_DAYS_AGO)
-    source = demo.unit.metrics_source
-    rows: list[dict[str, Any]] = []
-    if source is not None:
-        samples = source.fetch(demo.shop_id, today - timedelta(days=METRIC_DAYS), today)
-        for metric in metrics_for(demo.platform):
-            spec = PLATFORM_METRIC_SPECS[metric]
-            before = [s.value for s in samples if s.metric == metric and s.day < go_live]
-            after = [s.value for s in samples if s.metric == metric and s.day >= go_live]
-            if not before or not after:
-                continue
-            b, a = fmean(before), fmean(after)
-            improved = a > b if spec.higher_is_better else a < b
-            rows.append(
-                {
-                    "metric": metric.value,
-                    "label": spec.label,
-                    "unit": spec.unit,
-                    "higher_is_better": spec.higher_is_better,
-                    "note": spec.note,
-                    "before": round(b, 4),
-                    "after": round(a, 4),
-                    "delta": round(a - b, 4),
-                    "improved": improved,
-                    "days_before": len(before),
-                    "days_after": len(after),
-                }
-            )
-    return {"go_live": go_live.isoformat(), "days": METRIC_DAYS, "metrics": rows}
+    if demo.unit.repos.platform_metrics is None:
+        return {
+            "go_live": None,
+            "metrics": [],
+            "verdict": "insufficient",
+            "verdict_label": "本单元没有平台指标数据",
+            "notes": [],
+        }
+    report = platform_report(demo)
+    sync = demo.metrics_sync
+    return {
+        "go_live": report.go_live.isoformat() if report.go_live else None,
+        "go_live_label": "演示设定的接入日（和回放历史切到智能辅助是同一天）",
+        "window_days": report.window_days,
+        "before": [d.isoformat() if d else None for d in (report.before_start, report.before_end)],
+        "after": [d.isoformat() if d else None for d in (report.after_start, report.after_end)],
+        "verdict": report.verdict,
+        "verdict_label": report.verdict_label,
+        "reliable": report.reliable,
+        "counts": dict(report.counts),
+        "notes": list(report.notes),
+        "metrics": [_metric_view(m) for m in report.metrics],
+        "synced": None
+        if sync is None
+        else {
+            "written": sync.written,
+            "days": sync.days,
+            "since": sync.since.isoformat(),
+            "until": sync.until.isoformat(),
+            "at": sync.synced_at.isoformat(),
+        },
+    }
 
 
 def _first_metric_text(metrics: dict[str, Any]) -> str | None:
-    rows = metrics["metrics"]
+    rows = [m for m in metrics["metrics"] if m["before"] is not None and m["after"] is not None]
     if not rows:
         return None
     m = rows[0]
@@ -268,6 +311,13 @@ def dashboard(demo: PlatformDemo) -> dict[str, Any]:
         }
 
 
+def _metric_note(metrics: dict[str, Any]) -> str:
+    if not metrics.get("go_live"):
+        return metrics["verdict_label"]
+    days = metrics["window_days"]
+    return f"{metrics['verdict_label']} · 接入日 {metrics['go_live']}，前后各 {days} 天"
+
+
 def overview(demo: PlatformDemo) -> dict[str, Any]:
     """产品概览页的 §1.3 目标和当前演示值。"""
     board = dashboard(demo)
@@ -317,9 +367,8 @@ def overview(demo: PlatformDemo) -> dict[str, Any]:
                 "target": "较接入前改善",
                 "value": _first_metric_text(board["platform_metrics"]),
                 "unit": "text",
-                "ok": bool(board["platform_metrics"]["metrics"])
-                and all(m["improved"] for m in board["platform_metrics"]["metrics"]),
-                "note": f"接入日 {board['platform_metrics']['go_live']}，前后各 4 周平均",
+                "ok": board["platform_metrics"]["verdict"] == "improved",
+                "note": _metric_note(board["platform_metrics"]),
             },
             {
                 "key": "aftersale",
@@ -344,4 +393,11 @@ def overview(demo: PlatformDemo) -> dict[str, Any]:
     }
 
 
-__all__ = ["ADOPTION_TARGET", "SYNTHETIC_LABEL", "dashboard", "overview", "violations"]
+__all__ = [
+    "ADOPTION_TARGET",
+    "SYNTHETIC_LABEL",
+    "dashboard",
+    "overview",
+    "platform_report",
+    "violations",
+]

@@ -189,8 +189,15 @@
         <h1 id="workbench-title">智能辅助工作台</h1>
         <p class="page-sub"><span id="mode-label"></span></p>
       </div>
-      <p class="page-note">你扮演买家：点一个会话发出预设问题，或在输入框里自己打字。<span class="badge badge-synthetic">合成数据</span></p>
+      <p class="page-note">你扮演买家：点一个会话发出预设问题，或在输入框里自己打字、发图片。<span class="badge badge-synthetic">合成数据</span></p>
     </div>
+    <details id="rollout" class="rollout" hidden>
+      <summary class="rollout-head">
+        <h2 id="rollout-title">上线节奏</h2>
+        <span class="small muted">影子 → 智能辅助 → 半自动 → 全自动，每一步都要过门槛（§13.4、§15）· 本店现在：<strong id="rollout-stage"></strong></span>
+      </summary>
+      <ol id="rollout-steps" class="rollout-steps" aria-labelledby="rollout-title"></ol>
+    </details>
     <div class="workbench">
       <aside class="wb-list" aria-labelledby="conv-title">
         <h2 id="conv-title" class="wb-col-title">会话 <span id="conv-count" class="muted"></span></h2>
@@ -207,9 +214,21 @@
         <p id="chat-expect" class="expect" hidden></p>
         <ol id="messages" class="messages" aria-live="polite" aria-label="聊天记录"></ol>
         <form id="composer" class="composer" novalidate>
-          <label for="composer-text" class="visually-hidden">以买家身份输入</label>
-          <textarea id="composer-text" rows="2" placeholder="以买家身份输入，Ctrl + Enter 发送" maxlength="500" disabled></textarea>
-          <button type="submit" id="composer-send" class="btn btn-primary" disabled>发送</button>
+          <div id="image-picker" class="image-picker" role="group" aria-labelledby="picker-title" hidden>
+            <p id="picker-title" class="picker-head"><strong>以买家身份发图片</strong> <span class="muted">最多 <span id="picker-max">3</span> 张 · 演示站没有真实图片，图块是合成图片的占位</span></p>
+            <div id="picker-tiles" class="picker-tiles"></div>
+          </div>
+          <div id="composer-images" class="composer-images" aria-label="要发的图片" hidden></div>
+          <div class="composer-row">
+            <button type="button" id="composer-image" class="btn btn-secondary composer-image-btn" aria-expanded="false" aria-controls="image-picker" disabled>
+              <svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3.5" y="5" width="17" height="14" rx="2.5"></rect><circle cx="9" cy="10" r="1.6"></circle><path d="M5 17l4.5-4.5 3 3 2.5-2.5L19 17"></path></svg>
+              <span>发图片</span>
+            </button>
+            <label for="composer-text" class="visually-hidden">以买家身份输入</label>
+            <textarea id="composer-text" rows="2" placeholder="以买家身份输入，Ctrl + Enter 发送" maxlength="500" disabled></textarea>
+            <button type="submit" id="composer-send" class="btn btn-primary" disabled>发送</button>
+          </div>
+          <p id="composer-note" class="composer-note" hidden></p>
         </form>
       </section>
       <aside class="wb-ai" aria-labelledby="ai-title">
@@ -240,6 +259,7 @@
       <div>
         <h1 id="aftersale-title">售后审核助手</h1>
         <p class="page-sub">规则 R1–R8 给建议和理由；<strong>售后写操作必须人确认</strong>，执行前重读平台状态，幂等键防止重复操作（§7.3.2）</p>
+        <p class="page-sub small muted" id="aftersale-desk-note">这里是演示版。生产环境的售后审核工作台在各平台单元的 <code>/aftersale</code> 页面（客服令牌登录：客服、店长、商家各用自己的访问令牌），只列本店铺的售后单；质量问题单的凭证图片由平台云内的图片理解先看一遍，结论只供参考。</p>
       </div>
       <p id="aftersale-note" class="page-note"></p>
     </div>
@@ -268,8 +288,8 @@
       </article>
       <article class="panel panel-wide">
         <h2>平台客服指标：接入前 vs 接入后</h2>
-        <p class="panel-sub" id="metrics-sub">各 4 周平均（§12.4）</p>
-        <div id="chart-metrics" class="metric-grid"></div>
+        <p class="panel-sub" id="metrics-sub">接入前后各 28 天的均值（§12.4）</p>
+        <div id="chart-metrics" class="metrics-panel"></div>
       </article>
       <article class="panel">
         <h2>"不合适"的原因</h2>
@@ -358,7 +378,7 @@
       <div class="mask-demo panel">
         <form id="mask-form" novalidate>
           <label for="mask-input" class="field-label">一段买家消息（合成示例，可以改）</label>
-          <textarea id="mask-input" rows="3" maxlength="500">我的手机号 13812345678，收件地址是杭州市西湖区文三路 100 号 3 幢 2 单元 502，订单 o_1002 明天能到吗？微信 wx_demo_2026 加一下</textarea>
+          <textarea id="mask-input" rows="3" maxlength="500">我的手机号 13912345678，收件地址是杭州市西湖区文三路 100 号 3 幢 2 单元 502，订单 o_1002 明天能到吗？微信 wx_demo_2026 加一下</textarea>
           <div class="mask-actions">
             <button type="submit" class="btn btn-primary" id="mask-run">打码</button>
             <span id="mask-found" class="chips"></span>

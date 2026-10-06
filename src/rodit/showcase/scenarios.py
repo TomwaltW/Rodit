@@ -1,8 +1,9 @@
 """演示站的预设场景：方案 §11 的核心流程和几个典型问题，每个场景是工作台里的一位买家。
 
-每个场景写明对应的方案章节、买家说的话、带的商品 / 订单卡片，以及"会看到什么"（给讲解的人看）。
-买家的话都是合成的；预期行为有测试逐条核对（tests/showcase/test_scenarios.py），用的是真实的
-问答引擎和离线替身。拼多多只能做模式 C（§8.1）：话术助手查不到订单，带订单卡片的场景不出现，
+每个场景写明对应的方案章节、买家说的话（和发的图片）、带的商品 / 订单卡片，以及"会看到什么"
+（给讲解的人看）。买家的话和图片都是合成的；预期行为有测试逐条核对（tests/showcase/
+test_scenarios.py、test_images.py、test_semi_auto.py），用的是真实的问答引擎和离线替身。
+拼多多只能做模式 C（§8.1）：话术助手查不到订单、收不到图片，带订单卡片和图片的场景不出现，
 质检拦截场景换成不带订单的问法。
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from rodit.core.enums import Intent, Platform
+from rodit.showcase.images import IMAGE_PLATFORMS
 from rodit.showcase.llm import SIMULATED_NOTE
 
 ALL_PLATFORMS = frozenset(Platform)
@@ -23,13 +25,15 @@ class Scenario:
     id: str
     title: str
     section: str  # 方案章节
-    text: str  # 买家说的话
+    text: str  # 买家说的话（只发图片时为空）
     intent: Intent  # 列表上显示的问题类型标签（实际路由结果以引擎为准）
     expect: str  # 会看到什么
     item_id: str | None = None
     order_id: str | None = None
     note: str | None = None  # 演示说明（如模拟大模型的行为）
     platforms: frozenset[Platform] = ALL_PLATFORMS
+    images: tuple[str, ...] = ()  # 买家发的图片（合成标识，showcase.images）
+    buyer: str = "BUYER"  # 哪位合成买家（fixtures.RAW_BUYERS 的键；订单卡片要是这位买家的）
     texts: dict[Platform, str] = field(default_factory=dict)  # 按平台换问法
     expects: dict[Platform, str] = field(default_factory=dict)  # 按平台换说明
 
@@ -99,7 +103,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         texts={Platform.PDD: "明天能到吗？"},
         expects={
             Platform.PDD: "第一稿承诺「明天一定能到」，质检拦下；模式 C 查不到订单，"
-            "重写成只说发货时效的回答"
+            "重写成只说发货时效的回答。重写稿通过了质检、发货类又开了半自动，所以标"
+            "「可直接发送」，仍由客服核对后发出"
         },
     ),
     Scenario(
@@ -139,7 +144,25 @@ SCENARIOS: tuple[Scenario, ...] = (
         "§5.4",
         "能开发票吗",
         Intent.INVOICE_GIFT,
-        "FAQ 命中，直接用商家审核过的标准回答：便宜、快、零编造",
+        "FAQ 命中，直接用商家审核过的标准回答：便宜、快、零编造；发票类开了半自动，"
+        "推荐直接填进客服输入框",
+        expects={
+            Platform.PDD: "FAQ 命中，直接用商家审核过的标准回答：便宜、快、零编造；"
+            "发票类开了半自动，推荐标「可直接发送」"
+        },
+    ),
+    Scenario(
+        "ship_quick",
+        "发货时间（半自动）",
+        "§5.6、§13.4",
+        "什么时候发货呀？",
+        Intent.SHIPPING_POLICY,
+        "高置信度的简单问题、这一类开了半自动：推荐直接填进客服输入框，客服看一眼按发送即可，"
+        "仍是人工回复",
+        expects={
+            Platform.PDD: "高置信度的简单问题、这一类开了半自动：模式 C 没有平台输入框，推荐标"
+            "「可直接发送」，客服核对后复制回多多客服"
+        },
     ),
     Scenario(
         "price",
@@ -150,6 +173,42 @@ SCENARIOS: tuple[Scenario, ...] = (
         "价格类是高风险类型（§6.6 规则 4）：推荐只说活动配置里有的优惠，"
         "并提示「涉及价格承诺，请确认」",
         item_id="i_555",
+    ),
+    Scenario(
+        "photo_damage",
+        "破损照片",
+        "§15 Phase 3、§7.3.1",
+        "收到货发现破了，能退吗？",
+        Intent.QUALITY_ISSUE,
+        "图片理解认出破损（仅供参考，以凭证为准）；第一条是确定性模板：照片看到了、请在订单页申请"
+        "售后并上传照片，不承诺处理结果。这笔订单的售后单 as_2009 在售后审核助手里",
+        order_id="o_1013",
+        buyer="BUYER_R5",
+        images=("img_buyer_damage_1",),
+        platforms=IMAGE_PLATFORMS,
+    ),
+    Scenario(
+        "photo_size",
+        "尺码截图",
+        "§15 Phase 3、§11.1",
+        "",
+        Intent.SIZE_ADVICE,
+        "买家只发了一张身高体重截图，没打字：图中文字交给路由和生成，按商家填的尺码建议推荐 M 码",
+        item_id="i_555",
+        images=("img_buyer_size_1",),
+        platforms=IMAGE_PLATFORMS,
+    ),
+    Scenario(
+        "photo_logistics",
+        "物流截图（个人信息打码）",
+        "§15 Phase 3、§5.3",
+        "",
+        Intent.LOGISTICS_TRACK,
+        "截图面单上的手机号在识别结果里就已打码，物流截图的图中文字也不交给大模型；"
+        "回答按实时物流轨迹写明「截至」",
+        order_id="o_1003",
+        images=("img_buyer_logistics_1",),
+        platforms=IMAGE_PLATFORMS,
     ),
 )
 
@@ -165,6 +224,7 @@ def get_scenario(platform: Platform, scenario_id: str) -> Scenario | None:
 
 
 __all__ = [
+    "IMAGE_PLATFORMS",
     "ORDER_PLATFORMS",
     "SCENARIOS",
     "SCENARIO_IDS",

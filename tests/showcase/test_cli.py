@@ -38,6 +38,7 @@ def test_default_banner_and_loopback_host(monkeypatch):
     assert code == 0
     assert "【仅演示】" in text and "合成数据" in text and "离线替身" in text
     assert "不会动任何真实订单" in text
+    assert "没有任何真实图片" in text
     assert f"http://127.0.0.1:{DEFAULT_PORT}/" in text
     assert "注意" not in text
     [(app, kwargs)] = run.calls

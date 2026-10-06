@@ -27,9 +27,15 @@
     aftersales: {}, // 平台 → /aftersales 的结果
     selected: {}, // 平台 → 选中的售后单
     results: {}, // 平台:售后单 → 最近一次确认的结果
+    pending: {}, // 平台 → 输入框里选好、还没发的图片（合成图片标识）
+    pickerOpen: false,
     traceOpen: false,
     busy: false,
   };
+  const IMAGE_TILES = {};
+  (CONFIG.images || []).forEach((t) => {
+    IMAGE_TILES[t.ref] = t;
+  });
 
   // ================================================================ 工具
 
@@ -125,6 +131,47 @@
 
   function width(node, fraction) {
     node.style.width = Math.max(0, Math.min(1, fraction)) * 100 + '%';
+  }
+
+  // ================================================================ 合成图片的占位图块
+
+  // 演示站没有真实图片文件、不引用外部地址：每张合成图片画成一个带标题的图块（24×24 描边图形）
+  const TILE_ICONS = {
+    damage: ['M3.5 8.5L12 4l8.5 4.5v7L12 20l-8.5-4.5z', 'M3.5 8.5L12 13l8.5-4.5', 'M12 13v7', 'M16 6.2l-1.6 2.6 2.2 1.1-1.7 2.8'],
+    size: ['M10 6a2 2 0 1 1-4 0a2 2 0 1 1 4 0', 'M5 20v-6a3 3 0 0 1 6 0v6', 'M15.5 3.5h4v17h-4z', 'M15.5 7.5h2M15.5 11.5h2M15.5 15.5h2'],
+    wrong: ['M4 8.5h12.5l-3-3', 'M20 15.5H7.5l3 3', 'M5 4.5h4M15 19.5h4'],
+    logistics: ['M2.5 6.5h11v9h-11z', 'M13.5 9.5h4l3.5 3.5v2.5h-7.5', 'M8.5 18a1.5 1.5 0 1 1-3 0a1.5 1.5 0 1 1 3 0', 'M19 18a1.5 1.5 0 1 1-3 0a1.5 1.5 0 1 1 3 0'],
+    product: ['M9.5 3.5h5', 'M10 3.5L9 8h6l-1-4.5', 'M9 8L5.5 20.5h13L15 8'],
+    blur: ['M4 5h16v14H4z', 'M9.8 10a2.2 2.2 0 1 1 3 2c-.6.3-.8.7-.8 1.3', 'M12 16.2v.1'],
+    evidence: ['M4 8h3l1.5-2h7L17 8h3v11H4z', 'M15.5 13.5a3.5 3.5 0 1 1-7 0a3.5 3.5 0 1 1 7 0'],
+  };
+
+  function tileIcon(icon) {
+    const svg = svgEl('svg', { class: 'tile-icon', viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
+    (TILE_ICONS[icon] || TILE_ICONS.blur).forEach((d) => svg.appendChild(svgEl('path', { d })));
+    return svg;
+  }
+
+  /** 一张合成图片的占位图块：图形 + 标题（opts.caption 时再加说明）。opts.size：sm 小图块。 */
+  function imageTile(img, opts) {
+    const o = opts || {};
+    const t = IMAGE_TILES[img.ref] || img;
+    const label = '图片：' + (t.title || '图片') + (t.caption ? '（' + t.caption + '）' : '');
+    return el(
+      'span',
+      { cls: 'img-tile img-' + (t.icon || 'blur') + (o.size ? ' img-tile-' + o.size : ''), attrs: { 'data-ref': img.ref, role: 'img', 'aria-label': label, title: t.caption || null } },
+      [
+        tileIcon(t.icon),
+        el('span', { cls: 'img-tile-title', text: t.title || '图片' }),
+        o.caption && t.caption ? el('span', { cls: 'img-tile-caption', text: t.caption }) : null,
+      ]
+    );
+  }
+
+  /** 一条买家消息的文字摘要：图片写成"[图片] 标题"，再接买家的字。 */
+  function bubbleText(b) {
+    const images = (b.images || []).map((i) => '[图片] ' + (i.title || '图片'));
+    return images.concat(b.text ? [b.text] : []).join(' ');
   }
 
   function left(node, fraction) {
@@ -441,6 +488,7 @@
     $('mode-label').textContent = data.shop_name + ' · ' + data.access_label;
     $('ai-mode').textContent = data.access === 'C' ? '模式 C' : '模式 B';
     $('conv-count').textContent = '（' + data.scenarios.length + '）';
+    renderRollout(data.rollout);
     renderConversations();
     renderChat();
     const s = activeScenario();
@@ -449,7 +497,172 @@
 
   function lastText(s) {
     const bubbles = s.bubbles || [];
-    return bubbles.length ? bubbles[bubbles.length - 1].text : s.text;
+    return bubbleText(bubbles.length ? bubbles[bubbles.length - 1] : s);
+  }
+
+  // ---------------------------------------------------------------- 上线节奏（§13.4、§15）
+
+  const STEP_STATES = {
+    done: ['已走过', 'badge-ok'],
+    current: ['当前', 'badge-accent'],
+    partial: ['按类型开启', 'badge-kind'],
+    next: ['下一步', ''],
+    unavailable: ['本平台不适用', ''],
+  };
+
+  function semiAutoLines(semi) {
+    if (!semi.intents.length) return [el('p', { cls: 'rollout-detail', text: '还没有开半自动的问题类型' })];
+    const out = [el('p', { cls: 'rollout-detail' }, [el('strong', { text: '本店已开：' }), semi.intents.map((i) => i.label).join('、')])];
+    out.push(el('p', { cls: 'rollout-detail small muted', text: '近 ' + semi.periods + ' 周原样采纳率（每周推荐组数）：' }));
+    semi.intents.forEach((i) => {
+      const weeks = i.weeks.map((w) => (w.groups ? pct(w.as_is_rate, 0) + '（' + w.groups + ' 组）' : '没有推荐')).join(' / ');
+      out.push(
+        el('p', { cls: 'rollout-detail small', attrs: { 'data-intent': i.intent } }, [
+          el('span', { cls: 'muted', text: i.label + '：' }),
+          weeks + (i.gate_passed ? ' · 已达门槛' : ''),
+        ])
+      );
+    });
+    const forced = semi.intents.filter((i) => i.forced);
+    if (forced.length) {
+      out.push(
+        el('p', { cls: 'rollout-detail small rollout-forced', text: '合成数据的样本量和原样采纳率没到门槛（每周至少 ' + semi.min_groups + ' 组、≥ ' + pct(semi.min_as_is, 0) + '）：演示里由复核人员强制开启并写明原因，已留审计' })
+      );
+    }
+    return out;
+  }
+
+  function autoLines(auto) {
+    if (!auto.available) return [];
+    const parts = ['客服工作时间 ' + (auto.service_hours.length ? auto.service_hours.join('、') : '没填') + '，' + auto.timezone];
+    if (auto.in_service_hours !== null && auto.in_service_hours !== undefined) {
+      parts.push((auto.in_service_hours ? '现在是工作时间' : '现在是非工作时间') + (auto.next_switch_at ? '，' + auto.next_switch_at + ' 切换' : ''));
+    }
+    parts.push(auto.enabled ? (auto.active_now ? '全自动此刻生效' : '全自动此刻不生效，由客服接待') : '本店没开全自动');
+    return [el('p', { cls: 'rollout-detail small', text: parts.join(' · ') })];
+  }
+
+  function renderRollout(r) {
+    const section = $('rollout');
+    if (!r) {
+      section.hidden = true;
+      return;
+    }
+    if (section.hidden) {
+      // 第一次显示：桌面展开；手机上先收起，免得把会话列表挤到一屏以外
+      section.open = !(window.matchMedia && window.matchMedia('(max-width: 720px)').matches);
+    }
+    section.hidden = false;
+    $('rollout-stage').textContent = r.stage_label;
+    const list = clear($('rollout-steps'));
+    r.steps.forEach((step, i) => {
+      const st = STEP_STATES[step.state] || [step.state, ''];
+      const extra = step.key === 'semi_auto' ? semiAutoLines(r.semi_auto) : step.key === 'auto' ? autoLines(r.auto) : [];
+      list.appendChild(
+        el('li', { cls: 'rollout-step is-' + step.state, attrs: { 'data-step': step.key, 'aria-current': step.state === 'current' ? 'step' : null } }, [
+          el('div', { cls: 'rollout-step-head' }, [
+            el('span', { cls: 'rollout-no', text: String(i + 1), attrs: { 'aria-hidden': 'true' } }),
+            el('strong', { text: step.label }),
+            el('span', { cls: 'badge ' + st[1], text: st[0] }),
+          ]),
+          el('p', { cls: 'rollout-text', text: step.text }),
+        ].concat(extra))
+      );
+    });
+  }
+
+  // ---------------------------------------------------------------- 买家发图片（§15 Phase 3）
+
+  function canSendImages() {
+    const data = state.scenarios[state.platform];
+    return Boolean(data && data.can_send_images);
+  }
+
+  function pendingImages() {
+    return state.pending[state.platform] || [];
+  }
+
+  function setPending(list) {
+    state.pending[state.platform] = list;
+    renderComposerImages();
+    if (state.pickerOpen) renderPicker();
+  }
+
+  function togglePending(ref) {
+    const list = pendingImages().slice();
+    const at = list.indexOf(ref);
+    if (at >= 0) {
+      list.splice(at, 1);
+    } else {
+      if (list.length >= CONFIG.max_chat_images) {
+        toast('一条消息最多带 ' + CONFIG.max_chat_images + ' 张图片', true);
+        return;
+      }
+      list.push(ref);
+    }
+    setPending(list);
+  }
+
+  function renderPicker() {
+    const box = clear($('picker-tiles'));
+    $('picker-max').textContent = String(CONFIG.max_chat_images);
+    const chosen = pendingImages();
+    (CONFIG.images || [])
+      .filter((t) => t.picker)
+      .forEach((t) => {
+        const on = chosen.indexOf(t.ref) >= 0;
+        box.appendChild(
+          el('button', { cls: 'picker-tile', attrs: { type: 'button', 'data-ref': t.ref, 'aria-pressed': on ? 'true' : 'false' }, on: { click: () => togglePending(t.ref) } }, [
+            imageTile(t, { caption: true }),
+            el('span', { cls: 'picker-check', text: on ? '✓ 已选' : '选这张', attrs: { 'aria-hidden': 'true' } }),
+          ])
+        );
+      });
+  }
+
+  function renderComposerImages() {
+    const box = clear($('composer-images'));
+    const list = pendingImages();
+    box.hidden = !list.length;
+    list.forEach((ref) => {
+      const t = IMAGE_TILES[ref] || { ref, title: '图片' };
+      box.appendChild(
+        el('span', { cls: 'pending-image' }, [
+          imageTile(t, { size: 'sm' }),
+          el('button', {
+            cls: 'pending-remove',
+            text: '×',
+            attrs: { type: 'button', 'aria-label': '不发这张：' + t.title, 'data-remove': ref },
+            on: { click: () => setPending(pendingImages().filter((r) => r !== ref)) },
+          }),
+        ])
+      );
+    });
+  }
+
+  function setPicker(open) {
+    state.pickerOpen = Boolean(open) && canSendImages() && !$('composer-image').disabled;
+    $('image-picker').hidden = !state.pickerOpen;
+    $('composer-image').setAttribute('aria-expanded', state.pickerOpen ? 'true' : 'false');
+    if (state.pickerOpen) renderPicker();
+  }
+
+  $('composer-image').addEventListener('click', () => setPicker(!state.pickerOpen));
+
+  /** 输入框的发图片按钮：模式 B 可以发；拼多多模式 C 不能（说明原因）。 */
+  function updateComposer(enabled) {
+    const data = state.scenarios[state.platform];
+    const can = canSendImages();
+    const reason = (data && data.no_image_reason) || CONFIG.no_image_reason;
+    const button = $('composer-image');
+    button.disabled = !enabled || !can;
+    button.title = can ? '以买家身份发合成图片' : reason;
+    const note = $('composer-note');
+    note.hidden = can || !data;
+    note.textContent = can ? '' : reason;
+    if (!can) state.pending[state.platform] = [];
+    if (!enabled || !can) setPicker(false);
+    renderComposerImages();
   }
 
   function renderConversations() {
@@ -511,6 +724,7 @@
       contextCard(null);
       composer.disabled = true;
       send.disabled = true;
+      updateComposer(false);
       list.appendChild(el('li', { cls: 'msg msg-system', text: '还没有选中会话' }));
       return;
     }
@@ -522,16 +736,19 @@
     contextCard(s.card);
     composer.disabled = state.busy;
     send.disabled = state.busy;
+    updateComposer(!state.busy);
     if (!s.bubbles.length) {
-      list.appendChild(el('li', { cls: 'msg msg-system', text: '正在以买家身份发出：' + s.text }));
+      list.appendChild(el('li', { cls: 'msg msg-system', text: '正在以买家身份发出：' + bubbleText(s) }));
     }
     s.bubbles.forEach((b) => {
       const isBuyer = b.role === 'buyer';
       const who = isBuyer ? '买家' : '客服（' + (b.edited ? '编辑后发送' : '采纳推荐') + '）';
+      const images = b.images || [];
       list.appendChild(
         el('li', { cls: 'msg ' + (isBuyer ? 'msg-buyer' : 'msg-agent') }, [
           el('span', { cls: 'msg-who', text: who + ' · ' + shortTime(b.at) }),
-          el('span', { cls: 'bubble', text: b.text }),
+          images.length ? el('span', { cls: 'msg-images' }, images.map((img) => imageTile(img, { caption: true }))) : null,
+          b.text ? el('span', { cls: 'bubble', text: b.text }) : null,
         ])
       );
     });
@@ -546,25 +763,29 @@
     renderChat();
     const s = activeScenario();
     renderAI(s ? s.latest : null);
-    if (s && !s.bubbles.length) sendBuyer(null);
+    if (s && !s.bubbles.length) sendBuyer(null, []);
   }
 
-  async function sendBuyer(text) {
+  /** 以买家身份发一条：text、images 都为空时发场景预设的话（和图片）。 */
+  async function sendBuyer(text, images) {
     const platform = state.platform;
     const s = activeScenario();
     if (!s || state.busy) return;
     state.busy = true;
     $('composer-send').disabled = true;
     $('composer-text').disabled = true;
+    updateComposer(false);
     const box = clear($('suggestions'));
-    box.appendChild(el('p', { cls: 'empty', text: '问答引擎处理中：懂 → 找 → 写 → 判……' }));
+    box.appendChild(el('p', { cls: 'empty', text: (images && images.length ? '图片理解 → ' : '') + '问答引擎处理中：懂 → 找 → 写 → 判……' }));
     try {
       const body = { platform, scenario: s.id };
       if (text) body.text = text;
+      if (images && images.length) body.images = images;
       const view = await api('/chat', { method: 'POST', body });
       s.bubbles.push(view.message);
       s.latest = view;
       if (text) $('composer-text').value = '';
+      if (images && images.length) state.pending[platform] = [];
     } catch (err) {
       fail(err);
     } finally {
@@ -581,11 +802,13 @@
   $('composer').addEventListener('submit', (e) => {
     e.preventDefault();
     const text = $('composer-text').value.trim();
-    if (!text) {
-      toast('先以买家身份输入一句话', true);
+    const images = pendingImages();
+    if (!text && !images.length) {
+      toast(canSendImages() ? '先以买家身份输入一句话，或选一张图片' : '先以买家身份输入一句话', true);
       return;
     }
-    sendBuyer(text);
+    setPicker(false);
+    sendBuyer(text, images);
   });
 
   $('composer-text').addEventListener('keydown', (e) => {
@@ -608,12 +831,13 @@
       return;
     }
     const result = view.result;
-    result.alerts.forEach((a) => alerts.appendChild(el('p', { cls: 'alert', text: a })));
+    // 图片摘要（"……仅供参考"）用图片的样式，其余提醒照常标红
+    result.alerts.forEach((a) => alerts.appendChild(el('p', { cls: 'alert' + (a.indexOf('仅供参考') >= 0 ? ' alert-image' : ''), text: a })));
     const note = view.trace && view.trace.simulated_note;
     simulated.hidden = !note;
     simulated.textContent = note ? note + '（§11.5）：第一稿被质检拦下，下面是重写后通过的回答' : '';
     if (result.suggestions.length) {
-      result.suggestions.forEach((card) => box.appendChild(suggestionCard(card)));
+      result.suggestions.forEach((card) => box.appendChild(suggestionCard(card, result)));
     } else {
       const parts = [el('strong', { text: '没有推荐' }), el('p', { text: result.no_suggestion_reason || '客服自行处理' })];
       if (result.missing_knowledge.length) {
@@ -649,15 +873,33 @@
 
   const KIND_CLS = { faq: 'badge-ok', template: 'badge-kind', llm: 'badge-accent' };
 
-  function suggestionCard(card) {
+  /** 半自动（§5.6）：模式 B 插件把这条填进平台的客服输入框；模式 C 没有平台输入框，标"可直接发送"。 */
+  function prefillBanner(card, result) {
+    const platform = PLATFORMS[state.platform];
+    const inInput = result.prefill_mode === 'input' && result.input_prefill === card.suggestion_id;
+    return el('div', { cls: 'prefill-banner', attrs: { 'data-prefill': inInput ? 'input' : 'copy' } }, [
+      el('span', { cls: 'badge badge-prefill', text: inInput ? '半自动：已填入输入框，按发送即可' : '半自动：可直接发送' }),
+      el('span', {
+        cls: 'prefill-hint',
+        text: inInput
+          ? '这类问题开了半自动：插件已把这条填进' + platform.workbench + '的客服输入框，客服看一眼按发送，仍是人工回复'
+          : '这类问题开了半自动：模式 C 没有平台输入框，核对后复制回' + platform.workbench + '，仍由客服发出',
+      }),
+    ]);
+  }
+
+  function suggestionCard(card, result) {
     const data = state.scenarios[state.platform];
     const modeC = data && data.access === 'C';
-    const node = el('article', { cls: 'sg-card', attrs: { 'data-status': card.status, 'data-suggestion': card.suggestion_id } });
+    const prefill = card.prefill === true;
+    const node = el('article', { cls: 'sg-card' + (prefill ? ' is-prefill' : ''), attrs: { 'data-status': card.status, 'data-suggestion': card.suggestion_id, 'data-prefill': prefill ? 'true' : null } });
     const textId = 'sg-text-' + card.suggestion_id;
+    if (prefill && card.status === 'shown') node.appendChild(prefillBanner(card, result || {}));
     node.appendChild(
       el('div', { cls: 'sg-head' }, [
         el('span', { cls: 'badge ' + (KIND_CLS[card.kind] || ''), text: card.kind_label }),
         el('span', { cls: 'badge ' + (card.confidence === 'high' ? 'badge-ok' : 'badge-warn'), text: '置信度 ' + card.confidence_label }),
+        prefill && card.status !== 'shown' ? el('span', { cls: 'badge badge-prefill', text: '半自动' }) : null,
         el('span', { cls: 'sg-intent', text: card.intent_label }),
       ])
     );
@@ -796,8 +1038,56 @@
     ]);
   }
 
-  function understandStep(u) {
-    if (!u) return traceStep('懂', '懂问题', '', [el('p', { cls: 'muted', text: '这条消息没有走到路由（店铺停用或系统降级）。' })]);
+  /** 买家图片的识别（§15 Phase 3）：每张图的类型、置信度、摘要、图中文字（已打码），以及接在买家
+   *  消息后面给路由和生成看的描述、识别失败的降级。 */
+  function imagesBox(im) {
+    const box = el('div', { cls: 'trace-box trace-images' }, [
+      el('h4', { text: '买家发来 ' + im.total + ' 张图片 · 平台云内的图片理解（只是参考）' }),
+    ]);
+    im.findings.forEach((f) => {
+      const ocrHidden = f.extracted_text && f.kind !== 'size_reference';
+      box.appendChild(
+        el('div', { cls: 'finding-row', attrs: { 'data-ref': f.ref } }, [
+          imageTile(f, { size: 'sm' }),
+          el('div', { cls: 'finding-body' }, [
+            el('div', { cls: 'finding-head' }, [
+              el('span', { cls: 'badge badge-accent', text: f.kind_label }),
+              el('span', { cls: 'badge ' + (f.routed ? 'badge-ok' : 'badge-warn'), text: f.routed ? '交给路由和生成' : '置信度低，只给客服看' }),
+            ]),
+            el('div', { cls: 'prob-row' }, [
+              el('span', { cls: 'row-label', text: '置信度' }),
+              bar(f.confidence, { mark: im.min_confidence, markLabel: '进描述的下限' }),
+              el('span', { cls: 'row-value', text: pct(f.confidence, 0) }),
+            ]),
+            f.summary ? el('p', { cls: 'finding-summary', text: f.summary }) : null,
+            f.extracted_text
+              ? el('p', { cls: 'finding-ocr' }, [
+                  el('span', { cls: 'muted', text: '图中文字（已打码）：' }),
+                  el('span', { cls: 'finding-ocr-text', text: f.extracted_text }),
+                  ocrHidden ? el('span', { cls: 'muted', text: '（不交给大模型：截图、面单上常有手机号和地址，§5.3）' }) : null,
+                ])
+              : null,
+          ]),
+        ])
+      );
+    });
+    if (im.failed) box.appendChild(el('p', { cls: 'small risk', text: im.failed + ' 张没能识别 → 降级：' + im.degraded_label + '，照常出推荐（§12.2）' }));
+    if (im.skipped) box.appendChild(el('p', { cls: 'small muted', text: '另有 ' + im.skipped + ' 张没有识别（一条消息最多识别 3 张）' }));
+    if (im.description) {
+      box.appendChild(
+        el('p', { cls: 'finding-desc' }, [
+          el('span', { cls: 'muted', text: '接在买家消息后面，路由、检索、生成、质检看到的是同一份：' }),
+          el('code', { text: im.description }),
+        ])
+      );
+    }
+    im.alerts.forEach((a) => box.appendChild(el('p', { cls: 'small finding-alert', text: '提醒客服：' + a })));
+    return box;
+  }
+
+  function understandStep(u, images) {
+    const imageBox = images ? imagesBox(images) : null;
+    if (!u) return traceStep('懂', '懂问题', '', [imageBox, el('p', { cls: 'muted', text: '这条消息没有走到路由（店铺停用或系统降级）。' })]);
     const probs = el('div', { cls: 'trace-box' }, [el('h4', { text: '问题类型（choice，带概率）' })]);
     u.top_intents.forEach((t) => {
       probs.appendChild(
@@ -836,7 +1126,7 @@
       text: '判断层：' + u.provider_label + (u.questions_ver ? '（题目版本 ' + u.questions_ver + '）' : '') + (u.degraded ? ' · 已降级为关键词规则' : ''),
     });
     const head = u.intent_label + ' · 置信度 ' + pct(u.confidence, 0) + (u.high_risk ? ' · 高风险类型' : '');
-    return traceStep('懂', '懂问题', head, [el('div', { cls: 'trace-grid' }, [probs, gauges]), rule, provider]);
+    return traceStep('懂', '懂问题', head, [imageBox, el('div', { cls: 'trace-grid' }, [probs, gauges]), rule, provider]);
   }
 
   function findStep(parts) {
@@ -980,10 +1270,10 @@
 
   function renderTrace(view) {
     const t = view.trace;
-    $('trace-total').textContent = '买家：' + view.message.text + ' · 端到端 ' + ms(t.latency.since_received_ms);
+    $('trace-total').textContent = '买家：' + bubbleText(view.message) + ' · 端到端 ' + ms(t.latency.since_received_ms);
     const body = clear($('trace-body'));
     const steps = el('ol', { cls: 'trace-steps' }, [
-      understandStep(t.understand),
+      understandStep(t.understand, t.images),
       findStep(t.parts),
       writeStep(t.parts, t.simulated_note),
       judgeStep(t.parts),
@@ -1089,7 +1379,8 @@
     card.appendChild(tags);
     if (item.buyer_note) card.appendChild(el('p', { cls: 'small muted', text: '买家说明（已打码）：' + item.buyer_note }));
     card.appendChild(el('ul', { cls: 'as-rules' }, r.rules.map((rule) => el('li', {}, [el('span', { cls: 'rule-id', text: rule.id }), el('span', { text: rule.text })]))));
-    card.appendChild(el('div', { cls: 'as-suggest' }, [el('strong', { text: r.suggestion_label || '—' }), el('span', { text: r.reason || '' })]));
+    card.appendChild(el('div', { cls: 'as-suggest' }, [el('strong', { text: r.suggestion_label || '—' }), el('span', { text: r.reason_main || r.reason || '' })]));
+    if (r.vision_summary) card.appendChild(visionBox(item));
     const key = state.platform + ':' + item.aftersale_id;
     const last = state.results[key];
     if (last) card.appendChild(resultBox(last));
@@ -1123,6 +1414,21 @@
     if (!actions.childNodes.length) actions.appendChild(el('span', { cls: 'small muted', text: r.state === 'verify' ? '签收核查中：24 小时后仍未找到再建议同意' : r.state === 'evidence' ? '等买家补充凭证' : '不需要操作' }));
     card.appendChild(actions);
     return card;
+  }
+
+  /** R5 凭证的图片理解（§15 Phase 3）：凭证图片张数、占位图块、摘要；只是参考，建议和状态不变。 */
+  function visionBox(item) {
+    const r = item.review;
+    const images = item.evidence_images || [];
+    return el('div', { cls: 'as-vision', attrs: { 'data-vision': item.aftersale_id } }, [
+      el('p', { cls: 'as-vision-head' }, [
+        el('span', { cls: 'badge badge-kind', text: '图片理解 · 仅供参考' }),
+        el('span', { cls: 'small muted', text: '凭证图片 ' + images.length + ' 张 · 平台云内的视觉模型先看一遍' }),
+      ]),
+      images.length ? el('div', { cls: 'as-vision-tiles' }, images.map((img) => imageTile(img, { size: 'sm' }))) : null,
+      el('p', { cls: 'as-vision-text', text: r.vision_summary }),
+      el('p', { cls: 'small muted', text: '建议仍是「' + (r.suggestion_label || '人工决定') + '」：规则和状态不因图片理解改变，客服看过凭证原图再决定（§7.3.2 R5）' }),
+    ]);
   }
 
   function resultBox(res) {
@@ -1268,6 +1574,7 @@
     resizeTimer = setTimeout(() => {
       if (state.route === 'dashboard' && lastDashboard && lastDashboard.platform === state.platform) {
         weeklyChart($('chart-weekly'), lastDashboard.weekly, lastDashboard.kpis.adoption_target);
+        metricsPanel($('chart-metrics'), lastDashboard.platform_metrics);
       }
     }, 150);
   });
@@ -1448,35 +1755,112 @@
     box.appendChild(el('p', { cls: 'small ' + (within ? 'muted' : 'risk'), text: (within ? '✓ 端到端 P95 ' : '✗ 端到端 P95 ') + ms(lat.e2e.p95) + '，目标 ≤ 5 秒。' + (lat.offline ? '离线替身不联网；接真实大模型后按 §12.1 各环节目标核对。' : '') }));
   }
 
+  const VERDICT_CLS = { improved: 'badge-ok', worse: 'badge-danger', mixed: 'badge-warn', unchanged: '', insufficient: 'badge-warn', no_go_live: 'badge-warn' };
+
+  function deltaText(m) {
+    if (m.delta === null || m.delta === undefined) return m.direction_label;
+    const arrow = m.delta > 0 ? '▲' : m.delta < 0 ? '▼' : '＝';
+    const size = m.unit === 'ratio' ? Math.abs(m.delta * 100).toFixed(1) + ' 个百分点' : Math.abs((m.relative_change || 0) * 100).toFixed(0) + '%';
+    return arrow + ' ' + size + ' · ' + m.direction_label;
+  }
+
+  /** 一项指标按周的均值（接入前灰、接入后彩，竖虚线是接入日），按容器的实际宽度画。 */
+  function weeklyBars(holder, m) {
+    const box = clear(holder);
+    const weeks = m.weekly || [];
+    const values = weeks.filter((w) => w.mean !== null && w.mean !== undefined).map((w) => w.mean);
+    if (!values.length) return;
+    const W = Math.max(220, Math.round(box.clientWidth || 300));
+    const H = 104;
+    const pad = { l: 4, r: 4, t: 18, b: 20 };
+    const max = Math.max(...values) * 1.12 || 1;
+    const slot = (W - pad.l - pad.r) / weeks.length;
+    const bw = Math.min(slot * 0.62, 44);
+    const ih = H - pad.t - pad.b;
+    const title = m.label + ' 按周：' + weeks.map((w) => (w.phase === 'before' ? '接入前 ' : '接入后 ') + w.start.slice(5) + ' ' + (w.mean === null ? '—' : metricValue(w.mean, m.unit))).join('，');
+    const svg = svgEl('svg', { class: 'weekly-bars', viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img', 'aria-label': title });
+    svg.appendChild(svgEl('title', {}, [title]));
+    svg.appendChild(svgEl('line', { class: 'axis-line', x1: pad.l, x2: W - pad.r, y1: H - pad.b, y2: H - pad.b }));
+    weeks.forEach((w, i) => {
+      if (w.mean === null || w.mean === undefined) return;
+      const h = Math.max(1, (w.mean / max) * ih);
+      const rect = svgEl('rect', {
+        class: 'wbar ' + (w.phase === 'before' ? 'is-before' : 'is-after'),
+        x: (pad.l + i * slot + (slot - bw) / 2).toFixed(1),
+        y: (H - pad.b - h).toFixed(1),
+        width: bw.toFixed(1),
+        height: h.toFixed(1),
+        rx: 3,
+        tabindex: 0,
+        'aria-label': (w.phase === 'before' ? '接入前' : '接入后') + ' ' + w.start + ' 起一周 ' + metricValue(w.mean, m.unit),
+      });
+      attachTip(rect, () => [metricValue(w.mean, m.unit), (w.phase === 'before' ? '接入前 · ' : '接入后 · ') + w.start.slice(5) + '–' + w.end.slice(5), w.days + ' 天的均值']);
+      svg.appendChild(rect);
+    });
+    const split = weeks.findIndex((w) => w.phase === 'after');
+    if (split > 0) {
+      const x = pad.l + split * slot;
+      svg.appendChild(svgEl('line', { class: 'golive-line', x1: x, x2: x, y1: 4, y2: H - pad.b }));
+      svg.appendChild(svgEl('text', { class: 'golive-text', x: x + 4, y: 12 }, ['接入']));
+    }
+    svg.appendChild(svgEl('text', { class: 'axis-text', x: pad.l, y: H - 4 }, [weeks[0].start.slice(5)]));
+    svg.appendChild(svgEl('text', { class: 'axis-text', x: W - pad.r, y: H - 4, 'text-anchor': 'end' }, [weeks[weeks.length - 1].end.slice(5)]));
+    box.appendChild(el('p', { cls: 'small muted', text: '按周（每周 7 天的均值，悬停看数）' }));
+    box.appendChild(svg);
+  }
+
   function metricsPanel(container, pm) {
     const box = clear(container);
-    $('metrics-sub').textContent = '接入日 ' + pm.go_live + '，前后各 4 周的平均（§12.4）· 数据来自平台指标接口（合成）';
+    $('metrics-sub').textContent = pm.go_live
+      ? '接入日 ' + pm.go_live + '（演示设定），前后各 ' + pm.window_days + ' 天的均值；数据由平台指标接口同步（合成），口径和商家报表一样（§12.4）'
+      : pm.verdict_label;
+    const counts = pm.counts || {};
+    const summary = ['improved', 'worse', 'unchanged', 'insufficient']
+      .filter((d) => counts[d])
+      .map((d) => ({ improved: '变好', worse: '变差', unchanged: '持平', insufficient: '数据不足' })[d] + ' ' + counts[d] + ' 项');
+    box.appendChild(
+      el('div', { cls: 'verdict', attrs: { 'data-verdict': pm.verdict } }, [
+        el('span', { cls: 'badge ' + (VERDICT_CLS[pm.verdict] || ''), text: (pm.verdict === 'improved' ? '✓ ' : '') + '总体：' + pm.verdict_label }),
+        el('span', { cls: 'small muted', text: summary.join('、') + (pm.metrics.length ? (pm.reliable ? ' · 前后数据都够（每段 ≥ 7 天、样本量 ≥ 100）' : ' · 有可靠性提示，结论仅供参考') : '') }),
+      ])
+    );
+    (pm.notes || []).forEach((n) => box.appendChild(el('p', { cls: 'small muted', text: n })));
     if (!pm.metrics.length) {
       box.appendChild(el('p', { cls: 'empty', text: '没有平台指标数据' }));
       return;
     }
+    const grid = el('div', { cls: 'metric-grid' });
+    const weekly = [];
     pm.metrics.forEach((m) => {
-      const max = Math.max(m.before, m.after) * 1.15 || 1;
-      const rel = m.before ? (m.after - m.before) / m.before : 0;
-      const arrow = m.delta >= 0 ? '▲' : '▼';
-      const delta = el('span', { cls: 'delta ' + (m.improved ? 'delta-good' : 'delta-bad'), text: arrow + ' ' + (m.unit === 'ratio' ? (m.delta * 100).toFixed(1) + ' 个百分点' : Math.abs(rel * 100).toFixed(0) + '%') + ' · ' + (m.improved ? '改善' : '变差') });
+      const good = m.direction === 'improved';
+      const bad = m.direction === 'worse';
+      const delta = el('span', { cls: 'delta ' + (good ? 'delta-good' : bad ? 'delta-bad' : 'delta-flat'), text: deltaText(m) });
       const holder = el('div');
-      const card = el('article', { cls: 'metric', attrs: { 'data-metric': m.metric } }, [
+      const weeklyHolder = el('div', { cls: 'weekly-wrap' });
+      weekly.push([weeklyHolder, m]);
+      const card = el('article', { cls: 'metric', attrs: { 'data-metric': m.metric, 'data-direction': m.direction } }, [
         el('div', { cls: 'metric-head' }, [el('span', { cls: 'metric-label', text: m.label }), delta]),
         el('div', { cls: 'legend' }, [el('span', {}, [el('span', { cls: 'legend-key is-muted' }), '接入前']), el('span', {}, [el('span', { cls: 'legend-key' }), '接入后']), el('span', { text: m.higher_is_better ? '越高越好' : '越低越好' })]),
         holder,
+        weeklyHolder,
         el('p', { cls: 'metric-note', text: m.note }),
       ]);
-      hbars(
-        holder,
-        [
-          { label: '接入前', value: m.before, text: metricValue(m.before, m.unit), cls: 'is-muted', tip: m.days_before + ' 天平均' },
-          { label: '接入后', value: m.after, text: metricValue(m.after, m.unit), tip: m.days_after + ' 天平均' },
-        ],
-        { max }
-      );
-      box.appendChild(card);
+      (m.flag_notes || []).forEach((n) => card.appendChild(el('p', { cls: 'small risk', text: n })));
+      if (m.before !== null && m.after !== null) {
+        const sample = (n) => (n ? '，样本 ' + num(n) : '');
+        hbars(
+          holder,
+          [
+            { label: '接入前', value: m.before, text: metricValue(m.before, m.unit), cls: 'is-muted', tip: m.days_before + ' 天' + (m.weighted ? '按样本量加权' : '') + '的均值' + sample(m.sample_before) },
+            { label: '接入后', value: m.after, text: metricValue(m.after, m.unit), tip: m.days_after + ' 天' + (m.weighted ? '按样本量加权' : '') + '的均值' + sample(m.sample_after) },
+          ],
+          { max: Math.max(m.before, m.after) * 1.15 || 1 }
+        );
+      }
+      grid.appendChild(card);
     });
+    box.appendChild(grid);
+    weekly.forEach((pair) => weeklyBars(pair[0], pair[1])); // 放进页面之后才量得出宽度
   }
 
   // ================================================================ 合规：打码演示

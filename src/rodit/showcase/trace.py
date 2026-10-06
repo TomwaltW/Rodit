@@ -5,10 +5,13 @@
   提醒、转人工、缺失知识、降级、各环节耗时；
 - 判断日志（AuditLog.list_decisions，这条消息新写的）：路由、质检用的判断层实现和题目版本；
 - 审计（engine.result，这条消息新写的）：硬规则命中和质检原因的汇总；
-- 过程记录（showcase.recorder.Recording）：每条依据的内容、每份草稿、每份草稿的质检结果。
+- 审计（engine.understand，这条消息新写的）：买家图片的张数、识别失败 / 没识别的张数；
+- 过程记录（showcase.recorder.Recording）：路由看到的图片识别结果和描述、每条依据的内容、每份草稿、
+  每份草稿的质检结果。
 
 只放给讲解用的字段：不放 buyer_ref、买家昵称、会话里的其他买家消息；依据内容是引擎给大模型看的
-那份（已做个人信息最小化，§5.3）。
+那份（已做个人信息最小化，§5.3）；图片的识别结果（摘要、图中文字）是图片理解打过码的，这里
+再过一次 mask_pii。
 """
 
 from __future__ import annotations
@@ -18,9 +21,10 @@ from typing import Any
 
 from rodit.api.web import CONFIDENCE_LABELS, DEGRADED_LABELS, DRAFT_KIND_LABELS, HARD_RULE_LABELS
 from rodit.core import evidence as ev
+from rodit.core.audit import AuditAction
 from rodit.core.clock import fmt_time
 from rodit.core.config import EngineConfig
-from rodit.core.enums import INTENT_LABELS, DecisionStage, Intent, RouteAction
+from rodit.core.enums import IMAGE_KIND_LABELS, INTENT_LABELS, DecisionStage, Intent, RouteAction
 from rodit.core.models import (
     NON_BLOCKING_HARD_RULES,
     AuditEvent,
@@ -30,8 +34,11 @@ from rodit.core.models import (
     QAResult,
     SuggestionCard,
 )
+from rodit.core.pii import mask_pii
 from rodit.core.ports import KnowledgeRepository
+from rodit.engine.images import ALERT_VISION_FAILED, DEGRADED_VISION, ROUTING_MIN_CONFIDENCE
 from rodit.knowledge import describe_gap
+from rodit.showcase.images import tile_view
 from rodit.showcase.labels import (
     E2E_TARGET_MS,
     LATENCY_STAGES,
@@ -81,11 +88,15 @@ def gap_label(marker: str) -> str:
     return label
 
 
+EXTRA_DEGRADED_LABELS: dict[str, str] = {DEGRADED_VISION: "图片理解（没能识别，请客服自己看图）"}
+"""商家控制台的降级中文名里还没有的（图片理解是 §15 Phase 3 新加的）。"""
+
+
 def degraded_label(marker: str) -> str:
     if marker.startswith("tool:"):
         kind = marker.removeprefix("tool:")
         return f"{DEGRADED_LABELS['tool']}（{ev.TOOL_LABELS.get(kind, kind)}）"
-    return DEGRADED_LABELS.get(marker, marker)
+    return DEGRADED_LABELS.get(marker) or EXTRA_DEGRADED_LABELS.get(marker, marker)
 
 
 def card_view(card: SuggestionCard) -> dict[str, Any]:
@@ -102,7 +113,53 @@ def card_view(card: SuggestionCard) -> dict[str, Any]:
         "evidence": [{"id": e.id, "label": e.label} for e in card.evidence],
         "risk_hints": list(card.risk_hints),
         "qa_scores": dict(card.qa_scores),
+        "prefill": card.prefill,  # 半自动（§5.6）：可以直接填进客服输入框
         "status": "shown",
+    }
+
+
+def is_image_alert(alert: str) -> bool:
+    """引擎给客服的图片提醒（engine.images：图片摘要、没能识别、没开图片理解、只识别了前几张）。"""
+    return alert.startswith("买家发来") or alert == ALERT_VISION_FAILED
+
+
+def images_view(
+    result: EngineResult, recording: Recording, events: Sequence[AuditEvent]
+) -> dict[str, Any] | None:
+    """买家图片的识别（§15 Phase 3）：几张、每张的类型 / 置信度 / 摘要 / 图中文字（已打码）、
+    接在买家消息后面给路由和生成看的描述、识别失败的降级和给客服的提醒。没有图片时返回 None。"""
+    understand = next(
+        (e for e in reversed(events) if e.action == AuditAction.UNDERSTAND.value), None
+    )
+    detail = understand.detail if understand is not None else {}
+    total = int(detail.get("images") or 0)
+    if not total:
+        return None
+    routed = recording.routed[0] if recording.routed else None
+    findings = routed.image_findings if routed else []
+    return {
+        "total": total,
+        "failed": int(detail.get("images_failed") or 0),
+        "skipped": int(detail.get("images_skipped") or 0),
+        "findings": [
+            {
+                **tile_view(f.ref),
+                "kind": f.kind.value,
+                "kind_label": IMAGE_KIND_LABELS[f.kind],
+                "confidence": round(f.confidence, 3),
+                "summary": mask_pii(f.summary) if f.summary else "",
+                "extracted_text": mask_pii(f.extracted_text) if f.extracted_text else None,
+                "routed": f.confidence >= ROUTING_MIN_CONFIDENCE,
+            }
+            for f in findings
+        ],
+        "min_confidence": ROUTING_MIN_CONFIDENCE,
+        "description": mask_pii(routed.image_description)
+        if routed and routed.image_description
+        else None,
+        "degraded": DEGRADED_VISION in result.degraded,
+        "degraded_label": degraded_label(DEGRADED_VISION),
+        "alerts": [a for a in result.alerts if is_image_alert(a)],
     }
 
 
@@ -327,6 +384,7 @@ def build_trace(
     blocked = sum(1 for p in parts for c in p["judge"] if not c["passed"])
     return {
         "understand": _understand(result, config, decisions),
+        "images": images_view(result, recording, events),
         "parts": parts,
         "fallback": {
             "alerts": list(result.alerts),
@@ -365,5 +423,7 @@ __all__ = [
     "degraded_label",
     "describe_evidence",
     "gap_label",
+    "images_view",
     "intent_label",
+    "is_image_alert",
 ]

@@ -2,8 +2,10 @@
 
 在本进程里起一个只监听 127.0.0.1 随机端口的演示站（回放了合成历史、离线替身，不联网），用 node 跑
 showcase_smoke.cjs：产品概览、工作台（推荐卡片、过程面板、发送 / 编辑后发送 / 不合适、质检拦截、
-买家打字）、售后审核（确认框、重读状态、幂等、取消）、数据看板（图表、悬停提示）、合规页的打码演示、
-切换平台、重置、手机宽度没有横向滚动，全程没有控制台报错、没有 CSP 拦截、没有外部请求。
+买家打字、上线节奏和半自动的"已填入输入框"、买家图片：场景里的破损照片和物流截图、自己选图发送）、
+售后审核（确认框、重读状态、幂等、取消、凭证图片理解）、数据看板（图表、悬停提示、平台指标的总体
+结论和按周序列）、合规页的打码演示、切换平台（拼多多不能发图片）、重置、手机宽度没有横向滚动，
+全程没有控制台报错、没有 CSP 拦截、没有外部请求。
 设了 RODIT_SHOWCASE_SHOTS（目录）时把各页的整页截图存进去。
 没有 node / playwright 模块 / 浏览器时跳过（不新增 Python 依赖：用镜像里全局安装的
 Node 版 Playwright）。
@@ -90,6 +92,8 @@ def test_showcase_in_a_real_browser():
         "qa-block",
         "feedback",
         "typing",
+        "prefill",
+        "image",
         "aftersale",
         "dashboard",
         "compliance",
@@ -109,6 +113,10 @@ def test_showcase_in_a_real_browser():
     assert statuses["sc-size"] == SuggestionStatus.SENT
     assert statuses["sc-invoice"] == SuggestionStatus.EDITED_SENT
     assert statuses["sc-price"] == SuggestionStatus.REJECTED
+    assert statuses["sc-ship_quick"] == SuggestionStatus.SENT  # 半自动填进输入框，客服按的发送
+    # 买家图片走了图片理解（合成数据的替身）：场景预设的、自己选的
+    calls = {ref for _, ref in taobao.unit.vision.calls}
+    assert {"img_buyer_damage_1", "img_buyer_logistics_1", "img_buyer_size_1"} <= calls
     info = taobao.unit.tools.get_aftersale(taobao.shop_id, "as_2001")
     assert info is not None and info.status == AfterSaleStatus.REFUNDING
     assert len(taobao.unit.action_port.calls) == 1  # 再提交一次没有重复操作（幂等）
