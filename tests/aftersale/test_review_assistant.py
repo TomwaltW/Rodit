@@ -18,6 +18,7 @@ from rodit.aftersale.assistant import (
     MSG_TAOBAO_REFUSE,
     ReviewAssistant,
 )
+from rodit.aftersale.durations import CREATED_AT_KEY
 from rodit.aftersale.state_machine import history, last_result, was_negotiated
 from rodit.core.audit import AuditAction, InMemoryAuditSink
 from rodit.core.config import AfterSaleConfig, EngineConfig, effective_shop_config
@@ -253,6 +254,9 @@ def test_confirm_happy_path(env):
     assert confirm_ev[0].detail["expected_status_version"] == info.status_version
     assert action_ev[0].detail["ok"] is True and action_ev[0].detail["platform_code"] == "0"
     assert action_ev[0].detail["idempotency_key"] == key
+    # 平台申请时间（工作台统计审核时长用，统计时不再读平台）
+    for ev in (confirm_ev[0], action_ev[0]):
+        assert ev.detail[CREATED_AT_KEY] == info.created_at.isoformat()
     assert env.audit.actions(SHOP_A)[-3:] == [
         AuditAction.REVIEW_CONFIRM,
         AuditAction.REVIEW_ACTION,

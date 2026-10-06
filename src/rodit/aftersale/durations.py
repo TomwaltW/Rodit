@@ -5,6 +5,8 @@
 
 口径：
 - 审核时长 = 平台售后单的申请时间（AfterSaleInfo.created_at）→ 第一次由人确认执行的时间。
+  申请时间取审核助手确认执行时写进审计的 aftersale_created_at（CREATED_AT_KEY，执行前重读平台
+  拿到的），统计时不读平台；加这个字段之前确认的单没有，算"时长未知"。
   "由人确认"指客服在工作台里确认、平台写操作成功：审计 aftersale.action（ok=True，不含幂等键重复的
   那次）或审核记录迁移历史里第一条 待客服确认 → 已同意 / 已拒绝 / 退货中、带操作人的迁移，两者取早。
   R3 同意退货之后再同意退款是同一张售后单的第二次操作，不另算。
@@ -30,6 +32,10 @@ DECISION_STATES: frozenset[ReviewState] = frozenset(
     {ReviewState.AGREED, ReviewState.REFUSED, ReviewState.WAIT_RETURN}
 )
 """客服确认执行后进入的状态（core.enums.REVIEW_TRANSITIONS：只能从待客服确认进入）。"""
+
+CREATED_AT_KEY = "aftersale_created_at"
+"""审核助手确认执行时写进 aftersale.confirm / aftersale.action 审计 detail 的平台申请时间
+（AfterSaleInfo.created_at，ISO 格式带时区）：统计审核时长不再为每张单读平台。"""
 
 _NOT_HUMAN = frozenset({"system", "bot", "auto"})
 
@@ -108,6 +114,22 @@ def decision_times(events: Iterable[AuditEvent]) -> dict[str, datetime]:
     return out
 
 
+def application_times(events: Iterable[AuditEvent]) -> dict[str, datetime]:
+    """审计事件 → {售后单 ID: 平台申请时间}（aftersale.confirm / aftersale.action 的
+    CREATED_AT_KEY）。没有这个字段、格式不对、不带时区的跳过；其他事件忽略。"""
+    actions = {AuditAction.REVIEW_ACTION.value, AuditAction.REVIEW_CONFIRM.value}
+    out: dict[str, datetime] = {}
+    for event in events:
+        if event.action not in actions:
+            continue
+        detail = event.detail if isinstance(event.detail, Mapping) else {}
+        aftersale_id = detail.get("aftersale_id")
+        created = _parse_time(detail.get(CREATED_AT_KEY))
+        if isinstance(aftersale_id, str) and aftersale_id and created is not None:
+            out.setdefault(aftersale_id, created)
+    return out
+
+
 def merge_decisions(*sources: Mapping[str, datetime]) -> dict[str, datetime]:
     """几份 {售后单 ID: 确认时间} 合在一起，同一张售后单取最早的。"""
     out: dict[str, datetime] = {}
@@ -152,8 +174,10 @@ def summarize(durations: Iterable[timedelta]) -> DurationSummary:
 
 
 __all__ = [
+    "CREATED_AT_KEY",
     "DECISION_STATES",
     "DurationSummary",
+    "application_times",
     "decision_times",
     "first_decision",
     "merge_decisions",

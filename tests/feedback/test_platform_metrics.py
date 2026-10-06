@@ -536,6 +536,45 @@ def test_go_live_prefers_explicit_then_first_switch_to_assist_then_authorization
     assert "请填写接入日期" in unknown.label
 
 
+def _granted(at: datetime, event_at: object = None, shop: str = SHOP_A) -> AuditEvent:
+    detail: dict[str, object] = {"kind": "subscribed", "created": True}
+    if event_at is not None:
+        detail["event_at"] = event_at
+    return AuditEvent(
+        shop_id=shop,
+        actor="platform",
+        action=AuditAction.AUTH_GRANTED.value,
+        detail=detail,
+        created_at=at,
+    )
+
+
+def test_go_live_from_authorization_uses_the_first_grant_not_the_latest_renewal():
+    """续订改写 ShopAuth.granted_at；接入日期按这次开通最早的 auth.granted（优先平台事件时间）。"""
+    subscribed = datetime(2026, 7, 1, 12, 0, tzinfo=CST)
+    renewed = datetime(2026, 9, 1, 12, 0, tzinfo=CST)
+    grants = [
+        _granted(renewed + timedelta(minutes=1), renewed.isoformat()),
+        # 平台 7 月 1 日开通、隔天才送到：按平台事件时间
+        _granted(subscribed + timedelta(days=1), subscribed.isoformat()),
+    ]
+    go = resolve_go_live(None, grant_events=grants, granted_at=renewed)
+    assert (go.day, go.source) == (date(2026, 7, 1), "authorization")
+    assert "续订" in go.label
+    # 没记平台事件时间（或格式不对、不带时区）的按写入时间
+    old = [_granted(subscribed), _granted(renewed, "not-a-time"), _granted(renewed, "2026-06-01")]
+    assert resolve_go_live(None, grant_events=old, granted_at=renewed).day == date(2026, 7, 1)
+    # 别的审计事件不算；没有开通记录时才退回 granted_at
+    stages = [_stage(subscribed - timedelta(days=30), "shadow")]
+    fallback = resolve_go_live(None, stage_events=stages, grant_events=stages, granted_at=renewed)
+    assert (fallback.day, fallback.source) == (date(2026, 9, 1), "authorization")
+    # 顺序不变：填写的 > 第一次切到智能辅助 > 开通授权
+    assist = [_stage(datetime(2026, 8, 31, 9, 0, tzinfo=CST), "assist")]
+    assert resolve_go_live(None, stage_events=assist, grant_events=grants).source == "rollout"
+    explicit = resolve_go_live(date(2026, 8, 1), stage_events=assist, grant_events=grants)
+    assert explicit.source == "query"
+
+
 def test_go_live_dates_are_beijing_dates():
     # UTC 8 月 30 日 17:00 = 北京时间 8 月 31 日 1:00
     utc_evening = datetime.fromisoformat("2026-08-30T17:00:00+00:00")

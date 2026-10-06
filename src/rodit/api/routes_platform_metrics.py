@@ -101,7 +101,7 @@ def platform_metrics_report(
 ) -> PlatformMetricsReport:
     """平台客服指标接入前后对比（§12.4）：每项指标接入前 / 接入后的均值、变化、变好还是变差、
     可靠性提示、按周的序列，以及总体结论（§1.3 "较接入前改善"）。接入日期：填写的 > 第一次切到
-    智能辅助 > 店铺开通授权的日期；都没有时结论是 no_go_live，请填写。只读。"""
+    智能辅助 > 这次开通授权的日期（续订不改变）；都没有时结论是 no_go_live，请填写。只读。"""
     try:
         return _metrics(service).report(principal.shop_id, go_live=go_live, window_days=window_days)
     except PlatformMetricsUnavailable as exc:

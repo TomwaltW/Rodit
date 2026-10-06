@@ -21,7 +21,8 @@
 建议（仍由客服查看凭证后决定），识别失败时理由里写明未能识别。
 
 留痕：aftersale.suggest（规则建议）、aftersale.transition（每次迁移）、aftersale.confirm（谁确认了
-什么）、aftersale.action（平台返回结果）。审计 detail 不放买家原文（售后说明不进审计）；
+什么）、aftersale.action（平台返回结果）；确认和平台结果都带售后单的平台申请时间
+（aftersale_created_at，工作台统计审核时长用）。审计 detail 不放买家原文（售后说明不进审计）；
 凭证识别只记张数和类型（aftersale.suggest 的 evidence_vision）。
 迁移审计在记录保存成功后写；确认和平台结果在发生时就写（平台已经操作过，保存失败也要留痕）。
 
@@ -37,6 +38,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from rodit.aftersale.advisor import AFTERSALE_STATUS_LABELS
+from rodit.aftersale.durations import CREATED_AT_KEY
 from rodit.aftersale.evidence_vision import EVIDENCE_VISION_TIMEOUT_S, read_evidence
 from rodit.aftersale.rules import REASON_WAIT_SELLER_CONFIRM, ReviewSuggestion, evaluate
 from rodit.aftersale.state_machine import (
@@ -313,6 +315,8 @@ class ReviewAssistant:
             "rules": list(current.matched_rules),
             "suggestion": str(current.suggestion) if current.suggestion else None,
             "idempotency_key": key,
+            # 平台申请时间：工作台统计审核时长用，统计时不再逐张读平台（aftersale.durations）
+            CREATED_AT_KEY: info.created_at.isoformat(),
         }
         self._record(
             shop_id,

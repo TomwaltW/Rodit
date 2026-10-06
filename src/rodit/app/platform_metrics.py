@@ -13,8 +13,10 @@
   本平台考核的，比例在 0–1、时长有合理上限，日期不晚于今天、最多回溯 400 天；和已登记的一样时
   不写、不记审计。
 - 列表（list_samples）和报表（report）只读，不写审计。报表的接入日期：填写的 > 第一次切到智能辅助
-  （上线记录 shop.rollout_stage）> 店铺授权的开通时间（ShopAuth.granted_at，按 stamp 读，不解密
-  令牌）> 未知（报表请商家填写）。
+  （上线记录 shop.rollout_stage）> 这次开通授权的时间（最早的开通记录 auth.granted，优先用它记下的
+  平台事件时间；续订也写 auth.granted 但不会更早，取消订购时和店铺的审计一起删掉）> 没有开通记录时
+  用 ShopAuth.granted_at（按 stamp 读，不解密令牌；每次续订都会改写它，只作兜底）> 未知（报表请
+  商家填写）。没开影子模式的店铺没有上线记录，多半落到开通授权这一档。
 - 写操作都在 processing(shop_id) 里做（和取消订购互斥，§8.4），进了闸门先确认店铺还在、没停用
   （删完的店铺不会被写回来）；写完记审计（AuditAction.PLATFORM_METRICS_SYNCED /
   PLATFORM_METRICS_RECORDED：指标、日期、条数、数值，没有买家数据）。
@@ -49,6 +51,7 @@ from rodit.core.platform_metrics import metrics_for
 from rodit.core.ports import PlatformMetricsRepository, PlatformMetricsSource
 from rodit.core.scopes import MVP_SCOPES
 from rodit.feedback.platform_metrics import (
+    AUTH_GRANTED_ACTION,
     DEFAULT_WINDOW_DAYS,
     MAX_HISTORY_DAYS,
     ROLLOUT_STAGE_ACTION,
@@ -378,11 +381,14 @@ class PlatformMetricsService:
         if explicit is not None:
             check_day(explicit, self.today(), "接入日期")
             return resolve_go_live(explicit)
-        events = self.unit.repos.audit.list_events(shop_id, action=ROLLOUT_STAGE_ACTION)
+        audit = self.unit.repos.audit
+        events = audit.list_events(shop_id, action=ROLLOUT_STAGE_ACTION)
+        grants = audit.list_events(shop_id, action=AUTH_GRANTED_ACTION)
         stamp = self.unit.repos.auth.stamp(shop_id)
         return resolve_go_live(
             None,
             stage_events=[e for e in events if e.shop_id == shop_id],
+            grant_events=[e for e in grants if e.shop_id == shop_id],
             granted_at=stamp.granted_at if stamp is not None else None,
         )
 

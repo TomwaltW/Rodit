@@ -10,12 +10,15 @@ AssistService（review_aftersale / negotiate_aftersale / negotiation_done / conf
   授权过期时停止处理），授权无效抛 AuthExpired，一次平台接口都不调。
 - 列表 = 平台的待审核售后单（带缓存的只读网关，§12.1 省额度）+ 本地还没结束的审核记录
   （签收核查中、等待凭证、待客服确认、协商中、退货中……平台待审核列表里可能已经没有）。
+  审核记录整批读出来在内存里对（不按售后单逐张读：PostgreSQL 上每次读一个事务）。
   平台数据来自短时缓存：审核记录比缓存新时以审核记录同步到的平台状态为准；缓存比审核记录新、
   状态或状态版本不一样时标"平台已变化"，提示刷新（确认执行前审核助手还会重读，§7.3.2）。
   平台待审核列表读不到（ToolUnavailable）时只列本地审核记录，并标明（§12.2）。
 - 批量跑规则走 AssistService.review_aftersale（和单张一样：店铺闸门、授权检查、审核助手、审计、
   状态机都不变），一张失败（平台接口故障、并发冲突……）只记在这一行，不影响其他行；授权失效、
   店铺停用时停下，剩下的不再跑。
+- 统计的审核时长不读平台：申请时间用确认执行时审计里记下的（aftersale.durations），GET 不会按
+  历史上确认过的单数往平台扇出；没记下的（加这个字段之前确认的）算时长未知。
 - 详情重读平台（不走缓存：确认要带最新的状态版本）；读不到时退回缓存数据并标明，此时不能确认。
   可执行的操作按平台差异（§7.1、§7.3.2：拼多多没有拒绝接口、淘宝拒绝要先协商、抖店拒绝要原因码）、
   写接口和写售后权限（MVP 只给建议，§8.4）、审核状态、平台状态、R6 店长确认逐条给出不能做的原因。
@@ -53,6 +56,7 @@ from rodit.aftersale.assistant import (
 from rodit.aftersale.durations import (
     DECISION_STATES,
     DurationSummary,
+    application_times,
     decision_times,
     first_decision,
     merge_decisions,
@@ -294,7 +298,8 @@ class DeskStats(_Model):
       已结束的状态（已同意、已拒绝、平台已处理）只数 since 之后结束的（审核记录的更新时间）。
     - pending_by_rule：还没结束的审核记录各命中了哪些规则（一张单可以命中多条，各算一次）。
     - review_duration：since 之后由人确认执行的售后单，申请 → 第一次确认执行的时长
-      （rodit.aftersale.durations 的口径）；decided 是条数，duration_unknown 是平台申请时间读不到、
+      （rodit.aftersale.durations 的口径；申请时间取确认时审计里记下的，不读平台）；decided 是条数，
+      duration_unknown 是审计里没有申请时间（加这个字段之前确认的、只在迁移历史里找到确认的）、
       没算进时长的。
     - waiting：还没结束的售后单已经等了多久。
     """
@@ -582,8 +587,14 @@ class AfterSaleDesk:
             )
         return AfterSaleQueue(as_of=now, rows=rows, total=len(reviews))
 
-    def _open_rows(self, shop_id: str, now: datetime) -> tuple[list[QueueRow], bool]:
-        """平台待审核 + 本地还没结束的审核记录（已结束的不列）。返回（行，平台列表是否读不到）。"""
+    def _open_rows(
+        self, shop_id: str, now: datetime, reviews: list[AfterSaleReview] | None = None
+    ) -> tuple[list[QueueRow], bool]:
+        """平台待审核 + 本地还没结束的审核记录（已结束的不列）。返回（行，平台列表是否读不到）。
+
+        审核记录整批读，不逐张读：reviews 是调用方已经读好的这家店的全部审核记录（统计）；
+        不给时先读还没结束的，平台待审核里有对不上的再读一次已结束的（缓存里的平台列表可能还有
+        刚处理完的单）。"""
         repo = self.unit.repos.reviews
         pending: dict[str, AfterSaleInfo] = {}
         list_failed = False
@@ -594,18 +605,19 @@ class AfterSaleDesk:
         for info in listed:
             if info.shop_id == shop_id:  # 纵深防御：网关已按店铺隔离（§9.2）
                 pending.setdefault(info.aftersale_id, info)
-        open_reviews = {
-            r.aftersale_id: r
-            for r in repo.list_by_state(shop_id, OPEN_STATES)
-            if r.shop_id == shop_id and r.state in OPEN_STATES
-        }
+        if reviews is None:
+            reviews = repo.list_by_state(shop_id, OPEN_STATES)
+            known = {r.aftersale_id for r in reviews if r.shop_id == shop_id}
+            if pending.keys() - known:
+                reviews = [*reviews, *repo.list_by_state(shop_id, sorted(TERMINAL_STATES))]
+        mine = [r for r in reviews if r.shop_id == shop_id]  # 纵深防御（§9.2）
+        open_reviews = {r.aftersale_id: r for r in mine if r.state in OPEN_STATES}
+        finished = {r.aftersale_id for r in mine if r.state in TERMINAL_STATES}
         rows: list[QueueRow] = []
         for aftersale_id, info in pending.items():
             rec = open_reviews.pop(aftersale_id, None)
-            if rec is None:
-                rec = repo.get(shop_id, aftersale_id)
-                if rec is not None and (rec.shop_id != shop_id or rec.state in TERMINAL_STATES):
-                    continue  # 已经处理完（缓存里的平台列表还没更新）
+            if rec is None and aftersale_id in finished:
+                continue  # 已经处理完（缓存里的平台列表还没更新）
             rows.append(self._row(aftersale_id, rec, info, now, unavailable=False, missing=False))
         for aftersale_id, rec in open_reviews.items():  # 平台待审核列表里没有的（退货中等）
             info, unavailable = self._cached_info(shop_id, aftersale_id)
@@ -812,7 +824,8 @@ class AfterSaleDesk:
         unit = self.unit
         unit.auth.require(shop_id)
         now = unit.clock.now()
-        rows, list_failed = self._open_rows(shop_id, now)
+        reviews = [r for r in unit.repos.reviews.list_by_state(shop_id) if r.shop_id == shop_id]
+        rows, list_failed = self._open_rows(shop_id, now, reviews)
         by_state: dict[str, int] = {UNREVIEWED: 0, **{s.value: 0 for s in ReviewState}}
         pending_by_rule: dict[str, int] = {rule: 0 for rule in RULES}
         for row in rows:
@@ -820,15 +833,18 @@ class AfterSaleDesk:
             by_state[key] += 1
             for rule in row.matched_rules:
                 pending_by_rule[rule] = pending_by_rule.get(rule, 0) + 1
-        reviews = [r for r in unit.repos.reviews.list_by_state(shop_id) if r.shop_id == shop_id]
         recent = [r for r in reviews if since is None or (r.updated_at and r.updated_at >= since)]
         for rec in recent:
             if rec.state in TERMINAL_STATES:
                 by_state[rec.state.value] += 1
 
-        events = unit.repos.audit.list_events(
-            shop_id, action=AuditAction.REVIEW_ACTION.value, since=since
-        )
+        events = [
+            e
+            for e in unit.repos.audit.list_events(
+                shop_id, action=AuditAction.REVIEW_ACTION.value, since=since
+            )
+            if e.shop_id == shop_id
+        ]
         from_history: dict[str, datetime] = {}
         for rec in recent:
             at = first_decision(history(rec))
@@ -836,19 +852,19 @@ class AfterSaleDesk:
                 from_history[rec.aftersale_id] = at
         decided = {
             aftersale_id: at
-            for aftersale_id, at in merge_decisions(
-                decision_times(e for e in events if e.shop_id == shop_id), from_history
-            ).items()
+            for aftersale_id, at in merge_decisions(decision_times(events), from_history).items()
             if since is None or at >= since
         }
+        # 申请时间来自确认时的审计，不读平台：GET 不按历史上确认过的单数往平台扇出
+        applied = application_times(events)
         durations: list[timedelta] = []
         unknown = 0
-        for aftersale_id, at in sorted(decided.items()):
-            info, unavailable = self._cached_info(shop_id, aftersale_id)
-            if info is None or unavailable:
+        for aftersale_id, at in decided.items():
+            created = applied.get(aftersale_id)
+            if created is None:
                 unknown += 1
                 continue
-            durations.append(review_duration(info.created_at, at))
+            durations.append(review_duration(created, at))
         waits = [timedelta(seconds=r.waiting_s) for r in rows if r.waiting_s is not None]
         return DeskStats(
             as_of=now,
