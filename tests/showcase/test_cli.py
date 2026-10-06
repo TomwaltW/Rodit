@@ -112,7 +112,9 @@ def test_env_factory_reads_the_environment(monkeypatch):
         code = main(["--llm", "env"], out, run=run)
         assert code == 0 and "demo-model" in out.getvalue()
         assert stub.api_key not in out.getvalue()
-        assert stub.count("preflight") == 1 and stub.count("probe") == 1
+        # 启动检查就是评测的能力检查：普通调用、JSON 模式、logprobs（路由投票）各一次
+        assert [r.purpose for r in stub.requests] == ["preflight", "probe_json", "probe_logprobs"]
+        assert "启动检查通过——大模型能力检查（demo-model @ http://127.0.0.1:" in out.getvalue()
         assert run.calls  # 检查过了才起服务
 
 

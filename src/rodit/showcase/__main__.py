@@ -10,11 +10,15 @@
 - 默认用离线替身（不联网、不需要密钥），不读任何 RODIT_LLM_* 环境变量；
 - --llm env：接真实的境内大模型（和评测 python -m rodit.eval --llm env 取同一个：--config 里
   llm.base_url 和 llm.model 都写了用配置，否则用 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL /
-  RODIT_LLM_TIMEOUT_S；密钥 RODIT_LLM_API_KEY 只放本地 .env 或环境的密钥设置）。
+  RODIT_LLM_TIMEOUT_S；模型服务的差异用 RODIT_LLM_EXTRA_BODY / RODIT_LLM_JSON_MODE /
+  RODIT_LLM_LOGPROBS 调，配置文件里是 llm.extra_body / json_mode / logprobs；密钥
+  RODIT_LLM_API_KEY 只放本地 .env 或环境的密钥设置）。
   起服务时只允许监听本机地址，否则拒绝启动（退出码 2）：别人连进来演示会花你的大模型额度，
   买家问题（合成数据）也会发给模型服务。配置不全、格式不对也拒绝启动（提示里只有变量名和原因）；
-  启动前做一次检查（showcase.preflight：连通性 + JSON 模式探测），没过就退出码 2，
-  提示里写明是网络策略、密钥、地址 / 模型、参数、限流、服务端、超时还是证书的问题，只显示主机名；
+  启动前做一次能力检查（showcase.preflight，和评测同一个 rodit.eval.llm_env.probe_capabilities：
+  普通调用、JSON 模式，路由用大模型投票时再加 logprobs，至多三个很小的请求），结果打在横幅里、
+  自检报告里也有；没过就退出码 2，提示里写明是网络策略、密钥、地址 / 模型、参数（要改哪个开关）、
+  限流、服务端、超时还是证书的问题，只显示主机名；
 - --judge：llm（--llm env 时的默认）路由、质检照生产组装、用大模型投票（showcase.realchain）；
   offline（不接大模型时的默认、也是唯一选择）路由用关键词规则、质检用启发式判断。
   回放的合成历史一律用离线替身，不调用大模型；
@@ -45,6 +49,7 @@ import yaml
 from rodit.core.config import EngineConfig, load_config
 from rodit.core.enums import Platform, ProviderName
 from rodit.core.ports import LLMClient
+from rodit.eval.llm_env import render_capabilities
 from rodit.showcase.app import (
     DEFAULT_HOST,
     create_showcase_app,
@@ -185,11 +190,7 @@ def _banner(
             file=out,
         )
         if check is not None:
-            print(
-                f"  · 启动检查通过（连通性 + JSON 模式，最慢一步 {check.slowest_ms} ms）"
-                + ("；这个模型不返回选项概率，路由按票数算概率" if check.logprobs is False else ""),
-                file=out,
-            )
+            _print_capabilities(out, check.lines(), head="  · 启动检查通过——", indent="    ")
     print(
         "  · 买家图片是合成的占位图块，图片理解用合成数据的替身（演示站没有任何真实图片）",
         file=out,
@@ -219,6 +220,18 @@ def _banner(
             "（页面上标为降级）；演示时可以加 --latency relaxed",
             file=out,
         )
+
+
+def _print_capabilities(
+    out: TextIO, lines: Sequence[str], *, head: str = "", indent: str = ""
+) -> None:
+    """能力检查的文本（rodit.eval.llm_env.render_capabilities）：第一行接在 head 后面，
+    其余每行前面加 indent。"""
+    if not lines:
+        return
+    print(head + lines[0], file=out)
+    for line in lines[1:]:
+        print(indent + line, file=out)
 
 
 def _write_json(target: str, payload: dict[str, Any], out: TextIO) -> bool:
@@ -293,13 +306,15 @@ def main(
             print(f"拒绝启动：大模型配置（RODIT_LLM_*）不合法：{exc}", file=out)
             return EXIT_USAGE
         try:
-            # 路由用大模型投票时请求会带 logprobs（§6.4），探测也带上
+            # 能力检查（和评测同一个）：路由用大模型投票时请求会带 logprobs（§6.4），一并检查
             votes = judge == "llm" and effective.decision.provider == ProviderName.INCLOUD_LLM
             check = run_preflight(
                 llm, judge_llm=votes, vote_samples=effective.decision.vote_samples
             )
         except PreflightFailed as exc:
-            print(f"拒绝启动：大模型{exc}", file=out)
+            if exc.report is not None:
+                _print_capabilities(out, render_capabilities(exc.report))
+            print(f"拒绝启动：{exc}", file=out)
             return EXIT_USAGE
     platforms = _platforms(args.platform, args.selfcheck)
     hub = hub_factory(
@@ -313,7 +328,7 @@ def main(
     if not (args.selfcheck and args.json == "-"):  # --json - 时标准输出只放 JSON
         _banner(out, chain, check, selfcheck=args.selfcheck)
     if args.selfcheck:
-        return _selfcheck(hub, platforms, llm, args.json, out)
+        return _selfcheck(hub, platforms, llm, check, args.json, out)
     app = create_showcase_app(hub, host=args.host)
     if not loopback:
         print(
@@ -331,6 +346,7 @@ def _selfcheck(
     hub: ShowcaseHub,
     platforms: Sequence[Platform],
     llm: LLMClient | None,
+    check: PreflightResult | None,
     json_target: str | None,
     out: TextIO,
 ) -> int:
@@ -342,7 +358,13 @@ def _selfcheck(
         if not quiet:
             print(text, file=out, flush=True)
 
-    report = run_selfcheck(hub, platforms, secrets=_secrets(llm), progress=progress)
+    report = run_selfcheck(
+        hub,
+        platforms,
+        secrets=_secrets(llm),
+        progress=progress,
+        capabilities=check.view() if check is not None else None,
+    )
     if not quiet:
         print(render_summary(report), file=out)
     if json_target and not _write_json(json_target, report, out):

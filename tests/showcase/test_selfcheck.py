@@ -38,12 +38,14 @@ def test_offline_selfcheck_passes_and_prints_every_scenario(tmp_path: Path):
     code, text = _selfcheck(["--platform", "pdd", "--json", str(target)])
     assert code == 0, text
     assert "【仅演示】Rodit 客户演示站自检" in text and "离线替身" in text
+    assert "能力检查" not in text  # 离线不调大模型，没有能力检查
     assert "[拼多多] off_platform · 站外交易（§11.4）" in text
     assert "✓ 必查 站外交易命中 §6.6 规则 1" in text
     assert "耗时（P50 / P95，对照 §12.1）" in text and "自检通过" in text
     report = json.loads(target.read_text(encoding="utf-8"))
     assert report["summary"]["ok"] is True and report["summary"]["must"]["failed"] == 0
-    assert report["chain"]["real"] is False
+    assert report["chain"]["real"] is False and report["capabilities"] is None
+    assert report["chain"]["request_options"] is None
     assert {s["platform"] for s in report["scenarios"]} == {"pdd"}
     assert len(report["scenarios"]) == 10
     off = next(s for s in report["scenarios"] if s["scenario"] == "off_platform")
@@ -75,6 +77,16 @@ def test_real_chain_selfcheck_against_the_stub(stub_env: StubLLM):
     assert summary["llm"]["calls"]["route"] == 3 * len(report["scenarios"])
     assert summary["llm"]["input_tokens"] > 0 and summary["degradations"]["route_fallback"] == 0
     assert [c["id"] for c in report["platform_checks"]] == ["replay_offline"]
+    # 启动时的能力检查（和评测同一个）原样进报告
+    caps = report["capabilities"]
+    assert [(c["name"], c["status"]) for c in caps["checks"]] == [
+        ("plain", "ok"),
+        ("json_mode", "ok"),
+        ("logprobs", "ok"),
+    ]
+    assert caps["endpoint"] == chain["host"] and caps["model"] == "stub-chat"
+    assert caps["lines"][0].startswith("大模型能力检查（stub-chat @ ")
+    assert chain["request_options"] == {"json_mode": True, "logprobs": True, "extra_body_keys": []}
     assert stub_env.api_key not in text
 
 
@@ -94,6 +106,11 @@ def test_strict_selfcheck_reports_fallbacks_and_suggests_relaxed(stub_env: StubL
 def test_relaxed_banner(stub_env: StubLLM):
     code, text = _selfcheck(["--llm", "env", "--platform", "pdd", "--latency", "relaxed"])
     assert code == 0 and RELAXED_NOTE in text
+    # 横幅里是能力检查的每一步，汇总里一行列出
+    assert "启动检查通过——大模型能力检查（stub-chat @ http://127.0.0.1:" in text
+    assert "      JSON 模式：通过" in text
+    assert "启动时的大模型能力检查：普通调用 通过（" in text and "logprobs 通过" in text
+    assert "提示（logprobs：可以省掉这个参数：设 RODIT_LLM_LOGPROBS=off" in text
     assert "判断层每次调用 8 秒、生成 15 秒、整条消息 30 秒" in text
     assert "大多数托管大模型 1 秒内答不完" not in text
 

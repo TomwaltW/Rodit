@@ -234,14 +234,38 @@ def test_unreachable_stops_after_one_request(api_key, status, words):
     no_secrets(report)
 
 
+def test_output_ok_records_whether_the_answer_is_usable(api_key):
+    """output_ok：JSON 模式找得到 JSON 对象、logprobs 有返回（演示站据此拦下启动 / 提示）。"""
+    good = probe_capabilities(client(Provider()))
+    assert good.check("json_mode").output_ok is True and good.check("logprobs").output_ok is True
+    assert good.check("plain").output_ok is None
+    bad = probe_capabilities(client(Provider(json_text="好的，没问题", return_logprobs=False)))
+    assert bad.check("json_mode").output_ok is False and bad.check("logprobs").output_ok is False
+    rejected = probe_capabilities(client(Provider(json_status=400)))
+    assert rejected.check("json_mode").output_ok is None  # 没有结果
+
+
+def test_logprobs_check_can_be_skipped(api_key):
+    """调用方这次不会请求 logprobs（演示站路由不用大模型投票）：不发第三个请求，记为没检查。"""
+    provider = Provider(logprobs_status=400)
+    report = probe_capabilities(client(provider), check_logprobs=False)
+    check = report.check("logprobs")
+    assert check.status == "skipped" and check.note and report.blocking == []
+    assert len(provider.bodies) == 2
+    # 开关关着时仍记为"已关闭"（说的是请求参数，不是这次检没检查）
+    off = probe_capabilities(client(Provider(), logprobs=False), check_logprobs=False)
+    assert off.check("logprobs").status == "off"
+
+
 def test_timeouts_and_rate_limits_are_not_rejections(api_key):
     slow = probe_capabilities(client(Provider(json_error=TimeoutError())))
     check = slow.check("json_mode")
-    assert check.status == "failed" and check.http_status is None
+    assert check.status == "failed" and check.http_status is None and check.timed_out
     assert "RODIT_LLM_TIMEOUT_S" in (check.hint or "") and "思考" in (check.hint or "")
     assert slow.blocking == []
     limited = probe_capabilities(client(Provider(logprobs_status=429)))
     assert limited.check("logprobs").status == "failed" and limited.blocking == []
+    assert not limited.check("logprobs").timed_out
     assert "限流" in (limited.check("logprobs").hint or "")
 
 

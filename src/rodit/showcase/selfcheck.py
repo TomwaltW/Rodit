@@ -15,6 +15,10 @@ ShowcaseHub → PlatformDemo.chat，不起 HTTP 服务），逐个打印：路�
   有前提的必查（"按多问题分条时……"）前提不成立时记为"不适用"并写明原因，不算失败；
 - 参考（INFO）：和模型、时延有关、不算错的（问题类型和场景标注一致、端到端在 5 秒内……）。
 
+接真实大模型时，报告里还有启动时的能力检查（capabilities：普通调用、JSON 模式、logprobs 每一步的
+状态、耗时、提示，和评测 --llm env 打的一样，rodit.eval.llm_env.probe_capabilities），汇总里
+一行列出。能力检查没过的根本跑不到自检（启动时就拒绝了，退出码 2）。
+
 退出码：0 必查全部通过；1 有必查没通过；2 配置错误（由 __main__ 处理）。
 报告里没有密钥；大模型接口只写主机名。
 """
@@ -30,6 +34,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from rodit.core.enums import Platform
+from rodit.eval.llm_env import CHECK_LABELS, STATUS_LABELS
 from rodit.eval.perf import STAGE_LABELS, latency_report
 from rodit.routing.policy import ALERT_EMOTION
 from rodit.showcase.llm import SCRIPTED_PROMISE
@@ -605,9 +610,11 @@ def run_selfcheck(
     *,
     secrets: Sequence[str] = (),
     progress: Callable[[str], None] | None = None,
+    capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """跑一遍（见模块说明），返回报告（JSON 可序列化）。secrets 是不能出现在页面数据里的值
-    （密钥），只用来核对，不写进报告。"""
+    （密钥），只用来核对，不写进报告；capabilities 是启动时的能力检查（showcase.preflight
+    PreflightResult.view，离线时为 None），原样写进报告。"""
     results: list[ScenarioResult] = []
     platform_checks: list[Check] = []
     builds: dict[str, Any] = {}
@@ -628,6 +635,7 @@ def run_selfcheck(
                 progress(render_scenario(res))
     return {
         "chain": hub.chain.view(),
+        "capabilities": capabilities,
         "platforms": builds,
         "platform_checks": [asdict(c) for c in platform_checks],
         "scenarios": [asdict(r) for r in results],
@@ -705,12 +713,25 @@ def render_scenario(r: ScenarioResult | dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_capabilities_line(capabilities: dict[str, Any]) -> list[str]:
+    """汇总里的能力检查：一行列出每一步的结果，提示另起一行（要改哪个开关、参数）。"""
+    steps = []
+    for c in capabilities["checks"]:
+        took = f"（{_ms(c['latency_ms'])}）" if c.get("latency_ms") is not None else ""
+        steps.append(f"{CHECK_LABELS[c['name']]} {STATUS_LABELS[c['status']]}{took}")
+    lines = [f"  启动时的大模型能力检查：{' · '.join(steps)}；请求参数 {capabilities['options']}"]
+    lines.extend(f"    提示（{hint}）" for hint in capabilities.get("hints", []))
+    return lines
+
+
 def render_summary(report: dict[str, Any]) -> str:
     s = report["summary"]
     chain = report["chain"]
     lines = [f"== 汇总（{s['scenarios']} 个场景）· {chain['badge']}"]
     if chain.get("relaxed_note"):
         lines.append(f"  ! {chain['relaxed_note']}")
+    if report.get("capabilities"):
+        lines.extend(render_capabilities_line(report["capabilities"]))
     for c in report["platform_checks"]:
         detail = f"：{c['detail']}" if c["detail"] else ""
         lines.append(f"  {STATUS_MARKS[c['status']]} 必查 {c['label']}{detail}")
@@ -767,6 +788,7 @@ def render_summary(report: dict[str, Any]) -> str:
 __all__ = [
     "Check",
     "ScenarioResult",
+    "render_capabilities_line",
     "render_scenario",
     "render_summary",
     "run_scenario",

@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from rodit.core.config import EngineConfig
+from rodit.core.config import EngineConfig, LLMRequestOptions
 from rodit.core.decision import (
     ChoiceAnswer,
     ChoiceQuestion,
@@ -46,7 +46,7 @@ from rodit.core.questions import NO_SECOND_INTENT, Q_SECOND_INTENT
 from rodit.decision import build_decision_provider
 from rodit.decision.llm import InCloudLLMProvider, logprob_target
 from rodit.decision.voting import choice_distribution, parse_sample
-from rodit.eval.llm_env import describe_endpoint
+from rodit.eval.llm_env import client_options, describe_endpoint
 from rodit.showcase.preflight import short_label
 
 JudgeMode = Literal["llm", "offline"]
@@ -214,6 +214,11 @@ class ObservedLLM:
     @property
     def base_url(self) -> str | None:
         return getattr(self.inner, "base_url", None)
+
+    @property
+    def options(self) -> LLMRequestOptions:
+        """inner 生效的请求参数（OpenAICompatibleClient.options：JSON 模式、logprobs 开关等）。"""
+        return client_options(self.inner)
 
     def __repr__(self) -> str:
         return f"ObservedLLM(inner={self.inner!r})"
@@ -466,6 +471,9 @@ class ChainInfo:
     route_by_llm: bool = (
         True  # --judge llm 时路由是不是大模型投票（配置的 provider 是 rules 就不是）
     )
+    json_mode: bool = True  # 请求带不带 response_format（RODIT_LLM_JSON_MODE / llm.json_mode）
+    logprobs: bool = True  # 路由请求带不带 logprobs（RODIT_LLM_LOGPROBS / llm.logprobs）
+    extra_body_keys: tuple[str, ...] = ()  # 模型服务特有参数的键名（RODIT_LLM_EXTRA_BODY）
 
     @property
     def relaxed(self) -> bool:
@@ -528,6 +536,13 @@ class ChainInfo:
             "generation_timeout_s": self.generation_timeout_s,
             "vote_samples": self.vote_samples,
             "qa_vote_samples": self.qa_vote_samples,
+            "request_options": {
+                "json_mode": self.json_mode,
+                "logprobs": self.logprobs,
+                "extra_body_keys": list(self.extra_body_keys),
+            }
+            if self.real
+            else None,
             "badge": self.badge(),
             "footer": self.footer(),
         }
@@ -536,6 +551,7 @@ class ChainInfo:
 def chain_info(
     llm: LLMClient | None, config: EngineConfig, *, judge: JudgeMode, latency: LatencyMode
 ) -> ChainInfo:
+    options = client_options(llm)
     return ChainInfo(
         real=llm is not None,
         model=(str(getattr(llm, "model", "") or "") or None) if llm is not None else None,
@@ -548,6 +564,9 @@ def chain_info(
         vote_samples=config.decision.vote_samples,
         qa_vote_samples=config.decision.qa_vote_samples,
         route_by_llm=config.decision.provider == ProviderName.INCLOUD_LLM,
+        json_mode=options.json_mode,
+        logprobs=options.logprobs,
+        extra_body_keys=tuple(sorted(options.extra_body)),
     )
 
 

@@ -1,6 +1,8 @@
-"""--llm env 的启动检查（showcase.preflight）：连通性 + JSON 模式探测，每类故障一句中文诊断，
-只显示接口主机，不显示密钥。故障用注入的传输层或本机的模型替身（llm_stub.py）造，不联网；
-"网络策略拦截"用本机一个对 CONNECT 回 403 的假代理造（和沙箱出口代理拒绝时一样的错误）。"""
+"""--llm env 的启动检查（showcase.preflight）：就是评测的能力检查
+（rodit.eval.llm_env.probe_capabilities：普通调用、JSON 模式，路由投票时再加 logprobs），
+每类故障一句中文诊断，参数被拒绝时写明要改哪个开关；只显示接口主机，不显示密钥。
+故障用注入的传输层或本机的模型替身（llm_stub.py）造，不联网；"网络策略拦截"用本机一个对
+CONNECT 回 403 的假代理造（和沙箱出口代理拒绝时一样的错误）。"""
 
 from __future__ import annotations
 
@@ -26,6 +28,11 @@ from rodit.showcase.preflight import (
     run_preflight,
     short_label,
 )
+
+JSON_TOGGLE = "RODIT_LLM_JSON_MODE=off"
+LOGPROBS_TOGGLE = "RODIT_LLM_LOGPROBS=off"
+EXTRA_BODY = "RODIT_LLM_EXTRA_BODY"
+
 
 KEY = "sk-synthetic-preflight-key-0000"
 
@@ -95,7 +102,7 @@ def _key(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_network_failures_are_classified(exc, kind, phrases):
     failed = _fail(_client(transport=_raising(exc)))
-    assert failed.kind == kind and failed.stage == "连通性检查"
+    assert failed.kind == kind and failed.stage == "大模型连通性检查"
     for phrase in phrases:
         assert phrase in str(failed)
     assert KEY not in str(failed)
@@ -111,7 +118,7 @@ def test_network_failures_are_classified(exc, kind, phrases):
         (500, "server", "服务端出错（HTTP 500）"),
         (503, "server", "HTTP 503"),
         (302, "redirect", "重定向（HTTP 302）"),
-        (400, "bad_param", "JSON 模式"),
+        (400, "bad_param", EXTRA_BODY),  # 普通调用不带 response_format：不是 JSON 模式的事
     ],
 )
 def test_http_failures_are_classified(status, kind, phrase):
@@ -155,21 +162,45 @@ def stub_key(stub: StubLLM, monkeypatch: pytest.MonkeyPatch) -> StubLLM:
 
 
 def test_passing_preflight_reports_timings(stub_key: StubLLM):
+    """路由投票：普通调用、JSON 模式、logprobs 三个请求，各一次，不另发探测。"""
     result = run_preflight(_stub_client(stub_key), judge_llm=True)
-    assert set(result.steps_ms) == {"connect", "json"}
+    assert set(result.steps_ms) == {"plain", "json_mode", "logprobs"}
     assert result.host == stub_key.base_url.removesuffix("/v1") and result.model == "stub-chat"
     assert result.logprobs is False  # 替身默认不返回 logprobs
-    [probe] = stub_key.bodies("probe")
-    assert probe["response_format"] == {"type": "json_object"} and probe["logprobs"] is True
+    assert [r.purpose for r in stub_key.requests] == ["preflight", "probe_json", "probe_logprobs"]
+    [probe] = stub_key.bodies("probe_json")
+    assert probe["response_format"] == {"type": "json_object"} and "logprobs" not in probe
+    [lp] = stub_key.bodies("probe_logprobs")
+    assert lp["logprobs"] is True and "response_format" not in lp
+    assert "logprobs：通过" in "\n".join(result.lines())
+    assert "没返回选项概率" in "\n".join(result.lines())
+    view = result.view()
+    assert [c["status"] for c in view["checks"]] == ["ok", "ok", "ok"]
+    assert view["checks"][2]["output_ok"] is False and LOGPROBS_TOGGLE in "".join(view["hints"])
+
+
+def test_judge_offline_does_not_probe_logprobs(stub_key: StubLLM):
+    """路由不用大模型投票时请求不带 logprobs：不检查（少一个请求），记为没检查。"""
     offline = run_preflight(_stub_client(stub_key), judge_llm=False)
-    assert offline.logprobs is None
-    assert "logprobs" not in stub_key.bodies("probe")[-1]
+    assert offline.logprobs is None and set(offline.steps_ms) == {"plain", "json_mode"}
+    assert stub_key.count("probe_logprobs") == 0 and stub_key.count() == 2
+    assert offline.report.check("logprobs").status == "skipped"
 
 
 def test_logprobs_are_detected(monkeypatch):
     with StubLLM(logprobs="tokens") as stub:
         monkeypatch.setenv("RODIT_LLM_API_KEY", stub.api_key)
         assert run_preflight(_stub_client(stub), judge_llm=True).logprobs is True
+
+
+def test_toggled_off_capabilities_are_not_requested(stub_key: StubLLM):
+    """JSON 模式、logprobs 都关了：JSON 模式检查不带 response_format，logprobs 不检查。"""
+    result = run_preflight(_stub_client(stub_key, json_mode=False, logprobs=False), judge_llm=True)
+    assert stub_key.count() == 2 and result.logprobs is None
+    assert all("response_format" not in b and "logprobs" not in b for b in stub_key.bodies())
+    text = "\n".join(result.lines())
+    assert '"json_mode":false' in text and '"logprobs":false' in text
+    assert "RODIT_LLM_JSON_MODE=off：不发 response_format" in text and "logprobs：已关闭" in text
 
 
 def test_wrong_key_401_never_echoes_the_key(stub: StubLLM, monkeypatch):
@@ -197,26 +228,71 @@ def test_wrong_base_path_is_a_404(stub_key: StubLLM):
 
 
 def test_json_mode_rejected(stub_key: StubLLM):
-    stub_key.fail("probe", "400_response_format")
+    stub_key.fail("probe_json", "400_response_format")
     failed = _fail(_stub_client(stub_key), judge_llm=True)
-    assert failed.stage == "JSON 模式探测" and failed.kind == "bad_param"
-    assert "JSON 模式" in str(failed) and "logprobs" not in str(failed)
+    assert failed.stage == "大模型 JSON 模式检查" and failed.kind == "bad_param"
+    text = str(failed)
+    assert "不接受 JSON 模式参数 response_format（HTTP 400）" in text
+    assert JSON_TOGGLE in text and EXTRA_BODY in text and LOGPROBS_TOGGLE not in text
+    assert failed.report is not None and failed.report.check("json_mode").status == "rejected"
 
 
 def test_logprobs_rejected(stub_key: StubLLM):
-    stub_key.fail("probe", "400_logprobs")
+    stub_key.fail("probe_logprobs", "400_logprobs")
     failed = _fail(_stub_client(stub_key), judge_llm=True)
-    assert "logprobs" in str(failed) and "--judge offline" in str(failed)
-    # 去掉 logprobs 又探了一次，分清了是哪个参数
-    assert [bool(b.get("logprobs")) for b in stub_key.bodies("probe")] == [True, False]
-    # 判断层不用大模型时不请求 logprobs，探测照常通过
+    assert failed.stage == "大模型 logprobs 检查" and failed.kind == "bad_param"
+    assert LOGPROBS_TOGGLE in str(failed) and "--judge offline" in str(failed)
+    # 两种参数分开检查，不用去掉 logprobs 再探一次
+    assert stub_key.count("probe_json") == 1 and stub_key.count("probe_logprobs") == 1
+    # 判断层不用大模型时不请求 logprobs，检查照常通过
     assert run_preflight(_stub_client(stub_key), judge_llm=False).logprobs is None
 
 
+def test_every_blocking_problem_is_reported_at_once(stub_key: StubLLM):
+    """JSON 模式和 logprobs 都被拒绝：一次说全，不用改一个、重启、再看下一个。"""
+    stub_key.fail("probe_json", "400_response_format")
+    stub_key.fail("probe_logprobs", "400_logprobs")
+    failed = _fail(_stub_client(stub_key), judge_llm=True)
+    assert failed.stage == "大模型 JSON 模式检查"
+    assert JSON_TOGGLE in str(failed) and "另外大模型 logprobs 检查也没通过" in str(failed)
+    assert LOGPROBS_TOGGLE in str(failed)
+
+
+def test_logprobs_trouble_that_may_pass_only_warns(stub_key: StubLLM):
+    """logprobs 检查限流 / 超时：不拦启动（换个时间可能就过了），提示留在报告里。"""
+    stub_key.fail("probe_logprobs", "429")
+    result = run_preflight(_stub_client(stub_key), judge_llm=True)
+    check = result.report.check("logprobs")
+    assert check.status == "failed" and check.http_status == 429 and result.logprobs is None
+    assert any("限流" in hint for hint in result.report.hints)
+
+
+def test_json_check_that_times_out_blocks(stub_key: StubLLM):
+    """JSON 模式检查没有结果（超时）：每条消息都要用 JSON，拒绝启动，按超时诊断。"""
+    stub_key.timeout_sleep_s = 1.0
+    stub_key.fail("probe_json", "timeout")
+    failed = _fail(_stub_client(stub_key, timeout_s=0.3))
+    assert failed.stage == "大模型 JSON 模式检查" and failed.kind == "timeout"
+    assert "0.3 秒内没有响应" in str(failed)
+
+
 def test_non_json_output_fails_the_probe(stub_key: StubLLM):
-    stub_key.fail("probe", "not_json")
+    stub_key.fail("probe_json", "not_json")
     failed = _fail(_stub_client(stub_key))
     assert failed.kind == "json" and JSON_REQUIRED in str(failed)
+    assert EXTRA_BODY in str(failed) and JSON_TOGGLE not in str(failed)
+    # JSON 模式关着时，提示把它打开
+    stub_key.reset()
+    stub_key.fail("probe_json", "not_json")
+    failed = _fail(_stub_client(stub_key, json_mode=False))
+    assert "去掉 RODIT_LLM_JSON_MODE=off" in str(failed)
+
+
+def test_rejected_plain_call_names_the_extra_body_keys(stub_key: StubLLM):
+    stub_key.fail("preflight", "400")
+    failed = _fail(_stub_client(stub_key, extra_body={"thinking": {"type": "disabled"}}))
+    assert failed.stage == "大模型连通性检查" and failed.kind == "bad_param"
+    assert "RODIT_LLM_EXTRA_BODY（或 llm.extra_body）里的参数（thinking）" in str(failed)
 
 
 @pytest.mark.parametrize(
@@ -287,20 +363,26 @@ def test_egress_denied_by_the_network_policy(denying_proxy: str):
 
 
 def test_cli_exits_2_with_the_diagnosis(stub_env: StubLLM):
-    stub_env.fail("probe", "400_logprobs")
+    stub_env.fail("probe_logprobs", "400_logprobs")
     out = io.StringIO()
     runs: list = []
     code = main(["--llm", "env"], out, run=lambda app, **kw: runs.append(app))
     text = out.getvalue()
     assert code == EXIT_USAGE and runs == []
-    assert "拒绝启动：大模型JSON 模式探测没通过" in text and "logprobs" in text
+    # 先打能力检查的每一步（和评测打的一样），再说拒绝启动的原因和要改的开关
+    assert "大模型能力检查（stub-chat @ http://127.0.0.1:" in text
+    assert "  普通调用：通过" in text and "  logprobs：被拒绝" in text
+    assert "拒绝启动：大模型 logprobs 检查没通过" in text and LOGPROBS_TOGGLE in text
+    assert text.index("大模型能力检查") < text.index("拒绝启动")
     assert stub_env.api_key not in text
 
 
 def test_cli_with_judge_offline_does_not_ask_for_logprobs(stub_env: StubLLM):
-    stub_env.fail("probe", "400_logprobs")
+    stub_env.fail("probe_logprobs", "400_logprobs")
     out = io.StringIO()
     runs: list = []
     code = main(["--llm", "env", "--judge", "offline"], out, run=lambda app, **kw: runs.append(app))
     assert code == 0 and runs
-    assert "判断层：离线规则" in out.getvalue()
+    text = out.getvalue()
+    assert "判断层：离线规则" in text and "logprobs：没检查" in text
+    assert stub_env.count("probe_logprobs") == 0

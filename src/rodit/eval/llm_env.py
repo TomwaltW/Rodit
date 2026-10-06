@@ -18,6 +18,8 @@ RODIT_LLM_PRICE_INPUT_PER_1K / RODIT_LLM_PRICE_OUTPUT_PER_1K（每 1000 token �
 能力检查（probe_capabilities）在它之后再发至多两个很小的请求：JSON 模式（response_format）
 和 logprobs 接不接受，被拒绝时给出要改哪个开关 / 参数的提示——不同模型服务对这两个参数的
 支持不一样，preflight 的请求里没有它们，过了也不代表路由、质检、生成的请求能过。
+演示站 --llm env 的启动检查也是它（rodit.showcase.preflight，判断层不用大模型投票时不检查
+logprobs），两边打出来的检查结果一样。
 """
 
 from __future__ import annotations
@@ -130,7 +132,7 @@ STATUS_LABELS: dict[str, str] = {
     "skipped": "没检查",
 }
 _HTTP_STATUS = re.compile(r"HTTP (\d{3})")
-_THINKING_HINT = (
+THINKING_HINT = (
     f"默认开思考模式的模型要在 {ENV_PREFIX}EXTRA_BODY（或 llm.extra_body）里关闭，如 "
     '{"thinking":{"type":"disabled"}} 或 {"enable_thinking":false}，按服务商的写法'
 )
@@ -154,7 +156,9 @@ class CapabilityCheck(BaseModel):
     status: CheckStatus
     latency_ms: int | None = None
     http_status: int | None = None
+    timed_out: bool = False  # 没有结果是因为超时（LLMTimeout）
     error: str | None = None
+    output_ok: bool | None = None  # 通过时输出能不能用：JSON 模式找得到 JSON 对象、logprobs 有返回
     note: str | None = None  # 通过但有要注意的（输出不是 JSON、没返回 logprobs……）
     hint: str | None = None  # 要改哪个开关 / 参数
 
@@ -209,14 +213,14 @@ def _failure_hint(name: CheckName, status: int | None, timeout: bool) -> str:
     if timeout or status == 408:
         return (
             f"超时：先把 {ENV_PREFIX}TIMEOUT_S 调大量一次延迟（路由 decision.timeout_s、"
-            f"生成 generation.timeout_s 是各环节自己的上限）；{_THINKING_HINT}"
+            f"生成 generation.timeout_s 是各环节自己的上限）；{THINKING_HINT}"
         )
     if status == 429:
         return "限流：稍后再试或提高并发额度（路由每条消息并发 decision.vote_samples 次）"
     if name == "json_mode" and _is_rejection(status):
         return (
             f"该服务 / 模型不接受 response_format：{JSON_OFF_HINT}；"
-            f"若是思考模式下不支持 JSON 模式，{_THINKING_HINT}"
+            f"若是思考模式下不支持 JSON 模式，{THINKING_HINT}"
         )
     if name == "logprobs" and _is_rejection(status):
         return f"该服务 / 模型不接受 logprobs：{LOGPROBS_OFF_HINT}"
@@ -232,7 +236,7 @@ def _failure_hint(name: CheckName, status: int | None, timeout: bool) -> str:
         )
     if _is_rejection(status):
         return (
-            f"请求被拒绝：先确认 {ENV_PREFIX}MODEL；{_THINKING_HINT}；"
+            f"请求被拒绝：先确认 {ENV_PREFIX}MODEL；{THINKING_HINT}；"
             "不接受 temperature=0 的服务（质检用 0）暂不支持"
         )
     return "服务端错误或网络不通：稍后再试；网络错误时检查代理和出网策略"
@@ -264,6 +268,7 @@ def _attempt(
                 status="rejected" if _is_rejection(status) else "failed",
                 latency_ms=latency_ms,
                 http_status=status,
+                timed_out=timeout,
                 error=_scrub(str(e), client)[:200],
                 hint=_failure_hint(name, status, timeout),
             ),
@@ -274,14 +279,19 @@ def _attempt(
 
 
 def probe_capabilities(
-    client: LLMClient, *, timer: Callable[[], float] = time.perf_counter
+    client: LLMClient,
+    *,
+    timer: Callable[[], float] = time.perf_counter,
+    check_logprobs: bool = True,
 ) -> CapabilityReport:
     """检查这个模型服务接不接受我们会发的参数，至多三个很小的请求（purpose="other"）：
 
     1. 普通调用：就是 preflight 的请求（地址、模型名、密钥；不通就不再发后面的）；
     2. JSON 模式：要求只输出一个 JSON 对象（json_mode 开着时带 response_format，关着时只靠提示词），
-       看接不接受、输出能不能解析（判断层的解析规则：容忍代码块和前后文字）；
-    3. logprobs：开着时带 logprobs + top_logprobs，看接不接受、有没有返回；关着时不发。
+       看接不接受、输出能不能解析（判断层的解析规则：容忍代码块和前后文字；output_ok 记结果）；
+    3. logprobs：开着时带 logprobs + top_logprobs，看接不接受、有没有返回（output_ok）；关着时不发。
+       check_logprobs=False：调用方这次根本不会请求 logprobs（如演示站路由不用大模型投票），
+       不发这个请求，记为 skipped。
     被拒绝（4xx，限流除外）、超时都记下状态码 / 错误类型和要改哪个开关、参数的提示；不抛异常。
     结果里没有密钥：接口只留协议和主机，错误信息只有状态码和错误类型 / 代码。"""
     options = client_options(client)
@@ -312,7 +322,9 @@ def probe_capabilities(
         ),
         timer,
     )
-    if response is not None and extract_json_object(response.text) is None:
+    if response is not None:
+        json_check.output_ok = extract_json_object(response.text) is not None
+    if json_check.output_ok is False:
         json_check.note = "接受了请求，但输出里找不到 JSON 对象"
         json_check.hint = (
             f"确认思考模式已关闭（{ENV_PREFIX}EXTRA_BODY），或换一个能按要求只输出 JSON 的模型"
@@ -332,6 +344,13 @@ def probe_capabilities(
             )
         )
         return report
+    if not check_logprobs:
+        report.checks.append(
+            CapabilityCheck(
+                name="logprobs", status="skipped", note="这次的请求不带 logprobs，不检查"
+            )
+        )
+        return report
     lp_check, response = _attempt(
         client,
         "logprobs",
@@ -344,7 +363,9 @@ def probe_capabilities(
         ),
         timer,
     )
-    if response is not None and not response.logprobs:
+    if response is not None:
+        lp_check.output_ok = bool(response.logprobs)
+    if lp_check.output_ok is False:
         lp_check.note = "接受了参数，但没返回选项概率"
         lp_check.hint = f"可以省掉这个参数：{LOGPROBS_OFF_HINT}"
     report.checks.append(lp_check)
@@ -405,8 +426,13 @@ def resolve_pricing(
 
 
 __all__ = [
+    "CHECK_LABELS",
+    "JSON_OFF_HINT",
+    "LOGPROBS_OFF_HINT",
     "PRICE_INPUT_ENV",
     "PRICE_OUTPUT_ENV",
+    "STATUS_LABELS",
+    "THINKING_HINT",
     "CapabilityCheck",
     "CapabilityReport",
     "client_from_config",

@@ -1,11 +1,17 @@
 """接真实大模型（--llm env）前的启动检查和故障诊断。
 
-启动检查（run_preflight）：
-1. rodit.eval.llm_env.preflight：几个 token 的连通性检查（地址、模型名、密钥不对时立刻报错）；
-2. 一次 JSON 模式探测（json_mode，和生成、判断层的请求一样要求只输出 JSON）：判断层投票
-   （--judge llm）时同时请求选项概率（want_logprobs，路由请求就是这样问的，§6.4）；
-   探测被 HTTP 400 拒绝时，去掉 logprobs 再探一次，分清是 JSON 模式还是 logprobs 不被接受。
-任何一步失败都抛 PreflightFailed，带一句中文诊断（classify）；诊断里只有接口主机名，
+启动检查（run_preflight）就是评测 --llm env 用的能力检查 rodit.eval.llm_env.probe_capabilities，
+至多三个很小的请求，不另发探测：
+1. 普通调用（连通性：地址、模型名、密钥）；
+2. JSON 模式：生成和判断层的请求都要求只输出 JSON（json_mode）；RODIT_LLM_JSON_MODE=off 时请求
+   不带 response_format，只靠提示词，照样检查输出里找不找得到 JSON 对象；
+3. logprobs：只在判断层用大模型投票路由时检查（路由请求会带 logprobs，§6.4）；
+   RODIT_LLM_LOGPROBS=off 时不发。
+演示站比评测严（每条消息都要用 JSON）：普通调用、JSON 模式任何一步没有结果，或者输出里找不到
+JSON 对象，都拒绝启动；logprobs 被拒绝（4xx）也拒绝启动；logprobs 超时、限流、没返回只提示。
+没过就抛 PreflightFailed，带中文诊断：连通性问题按故障类型分（classify），参数被拒绝时写明要改
+哪个开关或参数（RODIT_LLM_JSON_MODE / RODIT_LLM_LOGPROBS / RODIT_LLM_EXTRA_BODY，配置文件里是
+llm.json_mode / llm.logprobs / llm.extra_body）；几项都没过时一次说全。诊断里只有接口主机名，
 没有密钥、路径、查询参数，也没有模型服务返回的错误原文（客户端的错误信息本来就只带状态码和
 错误类型 / 代码，见 rodit.llm.openai_compat）。
 
@@ -21,14 +27,24 @@ short_label 是同一套分类的短说明，给工作台过程面板里每一�
 from __future__ import annotations
 
 import re
-import time
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
+from rodit.core.config import LLM_ENV_PREFIX, LLMRequestOptions
 from rodit.core.errors import LLMError, LLMTimeout
-from rodit.core.ports import LLMClient, LLMMessage, LLMRequest, LLMResponse
-from rodit.decision.voting import extract_json_object
-from rodit.eval.llm_env import describe_endpoint, preflight
+from rodit.core.ports import LLMClient
+from rodit.eval.llm_env import (
+    JSON_OFF_HINT,
+    LOGPROBS_OFF_HINT,
+    THINKING_HINT,
+    CapabilityCheck,
+    CapabilityReport,
+    CheckName,
+    client_options,
+    describe_endpoint,
+    probe_capabilities,
+    render_capabilities,
+)
 
 Kind = Literal[
     "egress",
@@ -50,16 +66,12 @@ Kind = Literal[
     "other",
 ]
 
-PROBE_MARK = "演示站启动前的接口检查"
-"""JSON 模式探测请求的标记（测试用的本地模型替身据此认出探测请求）。"""
-
-PROBE_MESSAGES = (
-    LLMMessage(
-        role="system",
-        content=f"这是{PROBE_MARK}。只输出一个 JSON 对象，不要输出 JSON 以外的任何文字。",
-    ),
-    LLMMessage(role="user", content='请原样输出这个 JSON：{"ok": true}'),
-)
+STAGES: dict[CheckName, str] = {
+    "plain": "大模型连通性检查",
+    "json_mode": "大模型 JSON 模式检查",
+    "logprobs": "大模型 logprobs 检查",
+}
+"""启动检查各步的名字（"拒绝启动：<名字>没通过：……"）。"""
 
 _HTTP_STATUS = re.compile(r"HTTP (\d{3})")
 _EGRESS = re.compile(r"Tunnel connection failed|ProxyError|Proxy Authentication Required", re.I)
@@ -159,15 +171,46 @@ def short_label(exc: BaseException, *, timeout_s: float | None = None) -> str:
     return SHORT_LABELS[kind]
 
 
+def _param_rejected(
+    check: CheckName, host: str, status: int | None, options: LLMRequestOptions
+) -> str:
+    """参数不被接受（HTTP 400 等）时的诊断：写明要改哪个开关或参数（见模块说明）。"""
+    code = f"HTTP {status}" if status is not None else "被拒绝"
+    if check == "json_mode":
+        return (
+            f"{host} 不接受 JSON 模式参数 response_format（{code}）：{JSON_OFF_HINT}；"
+            f"如果是开着思考模式时不支持 JSON 模式，{THINKING_HINT}"
+        )
+    if check == "logprobs":
+        return (
+            f"{host} 不接受选项概率参数 logprobs（{code}）：判断层投票的路由请求会带 logprobs"
+            f"（§6.4），这样每次路由都会失败、退回关键词规则。{LOGPROBS_OFF_HINT}；"
+            "或者用 --judge offline（路由、质检用离线规则，只有生成走真实大模型）"
+        )
+    extra = (
+        f"；{LLM_ENV_PREFIX}EXTRA_BODY（或 llm.extra_body）里的参数"
+        f"（{'、'.join(sorted(options.extra_body))}）要是这个服务认的"
+        if options.extra_body
+        else ""
+    )
+    return (
+        f"{host} 不接受请求参数（{code}）：检查 {LLM_ENV_PREFIX}MODEL"
+        f"（模型 ID 要和控制台里的一致）；{THINKING_HINT}{extra}；"
+        "不接受 temperature=0 的服务（质检、启动检查用 0）暂不支持"
+    )
+
+
 def classify(
     exc: BaseException,
     host: str,
     *,
     timeout_s: float | None = None,
-    logprobs_rejected: bool = False,
     vote_samples: int | None = None,
+    check: CheckName = "plain",
+    options: LLMRequestOptions | None = None,
 ) -> str:
-    """启动检查失败时给人看的中文诊断（只含主机名，见模块说明）。"""
+    """启动检查失败时给人看的中文诊断（只含主机名，见模块说明）。check 是哪一步的请求失败了
+    （参数不被接受时据此说是哪个参数）；options 是客户端生效的请求参数。"""
     kind = kind_of(exc)
     status = _status(str(exc))
     if kind == "egress":
@@ -194,17 +237,7 @@ def classify(
             "（模型 ID 要和控制台里的一致）"
         )
     if kind == "bad_param":
-        if logprobs_rejected:
-            return (
-                f"{host} 不接受选项概率参数 logprobs（HTTP {status}）：判断层投票的路由请求会带"
-                " logprobs（§6.4），这样每次路由都会失败、退回关键词规则。换一个支持 logprobs 的"
-                "模型，或用 --judge offline（路由、质检用离线规则，只有生成走真实大模型）"
-            )
-        return (
-            f"{host} 不接受请求参数（HTTP {status}）：演示站的请求要求 JSON 模式"
-            "（response_format: json_object）；有的模型不支持 JSON 模式，或者要求关闭思考模式"
-            "这类专有参数。换一个支持 JSON 模式的模型（或它的非思考版本）"
-        )
+        return _param_rejected(check, host, status, options or LLMRequestOptions())
     if kind == "rate_limit":
         votes = f"（路由投票一次并发 {vote_samples} 个请求）" if vote_samples else ""
         return (
@@ -243,109 +276,141 @@ def classify(
     return f"调用 {host} 失败：{short_label(exc, timeout_s=timeout_s)}"
 
 
-JSON_REQUIRED = (
-    "模型没有按 JSON 输出（JSON 模式探测）：判断层和生成都要求只输出 JSON。"
-    "换一个支持 JSON 模式的模型，或者用它的非思考 / 非推理版本"
-)
+JSON_REQUIRED = "模型没有按 JSON 输出（JSON 模式检查）：判断层和生成都要求只输出 JSON"
+"""输出里找不到 JSON 对象时诊断的开头（json_required 补上要改什么）。"""
+
+
+def json_required(options: LLMRequestOptions) -> str:
+    """接受了 JSON 模式检查的请求，但输出里找不到 JSON 对象：多半是思考模式没关。"""
+    text = f"{JSON_REQUIRED}。{THINKING_HINT}"
+    if not options.json_mode:
+        text += (
+            f"；这个服务支持 JSON 模式的话去掉 {LLM_ENV_PREFIX}JSON_MODE=off"
+            "（或 llm.json_mode: false），让请求带上 response_format"
+        )
+    return text + "；还不行就换一个能按要求只输出 JSON 的模型"
 
 
 class PreflightFailed(RuntimeError):
-    """启动检查没过：message 是给人看的中文诊断（见 classify）。"""
+    """启动检查没过：message 是给人看的中文诊断（见 classify）；report 是能力检查的完整结果
+    （命令行把它逐行打出来，再报拒绝启动）。"""
 
-    def __init__(self, stage: str, message: str, kind: Kind) -> None:
+    def __init__(
+        self, stage: str, message: str, kind: Kind, report: CapabilityReport | None = None
+    ) -> None:
         super().__init__(f"{stage}没通过：{message}")
         self.stage = stage
         self.kind = kind
+        self.report = report
 
 
 @dataclass
 class PreflightResult:
-    """启动检查的结果：接口主机、模型名、每步耗时（毫秒）、探测有没有返回选项概率。"""
+    """启动检查通过：接口主机、模型名和能力检查的完整结果（每步状态、耗时、提示）。"""
 
     host: str
     model: str
-    steps_ms: dict[str, int] = field(default_factory=dict)
-    logprobs: bool | None = None  # 没请求时为 None
+    report: CapabilityReport
+
+    @property
+    def steps_ms(self) -> dict[str, int]:
+        return {c.name: c.latency_ms for c in self.report.checks if c.latency_ms is not None}
 
     @property
     def slowest_ms(self) -> int:
         return max(self.steps_ms.values(), default=0)
 
+    @property
+    def logprobs(self) -> bool | None:
+        """路由投票要的选项概率接口给不给：检查通过时看有没有返回；
+        没检查、已关闭、没有结果时为 None。"""
+        check = self.report.check("logprobs")
+        return check.output_ok if check.status == "ok" else None
 
-def _probe_request(*, logprobs: bool) -> LLMRequest:
-    return LLMRequest(
-        purpose="other",
-        messages=list(PROBE_MESSAGES),
-        temperature=0.0,
-        max_tokens=32,
-        json_mode=True,
-        want_logprobs=logprobs,
+    def lines(self) -> list[str]:
+        """能力检查的文本（rodit.eval.llm_env.render_capabilities，和评测打的一样）。"""
+        return render_capabilities(self.report)
+
+    def view(self) -> dict[str, Any]:
+        """自检报告（JSON）里的启动检查：能力检查的每一步、提示和文本。没有密钥。"""
+        return {
+            **self.report.model_dump(mode="json"),
+            "hints": self.report.hints,
+            "lines": self.lines(),
+        }
+
+
+def _as_error(check: CapabilityCheck) -> LLMError:
+    """能力检查记下的错误（客户端的错误信息，已抹掉密钥）还原成异常，交给 classify 分类。"""
+    message = check.error or "调用失败"
+    return LLMTimeout(message) if check.timed_out else LLMError(message)
+
+
+def _diagnose(
+    check: CapabilityCheck,
+    host: str,
+    options: LLMRequestOptions,
+    *,
+    timeout_s: float | None,
+    vote_samples: int | None,
+) -> tuple[str, Kind] | None:
+    """一步检查要不要拦下启动；要拦时返回 (诊断, 故障类型)（规则见模块说明）。"""
+    if check.status in ("off", "skipped"):
+        return None
+    if check.status == "ok":
+        if check.name == "json_mode" and check.output_ok is False:
+            return json_required(options), "json"
+        return None
+    if check.name == "logprobs" and check.status != "rejected":
+        return None  # 超时、限流、服务端错误：只提示，不拦
+    if check.name != "plain" and check.status == "rejected":
+        # 普通调用过了、同一个密钥和地址带上这个参数就被拒绝：就是这个参数的问题
+        return _param_rejected(check.name, host, check.http_status, options), "bad_param"
+    exc = _as_error(check)
+    return (
+        classify(
+            exc,
+            host,
+            timeout_s=timeout_s,
+            vote_samples=vote_samples,
+            check=check.name,
+            options=options,
+        ),
+        kind_of(exc),
     )
-
-
-def _timed(fn, *args):  # noqa: ANN001, ANN202
-    started = time.perf_counter()
-    result = fn(*args)
-    return result, int((time.perf_counter() - started) * 1000)
 
 
 def run_preflight(
     client: LLMClient, *, judge_llm: bool, vote_samples: int | None = None
 ) -> PreflightResult:
-    """启动检查（见模块说明）。失败抛 PreflightFailed。"""
+    """启动检查（见模块说明）：judge_llm 是判断层用大模型投票路由（路由请求带 logprobs，要检查）。
+    没过抛 PreflightFailed（第一步没过的名字 + 所有拦下启动的诊断）。"""
     host = endpoint_host(client)
     timeout_s = getattr(client, "timeout_s", None)
-    result = PreflightResult(host=host, model=str(getattr(client, "model", "") or ""))
-    stage = "连通性检查"
-    try:
-        _, result.steps_ms["connect"] = _timed(preflight, client)
-    except LLMError as exc:
-        raise PreflightFailed(
-            stage,
-            classify(exc, host, timeout_s=timeout_s, vote_samples=vote_samples),
-            kind_of(exc),
-        ) from None
-    stage = "JSON 模式探测"
-    response: LLMResponse
-    try:
-        response, result.steps_ms["json"] = _timed(
-            client.complete, _probe_request(logprobs=judge_llm)
-        )
-    except LLMError as exc:
-        logprobs_rejected = False
-        if judge_llm and kind_of(exc) == "bad_param":
-            # 分清是 JSON 模式还是 logprobs 不被接受：去掉 logprobs 再探一次
-            try:
-                client.complete(_probe_request(logprobs=False))
-                logprobs_rejected = True
-            except LLMError:
-                logprobs_rejected = False
-        raise PreflightFailed(
-            stage,
-            classify(
-                exc,
-                host,
-                timeout_s=timeout_s,
-                logprobs_rejected=logprobs_rejected,
-                vote_samples=vote_samples,
-            ),
-            kind_of(exc),
-        ) from None
-    if extract_json_object(response.text) is None:
-        raise PreflightFailed(stage, JSON_REQUIRED, "json")
-    if judge_llm:
-        result.logprobs = response.logprobs is not None
-    return result
+    options = client_options(client)
+    report = probe_capabilities(client, check_logprobs=judge_llm)
+    failures: list[tuple[CheckName, str, Kind]] = []
+    for check in report.checks:
+        found = _diagnose(check, host, options, timeout_s=timeout_s, vote_samples=vote_samples)
+        if found is not None:
+            failures.append((check.name, *found))
+    if failures:
+        name, message, kind = failures[0]
+        for other, more, _ in failures[1:]:
+            message += f"。另外{STAGES[other]}也没通过：{more}"
+        raise PreflightFailed(STAGES[name], message, kind, report)
+    return PreflightResult(host=host, model=str(getattr(client, "model", "") or ""), report=report)
 
 
 __all__ = [
     "JSON_REQUIRED",
-    "PROBE_MARK",
     "SHORT_LABELS",
+    "STAGES",
     "PreflightFailed",
     "PreflightResult",
     "classify",
     "endpoint_host",
+    "json_required",
     "kind_of",
     "run_preflight",
     "short_label",

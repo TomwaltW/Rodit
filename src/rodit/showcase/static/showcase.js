@@ -1177,7 +1177,9 @@
       box.appendChild(el('p', { cls: 'small risk', text: '失败的调用：' + judge.errors.map((e) => e.label + (e.count > 1 ? ' ×' + e.count : '')).join('、') }));
     }
     if (judge.samples > 1) {
-      box.appendChild(el('p', { cls: 'small muted', text: judge.probability_source === 'logprobs' ? '问题类型的概率取接口给的选项概率（logprobs）的平均' : '概率按有效票的占比算（这个接口没给能用的选项概率）' }));
+      const options = CONFIG.chain && CONFIG.chain.request_options;
+      const noLogprobs = options && options.logprobs === false ? '（请求参数关了 logprobs，不请求选项概率）' : '（这个接口没给能用的选项概率）';
+      box.appendChild(el('p', { cls: 'small muted', text: judge.probability_source === 'logprobs' ? '问题类型的概率取接口给的选项概率（logprobs）的平均' : '概率按有效票的占比算' + noLogprobs }));
     }
     return box;
   }

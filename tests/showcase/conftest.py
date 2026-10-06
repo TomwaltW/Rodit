@@ -30,7 +30,8 @@ def stub_env(stub: StubLLM, monkeypatch: pytest.MonkeyPatch) -> StubLLM:
     monkeypatch.setenv("RODIT_LLM_BASE_URL", stub.base_url)
     monkeypatch.setenv("RODIT_LLM_MODEL", stub.model)
     monkeypatch.setenv("RODIT_LLM_API_KEY", stub.api_key)
-    monkeypatch.delenv("RODIT_LLM_TIMEOUT_S", raising=False)
+    for name in ("TIMEOUT_S", "EXTRA_BODY", "JSON_MODE", "LOGPROBS"):
+        monkeypatch.delenv(f"RODIT_LLM_{name}", raising=False)
     return stub
 
 
