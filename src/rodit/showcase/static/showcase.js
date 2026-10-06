@@ -857,8 +857,11 @@
     result.alerts.forEach((a) => alerts.appendChild(el('p', { cls: 'alert' + (a.indexOf('仅供参考') >= 0 ? ' alert-image' : ''), text: a })));
     const note = view.trace && view.trace.simulated_note;
     simulated.hidden = !note;
+    // 重写的结果分三种：大模型重写稿通过 / 没通过 / 没有大模型重写稿（模板兜底不算"重写后通过"）
+    const rewrite = view.trace && view.trace.simulated_rewrite;
     let outcome = '第一稿被质检拦下，下面是重写后通过的回答';
-    if (note && !view.trace.simulated_rewrite_passed) outcome = '第一稿被质检拦下；重写稿没有通过质检（或质检不可用），这次不推荐大模型的回答';
+    if (note && rewrite === 'blocked') outcome = '第一稿被质检拦下；重写稿没有通过质检（或质检不可用），这次不推荐大模型的回答';
+    else if (note && rewrite !== 'passed') outcome = '第一稿被质检拦下；重写没有在时间内返回或生成失败，没有大模型重写稿' + (result.suggestions.length ? '，下面是 FAQ / 模板兜底' : '');
     simulated.textContent = note ? note + '（§11.5）：' + outcome : '';
     if (result.suggestions.length) {
       result.suggestions.forEach((card) => box.appendChild(suggestionCard(card, result)));
@@ -1187,7 +1190,7 @@
   /** 这条消息的真实大模型调用（按用途）。离线时没有。 */
   function llmCallsBox(llm) {
     if (!llm) return null;
-    const rows = llm.by_purpose.map((r) => r.label + ' ' + r.calls + ' 次' + (r.failed ? '（失败 ' + r.failed + '）' : '') + '，最慢 ' + ms(r.max_ms));
+    const rows = llm.by_purpose.map((r) => r.label + ' ' + r.calls + ' 次' + (r.failed ? '（失败 ' + r.failed + (r.timeouts ? '，其中超时 ' + r.timeouts : '') + '）' : '') + '，最慢 ' + ms(r.max_ms));
     return el('p', {
       cls: 'small muted',
       text: '真实大模型调用（' + llm.model + '）：' + (rows.length ? rows.join('；') : '这条没有调用') + ' · token 输入 ' + llm.input_tokens + ' / 输出 ' + llm.output_tokens,
@@ -1237,8 +1240,10 @@
     return traceStep('找', '找依据', '知识中心 + 平台只读工具；冲突时高优先级覆盖低优先级', children);
   }
 
-  function writeStep(parts, note) {
+  function writeStep(parts, note, generationFailed) {
     const children = [];
+    // 生成有没结果的调用（超时……）：引擎退回 FAQ / 模板，这里标为降级（§12.2）
+    if (generationFailed) children.push(el('p', { cls: 'notice notice-danger fallback-note generation-note', text: '降级：' + generationFailed }));
     parts.forEach((part) => {
       if (parts.length > 1) children.push(el('p', { cls: 'small', text: '分条 · ' + part.intent_label }));
       if (!part.write.length) children.push(el('p', { cls: 'muted small', text: '没有生成。' }));
@@ -1312,6 +1317,7 @@
     if (fb.no_suggestion_reason) children.push(el('p', { text: '不推荐：' + fb.no_suggestion_reason }));
     if (fb.missing_knowledge.length) children.push(el('p', { cls: 'small', text: '提醒商家补知识：' + fb.missing_knowledge.map((m) => m.label).join('、') }));
     if (fb.degraded.length) children.push(el('p', { cls: 'small risk', text: '降级：' + fb.degraded.map((d) => d.label).join('、') }));
+    if (fb.generation) children.push(el('p', { cls: 'small risk', text: '降级：' + fb.generation }));
     if (!children.length) children.push(el('p', { cls: 'muted', text: '这条不需要兜底：推荐交给客服确认后发送（人在回路，§4.1 原则 3）。' }));
     return traceStep('兜', '兜底', '拿不准的交给人（§5.7）', children);
   }
@@ -1351,7 +1357,7 @@
     const steps = el('ol', { cls: 'trace-steps' }, [
       understandStep(t.understand, t.images),
       findStep(t.parts),
-      writeStep(t.parts, t.simulated_note),
+      writeStep(t.parts, t.simulated_note, t.fallback.generation),
       judgeStep(t.parts),
       fallbackStep(t.fallback),
       latencyStep(t.latency, t.llm),

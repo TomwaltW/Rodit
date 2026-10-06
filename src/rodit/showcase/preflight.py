@@ -16,12 +16,17 @@ llm.json_mode / llm.logprobs / llm.extra_body）；几项都没过时一次说�
 错误类型 / 代码，见 rodit.llm.openai_compat）。
 
 故障分类（classify / short_label）按客户端的错误信息认：
-- 出口被网络策略拦下（代理对 CONNECT 回 403 / 407："Tunnel connection failed: 403"）；
+- 思考模式没关：模型只输出了思考过程（<think> 没结束，或正文为空、只有 reasoning_content；普通调用
+  的 token 上限很小，默认开思考的模型多半在这一步就被截断），提示在 extra_body 里关闭思考模式；
+- 出口被网络策略拦下（代理对 CONNECT 回 403 / 407："Tunnel connection failed: 403"），诊断里写
+  要放行的域名（不带协议、端口），重试没有用；
 - HTTP 401 密钥无效、403 没有权限、404 地址或模型 ID 不对、400 参数不被接受（JSON 模式、
   logprobs、思考模式这类专有参数）、429 限流或额度、5xx 服务端错误、3xx 重定向（不跟随）；
 - 超时（LLMTimeout）、TLS 证书校验失败、域名解析失败、连接被拒绝、响应不是 OpenAI 兼容格式、
   内容安全拦截、没有设置密钥。
 short_label 是同一套分类的短说明，给工作台过程面板里每一票的失败原因、自检报告用。
+诊断里要改的设置名跟着接口的来源走：环境变量那一路是 RODIT_LLM_*，配置文件里写全了 llm.base_url 和
+llm.model 时是 llm.*（RODIT_LLM_TIMEOUT_S 这些在那一路不起作用）；密钥是 llm.api_key_env 指的变量。
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from rodit.core.config import LLM_ENV_PREFIX, LLMRequestOptions
 from rodit.core.errors import LLMError, LLMTimeout
@@ -40,13 +46,16 @@ from rodit.eval.llm_env import (
     CapabilityCheck,
     CapabilityReport,
     CheckName,
+    SettingNames,
     client_options,
     describe_endpoint,
+    error_kind,
     probe_capabilities,
     render_capabilities,
 )
 
 Kind = Literal[
+    "thinking",
     "egress",
     "auth",
     "forbidden",
@@ -74,15 +83,6 @@ STAGES: dict[CheckName, str] = {
 """启动检查各步的名字（"拒绝启动：<名字>没通过：……"）。"""
 
 _HTTP_STATUS = re.compile(r"HTTP (\d{3})")
-_EGRESS = re.compile(r"Tunnel connection failed|ProxyError|Proxy Authentication Required", re.I)
-_TLS = re.compile(r"CERTIFICATE_VERIFY_FAILED|certificate verify failed|SSLCertVerification", re.I)
-_TLS_OTHER = re.compile(r"\[SSL[:\]]|SSLError|WRONG_VERSION_NUMBER", re.I)
-_DNS = re.compile(
-    r"Name or service not known|nodename nor servname|getaddrinfo failed|"
-    r"Temporary failure in name resolution|No address associated with hostname",
-    re.I,
-)
-_REFUSED = re.compile(r"Connection refused|ConnectionRefusedError|Errno 111|Errno 61", re.I)
 _FORMAT = re.compile(r"响应格式不对|JSONDecodeError|不是 JSON 对象|Expecting value", re.I)
 _NO_KEY = "没有大模型 API key"
 _FILTERED = "内容安全策略拦截"
@@ -105,8 +105,9 @@ def kind_of(exc: BaseException) -> Kind:
     message = str(exc)
     if _NO_KEY in message:
         return "no_key"
-    if _EGRESS.search(message):
-        return "egress"
+    network = error_kind(message)  # 思考模式没关、出口拦截、证书、域名、连接被拒（eval.llm_env）
+    if network in ("thinking", "egress"):
+        return network
     status = _status(message)
     if status is not None:
         if status == 401:
@@ -124,12 +125,8 @@ def kind_of(exc: BaseException) -> Kind:
         if status in (400, 413, 415, 422):
             return "bad_param"
         return "other"
-    if _TLS.search(message) or _TLS_OTHER.search(message):
-        return "tls"
-    if _DNS.search(message):
-        return "dns"
-    if _REFUSED.search(message):
-        return "refused"
+    if network is not None:
+        return network
     if "timed out" in message.lower():
         return "timeout"
     if _FILTERED in message:
@@ -140,6 +137,7 @@ def kind_of(exc: BaseException) -> Kind:
 
 
 SHORT_LABELS: dict[Kind, str] = {
+    "thinking": "思考模式没关",
     "egress": "网络策略拦截",
     "auth": "密钥无效（HTTP 401）",
     "forbidden": "没有权限（HTTP 403）",
@@ -172,7 +170,11 @@ def short_label(exc: BaseException, *, timeout_s: float | None = None) -> str:
 
 
 def _param_rejected(
-    check: CheckName, host: str, status: int | None, options: LLMRequestOptions
+    check: CheckName,
+    host: str,
+    status: int | None,
+    options: LLMRequestOptions,
+    names: SettingNames | None = None,
 ) -> str:
     """参数不被接受（HTTP 400 等）时的诊断：写明要改哪个开关或参数（见模块说明）。"""
     code = f"HTTP {status}" if status is not None else "被拒绝"
@@ -194,7 +196,7 @@ def _param_rejected(
         else ""
     )
     return (
-        f"{host} 不接受请求参数（{code}）：检查 {LLM_ENV_PREFIX}MODEL"
+        f"{host} 不接受请求参数（{code}）：检查 {(names or SettingNames()).model}"
         f"（模型 ID 要和控制台里的一致）；{THINKING_HINT}{extra}；"
         "不接受 temperature=0 的服务（质检、启动检查用 0）暂不支持"
     )
@@ -208,21 +210,29 @@ def classify(
     vote_samples: int | None = None,
     check: CheckName = "plain",
     options: LLMRequestOptions | None = None,
+    names: SettingNames | None = None,
 ) -> str:
     """启动检查失败时给人看的中文诊断（只含主机名，见模块说明）。check 是哪一步的请求失败了
-    （参数不被接受时据此说是哪个参数）；options 是客户端生效的请求参数。"""
+    （参数不被接受时据此说是哪个参数）；options 是客户端生效的请求参数；names 是要改的设置名
+    （接口来自环境变量时是 RODIT_LLM_*，写在配置文件里时是 llm.*，
+    见 eval.llm_env.SettingNames）。"""
+    names = names or SettingNames()
     kind = kind_of(exc)
     status = _status(str(exc))
+    if kind == "thinking":
+        return f"{host} 的模型开着思考模式（只输出了思考过程、没有回答）：{THINKING_HINT}"
     if kind == "egress":
+        domain = urlsplit(host).hostname if "://" in host else host
         return (
-            f"这个环境的网络策略没放行 {host}：在云端环境设置的网络访问里把它加进允许的域名"
-            "（改完要新开一个会话才生效）；在本地开发机上运行时检查公司代理或防火墙"
+            f"这个环境的网络策略没放行 {host}：在云端环境设置的网络访问里把域名 {domain} "
+            "加进允许的域名（改完要新开一个会话才生效，重试没有用）；在本地开发机上运行时"
+            "检查公司代理或防火墙"
         )
     if kind == "no_key":
         return f"{exc}"
     if kind == "auth":
         return (
-            f"{host} 拒绝了密钥（HTTP 401）：检查 RODIT_LLM_API_KEY 是不是这个服务的有效密钥"
+            f"{host} 拒绝了密钥（HTTP 401）：检查 {names.api_key} 是不是这个服务的有效密钥"
             "（密钥只放本地 .env 或环境的密钥设置，不要提交进仓库）"
         )
     if kind == "forbidden":
@@ -232,12 +242,12 @@ def classify(
         )
     if kind == "not_found":
         return (
-            f"{host} 找不到接口或模型（HTTP 404）：检查 RODIT_LLM_BASE_URL（OpenAI 兼容地址，"
-            "一般以 /v1 或服务文档写的兼容路径结尾，不含 /chat/completions）和 RODIT_LLM_MODEL"
+            f"{host} 找不到接口或模型（HTTP 404）：检查 {names.base_url}（OpenAI 兼容地址，"
+            f"一般以 /v1 或服务文档写的兼容路径结尾，不含 /chat/completions）和 {names.model}"
             "（模型 ID 要和控制台里的一致）"
         )
     if kind == "bad_param":
-        return _param_rejected(check, host, status, options or LLMRequestOptions())
+        return _param_rejected(check, host, status, options or LLMRequestOptions(), names)
     if kind == "rate_limit":
         votes = f"（路由投票一次并发 {vote_samples} 个请求）" if vote_samples else ""
         return (
@@ -248,14 +258,14 @@ def classify(
         return f"{host} 服务端出错（HTTP {status}）：模型服务的问题，稍后再试"
     if kind == "redirect":
         return (
-            f"{host} 返回了重定向（HTTP {status}）：检查 RODIT_LLM_BASE_URL"
+            f"{host} 返回了重定向（HTTP {status}）：检查 {names.base_url}"
             "（演示站不跟随重定向，避免把密钥带到别的地址）"
         )
     if kind == "timeout":
         limit = f" {timeout_s:g} 秒" if timeout_s is not None else "限定时间"
         return (
             f"{host} 在{limit}内没有响应：网络慢或者模型服务繁忙；"
-            "可以设 RODIT_LLM_TIMEOUT_S 调大单次调用的超时再试"
+            f"可以把 {names.timeout} 调大（单次调用的超时）再试"
         )
     if kind == "tls":
         return (
@@ -263,12 +273,12 @@ def classify(
             "（如 SSL_CERT_FILE），不要关闭证书校验"
         )
     if kind == "dns":
-        return f"解析不了 {host} 的域名：检查 RODIT_LLM_BASE_URL 的主机名和本机 DNS"
+        return f"解析不了 {host} 的域名：检查 {names.base_url} 的主机名和本机 DNS"
     if kind == "refused":
-        return f"{host} 拒绝连接：地址或端口不对，或者服务没有启动"
+        return f"{host} 拒绝连接：地址或端口不对（{names.base_url}），或者服务没有启动"
     if kind == "format":
         return (
-            f"{host} 的响应不是 OpenAI 兼容格式：检查 RODIT_LLM_BASE_URL 是不是 OpenAI 兼容接口"
+            f"{host} 的响应不是 OpenAI 兼容格式：检查 {names.base_url} 是不是 OpenAI 兼容接口"
             "（/chat/completions 的上一级）"
         )
     if kind == "filtered":
@@ -353,6 +363,7 @@ def _diagnose(
     *,
     timeout_s: float | None,
     vote_samples: int | None,
+    names: SettingNames,
 ) -> tuple[str, Kind] | None:
     """一步检查要不要拦下启动；要拦时返回 (诊断, 故障类型)（规则见模块说明）。"""
     if check.status in ("off", "skipped"):
@@ -365,7 +376,7 @@ def _diagnose(
         return None  # 超时、限流、服务端错误：只提示，不拦
     if check.name != "plain" and check.status == "rejected":
         # 普通调用过了、同一个密钥和地址带上这个参数就被拒绝：就是这个参数的问题
-        return _param_rejected(check.name, host, check.http_status, options), "bad_param"
+        return _param_rejected(check.name, host, check.http_status, options, names), "bad_param"
     exc = _as_error(check)
     return (
         classify(
@@ -375,23 +386,32 @@ def _diagnose(
             vote_samples=vote_samples,
             check=check.name,
             options=options,
+            names=names,
         ),
         kind_of(exc),
     )
 
 
 def run_preflight(
-    client: LLMClient, *, judge_llm: bool, vote_samples: int | None = None
+    client: LLMClient,
+    *,
+    judge_llm: bool,
+    vote_samples: int | None = None,
+    from_config: bool = False,
 ) -> PreflightResult:
-    """启动检查（见模块说明）：judge_llm 是判断层用大模型投票路由（路由请求带 logprobs，要检查）。
-    没过抛 PreflightFailed（第一步没过的名字 + 所有拦下启动的诊断）。"""
+    """启动检查（见模块说明）：judge_llm 是判断层用大模型投票路由（路由请求带 logprobs，要检查）；
+    from_config 是接口写在配置文件里（llm.base_url / llm.model，诊断叫人改 llm.*，不是
+    RODIT_LLM_*）。没过抛 PreflightFailed（第一步没过的名字 + 所有拦下启动的诊断）。"""
     host = endpoint_host(client)
     timeout_s = getattr(client, "timeout_s", None)
     options = client_options(client)
-    report = probe_capabilities(client, check_logprobs=judge_llm)
+    names = SettingNames.of(client, from_config=from_config)
+    report = probe_capabilities(client, check_logprobs=judge_llm, names=names)
     failures: list[tuple[CheckName, str, Kind]] = []
     for check in report.checks:
-        found = _diagnose(check, host, options, timeout_s=timeout_s, vote_samples=vote_samples)
+        found = _diagnose(
+            check, host, options, timeout_s=timeout_s, vote_samples=vote_samples, names=names
+        )
         if found is not None:
             failures.append((check.name, *found))
     if failures:

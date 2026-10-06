@@ -65,10 +65,26 @@ RELAXED_NOTE = "演示放宽了时间预算（生产按 §12.1：路由 ≤ 1 �
 """放宽时间预算时页面、横幅、自检报告上的说明。"""
 
 STRICT_WARNING = (
-    "判断层用大模型投票、时间预算按生产（§12.1：路由每一票限时 {route:g} 秒、整条消息 "
-    "{budget:g} 秒）：大多数托管大模型 1 秒内答不完，很多消息的路由会超时、退回关键词规则"
-    "（页面上标为降级）。演示时可以加 --latency relaxed"
+    "判断层用大模型投票、时间预算按生产（§12.1：路由每一票、质检每次限时 {route:g} 秒，"
+    "生成单次 {generation:g} 秒，整条消息 {budget:g} 秒）：大多数托管大模型 {route:g} 秒内答不完，"
+    "很多消息的路由会超时、退回关键词规则；大模型草稿的质检也会超时、判为不可用，这些草稿不推荐；"
+    "生成超时时退回 FAQ / 模板（页面上都标为降级）。演示时可以加 --latency relaxed"
 )
+"""判断层用大模型投票、时间预算是 strict 时启动横幅的提醒（数字是实际生效的配置）。质检和路由
+用同一个 decision.timeout_s（rodit.decision.build_llm_provider），提示词更长，一样会超时。"""
+
+STRICT_QA_ONLY_WARNING = (
+    "时间预算按生产（§12.1：质检每次限时 {route:g} 秒、生成单次 {generation:g} 秒、整条消息 "
+    "{budget:g} 秒）：模型慢的时候大模型草稿的质检会超时、判为不可用，这些草稿不推荐；生成会超时、"
+    "退回 FAQ / 模板（页面上都标为降级）。演示时可以加 --latency relaxed"
+)
+"""--judge llm、decision.provider = rules（路由不调大模型、质检照样用）时的提醒。"""
+
+STRICT_OFFLINE_JUDGE_WARNING = (
+    "时间预算按生产（§12.1：生成单次 {generation:g} 秒、整条消息 {budget:g} 秒）：模型慢的时候"
+    "大模型草稿会超时、退回 FAQ / 模板（页面上标为降级）。演示时可以加 --latency relaxed"
+)
+"""--judge offline（只有生成调大模型）时的提醒。"""
 
 JUDGE_LABELS: dict[str, str] = {
     "llm": "大模型投票",
@@ -579,6 +595,8 @@ __all__ = [
     "RELAXED_MIN_LLM_REMAINING_S",
     "RELAXED_NOTE",
     "REPLAY_BLOCKED",
+    "STRICT_OFFLINE_JUDGE_WARNING",
+    "STRICT_QA_ONLY_WARNING",
     "STRICT_WARNING",
     "SUPPORTED_JUDGE_PROVIDERS",
     "ChainInfo",

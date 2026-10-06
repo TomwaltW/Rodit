@@ -24,7 +24,9 @@ from rodit.core.models import Shop, ShopConfig
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # 校验报错不带输入值：配置里误写的密钥（如 llm.api_key）、extra_body 的值都不会被打出来。
+    # 要设在每一层（EngineConfig 和各段都继承这里）：只设在内层，外层的报错照样带值
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
 class DecisionConfig(_Model):
@@ -174,8 +176,14 @@ _SECRET_WORDS = frozenset(
         "credentials",
         "cookie",
         "signature",
+        "sign",
         "bearer",
         "apikey",
+        "key",  # app_key、appKey、x_key……（已知不是凭据的见 _BENIGN_KEYS）
+        "ak",
+        "sk",
+        "jwt",
+        "passphrase",
     }
 )
 _SECRET_FRAGMENTS = (
@@ -186,10 +194,14 @@ _SECRET_FRAGMENTS = (
     "secret",
     "password",
     "passwd",
+    "passphrase",
     "credential",
     "authorization",
 )
-_SECRET_VALUE_PREFIXES = ("bearer ", "sk-", "bce-v3/", "-----begin")
+_BENIGN_KEYS = frozenset({"prompt_cache_key"})
+"""带 key 这个词、但不是凭据的已知参数（规范化的蛇形写法）。"""
+# 值的开头：Bearer、sk-、百度 bce-v3/、PEM，JWT（eyJ）、AWS 风格的 AccessKey（AKIA）
+_SECRET_VALUE_PREFIXES = ("bearer ", "sk-", "bce-v3/", "-----begin", "eyj", "akia")
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _NON_WORD = re.compile(r"[^a-z0-9]+")
 
@@ -202,6 +214,8 @@ def _key_words(key: str) -> tuple[str, list[str]]:
 
 def _looks_like_secret_key(key: str) -> bool:
     norm, words = _key_words(key)
+    if norm in _BENIGN_KEYS:
+        return False
     compact = norm.replace("_", "")
     return any(w in _SECRET_WORDS for w in words) or any(f in compact for f in _SECRET_FRAGMENTS)
 
@@ -246,9 +260,11 @@ def check_extra_body(value: Any, *, source: str = "llm.extra_body") -> dict[str,
     - 必须是 JSON 对象；规范化 JSON 不超过 LLM_EXTRA_BODY_MAX_CHARS 个字符、嵌套不超过
       LLM_EXTRA_BODY_MAX_DEPTH 层；数字不能是 NaN / 无穷大；
     - 不能设置客户端控制的字段（LLM_CONTROLLED_FIELDS）；
-    - 任何一层的键都不能像凭据（api_key、authorization、token、secret、password……按词比较，
-      max_tokens 这类计数不算），字符串值不能像密钥（sk-、Bearer 开头……）：这些值会进评测
-      指纹、配置指纹和报告。
+    - 任何一层的键都不能像凭据（api_key、app_key、ak / sk、authorization、token、jwt、sign、
+      secret、password……按词比较，max_tokens 这类计数、prompt_cache_key 不算），字符串值不能像
+      密钥（sk-、Bearer、JWT 的 eyJ、AKIA 开头……）：凭据只放 API key 的环境变量。
+      挡不全的（比如网关自己起名的键）也不会被打出来：给人看的输出只有键名，评测指纹里是值的哈希
+      （LLMRequestOptions.summary / describe）。
     报错（ValueError）只带键名路径，不带值。"""
     if not isinstance(value, Mapping):
         raise ValueError(f"{source} 必须是 JSON 对象（键值对）")
@@ -416,23 +432,36 @@ class LLMRequestOptions:
     - extra_body：模型服务特有的参数（check_extra_body 校验过），标准字段优先；
     - json_mode：False 时不发 response_format（提示词本来就要求只输出 JSON）；
     - logprobs：False 时不发 logprobs / top_logprobs（路由的置信度按投票占比算）。
-    describe() 是规范化 JSON，记进评测指纹（会改变回答的东西）；里面没有密钥（校验挡掉了）。"""
+    extra_body 的值不出现在任何输出里（有的网关要在请求体里放凭据，键名校验挡不全）：
+    summary() 是给人看、写进报告的（只有键名）；describe() 记进评测指纹（会改变回答的东西），
+    键名加上值的规范化 JSON 的 SHA-256——值一改指纹就变，指纹里看不到值。"""
 
     extra_body: dict[str, Any] = field(default_factory=dict, hash=False)
     json_mode: bool = True
     logprobs: bool = True
 
+    @staticmethod
+    def _json(data: dict[str, Any]) -> str:
+        return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _public(self) -> dict[str, Any]:
+        return {
+            "extra_body_keys": sorted(self.extra_body),
+            "json_mode": self.json_mode,
+            "logprobs": self.logprobs,
+        }
+
+    def summary(self) -> str:
+        """给人看的（横幅、能力检查、自检报告）：extra_body 只有键名。"""
+        return self._json(self._public())
+
     def describe(self) -> str:
-        return json.dumps(
-            {
-                "extra_body": self.extra_body,
-                "json_mode": self.json_mode,
-                "logprobs": self.logprobs,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        """评测指纹里的：键名 + extra_body 规范化 JSON 的 SHA-256（没有 extra_body 时不带哈希）。"""
+        data = self._public()
+        if self.extra_body:
+            canonical = self._json(self.extra_body)
+            data["extra_body_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return self._json(data)
 
 
 def _reject_api_key_inside(

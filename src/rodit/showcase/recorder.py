@@ -11,8 +11,9 @@ route / retrieve / generate / check 套一层：照原样调用、照原样返�
 
 接真实大模型时另记两样（showcase.realchain）：每次大模型判断的 JudgeRecord（每票的答案、失败原因），
 挂到发起它的那次路由 / 质检上（判断在发起它的线程里做完，用线程局部变量对上）；每次真实大模型调用的
-LLMCall（用途、成败、耗时、token；投票、分条生成在线程池里调用，按消息汇总，不分到哪一步；调用开始时
-绑定到当时正在处理的消息，到截止时间没返回、在后台跑完的调用不会记到下一条消息上）。
+LLMCall（用途、成败、耗时、token；投票、分条生成在线程池里调用，按消息汇总，不分到哪一步）。
+四个组件的调用、判断、大模型调用都在开始时绑定到当时正在处理的消息，结束时那条消息已经结束就不记：
+到截止时间引擎不等了、在后台跑完的质检 / 生成 / 调用不会记到下一条消息上。
 
 只在演示站里用。记下来的东西里有买家原文所在的上下文对象，不往外传：trace.py 只取需要展示的字段。
 """
@@ -99,15 +100,23 @@ class Recorder:
             with self._lock:
                 self._current = None
 
-    def _add(self, kind: str, item: Any) -> None:
+    def _open(self) -> Recording | None:
         with self._lock:
-            if self._current is not None:
-                getattr(self._current, kind).append(item)
+            return self._current
+
+    def _add_to(self, recording: Recording | None, kind: str, item: Any) -> None:
+        """记进调用开始时绑定的那条消息，而且只在它还开着时记：到截止时间引擎不等了、在后台做完的
+        检索 / 生成 / 质检 / 判断，结果不会记到下一条消息上（那条消息的引擎根本没收到它）。"""
+        with self._lock:
+            if recording is not None and recording is self._current:
+                getattr(recording, kind).append(item)
 
     def add_judge(self, record: JudgeRecord) -> None:
-        """SwitchableLLMProvider 的 observer：记下判断，并留给本线程正在做的路由 / 质检。"""
+        """SwitchableLLMProvider 的 observer：记下判断，并留给本线程正在做的路由 / 质检。
+        判断在发起它的路由 / 质检线程里做完，记到那次调用开始时绑定的消息上。"""
         self._local.judge = record
-        self._add("judges", record)
+        bound = getattr(self._local, "recording", None)
+        self._add_to(bound if bound is not None else self._open(), "judges", record)
 
     def llm_call_sink(self) -> Callable[[LLMCall], None] | None:
         """ObservedLLM 每次调用开始时取：绑定到这时正在记录的消息（没有时返回 None，不记）。"""
@@ -133,10 +142,11 @@ class Recorder:
             raise RuntimeError("这个单元已经套过过程记录")
         router, retriever, generator, gate = unit.router, unit.retriever, unit.generator, unit.gate
 
-        def on_route(result: Any, ctx: Any, *args: Any, **kwargs: Any) -> None:
+        def on_route(rec: Recording | None, result: Any, ctx: Any, *args: Any, **kw: Any) -> None:
             text = getattr(getattr(ctx, "current", None), "text", "") or ""
             found = _IMAGE_DESCRIPTION.search(text)
-            self._add(
+            self._add_to(
+                rec,
                 "routed",
                 Routed(
                     list(getattr(ctx, "image_findings", []) or []),
@@ -145,10 +155,13 @@ class Recorder:
                 ),
             )
 
-        def on_retrieve(result: EvidenceBundle, ctx: Any, route: Any) -> None:
-            self._add("retrievals", Retrieval(route.intent, result))
+        def on_retrieve(
+            rec: Recording | None, result: EvidenceBundle, ctx: Any, route: Any
+        ) -> None:
+            self._add_to(rec, "retrievals", Retrieval(route.intent, result))
 
         def on_generate(
+            rec: Recording | None,
             result: list[Draft],
             ctx: Any,
             route: Any,
@@ -156,38 +169,47 @@ class Recorder:
             *,
             retry_feedback: list[str] | None = None,
         ) -> None:
-            self._add(
-                "generations", Generation(route.intent, list(retry_feedback or []), list(result))
-            )
+            generation = Generation(route.intent, list(retry_feedback or []), list(result))
+            self._add_to(rec, "generations", generation)
 
-        def on_check(result: QAResult, ctx: Any, route: Any, draft: Draft, evidence: Any) -> None:
-            self._add("checks", Check(route.intent, draft, result, self._take_judge()))
+        def on_check(
+            rec: Recording | None,
+            result: QAResult,
+            ctx: Any,
+            route: Any,
+            draft: Draft,
+            evidence: Any,
+        ) -> None:
+            self._add_to(rec, "checks", Check(route.intent, draft, result, self._take_judge()))
 
-        _wrap(router, "route", on_route, before=self._take_judge)
-        _wrap(retriever, "retrieve", on_retrieve)
-        _wrap(generator, "generate", on_generate)
-        _wrap(gate, "check", on_check, before=self._take_judge)
+        self._wrap(router, "route", on_route, judged=True)
+        self._wrap(retriever, "retrieve", on_retrieve)
+        self._wrap(generator, "generate", on_generate)
+        self._wrap(gate, "check", on_check, judged=True)
         unit._showcase_recorder = self
 
+    def _wrap(
+        self, obj: Any, name: str, observe: Callable[..., None], *, judged: bool = False
+    ) -> None:
+        """照原样调用、照原样返回；调用开始时绑定当时正在记录的消息（线程局部，判断的 observer
+        据此记），结束后交给 observe 记进这条消息（_add_to：消息已经结束就不记）。"""
+        original = getattr(obj, name)
 
-def _wrap(
-    obj: Any,
-    name: str,
-    observe: Callable[..., None],
-    *,
-    before: Callable[[], Any] | None = None,
-) -> None:
-    original = getattr(obj, name)
+        @functools.wraps(original)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            recording = self._open()
+            outer = getattr(self._local, "recording", None)
+            self._local.recording = recording
+            if judged:
+                self._take_judge()  # 清掉本线程上一次留下的判断，免得挂错
+            try:
+                result = original(*args, **kwargs)
+            finally:
+                self._local.recording = outer
+            observe(recording, result, *args, **kwargs)
+            return result
 
-    @functools.wraps(original)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        if before is not None:
-            before()  # 清掉本线程上一次留下的判断，免得挂错
-        result = original(*args, **kwargs)
-        observe(result, *args, **kwargs)
-        return result
-
-    setattr(obj, name, wrapped)
+        setattr(obj, name, wrapped)
 
 
 __all__ = ["Check", "Generation", "Recorder", "Recording", "Retrieval", "Routed"]

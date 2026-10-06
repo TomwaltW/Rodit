@@ -6,14 +6,16 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from functools import partial
 from pathlib import Path
 
 import pytest
-from llm_stub import StubLLM
+from llm_stub import StubLLM, qa_answer, route_answer
 from showcase_support import NOW
 
 from rodit.showcase.__main__ import EXIT_SELFCHECK_FAILED, EXIT_USAGE, main
+from rodit.showcase.llm import ShowcaseLLM
 from rodit.showcase.realchain import RELAXED_NOTE
 from rodit.showcase.state import ShowcaseHub
 from rodit.testing.fakes import FakeClock, FakeLLMClient
@@ -59,6 +61,25 @@ def test_json_to_stdout_is_only_json():
     assert code == 0
     report = json.loads(text)
     assert len(report["scenarios"]) == 15 and report["summary"]["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--llm", "env", "--platform", "taobao"],  # 启动检查没过（密钥被拒）
+        ["--config", "/nonexistent/rodit.yaml"],  # 配置不能用
+    ],
+)
+def test_json_to_stdout_stays_json_when_startup_fails(stub_env: StubLLM, argv):
+    """--json -：标准输出只放 JSON。启动就失败时标准输出是空的，诊断和"拒绝启动"都写到标准错误。"""
+    stub_env.fail("preflight", "401")
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["--selfcheck", *argv, "--json", "-"], out, err=err, run=_no_server, hub_factory=FAST_HUB
+    )
+    assert code == EXIT_USAGE
+    assert out.getvalue() == ""
+    assert "拒绝启动" in err.getvalue()
 
 
 def test_real_chain_selfcheck_against_the_stub(stub_env: StubLLM):
@@ -213,3 +234,106 @@ def test_phone_check_ignores_hex_epochs():
     assert PHONE.search('"text": "13812345678"')
     assert not PHONE.search('"epoch": "9a13812345678abc"')
     assert not PHONE.search("订单 o_1002、运单 ZT7300000001")
+
+
+# ================================================================ §12.2 降级不算必查失败
+
+
+def _report(argv: list[str], **kwargs) -> tuple[int, dict]:
+    code, text = _selfcheck([*argv, "--json", "-"], **kwargs)
+    return code, json.loads(text)
+
+
+def _check(report: dict, scenario: str, cid: str) -> dict:
+    s = next(s for s in report["scenarios"] if s["scenario"] == scenario)
+    return next(c for c in s["checks"] if c["id"] == cid)
+
+
+def _must_failures(report: dict) -> list[tuple[str, str, str]]:
+    return [
+        (s["scenario"], c["id"], c["detail"])
+        for s in report["scenarios"]
+        for c in s["checks"]
+        if c["must"] and c["status"] == "fail"
+    ]
+
+
+def test_qa_judge_timeouts_under_strict_are_not_must_failures(stub_env: StubLLM, tmp_path):
+    """路由投票、质检判断层每次都超时（同一个 decision.timeout_s）：路由退回关键词规则，大模型草稿
+    质检不可用、不推荐（§12.2）。分条那一项前提不成立（不适用），不是必查失败；汇总的提醒里写明
+    质检也超时了。"""
+    config = tmp_path / "rodit.yaml"
+    config.write_text("decision:\n  timeout_s: 0.2\n", encoding="utf-8")
+    stub_env.delay("route", 0.4)
+    stub_env.delay("qa", 0.4)
+    code, text = _selfcheck(["--llm", "env", "--platform", "taobao", "--config", str(config)])
+    assert code == 0, text
+    assert "大模型草稿的质检不可用" in text and "--latency relaxed" in text
+    code, report = _report(["--llm", "env", "--platform", "taobao", "--config", str(config)])
+    assert code == 0, _must_failures(report)
+    two = _check(report, "multi", "two_parts")
+    assert two["status"] == "skip" and "§12.2" in two["detail"]
+    deg = report["summary"]["degradations"]
+    assert deg["qa_unavailable"] > 0 and deg["route_fallback"] == 15
+
+
+@pytest.mark.parametrize("platform", ["taobao", "pdd"])
+def test_generation_timeouts_are_not_must_failures(stub_env: StubLLM, tmp_path, platform):
+    """生成每次都超时：重写稿、分条都没有大模型草稿，退回 FAQ / 模板（§12.2）。重写、分条两项记为
+    不适用（原因写生成超时），汇总里数出生成超时。"""
+    config = tmp_path / "rodit.yaml"
+    config.write_text("generation:\n  timeout_s: 0.2\n", encoding="utf-8")
+    stub_env.delay("generate", 0.4)
+    code, report = _report(["--llm", "env", "--platform", platform, "--config", str(config)])
+    assert code == 0, _must_failures(report)
+    rewrite = _check(report, "qa_block", "rewrite_passed")
+    assert rewrite["status"] == "skip" and "没有给出" in rewrite["detail"]
+    assert _check(report, "qa_block", "first_blocked")["status"] == "pass"
+    two = _check(report, "multi", "two_parts")
+    assert two["status"] == "skip" and "生成" in two["detail"]
+    deg = report["summary"]["degradations"]
+    assert deg["generate_failed"] > 0 and deg["generate_timeouts"] == deg["generate_failed"]
+    qa_block = next(s for s in report["scenarios"] if s["scenario"] == "qa_block")
+    assert any("生成" in label for label in qa_block["degraded"])
+
+
+def test_generation_timeouts_in_text_summary(stub_env: StubLLM, tmp_path):
+    """文字汇总里有生成超时的次数，并提示 --latency relaxed。"""
+    config = tmp_path / "rodit.yaml"
+    config.write_text("generation:\n  timeout_s: 0.2\n", encoding="utf-8")
+    stub_env.delay("generate", 0.4)
+    code, text = _selfcheck(["--llm", "env", "--platform", "taobao", "--config", str(config)])
+    assert code == 0, text
+    assert re.search(r"大模型生成失败 \d+ 次（其中超时 \d+ 次）", text)
+    assert "--latency relaxed" in text
+    assert "自检通过" in text
+
+
+def _emotion_below_threshold() -> FakeLLMClient:
+    """路由照关键词规则答，只是情绪激动的消息三票打 3、3、2（平均 2.67，没到阈值 3）。"""
+    scores = iter([3, 3, 2] * 1000)
+
+    def handler(request):
+        user = request.messages[-1].content
+        if request.purpose == "route":
+            answer = route_answer(user)
+            if answer.get("emotion", {}).get("score", 0) >= 3:
+                answer["emotion"] = {"score": next(scores)}
+            return answer
+        if request.purpose == "qa":
+            return qa_answer(user)
+        if request.purpose == "generate":
+            return ShowcaseLLM().complete(request).text
+        text = "\n".join(m.content for m in request.messages)
+        return '{"ok": true}' if "JSON" in text else "OK"
+
+    return FakeLLMClient(handler=handler, model="calm-model")
+
+
+def test_soothe_is_not_applicable_when_the_model_scores_emotion_below_threshold():
+    """情绪分是模型投出来的：没到阈值时规则 6 是对的，安抚那一项记为不适用（不是必查失败）。"""
+    client = _emotion_below_threshold()
+    code, report = _report(["--llm", "env", "--platform", "taobao"], llm_factory=lambda: client)
+    soothe = _check(report, "emotion", "soothe")
+    assert soothe["status"] == "skip" and "没到阈值" in soothe["detail"], soothe
+    assert code == 0, _must_failures(report)

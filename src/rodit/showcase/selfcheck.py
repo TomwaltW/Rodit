@@ -4,15 +4,20 @@
 把每个平台的每个预设场景（showcase.scenarios）都在演示站里发一遍（和页面上点场景走同一条路：
 ShowcaseHub → PlatformDemo.chat，不起 HTTP 服务），逐个打印：路由的问题类型、置信度、命中的
 §6.6 规则、动作、实际回答的判断层（大模型投票 / 关键词规则兜底）和票数；推荐的类型、是否填进
-输入框；质检拦了几份、过了几份；降级；各环节耗时；大模型调用次数和 token。最后汇总：
-各环节 P50 / P95 对照 §12.1 目标、降级次数、检查通过情况。
+输入框；质检拦了几份、过了几份；降级（含生成超时 / 失败——引擎不记，按调用记录补上）；各环节
+耗时；大模型调用次数和 token。最后汇总：各环节 P50 / P95 对照 §12.1 目标、降级次数（路由退回、
+质检不可用 / 时间不够、生成失败和其中超时的）、检查通过情况；时间预算是 strict、又有因超时的
+降级时提示可以加 --latency relaxed。
 
 检查分两种：
 - 必查（MUST）：不管模型怎么措辞，一个正确的系统都必须做到的（站外交易 → 规则 1 平台标准话术；
   投诉 → 不推荐、提醒人工；§11.5 的模拟承诺被拦下、重写稿通过质检才推荐；分条时两条都有推荐；
   尺码问题用上了商家的尺码建议；质检拦下的稿子不推荐出去；页面数据里没有买家标识和手机号；
   判断层降级时高风险类型不推荐（§12.2）；回放历史不调用真实大模型……）。
-  有前提的必查（"按多问题分条时……"）前提不成立时记为"不适用"并写明原因，不算失败；
+  有前提的必查（"按多问题分条时……"）前提不成立时记为"不适用"并写明原因，不算失败。§12.2 的
+  降级也是前提不成立：路由退回关键词规则、大模型草稿质检不可用或时间不够、生成超时 / 失败没有
+  大模型草稿（模板兜底过了质检不算"重写稿通过"）、时间预算用完；模型投出来的分数没到阈值
+  （情绪没到规则 3 的阈值）同样记为不适用；
 - 参考（INFO）：和模型、时延有关、不算错的（问题类型和场景标注一致、端到端在 5 秒内……）。
 
 接真实大模型时，报告里还有启动时的能力检查（capabilities：普通调用、JSON 模式、logprobs 每一步的
@@ -128,6 +133,52 @@ def _evidence_ids(trace: dict[str, Any], intent: str | None = None) -> set[str]:
 def _llm_drafts(trace: dict[str, Any]) -> list[dict[str, Any]]:
     drafts = [d for p in trace["parts"] for a in p["write"] for d in a["drafts"]]
     return [d for d in drafts if d["kind"] == "llm"]
+
+
+def generate_failures(trace: dict[str, Any]) -> tuple[int, int]:
+    """这条消息的大模型生成调用：(没结果的次数, 其中超时的次数)。离线时 (0, 0)。"""
+    rows = [r for r in (trace.get("llm") or {}).get("by_purpose", []) if r["purpose"] == "generate"]
+    return sum(r["failed"] for r in rows), sum(r.get("timeouts", 0) for r in rows)
+
+
+def _markers(trace: dict[str, Any]) -> set[str]:
+    return {d["marker"] for d in trace["fallback"]["degraded"]}
+
+
+def _qa_out_of_time(check: dict[str, Any]) -> bool:
+    return any("时间不够" in r for r in check["reasons"])
+
+
+GEN_FALLBACK = "大模型生成超时 / 失败，没有大模型草稿（§12.2 退回 FAQ / 模板）"
+BUDGET_FALLBACK = "时间预算用完，没做完的步骤已跳过（§12.2）"
+GEN_TIMEOUT_LABEL = "大模型生成超时（退回 FAQ / 模板）"
+GEN_FAILED_LABEL = "大模型生成失败（退回 FAQ / 模板）"
+"""场景的降级里补上的生成失败（引擎不记，按调用记录算）。"""
+
+
+def part_degradation(trace: dict[str, Any], part: dict[str, Any] | None) -> str | None:
+    """分条里的一条没出推荐，是不是因为 §12.2 的降级：质检不可用、时间不够没做完质检、
+    生成超时 / 失败没有大模型草稿、时间预算用完。是就返回原因，不是返回 None（那就是错）。
+    part 为 None：这一条在过程记录里没有（整条没做完）。"""
+    budget = "budget" in _markers(trace)
+    if part is None:
+        return BUDGET_FALLBACK if budget else None
+    checks = part["judge"]
+    if any(ch["degraded"] for ch in checks):
+        return "大模型草稿的质检不可用（§12.2）"
+    if any(_qa_out_of_time(ch) for ch in checks):
+        return "时间不够，没有做完大模型草稿的质检（§12.2）"
+    llm_texts = {d["text"] for a in part["write"] for d in a["drafts"] if d["kind"] == "llm"}
+    if llm_texts - {ch["text"] for ch in checks}:
+        return "大模型草稿的质检没在截止时间前做完（§12.2）"
+    last = part["write"][-1] if part["write"] else None
+    if (
+        last is not None
+        and not any(d["kind"] == "llm" for d in last["drafts"])
+        and generate_failures(trace)[0]
+    ):
+        return GEN_FALLBACK
+    return BUDGET_FALLBACK if budget else None
 
 
 def common_checks(
@@ -305,36 +356,67 @@ def scenario_checks(c: _Checks, platform: Platform, s: Scenario, view: dict[str,
                 first_check is not None and not first_check["passed"],
                 "第一稿没有被拦下",
             )
-            rewrites = [ch for ch in checks if ch["attempt"] > 1]
-            unavailable = [ch for ch in rewrites if ch["degraded"] or not ch["model_checked"]]
-            if not rewrites:
-                c.must("rewrite_passed", "带着原因重写、重写稿通过质检后推荐", False, "没有重写")
+            label = "带着原因重写、重写稿通过质检后推荐"
+            # 只算大模型重写稿：重写超时 / 失败后退回的模板过了质检不是"重写稿通过"
+            rewrites = [ch for ch in checks if ch["attempt"] > 1 and ch["kind"] == "llm"]
+            retried = any(a["attempt"] > 1 for p in trace["parts"] for a in p["write"])
+            unavailable = [ch for ch in rewrites if ch["degraded"] or _qa_out_of_time(ch)]
+            if not rewrites and (retried or generate_failures(trace)[0]):
+                c.skip(
+                    "rewrite_passed",
+                    label,
+                    "重写时大模型没有给出草稿（超时 / 失败 / 输出解析不了，§12.2 退回 FAQ / 模板）",
+                )
+            elif not rewrites and "budget" in _markers(trace):
+                c.skip("rewrite_passed", label, f"没有重写：{BUDGET_FALLBACK}")
+            elif not rewrites:
+                c.must("rewrite_passed", label, False, "没有重写")
             elif unavailable and not any(ch["passed"] for ch in rewrites):
                 c.skip(
                     "rewrite_passed",
-                    "带着原因重写、重写稿通过质检后推荐",
+                    label,
                     "重写稿的模型质检不可用或时间不够（降级），没有推荐大模型回答",
                 )
             else:
                 passed = [ch for ch in rewrites if ch["passed"]]
                 c.must(
                     "rewrite_passed",
-                    "带着原因重写、重写稿通过质检后推荐",
+                    label,
                     bool(passed) and any(card["kind"] == "llm" for card in cards),
-                    "重写稿没有通过质检",
+                    "通过质检的重写稿没有推荐出去" if passed else "重写稿没有通过质检",
                 )
 
     elif sid == "emotion":
-        c.must(
-            "soothe",
-            "情绪激动：§6.6 规则 3，先推荐安抚话术并标红",
-            u.get("rule") == 3
-            and first is not None
-            and first["kind"] == "template"
-            and "抱歉" in first["text"]
-            and ALERT_EMOTION in result["alerts"],
-            f"命中的是规则 {u.get('rule')}",
+        label = "情绪激动：§6.6 规则 3，先推荐安抚话术并标红"
+        rule = u.get("rule")
+        emotion, threshold = u.get("emotion"), u.get("emotion_threshold")
+        below = (
+            isinstance(emotion, int | float)
+            and isinstance(threshold, int | float)
+            and emotion < threshold
         )
+        if rule in (1, 2):  # 优先级更高的规则（站外交易、要人工）：前提不成立
+            c.skip("soothe", label, f"命中了优先级更高的规则 {rule}（{u.get('action_label')}）")
+        elif rule != 3 and below:  # 情绪分是模型投出来的：没到阈值时不走规则 3 是对的
+            c.skip("soothe", label, f"模型判的情绪 {emotion:.2f} 没到阈值 {threshold:g}")
+        else:
+            c.must(
+                "soothe",
+                label,
+                rule == 3
+                and first is not None
+                and first["kind"] == "template"
+                and "抱歉" in first["text"]
+                and ALERT_EMOTION in result["alerts"],
+                f"命中的是规则 {rule}",
+            )
+        if isinstance(emotion, int | float) and isinstance(threshold, int | float):
+            c.info(
+                "emotion_level",
+                "情绪分到了规则 3 的阈值",
+                not below,
+                f"情绪 {emotion:.2f}，阈值 {threshold:g}",
+            )
 
     elif sid == "complaint":
         c.must(
@@ -350,13 +432,28 @@ def scenario_checks(c: _Checks, platform: Platform, s: Scenario, view: dict[str,
             c.info("split", "按两个问题分条（§6.6 规则 5）", False, "没有分条")
         else:
             part_intents = [p["intent"] for p in u.get("parts", [])]
+            labels = {p["intent"]: p["label"] for p in u.get("parts", [])}
             card_intents = {card["intent"] for card in cards}
-            c.must(
-                "two_parts",
-                "按问题分条时两条都有推荐",
-                len(set(part_intents)) >= 2 and set(part_intents) <= card_intents,
-                f"分条 {part_intents}，推荐 {sorted(card_intents)}",
-            )
+            traced = {p["intent"]: p for p in trace["parts"]}
+            # 没出推荐的那一条要是 §12.2 降级（质检不可用、生成超时……）造成的：前提不成立
+            why = [
+                (i, reason)
+                for i in part_intents
+                if i not in card_intents
+                and (reason := part_degradation(trace, traced.get(i))) is not None
+            ]
+            if why:
+                intent, reason = why[0]
+                c.skip(
+                    "two_parts", "按问题分条时两条都有推荐", f"「{labels[intent]}」这一条{reason}"
+                )
+            else:
+                c.must(
+                    "two_parts",
+                    "按问题分条时两条都有推荐",
+                    len(set(part_intents)) >= 2 and set(part_intents) <= card_intents,
+                    f"分条 {part_intents}，推荐 {sorted(card_intents)}",
+                )
             c.info(
                 "split",
                 "分成「商品参数」「发票」两条",
@@ -501,6 +598,10 @@ def run_scenario(demo: PlatformDemo, s: Scenario, secrets: Sequence[str]) -> Sce
     lat = {st["key"]: st["ms"] for st in trace["latency"]["stages"]}
     lat["total"] = trace["latency"]["since_received_ms"]
     qa_checks = [ch for p in trace["parts"] for ch in p["judge"]]
+    degraded = [d["label"] for d in trace["fallback"]["degraded"]]
+    gen_failed, gen_timeouts = generate_failures(trace)
+    if gen_failed:  # 引擎不把生成失败记成降级（生成器自己退回 FAQ / 模板），这里补上
+        degraded.append(GEN_TIMEOUT_LABEL if gen_timeouts == gen_failed else GEN_FAILED_LABEL)
     return ScenarioResult(
         platform=platform.value,
         scenario=s.id,
@@ -522,7 +623,7 @@ def run_scenario(demo: PlatformDemo, s: Scenario, secrets: Sequence[str]) -> Sce
                 1 for ch in qa_checks if any("时间不够" in r for r in ch["reasons"])
             ),
         },
-        degraded=[d["label"] for d in trace["fallback"]["degraded"]],
+        degraded=degraded,
         latency_ms=lat,
         llm=trace.get("llm"),
         checks=checks.items,
@@ -565,11 +666,13 @@ def summarize(
     info = [c for c in all_checks if not c.must]
     calls: Counter[str] = Counter()
     failed: Counter[str] = Counter()
+    timeouts: Counter[str] = Counter()
     tokens = {"input": 0, "output": 0}
     for r in ran:
         for row in (r.llm or {}).get("by_purpose", []):
             calls[row["purpose"]] += row["calls"]
             failed[row["purpose"]] += row["failed"]
+            timeouts[row["purpose"]] += row.get("timeouts", 0)
             tokens["input"] += row["input_tokens"]
             tokens["output"] += row["output_tokens"]
     route_fallbacks = sum(1 for r in ran if r.route and r.route["degraded"])
@@ -582,11 +685,15 @@ def summarize(
             "route_fallback": route_fallbacks,
             "qa_unavailable": sum(r.qa.get("unavailable", 0) for r in ran),
             "qa_out_of_time": sum(r.qa.get("out_of_time", 0) for r in ran),
+            # 生成没结果的调用（引擎退回 FAQ / 模板，不记降级）和其中超时的
+            "generate_failed": failed["generate"],
+            "generate_timeouts": timeouts["generate"],
             "labels": dict(Counter(label for r in ran for label in r.degraded)),
         },
         "llm": {
             "calls": dict(calls),
             "failed": dict(failed),
+            "timeouts": dict(timeouts),
             "input_tokens": tokens["input"],
             "output_tokens": tokens["output"],
         },
@@ -741,14 +848,35 @@ def render_summary(report: dict[str, Any]) -> str:
         mark = {True: "✓", False: "✗", None: " "}[st["within_target"]]
         lines.append(f"    {mark} {st['label']}：{_ms(st['p50'])} / {_ms(st['p95'])}（{target}）")
     deg = s["degradations"]
-    if deg["route_fallback"] and chain.get("judge") == "llm" and chain.get("latency") == "strict":
-        lines.append(
-            f"  ! {deg['route_fallback']} 条消息的路由退回了关键词规则"
-            "（这些消息的判断层没用上大模型）；失败原因以超时为主时，演示可以加 --latency relaxed"
-        )
+    if chain.get("real") and chain.get("latency") == "strict":
+        slow = []
+        if deg["route_fallback"] and chain.get("route_by_llm"):
+            slow.append(
+                f"{deg['route_fallback']} 条消息的路由退回了关键词规则"
+                "（这些消息的判断层没用上大模型）"
+            )
+        if chain.get("judge") == "llm" and (deg["qa_unavailable"] or deg["qa_out_of_time"]):
+            slow.append(
+                f"大模型草稿的质检不可用 {deg['qa_unavailable']} 次、时间不够 "
+                f"{deg['qa_out_of_time']} 次（这些草稿不推荐）"
+            )
+        if deg.get("generate_timeouts"):
+            slow.append(f"大模型生成超时 {deg['generate_timeouts']} 次（退回 FAQ / 模板）")
+        if slow:
+            lines.append(
+                "  ! 时间预算按生产（§12.1）："
+                + "；".join(slow)
+                + "。失败原因以超时为主时，演示可以加 --latency relaxed"
+            )
     lines.append(
         f"  降级：路由退回关键词规则 {deg['route_fallback']} 次；"
         f"质检不可用 {deg['qa_unavailable']} 次；质检时间不够 {deg['qa_out_of_time']} 次"
+        + (
+            f"；大模型生成失败 {deg['generate_failed']} 次"
+            f"（其中超时 {deg['generate_timeouts']} 次）"
+            if deg.get("generate_failed")
+            else ""
+        )
         + (
             "；" + "、".join(f"{k} {n} 次" for k, n in deg["labels"].items())
             if deg["labels"]

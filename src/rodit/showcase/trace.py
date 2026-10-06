@@ -12,7 +12,10 @@
 
 接真实大模型时（chain.real）判断层的说明按实际情况写：路由是大模型投票答的，还是投票失败（超时、
 限流……）后退回了关键词规则（§12.2 降级，原因写明白）；质检是大模型答的，还是判断层不可用、
-大模型草稿不推荐。离线时照旧标"离线替身"。
+大模型草稿不推荐；生成有没结果的调用（超时……）时写明大模型草稿没拿到、退回 FAQ / 模板
+（fallback.generation，引擎不把它记成降级）。§11.5 模拟第一稿之后的重写结果分三种
+（simulated_rewrite：大模型重写稿通过 / 没通过 / 没有大模型重写稿），模板兜底不算"重写后通过"。
+离线时照旧标"离线替身"。
 
 只放给讲解用的字段：不放 buyer_ref、买家昵称、会话里的其他买家消息；依据内容是引擎给大模型看的
 那份（已做个人信息最小化，§5.3）；图片的识别结果（摘要、图中文字）是图片理解打过码的，这里
@@ -223,6 +226,7 @@ PURPOSE_LABELS: dict[str, str] = {
 
 FALLBACK_ROUTE = "这条消息改用关键词规则路由（降级，§12.2）"
 FALLBACK_QA = "质检不可用：大模型草稿不推荐（§12.2）"
+FALLBACK_GENERATION = "没拿到的大模型草稿已丢掉，退回 FAQ / 模板（§12.2）"
 
 
 def provider_label(name: str | None, chain: ChainInfo | None) -> str:
@@ -317,6 +321,27 @@ def judge_view(record: JudgeRecord | None, chain: ChainInfo | None) -> dict[str,
         "failure": judge_failure(record),
         "questions": _judge_questions(record),
     }
+
+
+def generation_failure(calls: Sequence[LLMCall]) -> str | None:
+    """这条消息的大模型生成有没有没结果的调用（超时、限流……）：有就返回白话说明（页面上标为
+    降级）。引擎不把生成失败记成降级（生成器自己退回 FAQ / 模板，§12.2），这里按调用记录补上。"""
+    failed = [c for c in calls if c.purpose == "generate" and c.error]
+    if not failed:
+        return None
+    errors = Counter(str(c.error) for c in failed)
+    listed = "、".join(f"{label} ×{n}" if n > 1 else label for label, n in errors.items())
+    return f"大模型生成有 {len(failed)} 次调用没有结果：{listed} → {FALLBACK_GENERATION}"
+
+
+def rewrite_outcome(parts: Sequence[dict[str, Any]], cards: Sequence[SuggestionCard]) -> str:
+    """§11.5 模拟第一稿被拦之后重写的结果：passed 大模型重写稿通过质检、推荐了出去；
+    blocked 有大模型重写稿，但没通过质检（或质检不可用）；none 没有大模型重写稿（重写超时、
+    生成失败、时间不够，退回 FAQ / 模板）。模板兜底的卡片不算"重写后通过"。"""
+    rewrites = [c for p in parts for c in p["judge"] if c["attempt"] > 1 and c["kind"] == "llm"]
+    if any(c["passed"] for c in rewrites) and any(c.kind.value == "llm" for c in cards):
+        return "passed"
+    return "blocked" if rewrites else "none"
 
 
 _PURPOSE_ORDER = ("route", "generate", "qa", "other")
@@ -572,7 +597,8 @@ def build_trace(
     since = int(latency.get("since_received", total))
     route = result.route
     blocked = sum(1 for p in parts for c in p["judge"] if not c["passed"])
-    rewrite_passed = any(c["passed"] and c["attempt"] > 1 for p in parts for c in p["judge"])
+    rewrite = rewrite_outcome(parts, result.suggestions) if simulated_note else None
+    real = chain is not None and chain.real
     return {
         "understand": _understand(result, config, decisions, recording, chain),
         "images": images_view(result, recording, events),
@@ -585,6 +611,8 @@ def build_trace(
                 {"marker": m, "label": gap_label(m)} for m in result.missing_knowledge
             ],
             "degraded": [{"marker": m, "label": degraded_label(m)} for m in result.degraded],
+            # 接真实大模型时生成有没结果的调用（引擎不记降级，生成器自己退回 FAQ / 模板）
+            "generation": generation_failure(recording.llm_calls) if real else None,
             "human_only": route is not None
             and route.action in (RouteAction.HUMAN_PRIORITY, RouteAction.NO_SUGGESTION),
         },
@@ -610,11 +638,13 @@ def build_trace(
         },
         "llm": llm_view(recording.llm_calls, chain),
         "simulated_note": simulated_note,
-        "simulated_rewrite_passed": rewrite_passed if simulated_note else None,
+        "simulated_rewrite": rewrite,
+        "simulated_rewrite_passed": rewrite == "passed" if simulated_note else None,
     }
 
 
 __all__ = [
+    "FALLBACK_GENERATION",
     "FALLBACK_QA",
     "FALLBACK_ROUTE",
     "build_trace",
@@ -622,6 +652,7 @@ __all__ = [
     "degraded_label",
     "describe_evidence",
     "gap_label",
+    "generation_failure",
     "images_view",
     "intent_label",
     "is_image_alert",
@@ -629,4 +660,5 @@ __all__ = [
     "judge_view",
     "llm_view",
     "provider_label",
+    "rewrite_outcome",
 ]

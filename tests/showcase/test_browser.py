@@ -140,8 +140,10 @@ def test_showcase_in_a_real_browser():
 
 @pytest.mark.skipif(NODE is None, reason="没有 node，跳过真浏览器冒烟测试")
 def test_showcase_with_the_real_llm_chain_in_a_real_browser(stub_env: StubLLM):
-    """--llm env --judge llm：徽标、降级说明、真实票数（大模型是本机的 OpenAI 兼容替身）。"""
+    """--llm env --judge llm：徽标、降级说明、真实票数、§11.5 重写失败的说明（大模型是本机的
+    OpenAI 兼容替身）。"""
     stub_env.fail("route", "429", times=3)  # 第一条消息的三票都被限流：页面要写明退回了关键词规则
+    stub_env.fail("generate_retry", "500")  # §11.5 重写那次生成失败：页面不能说"重写后通过"
     hub = ShowcaseHub(
         clock=FakeClock(NOW),
         llm=client_from_env(),
@@ -157,7 +159,7 @@ def test_showcase_with_the_real_llm_chain_in_a_real_browser(stub_env: StubLLM):
             "RODIT_EXPECT_HOST": stub_env.base_url.removesuffix("/v1"),
         },
     )
-    assert result["steps"] == ["badge", "fallback", "votes", "phone"]
+    assert result["steps"] == ["badge", "fallback", "votes", "rewrite_failed", "phone"]
     # 页面上的操作真的走到了模型替身：每条消息路由 3 个请求，生成、质检都有
     assert stub_env.count("route") >= 9 and stub_env.count("generate") >= 1
     assert stub_env.count("qa") >= 1

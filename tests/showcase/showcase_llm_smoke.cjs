@@ -4,7 +4,8 @@
  *
  * 核对：页眉下的徽标和页脚写明"真实大模型：<模型>（<主机>）· 判断层 · 时间预算"；第一条消息的路由
  * 三票都失败（Python 端让替身限流）时，过程面板写明退回了关键词规则；之后的消息过程面板显示真实的
- * 票数、生成由真实大模型写、真实调用的次数；手机宽度没有横向滚动；没有控制台报错、CSP 拦截、外部请求。
+ * 票数、生成由真实大模型写、真实调用的次数；§11.5 重写那次生成失败（替身对重写回 500）时，页面不说
+ * "重写后通过"、写明生成失败退回 FAQ / 模板；手机宽度没有横向滚动；没有控制台报错、CSP 拦截、外部请求。
  *
  * 环境变量：RODIT_BASE_URL 测试服务器地址；RODIT_LLM_MODEL 模型名；RODIT_EXPECT_HOST 接口主机；
  * RODIT_SHOWCASE_SHOTS（可选）截图目录。退出码：0 通过；77 没有 Playwright / 浏览器（跳过）；其他失败。
@@ -139,6 +140,17 @@ async function main() {
     await cspClean(page, '桌面');
     await shot(page, 'llm-votes');
     steps.push('votes');
+
+    // ---------------------------------------------------------------- §11.5 重写那次生成失败（Python 端让替身对重写回 500）
+    await page.locator('.conv-btn[data-scenario="qa_block"]').click();
+    await page.locator('#trace .generation-note').first().waitFor();
+    const simulated = await page.locator('#ai-simulated').textContent();
+    check(simulated.includes('没有大模型重写稿') && !simulated.includes('重写后通过'), `重写失败的说明：${simulated}`);
+    const genNote = await page.locator('#trace .generation-note').first().textContent();
+    check(genNote.includes('大模型生成有') && genNote.includes('服务端错误（HTTP 500）') && genNote.includes('§12.2'), `生成失败的降级说明：${genNote}`);
+    check((await page.locator('#trace').textContent()).includes('生成 2 次（失败 2）'), '生成失败的次数');
+    await shot(page, 'llm-rewrite-failed');
+    steps.push('rewrite_failed');
 
     // ---------------------------------------------------------------- 手机宽度
     const phone = await newPage(browser, { width: 390, height: 844 }, problems);

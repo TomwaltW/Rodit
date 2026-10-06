@@ -27,11 +27,13 @@ usage 按字数估 token。logprobs：
 - thinking=True：默认开思考模式的模型——请求里没有 {"thinking": {"type": "disabled"}} 或
   {"enable_thinking": false}（RODIT_LLM_EXTRA_BODY）时，带 response_format 的请求 HTTP 400
   （思考模式下不支持 JSON 模式），不带的回答前面多一段 <think>…</think>（里面还有一个 JSON 草稿，
-  客户端要去掉它）。
+  客户端要去掉它）。thinking_style 改思考过程的样子：closed（默认，上面那样）；truncated（请求的
+  token 上限 ≤ 64 时 </think> 来不及输出，只有思考的开头）；reasoning（思考放在 reasoning_content
+  字段里，token 上限 ≤ 64 时正文为空）。
 rejected 是因为这些被拒绝的请求数。
 
 可以按用途（route / qa / generate / preflight / probe_json / probe_logprobs / "*"）设延迟（delay）
-和注入失败（fail）：
+和注入失败（fail；另有 generate_retry：只对带着质检原因重写的那次生成生效）：
 401 / 403 / 404 / 400 / 400_response_format（请求带 response_format 才拒）/ 400_logprobs（请求带
 logprobs 才拒）/ 429 / 500 / timeout（睡够 timeout_sleep_s 秒再回）/ malformed（200 但响应体不是
 JSON）/ not_json（200，内容不是 JSON）/ content_filter（finish_reason=content_filter）/ no_choices。
@@ -64,7 +66,7 @@ from rodit.core.questions import (
 from rodit.decision import RuleProvider
 from rodit.decision.llm import SYSTEM_PROMPT
 from rodit.eval.llm_env import JSON_PROBE_PROMPT, LOGPROBS_PROBE_PROMPT
-from rodit.showcase.llm import ShowcaseLLM
+from rodit.showcase.llm import RETRY_MARK, ShowcaseLLM
 
 STUB_KEY = "stub-test-key-0000"
 """测试用的假密钥（不是任何服务的真实密钥）。"""
@@ -76,6 +78,10 @@ PURPOSES = ("route", "qa", "generate", "preflight", "probe_json", "probe_logprob
 
 THINKING_PREFIX = '<think>先想一想：买家问的是什么？草稿 {"answer": "思考里的草稿"}</think>\n'
 """thinking=True 且没关思考时，回答前面多出来的思考过程（有的模型把它放在正文里）。"""
+THINKING_TRUNCATED = "<think>\n嗯，用户让我只回复"
+"""thinking_style="truncated"：请求的 token 上限小（≤ THINKING_CUTOFF_TOKENS）时
+只来得及输出的思考开头。"""
+THINKING_CUTOFF_TOKENS = 64
 
 
 @dataclass
@@ -105,6 +111,7 @@ class StubLLM:
     accept_response_format: bool = True
     accept_logprobs: bool = True
     thinking: bool = False
+    thinking_style: str = "closed"  # closed / truncated / reasoning，见模块说明
     requests: list[StubRequest] = field(default_factory=list)
     _delays: dict[str, float] = field(default_factory=dict)
     _failures: dict[str, list[_Failure]] = field(default_factory=dict)
@@ -209,8 +216,11 @@ class StubLLM:
     # ---------------------------------------------------------------- 处理
 
     def _failure_for(self, purpose: str, body: dict[str, Any]) -> str | None:
+        keys = [purpose, "*"]
+        if purpose == "generate" and RETRY_MARK in _user(body.get("messages", [])):
+            keys.insert(0, "generate_retry")  # 带着质检原因重写的那次生成（§5.5）
         with self._lock:
-            for key in (purpose, "*"):
+            for key in keys:
                 for f in self._failures.get(key, []):
                     if f.times is not None and f.times <= 0:
                         continue
@@ -283,23 +293,40 @@ class StubLLM:
             text = self._answer(purpose, body)
             if failure == "not_json":
                 text = "我认为这是尺码问题，建议选 M 码。"
+            reasoning: str | None = None
             if self.thinking_on(body):
-                text = THINKING_PREFIX + text
-            return _send(h, 200, self._completion(purpose, body, text, failure))
+                short = int(body.get("max_tokens") or 0) <= THINKING_CUTOFF_TOKENS
+                if self.thinking_style == "truncated" and short:
+                    text = THINKING_TRUNCATED  # token 上限小：</think> 来不及输出
+                elif self.thinking_style == "reasoning":
+                    reasoning = THINKING_TRUNCATED.removeprefix("<think>\n")
+                    text = None if short else text  # 思考在单独字段里；上限小时正文为空
+                else:
+                    text = THINKING_PREFIX + text
+            return _send(h, 200, self._completion(purpose, body, text, failure, reasoning))
         except (BrokenPipeError, ConnectionResetError):  # 客户端已经超时走了
             return None
 
     def _completion(
-        self, purpose: str, body: dict[str, Any], text: str, failure: str | None
+        self,
+        purpose: str,
+        body: dict[str, Any],
+        text: str | None,
+        failure: str | None,
+        reasoning: str | None = None,
     ) -> dict[str, Any]:
         if failure == "no_choices":
             return {"object": "chat.completion", "model": self.model}
         prompt_chars = sum(len(str(m.get("content", ""))) for m in body.get("messages", []))
+        message: dict[str, Any] = {"role": "assistant", "content": text}
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
         choice: dict[str, Any] = {
             "index": 0,
-            "message": {"role": "assistant", "content": text},
+            "message": message,
             "finish_reason": "content_filter" if failure == "content_filter" else "stop",
         }
+        text = text or ""
         if body.get("logprobs") and self.logprobs:
             choice["logprobs"] = self._logprobs(purpose, text)
         return {

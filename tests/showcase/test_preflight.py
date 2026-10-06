@@ -139,6 +139,50 @@ def test_missing_key_is_reported_by_variable_name(monkeypatch):
     assert failed.kind == "no_key" and "RODIT_LLM_API_KEY" in str(failed)
 
 
+def _choice(message: dict) -> dict:
+    return {
+        "choices": [{"message": {"role": "assistant", **message}, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 8},
+    }
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"content": "<think>\n好的，用户让我"},  # 思考放在正文里，被 max_tokens 截在 <think> 里
+        {"content": None, "reasoning_content": "好的，用户让我只回复"},  # 思考放在单独的字段里
+        {"content": "", "reasoning_content": "好的，用户让我只回复"},
+    ],
+)
+def test_thinking_model_cut_off_is_diagnosed_as_thinking(message):
+    """默认开思考模式的模型：普通调用（max_tokens 8）只来得及输出思考。诊断要指向关闭思考模式，
+    不是"调用失败 / 网络不通"或"不是 OpenAI 兼容格式"。"""
+    failed = _fail(_client(transport=_status(200, _choice(message))), judge_llm=True)
+    assert failed.kind == "thinking" and failed.stage == "大模型连通性检查"
+    text = str(failed)
+    assert "思考模式" in text and EXTRA_BODY in text
+    assert "调用失败" not in text and "OpenAI 兼容格式" not in text
+    hints = failed.report.hints
+    assert hints and all("稍后再试" not in h for h in hints)
+    assert any(EXTRA_BODY in h for h in hints)
+
+
+@pytest.mark.parametrize("style", ["truncated", "reasoning"])
+def test_thinking_stub_cut_off_by_the_token_limit(stub: StubLLM, monkeypatch, style: str):
+    """本机替身：思考放在正文里、请求的 token 上限小时 </think> 来不及输出（truncated）；
+    思考放在 reasoning_content 里、正文为空（reasoning）。"""
+    monkeypatch.setenv("RODIT_LLM_API_KEY", stub.api_key)
+    stub.thinking, stub.thinking_style = True, style
+    failed = _fail(_stub_client(stub), judge_llm=True)
+    assert failed.kind == "thinking" and "思考模式" in str(failed)
+    assert short_label(LLMError(failed.report.check("plain").error or "")) == "思考模式没关"
+    # 关掉思考模式就过了
+    ok = run_preflight(
+        _stub_client(stub, extra_body={"thinking": {"type": "disabled"}}), judge_llm=True
+    )
+    assert ok.report.reachable
+
+
 def test_short_labels():
     assert short_label(LLMTimeout("x"), timeout_s=1.0) == "超时（限时 1 秒）"
     assert short_label(LLMError("大模型服务错误（HTTP 502）")) == "服务端错误（HTTP 502）"
@@ -357,6 +401,73 @@ def test_egress_denied_by_the_network_policy(denying_proxy: str):
     assert failed.kind == "egress"
     assert "网络策略没放行 https://llm.blocked.example.test" in str(failed)
     assert "/v1" not in str(failed) and KEY not in str(failed)
+    # 要放行的是域名（不带协议、端口）；能力检查的提示也不能叫人"稍后再试"（重试没有用）
+    assert "把域名 llm.blocked.example.test 加进允许的域名" in str(failed)
+    hints = failed.report.hints
+    assert hints and all("稍后再试" not in h for h in hints)
+    assert any("llm.blocked.example.test" in h and "重试没有用" in h for h in hints)
+
+
+@pytest.mark.parametrize(
+    ("exc", "phrase"),
+    [
+        (urllib.error.URLError(socket.gaierror(-2, "Name or service not known")), "解析不了域名"),
+        (urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")), "连接被拒绝"),
+        (
+            urllib.error.URLError(
+                ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] verify failed")
+            ),
+            "TLS 证书校验失败",
+        ),
+    ],
+)
+def test_network_hints_match_the_failure(exc, phrase):
+    """能力检查的提示按故障类型给：域名解析、连接被拒、证书，不是笼统的"稍后再试"。"""
+    failed = _fail(_client(transport=_raising(exc)))
+    hint = failed.report.check("plain").hint or ""
+    assert phrase in hint and "稍后再试" not in hint
+
+
+# ================================================================ 接口写在配置文件里：诊断说 llm.*
+
+
+def _config_main(tmp_path, stub: StubLLM, llm_yaml: str) -> tuple[int, str]:
+    config = tmp_path / "rodit.yaml"
+    config.write_text(
+        f"llm:\n  base_url: {stub.base_url}\n  model: {stub.model}\n{llm_yaml}", encoding="utf-8"
+    )
+    out = io.StringIO()
+    code = main(["--llm", "env", "--config", str(config)], out, run=lambda app, **kw: None)
+    return code, out.getvalue()
+
+
+def test_config_endpoint_timeout_names_llm_timeout_s(stub_env: StubLLM, tmp_path, monkeypatch):
+    """接口写在配置里（llm.base_url / llm.model）时 RODIT_LLM_TIMEOUT_S 不起作用：诊断和提示都要说
+    llm.timeout_s。"""
+    monkeypatch.setenv("RODIT_LLM_TIMEOUT_S", "30")
+    stub_env.delay("preflight", 1.0)
+    code, text = _config_main(tmp_path, stub_env, "  timeout_s: 0.3\n")
+    assert code == EXIT_USAGE and "0.3 秒内没有响应" in text
+    assert "llm.timeout_s" in text and "RODIT_LLM_TIMEOUT_S" not in text
+
+
+def test_config_endpoint_404_names_llm_base_url(stub_env: StubLLM, tmp_path):
+    stub_env.fail("preflight", "404")
+    code, text = _config_main(tmp_path, stub_env, "")
+    assert code == EXIT_USAGE and "HTTP 404" in text
+    assert "llm.base_url" in text and "llm.model" in text
+    assert "RODIT_LLM_BASE_URL" not in text and "RODIT_LLM_MODEL" not in text
+
+
+def test_config_key_variable_is_named_in_the_401_diagnosis(
+    stub_env: StubLLM, tmp_path, monkeypatch
+):
+    """llm.api_key_env 换了变量名：401 的诊断说的是这个变量，不是 RODIT_LLM_API_KEY。"""
+    monkeypatch.setenv("SHOP_DEMO_LLM_KEY", "synthetic-wrong-key-123")
+    code, text = _config_main(tmp_path, stub_env, "  api_key_env: SHOP_DEMO_LLM_KEY\n")
+    assert code == EXIT_USAGE and "HTTP 401" in text
+    assert "SHOP_DEMO_LLM_KEY" in text and "RODIT_LLM_API_KEY" not in text
+    assert "synthetic-wrong-key-123" not in text
 
 
 # ================================================================ 命令行

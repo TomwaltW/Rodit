@@ -254,7 +254,7 @@ def test_cli_env_mode_with_injected_client(tmp_path):
 
 def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_path):
     """真实客户端 + 假 transport：地址、模型、超时来自环境变量；密钥只出现在请求头里。"""
-    monkeypatch.setenv("RODIT_LLM_BASE_URL", "https://user:pw@llm.example.invalid:8443/v1")
+    monkeypatch.setenv("RODIT_LLM_BASE_URL", "https://llm.example.invalid:8443/v1")
     monkeypatch.setenv("RODIT_LLM_MODEL", "synthetic-model")
     monkeypatch.setenv("RODIT_LLM_API_KEY", FAKE_KEY)
     monkeypatch.setenv("RODIT_LLM_TIMEOUT_S", "7")
@@ -301,7 +301,7 @@ def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_pat
     )
     assert code == 0, err
     assert seen and all(
-        url == "https://user:pw@llm.example.invalid:8443/v1/chat/completions" for url, _, _ in seen
+        url == "https://llm.example.invalid:8443/v1/chat/completions" for url, _, _ in seen
     )
     assert all(auth == f"Bearer {FAKE_KEY}" for _, auth, _ in seen)
     assert seen[0][2] == 7.0  # 连通性检查用客户端默认超时（RODIT_LLM_TIMEOUT_S）

@@ -9,6 +9,7 @@ logprobs——各家模型服务支持得不一样。能力检查至多再发两
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 from typing import Any
@@ -39,7 +40,9 @@ from rodit.llm import OpenAICompatibleClient
 from rodit.testing.fakes import FakeLLMClient
 
 KEY = "sk-synthetic-capability-probe-0001"  # 合成密钥，只用于测试
-BASE = "https://user:pw@llm.example.invalid:8443/v1"
+BASE = (
+    "https://llm.example.invalid:8443/v1"  # 带用户名密码的地址客户端拒绝构造（test_secret_hygiene）
+)
 ENV = {
     "RODIT_LLM_BASE_URL": BASE,
     "RODIT_LLM_MODEL": "synthetic-model",
@@ -144,9 +147,14 @@ def test_everything_supported(api_key):
     ]
     assert report.reachable and report.blocking == [] and report.hints == []
     assert report.endpoint == "https://llm.example.invalid:8443"
-    assert report.options == describe_options(
-        client(provider, extra_body={"enable_thinking": False})
+    # 给人看的请求参数只有 extra_body 的键名（值可能是网关凭据）；指纹里是值的哈希
+    shown = client(provider, extra_body={"enable_thinking": False}).options
+    assert (
+        report.options
+        == shown.summary()
+        != describe_options(client(provider, extra_body={"enable_thinking": False}))
     )
+    assert '"extra_body_keys":["enable_thinking"]' in report.options
     # 三个小请求：第一个就是 preflight 的请求；后两个各只带一个要检查的参数；extra_body 每个都带
     assert len(provider.bodies) == 3
     plain, as_json, with_lp = provider.bodies
@@ -328,11 +336,14 @@ def test_cli_runs_with_switches_from_the_environment_and_records_them(llm_env, t
     assert all("logprobs" not in b for b in provider.bodies)
     fp = json.loads(path.read_text(encoding="utf-8"))["fingerprint"]
     assert fp["llm_options"] == running_llm_options(EngineConfig())
+    # 指纹里只有键名和值的哈希（值不进报告、系统事件）
     assert json.loads(fp["llm_options"]) == {
-        "extra_body": {"thinking": {"type": "disabled"}},
+        "extra_body_keys": ["thinking"],
+        "extra_body_sha256": hashlib.sha256(b'{"thinking":{"type":"disabled"}}').hexdigest(),
         "json_mode": True,
         "logprobs": False,
     }
+    assert "disabled" not in json.dumps(fp)
 
 
 # ================================================================ 指纹：请求参数也要一致
@@ -355,7 +366,7 @@ def test_changed_request_options_need_a_new_verdict(llm_env):
     changed = current_fingerprint(config)
     assert not same_setup(verdict, changed)
     (diff,) = differences(verdict, changed)
-    assert diff.startswith("大模型请求参数") and "disabled" in diff
+    assert diff.startswith("大模型请求参数") and "thinking" in diff and "disabled" not in diff
     # 旧结论没记请求参数：对不上
     old = verdict.model_copy(update={"llm_options": None})
     assert any("没记录" in d for d in differences(old, verdict))
@@ -390,3 +401,27 @@ def test_config_pinned_endpoint_brings_its_own_options(llm_env):
 def test_offline_runs_record_no_request_options():
     assert describe_options(None) is None
     assert _run_fingerprint(None, None, None, None).llm_options is None
+
+
+def test_cli_does_not_probe_logprobs_when_routing_never_asks_for_them(llm_env, tmp_path):
+    """decision.provider: rules：路由不调大模型，质检、生成都不带 logprobs——不检查 logprobs，
+    服务不接受 logprobs 也照样跑（不用为此设 RODIT_LLM_LOGPROBS=off，那样指纹就和线上对不上）。"""
+    path = tmp_path / "rodit.yaml"
+    path.write_text("decision:\n  provider: rules\n", encoding="utf-8")
+    provider = Provider(logprobs_status=400)
+    code, _, err = _run(
+        ["--llm", "env", "--config", str(path), "--intent", "shipping_policy", "--limit", "1"],
+        client_factory=lambda: client_from_env(transport=provider),
+    )
+    assert code == 0, err
+    assert "logprobs：没检查" in err and "评测没有运行" not in err
+    assert not any(b.get("logprobs") for b in provider.bodies)
+
+
+def test_config_errors_do_not_echo_values(tmp_path):
+    """配置里误写了密钥（llm.api_key）：评测拒绝运行，报错里没有这个值。"""
+    path = tmp_path / "rodit.yaml"
+    path.write_text("llm:\n  api_key: sk-0123456789abcdefSYNTHETICKEY\n", encoding="utf-8")
+    code, out, err = _run(["--config", str(path), "--limit", "1"])
+    assert code == 2 and "评测没有运行" in err and "api_key" in err
+    assert "0123456789abcdef" not in err + out

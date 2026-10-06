@@ -16,7 +16,8 @@
   - 路由判断层（decision_provider）和路由分类器模型文件的 SHA-256（classifier 路由时）；
   - 大模型：模型名和接口地址（只留协议和主机），以及请求参数（llm_options：模型服务特有的
     extra_body、JSON 模式和 logprobs 开关，core.config.LLMRequestOptions.describe 的规范化 JSON——
-    关思考模式、关 logprobs 都会改变回答；校验挡掉了像凭据的键和值，里面没有密钥）。
+    关思考模式、关 logprobs 都会改变回答。extra_body 只记键名和值的 SHA-256：值一改指纹就变，
+    报告、系统事件里看不到值——有的网关要在请求体里放凭据，键名校验挡不全）。
   模块按名字排序、按 importlib 找到源文件来算。列表以外的代码（阈值判断、质检硬规则……）
   改了指纹不变：它们的改动靠代码版本留痕（git，拿得到时；部署镜像里没有 .git 时由环境变量
   RODIT_GIT_SHA 提供），代码版本只作记录，same_setup 不比较。
@@ -127,7 +128,8 @@ class EvalFingerprint(_Model):
     decision_provider: str | None = None  # 路由判断层（ProviderName 的值）
     llm_model: str | None = None  # 大模型的模型名
     llm_endpoint: str | None = None  # 大模型接口的协议和主机（端口），没有路径、用户名密码
-    # 大模型请求参数（LLMRequestOptions.describe：extra_body、json_mode、logprobs 的规范化 JSON）
+    # 大模型请求参数（LLMRequestOptions.describe：extra_body 的键名和值的 SHA-256、json_mode、
+    # logprobs 的规范化 JSON）
     llm_options: str | None = None
     git_sha: str | None = None
     git_dirty: bool | None = None  # 有没有提交的改动（环境变量给的版本为 None）

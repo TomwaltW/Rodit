@@ -49,7 +49,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from rodit.app.offline import EvidenceEchoLLM
-from rodit.core.config import EngineConfig, load_config
+from rodit.core.config import EngineConfig, llm_endpoint, load_config
 from rodit.core.decision import DecisionProvider
 from rodit.core.enums import INTENT_LABELS, Intent, ProviderName
 from rodit.core.models import EngineResult
@@ -69,6 +69,7 @@ from rodit.eval.harness import DEMO_PLATFORM, DemoHarness, demo_harness, llm_har
 from rodit.eval.llm_env import (
     PRICE_INPUT_ENV,
     PRICE_OUTPUT_ENV,
+    SettingNames,
     client_from_config,
     describe_endpoint,
     describe_model,
@@ -862,8 +863,19 @@ def main(
         llm: LLMClient | None = None
         if args.llm == "env":
             llm = client_factory() if client_factory is not None else env_client(config)
-            # 连通性检查（preflight 的请求）+ JSON 模式、logprobs 接不接受（至多三个小请求）
-            capabilities = probe_capabilities(llm)
+            # 连通性检查（preflight 的请求）+ JSON 模式、logprobs 接不接受（至多三个小请求）。
+            # 只有路由用大模型投票时请求才带 logprobs（--classifier、decision.provider: rules
+            # 时一个请求都不带，不检查，和演示站一样）；接口写在配置里时提示说 llm.*
+            votes = (
+                route_provider is None
+                and (config or EngineConfig()).decision.provider == ProviderName.INCLOUD_LLM
+            )
+            from_config = config is not None and llm_endpoint(config.llm)[2]
+            capabilities = probe_capabilities(
+                llm,
+                check_logprobs=votes,
+                names=SettingNames.of(llm, from_config=from_config),
+            )
             for line in render_capabilities(capabilities):
                 print(line, file=err)
             if not capabilities.reachable:  # 客户端的错误信息里已经抹掉了密钥

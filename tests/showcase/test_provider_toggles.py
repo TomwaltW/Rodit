@@ -177,7 +177,9 @@ def test_thinking_provider_needs_extra_body(
     assert bodies and all(b["thinking"] == {"type": "disabled"} for b in bodies)
     assert any(b.get("response_format") == {"type": "json_object"} for b in bodies)
     assert report["chain"]["request_options"]["extra_body_keys"] == ["thinking"]
-    assert '"extra_body":{"thinking":{"type":"disabled"}}' in report["capabilities"]["options"]
+    # 报告里只有 extra_body 的键名（值可能是网关凭据，见 core.config.LLMRequestOptions.summary）
+    assert '"extra_body_keys":["thinking"]' in report["capabilities"]["options"]
+    assert "disabled" not in report["capabilities"]["options"]
 
 
 def test_thinking_output_is_stripped_when_only_json_mode_is_off(

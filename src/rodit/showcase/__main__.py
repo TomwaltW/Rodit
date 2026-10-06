@@ -24,12 +24,14 @@
   回放的合成历史一律用离线替身，不调用大模型；
 - --config YAML：引擎配置（和评测同一个读取函数 rodit.core.config.load_config）；
 - --latency：strict（默认）照配置的时间预算（§12.1：路由每一票 1 秒、整条消息 4.5 秒）；relaxed
-  放宽到演示友好的值（showcase.realchain.RELAXED_*），页面和横幅都写明"演示放宽了时间预算"。
-  判断层用大模型投票、时间预算又是 strict 时，启动时提醒：大多数托管模型 1 秒内答不完，很多消息的
-  路由会退回关键词规则（页面上标为降级），演示可以加 --latency relaxed；
+  放宽到演示友好的值（showcase.realchain.RELAXED_*，配置里更宽的保留），页面和横幅都写明"演示放宽
+  了时间预算"和实际生效的数字。时间预算是 strict 时启动时提醒：判断层用大模型时，路由每一票和质检
+  都限时 decision.timeout_s（默认 1 秒），大多数托管模型答不完，很多消息的路由会退回关键词规则、
+  大模型草稿的质检判为不可用（草稿不推荐）；生成超时时退回 FAQ / 模板（页面上都标为降级）；
+  演示可以加 --latency relaxed；
 - --selfcheck：不起服务，把每个预设场景在演示站里跑一遍并检查（showcase.selfcheck），--json OUT
-  另把完整结果写成 JSON（OUT 为 - 时写到标准输出）。退出码 0 必查全部通过、1 有没通过的、
-  2 配置错误。
+  另把完整结果写成 JSON（OUT 为 - 时写到标准输出，这时标准输出只放 JSON：配置错误、启动检查的
+  结果和"拒绝启动"都写到标准错误）。退出码 0 必查全部通过、1 有没通过的、2 配置错误。
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ from typing import Any, TextIO
 import uvicorn
 import yaml
 
-from rodit.core.config import EngineConfig, load_config
+from rodit.core.config import EngineConfig, llm_endpoint, load_config
 from rodit.core.enums import Platform, ProviderName
 from rodit.core.ports import LLMClient
 from rodit.eval.llm_env import render_capabilities
@@ -59,10 +61,9 @@ from rodit.showcase.app import (
 )
 from rodit.showcase.preflight import PreflightFailed, PreflightResult, run_preflight
 from rodit.showcase.realchain import (
-    RELAXED_DECISION_TIMEOUT_S,
-    RELAXED_GENERATION_TIMEOUT_S,
-    RELAXED_MESSAGE_BUDGET_S,
     RELAXED_NOTE,
+    STRICT_OFFLINE_JUDGE_WARNING,
+    STRICT_QA_ONLY_WARNING,
     STRICT_WARNING,
     ChainInfo,
     chain_config,
@@ -196,16 +197,25 @@ def _banner(
         file=out,
     )
     print("  · 售后写操作调用的是模拟的平台接口，不会动任何真实订单", file=out)
-    if chain.real and chain.relaxed:
+    if not chain.real:
+        return
+    # 数字都是实际生效的（relax_latency 保留配置里更宽的值；strict 照配置）
+    numbers = {
+        "route": chain.route_timeout_s,
+        "generation": chain.generation_timeout_s,
+        "budget": chain.message_budget_s,
+    }
+    if chain.relaxed:
         print(
-            f"  ! {RELAXED_NOTE}：判断层每次调用 {RELAXED_DECISION_TIMEOUT_S:g} 秒、生成 "
-            f"{RELAXED_GENERATION_TIMEOUT_S:g} 秒、整条消息 {RELAXED_MESSAGE_BUDGET_S:g} 秒",
+            f"  ! {RELAXED_NOTE}：判断层每次调用 {chain.route_timeout_s:g} 秒、生成 "
+            f"{chain.generation_timeout_s:g} 秒、整条消息 {chain.message_budget_s:g} 秒",
             file=out,
         )
-    elif chain.real and chain.judge_llm and chain.route_by_llm:
+    elif chain.judge_llm:
+        warning = STRICT_WARNING if chain.route_by_llm else STRICT_QA_ONLY_WARNING
         print(
             "  ! "
-            + STRICT_WARNING.format(route=chain.route_timeout_s, budget=chain.message_budget_s)
+            + warning.format(**numbers)
             + (
                 f"（启动检查最慢一步就用了 {check.slowest_ms} ms）"
                 if check is not None and check.slowest_ms > chain.route_timeout_s * 1000
@@ -213,13 +223,8 @@ def _banner(
             ),
             file=out,
         )
-    elif chain.real:
-        print(
-            f"  ! 时间预算按生产（§12.1：生成单次 {chain.generation_timeout_s:g} 秒、整条消息 "
-            f"{chain.message_budget_s:g} 秒）：模型慢的时候大模型草稿会超时、退回 FAQ / 模板"
-            "（页面上标为降级）；演示时可以加 --latency relaxed",
-            file=out,
-        )
+    else:
+        print("  ! " + STRICT_OFFLINE_JUDGE_WARNING.format(**numbers), file=out)
 
 
 def _print_capabilities(
@@ -234,7 +239,7 @@ def _print_capabilities(
         print(indent + line, file=out)
 
 
-def _write_json(target: str, payload: dict[str, Any], out: TextIO) -> bool:
+def _write_json(target: str, payload: dict[str, Any], out: TextIO, diag: TextIO) -> bool:
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if target == "-":
         print(text, file=out)
@@ -244,7 +249,7 @@ def _write_json(target: str, payload: dict[str, Any], out: TextIO) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text + "\n", encoding="utf-8")
     except OSError as exc:
-        print(f"自检结果写不进 {target}：{type(exc).__name__}", file=out)
+        print(f"自检结果写不进 {target}：{type(exc).__name__}", file=diag)
         return False
     return True
 
@@ -256,14 +261,20 @@ def main(
     run: Callable[..., Any] = uvicorn.run,
     llm_factory: Callable[[], LLMClient] | None = None,
     hub_factory: Callable[..., ShowcaseHub] = ShowcaseHub,
+    err: TextIO | None = None,
 ) -> int:
     """命令行入口（见模块说明）。llm_factory：--llm env 时构造大模型客户端（默认 _env_llm）；
-    hub_factory：构造 ShowcaseHub（测试注入不回放历史的版本）。"""
+    hub_factory：构造 ShowcaseHub（测试注入不回放历史的版本）；err：--selfcheck --json - 时
+    诊断、拒绝启动这些非 JSON 的输出写到这里（默认标准错误），标准输出只放 JSON。"""
     out = out or sys.stdout
     try:
         args = _parser().parse_args(argv)
     except SystemExit as exc:  # --help 或参数错误
         return int(exc.code or 0)
+    if args.selfcheck and args.json == "-":  # 标准输出只放 JSON：其余的都写到标准错误
+        json_out, out = out, err or sys.stderr
+    else:
+        json_out = out
     if not 0 <= args.port <= 65535:
         print(f"端口不合法：{args.port}", file=out)
         return EXIT_USAGE
@@ -309,7 +320,11 @@ def main(
             # 能力检查（和评测同一个）：路由用大模型投票时请求会带 logprobs（§6.4），一并检查
             votes = judge == "llm" and effective.decision.provider == ProviderName.INCLOUD_LLM
             check = run_preflight(
-                llm, judge_llm=votes, vote_samples=effective.decision.vote_samples
+                llm,
+                judge_llm=votes,
+                vote_samples=effective.decision.vote_samples,
+                # 接口写在配置文件里时诊断叫人改 llm.*（RODIT_LLM_* 在那一路不起作用）
+                from_config=config is not None and llm_endpoint(config.llm)[2],
             )
         except PreflightFailed as exc:
             if exc.report is not None:
@@ -328,7 +343,7 @@ def main(
     if not (args.selfcheck and args.json == "-"):  # --json - 时标准输出只放 JSON
         _banner(out, chain, check, selfcheck=args.selfcheck)
     if args.selfcheck:
-        return _selfcheck(hub, platforms, llm, check, args.json, out)
+        return _selfcheck(hub, platforms, llm, check, args.json, json_out, out)
     app = create_showcase_app(hub, host=args.host)
     if not loopback:
         print(
@@ -349,7 +364,10 @@ def _selfcheck(
     check: PreflightResult | None,
     json_target: str | None,
     out: TextIO,
+    diag: TextIO,
 ) -> int:
+    """跑自检。out 是标准输出（--json - 时只放 JSON）；diag 是文字报告、出错提示的去处（--json -
+    时是标准错误，否则就是 out）。"""
     from rodit.showcase.selfcheck import render_summary, run_selfcheck
 
     quiet = json_target == "-"  # 标准输出只放 JSON，逐个场景的文字报告不打印
@@ -367,7 +385,7 @@ def _selfcheck(
     )
     if not quiet:
         print(render_summary(report), file=out)
-    if json_target and not _write_json(json_target, report, out):
+    if json_target and not _write_json(json_target, report, out, diag):
         return EXIT_USAGE
     if json_target and not quiet:
         print(f"完整结果（JSON）已写入 {json_target}", file=out)

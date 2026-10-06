@@ -138,6 +138,50 @@ def test_scripted_first_draft_is_blocked_and_the_real_model_rewrites(stub_env: S
     prompts = [b["messages"][-1]["content"] for b in stub_env.bodies("generate")]
     assert prompts and all(RETRY_MARK in p for p in prompts)  # 只有重写稿发给了模型
     assert all(SCRIPTED_PROMISE not in c["text"] for c in view["result"]["suggestions"])
+    assert trace["simulated_rewrite"] == "passed" and second["kind"] == "llm"
+    assert trace["fallback"]["generation"] is None
+
+
+def _slow_generation(stub: StubLLM) -> EngineConfig:
+    """生成每次都超时（限时 0.2 秒，替身 0.4 秒才答）。"""
+    stub.delay("generate", 0.4)
+    base = EngineConfig()
+    return base.model_copy(
+        update={"generation": base.generation.model_copy(update={"timeout_s": 0.2})}
+    )
+
+
+@pytest.mark.parametrize("platform", ["taobao", "pdd"])
+def test_rewrite_that_times_out_is_not_called_a_passed_rewrite(stub_env: StubLLM, platform):
+    """§11.5：重写稿的生成超时、退回模板（或什么都没有）：模板过了质检不算"重写后通过"，
+    页面写明没有大模型重写稿、生成超时退回 FAQ / 模板（§12.2）。"""
+    sc = build_real_showcase(config=_slow_generation(stub_env))
+    view = sc.chat(platform, "qa_block")
+    trace = view["trace"]
+    assert trace["simulated_note"] == SIMULATED_NOTE
+    assert trace["simulated_rewrite"] == "none" and trace["simulated_rewrite_passed"] is False
+    assert all(c["kind"] != "llm" for c in view["result"]["suggestions"])
+    note = trace["fallback"]["generation"]
+    assert note is not None and "超时（限时 0.2 秒）" in note and "§12.2" in note
+    by = {row["purpose"]: row for row in trace["llm"]["by_purpose"]}
+    assert by["generate"]["timeouts"] == by["generate"]["failed"] > 0
+
+
+def test_generation_timeout_is_marked_on_the_page(stub_env: StubLLM):
+    """生成超时：引擎退回 FAQ / 模板（这里什么都没有），不记降级；过程面板要写明是生成超时。"""
+    sc = build_real_showcase(judge="offline", config=_slow_generation(stub_env))
+    view = sc.chat("taobao", "size")
+    assert view["result"]["suggestions"] == []
+    note = view["trace"]["fallback"]["generation"]
+    assert note is not None and note.startswith("大模型生成有 ") and "超时（限时 0.2 秒）" in note
+
+
+def test_offline_trace_has_no_generation_note():
+    from showcase_support import build_showcase
+
+    view = build_showcase().chat("taobao", "qa_block")
+    assert view["trace"]["fallback"]["generation"] is None
+    assert view["trace"]["simulated_rewrite"] == "passed"
 
 
 # ================================================================ 回放历史不调模型
@@ -259,6 +303,25 @@ def test_unparseable_votes_fall_back(stub_env: StubLLM):
     u = view["trace"]["understand"]
     assert u["degraded"] and "解析不出" in u["fallback"]
     assert view["result"]["suggestions"][0]["kind"] == "faq"  # FAQ 不靠判断层
+
+
+def test_late_qa_is_not_recorded_on_the_next_message(stub_env: StubLLM):
+    """质检到截止时间还没做完（引擎不等了，线程在后台跑完）：它的结果和判断不能记到下一条消息的
+    过程面板上。下一条自己的质检也没做完，所以下一条的"判"里什么都没有。"""
+    stub_env.delay("qa", 0.85)
+    config = EngineConfig.model_validate(
+        {
+            "decision": {"timeout_s": 3.0},
+            "latency": {"message_budget_s": 0.6, "min_llm_remaining_s": 0.1},
+        }
+    )
+    sc = build_real_showcase(config=config)
+    first = sc.chat("taobao", "size")
+    second = sc.chat("taobao", "size")
+    for view in (first, second):
+        assert [c for p in view["trace"]["parts"] for c in p["judge"]] == []
+    # 第一条的质检确实在后台跑完了（替身答完才记请求），只是没记到第二条上
+    assert stub_env.count("qa") >= 1
 
 
 def test_high_risk_question_gets_no_answer_when_routing_degraded(stub_env: StubLLM):
