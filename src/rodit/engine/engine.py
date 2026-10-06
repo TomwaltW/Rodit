@@ -41,7 +41,8 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
 6. 推荐卡片（engine.cards，§5.6）写 SuggestionRecord（SHOWN；影子模式 SHADOW），
    question_text = mask_pii(当前买家消息)，回填 SuggestionCard.suggestion_id；
    半自动（engine.semi_auto，§5.6、§13.4）：智能辅助下第一张卡片满足条件时 prefill=True
-   （店铺开了这个类型的半自动、规则 6 的正常回答、置信度够、卡片为高、没有提醒和降级），
+   （店铺开了这个类型的半自动、规则 6 的正常回答、置信度够、卡片为高、这一条没有草稿被质检拦下过
+   ——重写后才通过的也不填，没有提醒和降级），
    客服仍要按发送；记录写不进去（没有推荐编号）时去掉 prefill。SUGGEST 审计另加 prefill
    （打了 prefill 的推荐编号，只在有时写）；
 7. 全自动（§5.6、§12.2、§12.3）：以下全部满足才出 auto_reply——
@@ -1225,6 +1226,7 @@ class AssistEngine:
             qa=qa,
             alerts=[*run.alerts, *unit.alerts, *unit.bundle.alerts],
             degraded=run.degraded,
+            qa_blocked=unit.qa_failed,  # 第一稿被拦、重写后才通过的也不填（§5.6 宁可保守）
         )
         if blocker is not None:
             return scored

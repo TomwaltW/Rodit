@@ -284,10 +284,12 @@ class KnowledgeView(_View):
 
 
 class QuestionnaireView(_View):
-    """问卷写入结果：写进了哪些政策键、改了哪些店铺配置项。"""
+    """问卷写入结果：写进了哪些政策键、改了哪些店铺配置项；warnings 是要提醒商家的事
+    （如第 13 题的客服工作时间没看懂：已清空，请到设置页填写）。"""
 
     policies: list[str]
     config: list[str]
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RevokeView(_View):

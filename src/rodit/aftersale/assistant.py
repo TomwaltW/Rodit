@@ -18,7 +18,9 @@
 
 凭证的图片理解（§7.3.2 R5、§15 Phase 3，aftersale.evidence_vision）：R5 命中、售后单有凭证图片标识、
 注入了 vision 时，识别最多 6 张凭证，在建议理由后面加一句"图片理解（仅供参考）：…"；不改命中的规则和
-建议（仍由客服查看凭证后决定），识别失败时理由里写明未能识别。
+建议（仍由客服查看凭证后决定），识别失败时理由里写明未能识别。超时被丢下、还在后台跑的识别按店铺
+记在 BackgroundWork 里：取消订购删数据之前 AssistService.revoke_shop 用 wait_background 等它们做完
+（和问答引擎一样，§8.4）。
 
 留痕：aftersale.suggest（规则建议）、aftersale.transition（每次迁移）、aftersale.confirm（谁确认了
 什么）、aftersale.action（平台返回结果）；确认和平台结果都带售后单的平台申请时间
@@ -48,6 +50,7 @@ from rodit.aftersale.state_machine import (
     with_result,
 )
 from rodit.core.audit import AuditAction
+from rodit.core.budget import BackgroundWork, background_scope
 from rodit.core.clock import Clock
 from rodit.core.config import AfterSaleConfig
 from rodit.core.enums import (
@@ -144,6 +147,7 @@ class ReviewAssistant:
     ) -> None:
         self._vision = vision
         self._vision_timeout_s = vision_timeout_s
+        self._background = BackgroundWork()  # 超时被丢下、还在跑的凭证识别（按店铺）
         uncached = getattr(gateway, "uncached", None)
         self._gateway: ToolGateway = uncached() if callable(uncached) else gateway
         self._repo = repo
@@ -157,6 +161,11 @@ class ReviewAssistant:
         )
 
     # ================================================================ 公开接口
+
+    def wait_background(self, shop_id: str, timeout: float | None = None) -> bool:
+        """等这家店留在后台的凭证识别（超时被丢下、还在跑的）全部做完；timeout 秒之内做完
+        （或本来就没有）返回 True。取消订购删数据之前调（AssistService.revoke_shop）。"""
+        return self._background.wait_idle(shop_id, timeout)
 
     def review(self, shop_id: str, aftersale_id: str) -> AfterSaleReview:
         """拉取售后单并跑规则，新建审核记录。已有记录时等同 refresh。
@@ -427,9 +436,10 @@ class ReviewAssistant:
         """R5 有凭证图片时，在理由后面加图片理解的摘要（只是参考：规则、建议、状态都不变）。"""
         if self._vision is None or "R5" not in suggestion.matched_rules or not info.evidence_images:
             return suggestion
-        reading = read_evidence(
-            self._vision, shop_id, info.evidence_images, timeout_s=self._vision_timeout_s
-        )
+        with background_scope(self._background, shop_id):  # 识别任务记进 BackgroundWork
+            reading = read_evidence(
+                self._vision, shop_id, info.evidence_images, timeout_s=self._vision_timeout_s
+            )
         return suggestion.model_copy(
             update={
                 "reason": f"{suggestion.reason}；{reading.summary()}",

@@ -8,7 +8,12 @@ R5 命中、售后单带凭证图片标识（AfterSaleInfo.evidence_images）、
 - 只是参考：不改命中的规则、建议和下一个状态（仍是客服查看凭证后决定），不据此自动同意或拒绝；
 - 并行识别（core.budget.submit_in_context，带上店铺范围），最多等 EVIDENCE_VISION_TIMEOUT_S 秒；
   识别失败、超时当作没有这张图的理解：全部失败时理由里写"凭证图片未能识别，请客服查看原图"，
-  部分失败写"另有 n 张未能识别"（§12.2）；
+  部分失败写"另有 n 张未能识别"（§12.2）；超时被丢下的识别留在后台跑完，任务记在调用方的
+  BackgroundWork 里（审核助手的 background_scope；取消订购删数据之前等它们做完，§8.4）；
+- 批量审核（售后工作台一次最多 50 张，app.aftersale_desk）包在 evidence_batch 里：这一批的识别
+  加起来最多等 EVIDENCE_BATCH_BUDGET_S 秒，有一张单的识别超时（视觉模型可能挂了）就熔断，
+  这一批剩下的单不再识别、理由里写未能识别——一次请求不会因为每张单各等一遍超时而拖到几分钟，
+  后台也最多留下一张单的识别。单张审核不受影响；
 - 置信度低于 MIN_CONFIDENCE 的结果算"看不清"，不计入"显示破损"；
 - 个人信息（§5.3）：识别结果再过一次 mask_pii；审计只记张数和类型（EvidenceReading.audit），
   不记识别出的文字。
@@ -18,7 +23,10 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import logging
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +45,9 @@ MAX_EVIDENCE_IMAGES = 6
 
 EVIDENCE_VISION_TIMEOUT_S = 8.0
 """识别凭证最多等多久（秒）。审核助手不在买家消息的 5 秒预算里，但客服在等建议。"""
+
+EVIDENCE_BATCH_BUDGET_S = 20.0
+"""批量审核（evidence_batch）时这一批的凭证识别加起来最多等多久（秒）。"""
 
 MIN_CONFIDENCE = 0.5
 """置信度低于它的识别结果算"看不清"。"""
@@ -124,6 +135,36 @@ class EvidenceReading:
         }
 
 
+class _Batch:
+    """一批审核共用的识别预算和熔断（evidence_batch）。只在发起批量的线程里读写。"""
+
+    def __init__(self, budget_s: float, now: Callable[[], float]) -> None:
+        self._now = now
+        self._deadline = now() + budget_s
+        self.tripped = False  # 这一批里有单子的识别超时了
+
+    def remaining(self) -> float:
+        return self._deadline - self._now()
+
+
+_batch: ContextVar[_Batch | None] = ContextVar("rodit_evidence_batch", default=None)
+
+
+@contextmanager
+def evidence_batch(
+    budget_s: float = EVIDENCE_BATCH_BUDGET_S, *, now: Callable[[], float] = time.monotonic
+) -> Iterator[None]:
+    """批量审核共用的识别预算和熔断（见模块说明）：这段代码里的 read_evidence 每次最多等
+    min(timeout_s, 剩余预算) 秒；预算用完或有一次超时之后不再识别，按未能识别处理。"""
+    if budget_s <= 0:
+        raise ValueError("批量识别的时间预算必须大于 0")
+    token = _batch.set(_Batch(budget_s, now))
+    try:
+        yield
+    finally:
+        _batch.reset(token)
+
+
 def read_evidence(
     vision: ImageUnderstanding,
     shop_id: str,
@@ -132,7 +173,8 @@ def read_evidence(
     max_images: int = MAX_EVIDENCE_IMAGES,
     timeout_s: float = EVIDENCE_VISION_TIMEOUT_S,
 ) -> EvidenceReading:
-    """并行识别售后单的凭证图片（只看 shop_id 这家店的，§9.2）。不抛错：失败按张数记下。"""
+    """并行识别售后单的凭证图片（只看 shop_id 这家店的，§9.2）。不抛错：失败按张数记下。
+    在 evidence_batch 里时受这一批的预算和熔断约束（见模块说明）。"""
     unique = list(dict.fromkeys(r for r in refs if isinstance(r, str)))
     targets = unique[:max_images]
     skipped = len(unique) - len(targets)
@@ -145,12 +187,24 @@ def read_evidence(
     valid = [img for img in images if img is not None]
     if not valid:
         return EvidenceReading(total=len(unique), findings=(), failed=len(targets), skipped=skipped)
+    batch = _batch.get()
+    wait_s = timeout_s
+    if batch is not None:
+        left = batch.remaining()
+        if batch.tripped or left <= 0:  # 这一批已经熔断或用完预算：不再识别
+            logger.warning("本批凭证识别已停止（超时或预算用完），%d 张按未能识别处理", len(valid))
+            return EvidenceReading(
+                total=len(unique), findings=(), failed=len(targets), skipped=skipped
+            )
+        wait_s = min(timeout_s, left)
     pool = cf.ThreadPoolExecutor(max_workers=len(valid), thread_name_prefix="rodit-evidence")
     try:
         futures = {img.ref: submit_in_context(pool, vision.analyze, shop_id, img) for img in valid}
     finally:
-        pool.shutdown(wait=False)  # 超时的识别留在后台跑完，结果不用
-    cf.wait(futures.values(), timeout=timeout_s)
+        pool.shutdown(wait=False)  # 超时的留在后台跑完、结果不用（调用方的 BackgroundWork 记着）
+    _, not_done = cf.wait(futures.values(), timeout=wait_s)
+    if not_done and batch is not None:
+        batch.tripped = True  # 视觉模型可能挂了：这一批剩下的单不再等
     findings: list[ImageFinding] = []
     failed = len(targets) - len(valid)
     for img in valid:
@@ -173,11 +227,13 @@ def read_evidence(
 
 
 __all__ = [
+    "EVIDENCE_BATCH_BUDGET_S",
     "EVIDENCE_VISION_TIMEOUT_S",
     "MAX_EVIDENCE_IMAGES",
     "MIN_CONFIDENCE",
     "NOTE_FAILED",
     "SUMMARY_PREFIX",
     "EvidenceReading",
+    "evidence_batch",
     "read_evidence",
 ]

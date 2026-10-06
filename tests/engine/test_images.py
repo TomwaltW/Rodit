@@ -108,8 +108,36 @@ def test_describe_only_size_screenshots_carry_extracted_text():
         ImageKind.LOGISTICS_SCREENSHOT, summary="物流页面截图", extracted=f"联系电话 {PHONE}"
     )
     text = describe(1, [logistics], vision=True)
-    assert text == "【买家发来图片：物流 / 订单截图（物流页面截图）】"
+    assert text == "【买家发来图片：物流 / 订单截图】"
     assert "电话" not in text
+
+
+@pytest.mark.parametrize("kind", [ImageKind.LOGISTICS_SCREENSHOT, ImageKind.OTHER])
+def test_describe_personal_kinds_carry_only_the_label(kind: ImageKind):
+    """物流截图、其他图片的摘要可能带收件人姓名（mask_pii 遮不掉）：描述只写类型；
+    给客服的提醒里照常有摘要（客服本来就能看图）。"""
+    named = _finding(kind, summary="物流页面截图：收件人王小明，已签收", extracted="收件人 王小明")
+    damage = _finding(ImageKind.DAMAGE, summary="外包装压扁")
+    text = describe(2, [named, damage], vision=True)
+    assert "王小明" not in text and "签收" not in text
+    assert text.startswith("【买家发来 2 张图片：") and "破损（外包装压扁）" in text
+    alert = summary_alert(2, [named, damage])
+    assert alert is not None and "王小明" in alert
+
+
+def test_history_description_of_personal_kinds_carries_only_the_label(rig: Rig):
+    """历史轮次里缓存记得的物流截图同样只写类型（engine.images._annotate_history）。"""
+    rig.vision.findings["img_named"] = {
+        "kind": ImageKind.LOGISTICS_SCREENSHOT,
+        "confidence": 0.9,
+        "summary": "物流页面截图：收件人王小明，已签收",
+    }
+    rig.send("", "img_named")
+    assert "王小明" not in rig.routed.current.text
+    rig.send("那怎么办")
+    history = [t.text for t in rig.routed.history]
+    assert any("物流 / 订单截图" in t for t in history)
+    assert not any("王小明" in t for t in history)
 
 
 def test_describe_masks_and_clips():

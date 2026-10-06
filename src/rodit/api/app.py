@@ -383,7 +383,9 @@ def questionnaire(
 ) -> QuestionnaireView:
     """店铺政策问卷（§5.2.3 冷启动、附录 C）：写入政策，合并店铺配置（§9.3）。"""
     applied = service.apply_questionnaire(principal.shop_id, body.answers)
-    return QuestionnaireView(policies=applied["policies"], config=applied["config"])
+    return QuestionnaireView(
+        policies=applied["policies"], config=applied["config"], warnings=applied["warnings"]
+    )
 
 
 # ---------------------------------------------------------------- 报表（§12.4）

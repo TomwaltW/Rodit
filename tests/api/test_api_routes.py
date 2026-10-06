@@ -320,7 +320,11 @@ def test_questionnaire_writes_policies_and_config(api: Api):
         },
     )
     assert r.status_code == 200, r.text
-    assert r.json() == {"policies": ["invoice"], "config": ["salutation", "tone"]}
+    assert r.json() == {
+        "policies": ["invoice"],
+        "config": ["salutation", "tone"],
+        "warnings": [],
+    }
     policies = api.unit.repos.knowledge.get_policies(SHOP_A)
     assert "专用发票" in policies["invoice"].value
     shop = api.unit.repos.knowledge.get_shop(SHOP_A)

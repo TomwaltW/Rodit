@@ -34,6 +34,7 @@ from rodit.engine.semi_auto import (
     BLOCK_INTENT,
     BLOCK_MODE,
     BLOCK_QA,
+    BLOCK_QA_BLOCKED,
     BLOCK_RISK_HINTS,
     BLOCK_ROUTE,
     prefill_blocker,
@@ -259,6 +260,18 @@ def _dropped_faq(kit: Kit) -> dict[str, Any]:
     return {}
 
 
+def _rewritten_after_qa_block(kit: Kit) -> dict[str, Any]:
+    """第一稿被质检拦下、带原因重写后通过（§5.5）：最终那份通过了也不填——这一条的生成本身出过问题，
+    半自动要保守（§5.6 客服可能不看就发）。"""
+    semi(kit)
+    promise = Draft(text="亲，一定 48 小时内发货", kind=DraftKind.LLM)
+    fixed = Draft(
+        text="亲，48 小时内发货哦~", kind=DraftKind.LLM, evidence_ids=["policy:ship_time"]
+    )
+    kit.generator.script = [[promise], [fixed]]
+    return {}
+
+
 BLOCKERS = {
     "shadow": _shadow,
     "auto": _auto,
@@ -278,7 +291,17 @@ BLOCKERS = {
     "qa_degraded": _qa_degraded,
     "tool_degraded": _tool_degraded,
     "dropped_faq": _dropped_faq,
+    "rewritten_after_qa_block": _rewritten_after_qa_block,
 }
+
+
+def test_rewrite_after_qa_block_gives_a_card_but_no_prefill(kit: Kit) -> None:
+    _rewritten_after_qa_block(kit)
+    result = ask(kit)
+    [card] = result.suggestions
+    assert card.text == "亲，48 小时内发货哦~" and card.confidence == Confidence.HIGH
+    assert [c["retry_feedback"] is not None for c in kit.generator.calls] == [False, True]
+    assert prefills(result) == [False]
 
 
 @pytest.mark.parametrize("name", list(BLOCKERS))
@@ -400,6 +423,7 @@ def test_prefill_blocker_ok() -> None:
         ({"route": make_route(SHIP, confidence=0.95, degraded=True)}, BLOCK_DEGRADED),
         ({"route": make_route(SHIP, confidence=0.8)}, BLOCK_CONFIDENCE),
         ({"qa": QAResult(passed=False, text="x")}, BLOCK_QA),
+        ({"qa_blocked": 1}, BLOCK_QA_BLOCKED),  # 最终那份通过了，但这一条有草稿被拦下过
         (
             {
                 "draft": Draft(

@@ -310,7 +310,8 @@ def test_page_flow_questionnaire_answers_use_string_keys(api: Api):
         "merchant_a",
         json={"answers": {"11": "保修一年，联系客服寄回维修"}},
     )
-    assert r.status_code == 200 and r.json() == {"policies": ["warranty"], "config": []}
+    assert r.status_code == 200
+    assert r.json() == {"policies": ["warranty"], "config": [], "warnings": []}
     policy = api.unit.repos.knowledge.get_policies(SHOP_A)["warranty"]
     assert policy.value == "保修一年，联系客服寄回维修"
     # 店长能看缺失知识，但不能填问卷（页面只给商家显示问卷）

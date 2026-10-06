@@ -20,7 +20,10 @@
 - 历史轮次（§5.3 最近 5 轮）里缓存还记得的图片同样补上描述，只用缓存里的识别结果，不再调用。
 - 个人信息（§5.3）：图片标识是平台给的不透明 ID（接入层已经挡掉带签名的网址）；识别出的文字
   再过一次 mask_pii（实现本应已经打码）。图中文字只有尺码截图的进描述——物流截图、面单上有手机号、
-  地址，不往后传。审计只记张数和类型（describe_for_audit），不记识别出的文字。
+  地址，不往后传。物流 / 订单截图、其他图片（PERSONAL_KINDS）的内容本来就可能是个人信息
+  （收件人姓名、聊天记录……，mask_pii 遮不掉姓名），描述里只写类型，摘要也不写：描述会进路由、
+  生成、质检的提示词和推荐记录（question_text，还会进知识候选）；摘要只在给客服的提醒里。
+  审计只记张数和类型（describe_for_audit），不记识别出的文字。
 - 给客服的提醒："买家发来 1 张图片：破损（93%）——外包装一角压扁…；仅供参考，以凭证为准"。
   图片理解只是参考，不据此承诺任何处理结果（§7.3.2 R5 由客服看凭证决定）；有提醒的消息不出全自动
   回复（引擎的全自动条件，§5.6），全自动模式下因此转人工。
@@ -65,6 +68,10 @@ ROUTING_MIN_CONFIDENCE = 0.5
 
 PROBLEM_KINDS = frozenset({ImageKind.DAMAGE, ImageKind.DEFECT, ImageKind.WRONG_ITEM})
 """质量问题类的图片（§7.3.1 收到的东西坏了、§7.3.2 R5）。"""
+
+PERSONAL_KINDS = frozenset({ImageKind.LOGISTICS_SCREENSHOT, ImageKind.OTHER})
+"""内容本来就可能是个人信息的图片（物流 / 订单页面上的收件人、聊天截图……）：描述只写类型，
+不写摘要和图中文字；摘要只在给客服的提醒里（§5.3，见模块说明）。"""
 
 DESCRIPTION_CHARS = 60  # 描述里每张图的摘要 / 图中文字最多字数
 ALERT_CHARS = 40  # 提醒里每张图的摘要最多字数
@@ -117,8 +124,11 @@ def sanitize(finding: ImageFinding, ref: str) -> ImageFinding:
 
 
 def _finding_text(finding: ImageFinding) -> str:
-    """描述里的一张图：类型（摘要；图中文字）。图中文字只有尺码截图的才写（见模块说明）。"""
+    """描述里的一张图：类型（摘要；图中文字）。图中文字只有尺码截图的才写；物流截图、其他图片
+    只写类型（PERSONAL_KINDS，见模块说明）。"""
     label = IMAGE_KIND_LABELS[finding.kind]
+    if finding.kind in PERSONAL_KINDS:
+        return label
     parts: list[str] = []
     summary = _clip(_mask(finding.summary), DESCRIPTION_CHARS)
     if summary:
@@ -417,6 +427,7 @@ __all__ = [
     "DEGRADED_VISION",
     "MAX_IMAGES",
     "MEMORY_TTL_S",
+    "PERSONAL_KINDS",
     "PROBLEM_KINDS",
     "ROUTING_MIN_CONFIDENCE",
     "VISION_BUDGET_S",

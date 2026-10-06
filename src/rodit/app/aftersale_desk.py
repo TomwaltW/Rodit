@@ -16,7 +16,8 @@ AssistService（review_aftersale / negotiate_aftersale / negotiation_done / conf
   平台待审核列表读不到（ToolUnavailable）时只列本地审核记录，并标明（§12.2）。
 - 批量跑规则走 AssistService.review_aftersale（和单张一样：店铺闸门、授权检查、审核助手、审计、
   状态机都不变），一张失败（平台接口故障、并发冲突……）只记在这一行，不影响其他行；授权失效、
-  店铺停用时停下，剩下的不再跑。
+  店铺停用时停下，剩下的不再跑。R5 凭证的图片识别这一批共用预算、超时一次就熔断
+  （aftersale.evidence_vision.evidence_batch）：视觉模型挂住时一次请求不会拖到几分钟。
 - 统计的审核时长不读平台：申请时间用确认执行时审计里记下的（aftersale.durations），GET 不会按
   历史上确认过的单数往平台扇出；没记下的（加这个字段之前确认的）算时长未知。
 - 详情重读平台（不走缓存：确认要带最新的状态版本）；读不到时退回缓存数据并标明，此时不能确认。
@@ -64,6 +65,7 @@ from rodit.aftersale.durations import (
     summarize,
     waiting_seconds,
 )
+from rodit.aftersale.evidence_vision import EVIDENCE_BATCH_BUDGET_S, evidence_batch
 from rodit.app.service import aftersale_scopes
 from rodit.app.unit import Unit
 from rodit.core.audit import AuditAction
@@ -518,9 +520,16 @@ class AfterSaleDesk:
     读操作不写任何东西；批量跑规则的每一张都走 review（店铺闸门、授权、审计都在里面）。
     """
 
-    def __init__(self, unit: Unit, review: Callable[[str, str], AfterSaleReview]) -> None:
+    def __init__(
+        self,
+        unit: Unit,
+        review: Callable[[str, str], AfterSaleReview],
+        *,
+        vision_budget_s: float = EVIDENCE_BATCH_BUDGET_S,
+    ) -> None:
         self.unit = unit
         self._review = review
+        self._vision_budget_s = vision_budget_s  # 批量跑规则时凭证识别共用的预算（秒）
 
     # ---------------------------------------------------------------- 列表
 
@@ -713,17 +722,18 @@ class AfterSaleDesk:
         result = BatchResult(as_of=now)
         chosen = targets[:limit]
         result.remaining = len(targets) - len(chosen)
-        for i, aftersale_id in enumerate(chosen):
-            try:
-                review = self._review(shop_id, aftersale_id)
-                result.outcomes.append(BatchOutcome(aftersale_id, review=review))
-            except (AuthExpired, ShopInactive) as exc:
-                result.outcomes.append(BatchOutcome(aftersale_id, error=exc))
-                result.stopped = exc
-                result.remaining += len(chosen) - i - 1
-                break
-            except (RoditError, KeyError) as exc:
-                result.outcomes.append(BatchOutcome(aftersale_id, error=exc))
+        with evidence_batch(self._vision_budget_s):  # 凭证识别这一批共用预算、超时一次就熔断
+            for i, aftersale_id in enumerate(chosen):
+                try:
+                    review = self._review(shop_id, aftersale_id)
+                    result.outcomes.append(BatchOutcome(aftersale_id, review=review))
+                except (AuthExpired, ShopInactive) as exc:
+                    result.outcomes.append(BatchOutcome(aftersale_id, error=exc))
+                    result.stopped = exc
+                    result.remaining += len(chosen) - i - 1
+                    break
+                except (RoditError, KeyError) as exc:
+                    result.outcomes.append(BatchOutcome(aftersale_id, error=exc))
         return result
 
     # ---------------------------------------------------------------- 详情

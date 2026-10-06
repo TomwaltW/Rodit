@@ -50,9 +50,11 @@ def _leaky_analyze(vision: FakeImageUnderstanding):
     return analyze
 
 
-def _service(*, leaky: bool = False) -> tuple[AssistService, Any]:
+def _service(
+    *, leaky: bool = False, routes: tuple[tuple[str, Intent], ...] = ()
+) -> tuple[AssistService, Any]:
     llm = production_like_llm(
-        [("物流", Intent.LOGISTICS_TRACK), ("签收", Intent.NOT_RECEIVED)],
+        [("物流", Intent.LOGISTICS_TRACK), ("签收", Intent.NOT_RECEIVED), *routes],
         {"": {"answer": "亲，我帮您查一下物流哦", "evidence_ids": [], "need_clarify": False}},
     )
     unit = build_demo_unit(Platform.TAOBAO, world=build_demo_world(), llm=llm)
@@ -164,3 +166,62 @@ def test_extracted_text_of_logistics_screenshot_never_reaches_prompts(leaky: boo
         assert "联系电话" not in buyer_side and "中通快递" not in buyer_side
         if not leaky:
             assert "[手机号]" not in buyer_side
+
+
+NAME = "王小明"  # 合成的收件人姓名：mask_pii 不遮姓名
+
+
+def _named_analyze(vision: FakeImageUnderstanding, kind: ImageKind):
+    """物流截图 / 其他图片的摘要和图中文字带着收件人姓名（视觉模型按约定打了码也遮不掉姓名）。"""
+
+    def analyze(shop_id: str, image: ImageRef) -> ImageFinding:
+        vision.calls.append((shop_id, image.ref))
+        return ImageFinding(
+            ref=image.ref,
+            kind=kind,
+            confidence=0.9,
+            summary=f"物流页面截图：收件人{NAME}，已签收",
+            extracted_text=f"收件人 {NAME} 已签收",
+        )
+
+    return analyze
+
+
+@pytest.mark.parametrize("kind", [ImageKind.LOGISTICS_SCREENSHOT, ImageKind.OTHER])
+def test_recipient_name_in_personal_screenshots_never_reaches_prompts_or_records(kind: ImageKind):
+    """物流截图、其他图片本来就可能是个人信息（收件人、聊天记录）：进路由、生成、质检提示词和
+    推荐记录的描述只写图片类型，不写摘要和图中文字；摘要只在给客服的提醒里
+    （§5.3 最小化个人信息）。"""
+    # 只发图、"那怎么办"也走大模型路由（路由脚本里写上），生成、质检都调到
+    service, llm = _service(
+        routes=(("图片", Intent.LOGISTICS_TRACK), ("怎么办", Intent.NOT_RECEIVED))
+    )
+    unit = service.unit
+    vision = unit.vision
+    unit.vision.analyze = _named_analyze(vision, kind)  # type: ignore[method-assign]
+
+    first = service.handle_event("B", _event(service, "n1", order_id="o_1003"))
+    second = service.handle_event("B", _event(service, "n2", caption="显示签收了但我没收到"))
+    unit.clock.set(unit.clock.now() + timedelta(minutes=1))
+    third = service.handle_event("B", taobao_event("那怎么办", msg_id="n3", session_id="c_priv"))
+    results = [r for r in (first, second, third) if r is not None]
+    assert vision.calls and len(results) == 3
+
+    # 给客服的提醒里照常有摘要（客服本来就能看图）
+    assert any(NAME in a for a in results[0].alerts)
+    # 大模型（路由、质检、生成）收到的全部提示词：只有图片类型
+    assert llm.calls
+    label = "物流 / 订单截图" if kind == ImageKind.LOGISTICS_SCREENSHOT else "其他图片"
+    assert any(label in _buyer_side(r) for r in llm.calls)
+    for request in llm.calls:
+        assert NAME not in "\n".join(m.content for m in request.messages), request.purpose
+    # 审计、判断层留痕、推荐记录（question_text 进知识候选）、缺失知识、标注样本
+    for source, text in stored_texts(unit, SHOP_A).items():
+        assert NAME not in text, source
+    for record in unit.repos.suggestions.list(SHOP_A):
+        assert NAME not in record.model_dump_json(), "suggestion record"
+    for result in results:
+        assert NAME not in json.dumps(
+            [c.model_dump(mode="json") for c in result.suggestions], ensure_ascii=False
+        )
+        assert result.route is None or NAME not in result.route.model_dump_json()

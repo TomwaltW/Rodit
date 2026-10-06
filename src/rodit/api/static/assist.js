@@ -1058,8 +1058,10 @@
     try {
       const result = await api('POST', shopPath('questionnaire'), { answers });
       if (state.me !== me) return;
-      status.textContent = `已保存：写入政策 ${result.policies.length} 项，更新店铺配置 ${result.config.length} 项。`;
-      status.className = 'status ok';
+      // warnings：要商家处理的事（如第 13 题的客服工作时间没看懂，已清空，请到设置页填写）
+      const warnings = result.warnings || [];
+      status.textContent = `已保存：写入政策 ${result.policies.length} 项，更新店铺配置 ${result.config.length} 项。${warnings.join('')}`;
+      status.className = warnings.length ? 'status error' : 'status ok';
       loadConsole();
     } catch (err) {
       if (state.me !== me) return;
