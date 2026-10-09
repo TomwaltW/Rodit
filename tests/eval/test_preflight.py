@@ -255,7 +255,11 @@ def test_every_shape_follows_the_config():
     assert "9 次调用" in text
     assert "路由（5 票并发）" in text and "质检（3 票并发）" in text and "生成（1 次）" in text
     assert text.count("单次超时 3 秒（decision.timeout_s）") == 2
-    assert "单次超时 6 秒（generation.timeout_s）" in text
+    # 生成的超时配了 6 秒，每条消息的时间预算还是默认的 4.5 秒：评测里实际的超时写在旁边
+    assert (
+        "单次超时 6 秒（generation.timeout_s；评测里受 latency.message_budget_s 限制，"
+        "路由之后实际只有 4.50 秒）" in text
+    )
 
     single = _fake()  # 只投一票：判断层的温度是 0（decision.factory），不并发
     text = "\n".join(run_preflight(single, _config(decision={"vote_samples": 1})))
@@ -309,6 +313,9 @@ def test_a_latency_above_70_percent_of_the_timeout_is_a_warning_not_a_failure():
     assert "不能当上线依据" in warnings[0]  # 放宽超时的配置指纹不同
     assert warnings[1].startswith("注意：最慢的一次用了 1.90 秒，超过单次超时 2.5 秒的 70%")
     assert "调大 generation.timeout_s" in warnings[1]
+    # 只放宽单次超时不够：每条消息的时间预算也要跟着放宽
+    assert "调大 decision.timeout_s（和 latency.message_budget_s）" in warnings[0]
+    assert "调大 generation.timeout_s（和 latency.message_budget_s）" in warnings[1]
     assert summary.index("    " + warnings[0]) == 2  # 紧跟在路由那一行后面
 
     exactly = scripted(clock, latency={"route": 0.7})  # 正好 70%：不提醒
@@ -367,6 +374,9 @@ def test_rejected_response_format_fails_every_shape_and_names_the_cause():
     steps = rest[rest.index("下一步：") + 1 :]
     assert len(steps) == 1  # 同一种原因只说一次
     assert "response_format json_object" in steps[0] and "模型名" in steps[0]
+    # JSON 模式关不掉：拒的是它就只能换模型或接口（或者用服务方自己的参数打开 JSON 输出）
+    assert "JSON 模式是一直开着的，没有配置能关" in steps[0]
+    assert "换一个支持 JSON 模式的模型或接口" in steps[0] and "llm.extra_body" in steps[0]
     assert len(fake.calls) == 5  # 没有重试
 
 
@@ -610,6 +620,8 @@ def test_http_429_on_concurrent_votes(limit: int, lost: int):
     hint, occasional = lines[lines.index("下一步：") + 1 :]
     assert "并发或速率上限低于一条消息要的量（路由 3 票同时发）" in hint
     assert "decision.vote_samples" in hint and "余额" in hint
+    assert "--min-interval 只是把用例和用例隔开" in hint  # 隔开用例治不了一条消息里的并发
+    assert "降不了一条消息里同时发的票数" in hint
     assert "有的调用过了、有的没过" in occasional  # 另外几票是通过的
     assert len(vendor.calls) == 5
 
@@ -734,6 +746,283 @@ def test_every_failure_kind_has_a_label_and_one_next_step(kind: str):
     assert hint.startswith("  - ") and hint.endswith("。")
 
 
+# ================================================================ 回答里不止一个 JSON 对象
+
+
+def _draft_then_answer(draft: dict[str, Any], final: dict[str, Any]) -> str:
+    """没有标签的"先打草稿"：一个完整的 JSON 草稿，后面才是最终答案（合成）。"""
+    dump = lambda value: json.dumps(value, ensure_ascii=False)  # noqa: E731
+    return f"先想一下，草稿：{dump(draft)}\n再核对一遍，最终答案：{dump(final)}"
+
+
+@pytest.mark.parametrize(
+    ("purpose", "draft", "line"),
+    [
+        ("route", {**ROUTE_OK, "intent": {"choice": "other"}}, "- 3 票："),
+        ("qa", {**QA_OK, "grounded": {"answer": "否", "p": 0.1}}, "- 1 次："),
+        ("generate", {**GENERATION_OK, "answer": "草稿：这个我再确认一下"}, "- 1 次："),
+    ],
+    ids=["route", "qa", "generate"],
+)
+def test_an_answer_with_two_json_objects_fails_that_shape(
+    purpose: str, draft: dict[str, Any], line: str
+):
+    """草稿是完整的 JSON 时各环节的解析器照样读得出来（读到的是草稿）：检查不放行。"""
+    text = _draft_then_answer(draft, ANSWERS[purpose])
+    fake = _fake(scripted(answers={**ANSWERS, purpose: text}))
+    lines = _failure(fake, timer=ThreadClock()).splitlines()
+    label = {"route": "路由", "qa": "质检", "generate": "生成"}[purpose]
+    assert f"{label}没过，评测没有开跑" in lines[0]
+    assert f"    {line}回答里有 2 个 JSON 对象，分不清哪个才是答案（只该有一个）" in lines
+    (hint,) = lines[lines.index("下一步：") + 1 :]
+    assert hint.startswith("  - 回答里不止一个 JSON 对象：模型把草稿或推理过程也写进了回答")
+    assert "llm.extra_body" in hint and "enable_thinking: false" in hint
+    assert "换一个照 JSON 模式只输出一个对象的模型或接口" in hint
+    assert sum("：通过，" in line for line in lines) == 2  # 另外两种请求照常通过
+
+
+def test_one_json_object_with_nested_objects_or_stray_braces_is_not_ambiguous():
+    """嵌套的对象、空对象、解析不了的花括号都不算第二个答案。"""
+    nested = json.dumps(ROUTE_OK, ensure_ascii=False) + "\n（以上，{}，{没写完"
+    fake = _fake(scripted(answers={**ANSWERS, "route": nested}))
+    assert run_preflight(fake)[0].startswith("大模型连通性检查通过")
+
+
+# ================================================================ 每条消息的时间预算
+
+
+def _timed(route: float | list[float], generate: float, qa: float) -> tuple[Any, ThreadClock]:
+    """三种请求各花这么多秒的假模型和它的假时钟。"""
+    clock = ThreadClock()
+    latency = {"route": route, "generate": generate, "qa": qa}
+    return _fake(scripted(clock, latency=latency)), clock
+
+
+RELAXED_CALLS = {"decision": {"timeout_s": 3.0}, "generation": {"timeout_s": 8.0}}
+
+
+def test_slow_generation_under_relaxed_timeouts_and_the_default_budget_fails():
+    """只放宽了单次超时：生成 5 秒没到 generation.timeout_s 的 8 秒，但评测里这次调用的超时是
+    路由之后剩下的 4.5 − 0.2 = 4.3 秒——整轮每条都会超时。"""
+    fake, clock = _timed(0.2, 5.0, 0.2)
+    lines = _failure(fake, _config(**RELAXED_CALLS), timer=clock).splitlines()
+    assert lines[0] == (
+        "大模型连通性检查失败：按这次评测要发的请求试了 3 种、5 次调用（合成数据），"
+        "每次调用都答上了，但按每条消息的时间预算算下来来不及，评测没有开跑。"
+    )
+    assert (
+        "  生成（1 次）：耗时 5.00 秒，单次超时 8 秒（generation.timeout_s；"
+        "评测里受 latency.message_budget_s 限制，路由之后实际只有 4.30 秒）" in lines
+    )
+    assert (
+        "  时间预算：每条消息 4.5 秒（latency.message_budget_s），剩下不到 0.8 秒就不再调大模型"
+        "（latency.min_llm_remaining_s）；一条消息先后等路由 0.20 秒、生成 5.00 秒、"
+        "质检 0.20 秒（各取上面最慢的一次）" in lines
+    )
+    assert (
+        "    - 生成用了 5.00 秒，评测里这次调用的超时是 4.30 秒（generation.timeout_s 8 秒和"
+        "路由之后剩下的 4.5 − 0.20 秒里较小的）：评测里生成会超时，草稿作废。" in lines
+    )
+    (step,) = lines[lines.index("下一步：") + 1 :]
+    assert step.startswith("  - 时间预算不够：")
+    for part in (
+        "latency.message_budget_s（最大 30 秒）调大",
+        "头一次调用可能偏慢",
+        "会把某一个耗时量大，可以先再试一次",
+        "--config",
+        "不能当上线依据",
+    ):
+        assert part in step, part
+    assert len(fake.calls) == 5  # 没有多发请求，也没有重试
+
+
+def test_the_same_latencies_pass_once_the_budget_is_raised():
+    fake, clock = _timed(0.2, 5.0, 0.2)
+    config = _config(**RELAXED_CALLS, latency={"message_budget_s": 30})
+    summary = run_preflight(fake, config, timer=clock)
+    assert summary[0].startswith("大模型连通性检查通过")
+    assert "  生成（1 次）：耗时 5.00 秒，单次超时 8 秒（generation.timeout_s）" in summary
+    assert not any("时间预算" in line or "注意：" in line for line in summary)
+
+
+def test_the_default_config_at_typical_latencies_passes():
+    """0.9 / 2.3 / 0.9 秒：加起来 4.1 秒，放得进 4.5 秒（只有偏慢的提醒）。"""
+    fake, clock = _timed(0.9, 2.3, 0.9)
+    summary = run_preflight(fake, timer=clock)
+    assert summary[0].startswith("大模型连通性检查通过")
+    assert sum("注意：" in line for line in summary) == 3
+    assert not any("时间预算：" in line for line in summary)
+    assert "  生成（1 次）：耗时 2.30 秒，单次超时 2.5 秒（generation.timeout_s）" in summary
+
+
+def test_routing_that_leaves_no_time_for_generation_fails():
+    """decision.timeout_s 放宽到 6 秒、预算没动：路由 4.0 秒之后只剩 0.5 秒，不到 0.8 秒的下限，
+    评测里生成根本不会被调（也不留任何降级标记）。"""
+    fake, clock = _timed(4.0, 0.3, 0.3)
+    config = _config(decision={"timeout_s": 6.0})
+    lines = _failure(fake, config, timer=clock).splitlines()
+    assert "按每条消息的时间预算算下来来不及，评测没有开跑" in lines[0]
+    assert (
+        "  路由（3 票并发）：耗时 4.00 / 4.00 / 4.00 秒，单次超时 6 秒（decision.timeout_s）"
+        in lines
+    )
+    assert (
+        "    - 路由用了 4.00 秒，之后剩下的时间（4.5 − 4.00 秒）不比 0.8 秒多：评测里路由之后"
+        "不会再调生成，每条用例都只有 FAQ / 模板，没有模型草稿。" in lines
+    )
+    assert "latency.message_budget_s" in lines[-1]
+    # 路由用的是最慢的一票
+    fake, clock = _timed([0.2, 4.0, 0.2], 0.3, 0.3)
+    assert "    - 路由用了 4.00 秒" in _failure(fake, config, timer=clock)
+    fake, clock = _timed(4.0, 0.3, 0.3)
+    relaxed = _config(decision={"timeout_s": 6.0}, latency={"message_budget_s": 12})
+    assert run_preflight(fake, relaxed, timer=clock)[0].startswith("大模型连通性检查通过")
+
+
+def test_generation_that_leaves_no_time_for_qa_fails():
+    """路由 + 生成 = 3.9 秒，剩 0.6 秒：评测里生成之后不调质检，模型草稿不放行。"""
+    fake, clock = _timed(0.4, 3.5, 0.2)
+    config = _config(generation={"timeout_s": 4.0})
+    lines = _failure(fake, config, timer=clock).splitlines()
+    assert (
+        "    - 路由加生成用了 3.90 秒，之后剩下的时间（4.5 − 3.90 秒）不到 0.8 秒："
+        "评测里生成之后不会调质检，模型草稿没有质检结论、不放行。" in lines
+    )
+    assert lines[-1].startswith("  - 时间预算不够：") and "可以先再试一次" in lines[-1]
+
+
+def test_a_verdict_that_arrives_after_the_deadline_fails():
+    """路由 + 生成 = 3.6 秒，质检还会调，但 1.0 秒之后已经过了 4.5 秒：结论不采用。"""
+    fake, clock = _timed(0.6, 3.0, 1.0)
+    config = _config(decision={"timeout_s": 1.5}, generation={"timeout_s": 4.0})
+    lines = _failure(fake, config, timer=clock).splitlines()
+    assert (
+        "    - 路由、生成、质检加起来 4.60 秒，超过 4.5 秒：评测里质检的结论在截止时间之后才到、"
+        "不采用，模型草稿不放行。" in lines
+    )
+    assert lines[-1].startswith("  - 时间预算不够：") and "可以先再试一次" in lines[-1]
+    fake, clock = _timed(0.6, 3.0, 0.9)  # 4.5 秒整：放得进
+    assert run_preflight(fake, config, timer=clock)[0].startswith("大模型连通性检查通过")
+
+
+def test_routing_that_skips_the_llm_counts_as_zero():
+    """--classifier / rules：路由不调大模型，按 0 秒算——生成 3.0 秒放得进，3.8 秒就来不及质检。"""
+    config = _config(decision={"provider": "classifier"}, generation={"timeout_s": 4.0})
+    fake, clock = _timed(9.9, 3.0, 0.5)  # 路由的耗时用不上：这种请求不发
+    summary = run_preflight(fake, config, timer=clock)
+    assert summary[0].startswith("大模型连通性检查通过") and fake.calls_for("route") == []
+    assert "  生成（1 次）：耗时 3.00 秒，单次超时 4 秒（generation.timeout_s）" in summary
+
+    fake, clock = _timed(9.9, 3.8, 0.5)
+    lines = _failure(fake, config, timer=clock).splitlines()
+    assert "一条消息先后等路由不走大模型（按 0 秒算）、生成 3.80 秒、质检 0.50 秒" in "\n".join(
+        lines
+    )
+    assert (
+        "    - 路由加生成用了 3.80 秒，之后剩下的时间（4.5 − 3.80 秒）不到 0.8 秒："
+        in "\n".join(lines)
+    )
+
+
+def test_the_budget_is_not_applied_while_a_shape_fails():
+    """有请求没过时先报那个原因：时间预算等几种请求都过了再算。"""
+    clock = ThreadClock()  # 路由 4.0 秒（超时 6 秒）本来放不进预算；质检的回答读不出来
+    bad = scripted(clock, latency={"route": 4.0}, answers={**ANSWERS, "qa": "读不出来"})
+    lines = _failure(_fake(bad), _config(decision={"timeout_s": 6.0}), timer=clock).splitlines()
+    assert "质检没过，评测没有开跑" in lines[0]
+    assert not any("时间预算" in line for line in lines)
+    (step,) = lines[lines.index("下一步：") + 1 :]
+    assert step.startswith("  - 回答读不出来：")
+
+
+def _overrunning(seconds: Mapping[str, float], clock: ThreadClock) -> Handler:
+    """不守超时的假模型：过了请求自带的超时照样等到底、照样作答（超时没有被端到端执行）。"""
+
+    def handler(request: LLMRequest) -> Any:
+        clock.spend(seconds.get(request.purpose, 0.1))
+        return ANSWERS[request.purpose]
+
+    return handler
+
+
+def test_a_successful_call_slower_than_its_timeout_fails_the_check():
+    """4.6 秒才答上来的路由（超时 1 秒）：不是"间歇性超时"，是超时没生效——整轮会被预算截断。"""
+    clock = ThreadClock()
+    fake = _fake(_overrunning({"route": 4.6}, clock))
+    lines = _failure(fake, timer=clock).splitlines()
+    assert "路由没过，评测没有开跑" in lines[0]
+    assert (
+        "  路由（3 票并发）：没过，耗时 4.60 / 4.60 / 4.60 秒，单次超时 1 秒（decision.timeout_s）"
+        in lines
+    )
+    assert (
+        "    - 3 票：调用成功，但用了 4.60 秒，超过这次请求的超时 1 秒：超时没有被端到端执行"
+        in lines
+    )
+    assert not any("注意：" in line or "间歇性超时" in line for line in lines)
+    (step,) = lines[lines.index("下一步：") + 1 :]
+    assert step.startswith("  - 调用成功但比自己的超时还慢：这不是偶发的超时")
+    for part in (
+        "超时没有被端到端执行",
+        "latency.message_budget_s",
+        "被预算截断",
+        "可以先再试一次",
+        "不能当上线依据",
+    ):
+        assert part in step, part
+    assert len(fake.calls) == 5
+
+    clock = ThreadClock()  # 只超一点也一样：1.2 / 2.61 / 1.11 秒对 1 / 2.5 / 1 秒
+    fake = _fake(_overrunning({"route": 1.2, "generate": 2.61, "qa": 1.11}, clock))
+    lines = _failure(fake, timer=clock).splitlines()
+    assert "路由、质检、生成没过，评测没有开跑" in lines[0]
+    assert (
+        "    - 1 次：调用成功，但用了 2.61 秒，超过这次请求的超时 2.5 秒：超时没有被端到端执行"
+        in (lines)
+    )
+    assert len(lines[lines.index("下一步：") + 1 :]) == 1  # 同一种原因只说一次
+
+    clock = ThreadClock()  # 三票里只有一票这样：另外提醒可能是偶发的
+    votes = itertools.count()
+
+    def one_vote(request: LLMRequest) -> Any:
+        clock.spend(1.3 if request.purpose == "route" and next(votes) == 0 else 0.2)
+        return ANSWERS[request.purpose]
+
+    lines = _failure(_fake(one_vote), timer=clock).splitlines()
+    assert (
+        "    - 1 票：调用成功，但用了 1.30 秒，超过这次请求的超时 1 秒：超时没有被端到端执行"
+        in (lines)
+    )
+    assert "有的调用过了、有的没过" in lines[-1]
+
+
+def test_the_route_only_check_does_not_apply_the_message_budget():
+    """python -m rodit.eval.compare 直接调判断层，没有每条消息的时间预算：只查路由的检查照旧——
+    4.0 秒的路由（超时 6 秒）通过；比超时慢的成功调用还是原来那条提醒，不提时间预算。"""
+    request = _first_route_request()
+    config = _config(decision={"timeout_s": 6.0})
+    clock = ThreadClock()
+    fake = _fake(scripted(clock, latency={"route": 4.0}, answers={"route": ROUTE_OK}))
+    summary = run_preflight(fake, config, route_request=request, timer=clock)
+    assert summary == [
+        "大模型连通性检查通过：按这次评测要发的请求试了 3 次调用（合成数据，不计入评测用量）",
+        "  路由（3 票并发）：耗时 4.00 / 4.00 / 4.00 秒，单次超时 6 秒（decision.timeout_s）",
+        "  网络路径：不确定经没经代理（不是直接走 HTTP 的客户端，或者注入了 transport）",
+    ]
+
+    clock = ThreadClock()
+    fake = _fake(_overrunning({"route": 4.6}, clock))
+    summary = run_preflight(fake, route_request=request, timer=clock)
+    assert summary[0].startswith("大模型连通性检查通过") and len(summary) == 4
+    assert summary[2] == (
+        "    注意：最慢的一票用了 4.60 秒，超过单次超时 1 秒的 70%——整轮评测里这种请求会间歇性"
+        "超时（超时的那一票作废，票不够就退回关键词规则）。要放宽就另写 --config 调大 "
+        "decision.timeout_s（这样的配置指纹和线上不同，结论不能当上线依据）。"
+    )
+    assert "latency.message_budget_s" not in "\n".join(summary)
+
+
 def test_errors_that_are_not_llm_errors_are_not_swallowed():
     """LLMError 以外的异常是程序错误（或者替身没写这种请求），照常抛出来，不当成接口的问题报。"""
     with pytest.raises(ZeroDivisionError):
@@ -829,6 +1118,46 @@ def test_eval_cli_reports_the_failed_check_and_does_not_run():
     assert any(line.startswith("评测没有运行：大模型连通性检查失败：") for line in log.splitlines())
     assert "llm.extra_body" in log and "Traceback" not in log
     assert len(fake.calls) == 5
+
+
+def _train_classifier(path: Any) -> None:
+    """用开发集的合成问句训练一个路由分类器（只为测试接线，同 tests/eval/test_run.py）。"""
+    from datetime import datetime
+
+    from rodit.core.clock import CST
+    from rodit.decision import ClassifierProvider, RuleProvider
+
+    pairs = [(c.text, c.expected_intent) for c in cases("dev")]
+    model = ClassifierProvider(RuleProvider()).fit(pairs, seed_examples=True)
+    model.save(path, trained_at=datetime(2026, 9, 28, 10, 0, tzinfo=CST))
+
+
+def test_classifier_run_does_not_check_the_routing_judge(tmp_path):
+    """--classifier：路由不走大模型判断层，检查不发路由请求——判断层那种请求在这个接口上调不通
+    也不拦这一轮（它本来就不发）。"""
+    target = tmp_path / "classifier.json"
+    _train_classifier(target)
+
+    def no_route(request: LLMRequest) -> Any:
+        if request.purpose == "route":
+            return LLMError("合成的故障：判断层的请求调不通", status=400, kind="bad_request")
+        return _run_model(request)
+
+    fake = _fake(no_route)
+    out, err = io.StringIO(), io.StringIO()
+    argv = ["--llm", "env", "--classifier", str(target), "--limit", "2", "--json"]
+    code = eval_main(argv, out=out, err=err, client_factory=lambda: fake)
+    log = err.getvalue()
+    assert code == 0, log
+    checks = [r for r in fake.calls if PREFLIGHT_QUESTION in r.messages[-1].content]
+    assert [r.purpose for r in checks] == ["generate", "qa"]
+    assert fake.calls_for("route") == []  # 整轮都没有发过路由请求
+    assert (
+        "  路由：没有检查——这份配置的路由不走大模型判断层（decision.provider 是 classifier）"
+        in log.splitlines()
+    )
+    assert "大模型连通性检查通过：按这次评测要发的请求试了 2 次调用" in log
+    assert json.loads(out.getvalue())["llm"]["decision_provider"] == "classifier"
 
 
 # ================================================================ 是否经代理
