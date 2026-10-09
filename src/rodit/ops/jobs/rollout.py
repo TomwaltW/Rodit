@@ -9,10 +9,13 @@
         关键词规则、质检判断层不可用、生成没有可用草稿……超过上限的不收，原因逐条打出来（退出码
         同样是 2）；报告里没有运行健康度的（旧版本生成的）也不收，要用本版本重新跑。
         收下的结论带着这些计数，记录时打出来（全部用例和测试集）。
-        顺带说明报告的指纹和线上（部署配置：--config，其次
-        RODIT_CONFIG，都没有时是内置默认值；大模型、分类器按部署规则取配置和环境变量
-        RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_CLASSIFIER_PATH）一致不一致、哪几项不一致：
-        上线状态只认一致的、真实大模型跑的结论。
+        顺带说明报告的指纹和线上（部署配置：--config，其次 RODIT_CONFIG；大模型、分类器按部署
+        规则取配置和环境变量 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_CLASSIFIER_PATH）
+        一致不一致、哪几项不一致：上线状态只认一致的、真实大模型跑的结论。"线上"是本任务这个进程
+        自己的配置：在平台单元里跑（镜像设了 RODIT_CONFIG）就是部署的那一份。--config 和
+        RODIT_CONFIG 都没有时比的是内置默认值，不是部署——这时不说一致不一致，只说和内置默认值
+        比的结果，并提醒用配置文件启动的部署（镜像用 config/rodit.yaml）是另一个配置指纹、
+        上线状态由 serve 按自己的 RODIT_CONFIG 和 RODIT_LLM_* 判断；结论照样记下，退出码不变。
     acceptance-report --since ISO [--until ISO] [--json] [--config YAML]
         Phase 1 验收报告（feedback.acceptance，§15）：每家店一份 + 合在一起一份。店铺来自
         ShopAuthRepository.expiring_shop_ids(很远的将来)——本单元有授权的店铺（只有 ID 和到期时间，
@@ -64,6 +67,10 @@ EXIT_BAD_INPUT = 2
 FAR_FUTURE = datetime(9999, 12, 31, tzinfo=UTC)
 """expiring_shop_ids 给一个很远的时间：本单元全部有授权的店铺。"""
 SYSTEM_ACTOR = "system"
+BUILTIN_CONFIG_SOURCE = "内置默认值（没有 --config，也没有 RODIT_CONFIG）"
+"""_config 在 --config 和 RODIT_CONFIG 都没有时给的配置来源：这时本任务手里的不是部署配置。"""
+SHIPPED_CONFIG = "config/rodit.yaml"
+"""镜像里 RODIT_CONFIG 指的配置文件（Dockerfile）；它的配置指纹和内置默认值不同。"""
 PURGE_CLOCK_MARGIN = timedelta(minutes=5)
 """compliance-scan 找"扫描期间开始的清理"时往前放的余量：开始清理的标记 shop.purge_started 按 serve
 的时钟写，扫描开始的时间按本任务的时钟取，两台机器的时钟差在这之内（也盖住清理写了标记之后、
@@ -106,7 +113,7 @@ def _config(args: argparse.Namespace, environ: Mapping[str, str]) -> tuple[Engin
     path = (getattr(args, "config", None) or environ.get("RODIT_CONFIG", "")).strip()
     if path:
         return load_config(path), path
-    return load_config(None), "内置默认值（没有 --config，也没有 RODIT_CONFIG）"
+    return load_config(None), BUILTIN_CONFIG_SOURCE
 
 
 def _pg_audit() -> AuditLog:
@@ -216,6 +223,25 @@ def record_eval(
     diffs = differences(fp, current_fingerprint(config, environ=environ))
     if verdict.llm_mode != "env":
         print("离线替身跑的评测只作回归基线，上线状态不会用它判断测试集门槛", file=out)
+    elif source == BUILTIN_CONFIG_SOURCE:
+        # 手里没有部署配置：和内置默认值比出来的结果说明不了上线状态用不用这次结论，两头都不下断言
+        if diffs:
+            compared = (
+                f"报告的指纹和它对不上（{'、'.join(diffs)}）——报告是按部署配置跑的话本来就该"
+                "对不上，这不说明上线状态不用这次结论"
+            )
+        else:
+            compared = (
+                "报告的指纹和它对得上——这次评测是按内置默认值跑的，配置指纹不同的部署不会用这次结论"
+            )
+        print(
+            "注意：没有 --config，也没有 RODIT_CONFIG，这里没法和部署比，只能和内置默认值（加本进程"
+            f"环境变量里的大模型）比：{compared}。镜像用 {SHIPPED_CONFIG} 启动，配置指纹和内置"
+            "默认值不同；上线状态由 serve 按它自己的 RODIT_CONFIG 和 RODIT_LLM_* 判断用不用这次"
+            "结论。要在这里看结果，带上部署的 --config（或 RODIT_CONFIG）和 RODIT_LLM_* 再跑一次 "
+            "record-eval（会再记一条同样的结论）",
+            file=out,
+        )
     elif diffs:
         print(
             f"注意：和线上（部署配置 {source}）不一致（{'、'.join(diffs)}），"

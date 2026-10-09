@@ -219,11 +219,13 @@ def test_an_env_report_keeps_the_health_counts_in_the_verdict():
         ("overall", "generation_unusable", 5),
         ("overall", "engine_errors", 6),
         ("overall", "route_lost_votes", 32),
+        ("overall", "budget_unjudged", 6),
         ("test", "route_fallback", 1),
         ("test", "qa_unavailable", 1),
         ("test", "generation_unusable", 1),
         ("test", "engine_errors", 1),
         ("test", "route_lost_votes", 6),
+        ("test", "budget_unjudged", 1),
     ],
 )
 def test_each_health_rule_refuses_the_report_only_above_its_limit(
@@ -276,6 +278,46 @@ def test_the_health_verdict_is_recomputed_not_read_from_the_report():
     # 时间预算截断（§12.1）是正常行为：照实记下，不算"模型没被评到"
     v = verdict_from_report(report(health=health(overall={"budget_cut": 200})))
     assert v.health_overall is not None and v.health_overall.budget_cut == 200
+
+
+def test_budget_cuts_count_only_when_no_draft_was_judged():
+    """被时间预算截断本身照收；其中没有一条大模型草稿过完质检的（budget_unjudged）量到的不是模型的
+    回答：超过上限不收，全部用例和测试集各看一遍。一条生成、质检都没调成的全量报告也在这里拦下。"""
+    cut = {"budget_cut": 315, "budget_unjudged": 315, "qa_judged": 0, "generation_attempted": 0}
+    cut_test = {"budget_cut": 64, "budget_unjudged": 64, "qa_judged": 0, "generation_attempted": 0}
+    with pytest.raises(ModelNotEvaluated) as exc:
+        verdict_from_report(report(health=health(overall=cut, test=cut_test)))
+    assert exc.value.reasons == [
+        "时间预算：324 条里有 315 条（97.2%）被时间预算截断、没有大模型草稿过完质检，上限 6 条。",
+        "测试集：时间预算：66 条里有 64 条（97.0%）被时间预算截断、没有大模型草稿过完质检，"
+        "上限 1 条。",
+    ]
+    # 报告自己说算数也一样（计数经 _CountsDigest 读出来，规则是 assess 的）
+    lenient = health(overall=cut, test=cut_test, valid=True, reasons=[], ceiling=1.0)
+    with pytest.raises(ModelNotEvaluated, match="被时间预算截断、没有大模型草稿过完质检"):
+        verdict_from_report(report(health=lenient))
+    # 只跑测试集的报告：全部用例就是测试集，两遍都看
+    only_test = report(split="test", n=66, health=health(overall={**TEST, "budget_unjudged": 2}))
+    only_test["health"]["test"] = None
+    with pytest.raises(ModelNotEvaluated) as exc:
+        verdict_from_report(only_test)
+    assert [r.startswith("测试集：时间预算：") for r in exc.value.reasons] == [False, True]
+    # 截断得再多，只要草稿都判过（只是重写被截断），照收；在上限以内的记进结论
+    kept = {"budget_cut": 200, "budget_unjudged": 6}
+    v = verdict_from_report(report(health=health(overall=kept, test={"budget_unjudged": 1})))
+    assert v.health_overall is not None and v.health_test is not None
+    assert (v.health_overall.budget_unjudged, v.health_test.budget_unjudged) == (6, 1)
+    assert v.model_dump(mode="json")["health_overall"]["budget_unjudged"] == 6
+
+
+def test_a_report_written_before_budget_unjudged_is_read_as_zero():
+    """加这项计数之前的评测命令行写的报告里没有 budget_unjudged：按 0 读，照收。"""
+    block = health(overall={"budget_cut": 9})
+    for counts in (block["overall"], block["test"]):
+        del counts["budget_unjudged"]
+    v = verdict_from_report(report(health=block))
+    assert v.health_overall is not None and v.health_overall.budget_unjudged == 0
+    assert v.health_overall.budget_cut == 9
 
 
 def test_health_fields_added_later_are_ignored():
@@ -361,6 +403,13 @@ def test_describe_verdict_mentions_the_health_counts_when_the_verdict_has_them()
     assert describe_health(busy) == (
         "路由退回 2/324、质检不可用 1/233、生成没有可用草稿 3/250、"
         "路由丢票 12/324、引擎异常 1/324、被时间预算截断 9/324"
+    )
+    # 截断时没有草稿过完质检的（被截断的一部分）：不是 0 才写，写在被截断的后面
+    unjudged = busy.model_copy(update={"budget_unjudged": 4})
+    assert describe_health(unjudged) == describe_health(busy) + "、截断时没有草稿过完质检 4/324"
+    kept = report(health=health(overall={"budget_cut": 9, "budget_unjudged": 4}))
+    assert describe_verdict(T0, verdict_from_report(kept)).endswith(
+        f"{counts}、被时间预算截断 9/324、截断时没有草稿过完质检 4/324"
     )
     failing = {**report()["gate"], "factual": 0.9, "passes": False}
     text = describe_verdict(T0, verdict_from_report(report(gate=failing)))
@@ -467,3 +516,18 @@ def test_verdicts_recorded_before_the_health_counts_still_count():
     [(_, new)] = parse_verdicts([verdict_event(T0)])
     assert new.health_overall == HealthCounts(**OVERALL) and new.health_test == HealthCounts(**TEST)
     assert set(verdict_event(T0).detail) == {*detail, "health_overall", "health_test"}
+
+
+def test_verdicts_recorded_before_budget_unjudged_still_parse():
+    """带运行健康度、但记在 budget_unjudged 之前的 eval.verdict（计数里没有这一项）：照样读得出来、
+    照样能当依据，这一项按 0，说明里不写。"""
+    event = verdict_event(T0, health=health(overall={"budget_cut": 9}))
+    for key in ("health_overall", "health_test"):
+        assert event.detail[key].pop("budget_unjudged") == 0
+    [(at, v)] = parse_verdicts([event])
+    assert at == T0 and v.health_overall is not None and v.health_test is not None
+    assert (v.health_overall.budget_cut, v.health_overall.budget_unjudged) == (9, 0)
+    assert v.health_test.budget_unjudged == 0
+    ev = test_set_evidence([event], RUNNING)
+    assert ev.passed is True and "被时间预算截断 9/324" in ev.detail
+    assert "没有草稿过完质检" not in ev.detail
