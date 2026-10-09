@@ -189,6 +189,7 @@ def _run(tmp_path: Path, fault: Fault | None = None, *extra: str, client: Any = 
     """client 给了就用它（包在假模型外面的慢客户端、接了脚本化传输层的真实客户端），fault 不用。"""
     client = client or FakeLLMClient(handler=Vendor(fault), model=MODEL)
     target = tmp_path / "report.json"
+    target.unlink(missing_ok=True)  # 每次从没有文件开始：不算数的一轮不覆盖已有的报告
     out, err = io.StringIO(), io.StringIO()
     argv = [*ARGV, *extra, "--json", str(target)]
     code = main(argv, out=out, err=err, client_factory=lambda: client)

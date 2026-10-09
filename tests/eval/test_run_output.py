@@ -412,7 +412,8 @@ def test_the_abort_message_names_the_remedy_for_what_failed(status, kind, expect
     code, out, err, _ = _run(ARGV, outage)
     assert code == 2 and out == ""
     last = err.strip().splitlines()[-1]
-    assert last.startswith(f"评测中止：连续 {STOP_AFTER_FAILED_CASES} 条用例的大模型调用全部失败（")
+    head = f"评测中止：连续 {STOP_AFTER_FAILED_CASES} 条用例的大模型调用没有一次用得上（"
+    assert last.startswith(head)
     assert f"http_{status} ×" in last and expected in last and absent not in last
     assert last.endswith("确实要跑完、看兜底逻辑的数字时加 --allow-degraded")
 

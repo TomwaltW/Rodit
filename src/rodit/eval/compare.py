@@ -488,7 +488,7 @@ def _chain(e: BaseException) -> list[BaseException]:
     cur: BaseException | None = e
     while cur is not None and all(cur is not s for s in seen):
         seen.append(cur)
-        cur = cur.__cause__ or cur.__context__
+        cur = cur.__cause__ or (None if cur.__suppress_context__ else cur.__context__)
     return seen
 
 

@@ -38,7 +38,7 @@
 每个用途的调用里失败（按原因分开）、被截断、为空、用不上的各有几次，实际做出路由的判断层。
 超过上限（默认 2%，至少容许 1 条；--max-degraded 改这一次的上限，路由丢票的上限固定是 10%、
 不随它变）这一轮就不算数：文本报告开头和上线门槛旁边写明原因，退出码 3。--allow-degraded 时
-不因此返回 3（没有回归就是 0；JSON 里的 valid 照旧是 false）。连续 8 条用例的大模型调用全部失败
+不因此返回 3（没有回归就是 0；JSON 里的 valid 照旧是 false）。连续 8 条用例的调用没有一次用得上
 （抛 LLMError / LLMTimeout）时提前停下（退出码 2，不出报告；标准错误按失败原因给下一步）；
 --allow-degraded 时不停。
 --min-interval 秒数：相邻两条用例的开始至少隔这么久（限流时用，等待不计入耗时）。
@@ -168,13 +168,14 @@ ASSIST_PRECISION = 0.90  # §13.3 智能辅助阈值
 GATE = 0.95  # §13.2 上线门槛
 SLOWEST_SHOWN = 5  # 文本报告里列出最慢的几条
 LOST_VOTES_SHOWN = 20  # 文本报告里列出路由丢票的用例，最多这么多条
-STOP_AFTER_FAILED_CASES = 8  # 连续这么多条用例的大模型调用全部失败就停下（--allow-degraded 时不停）
+# 连续这么多条用例的大模型调用没有一次用得上就停下（--allow-degraded 时不停）
+STOP_AFTER_FAILED_CASES = 8
 CONFIG_ENV = "RODIT_CONFIG"  # 没给 --config 时 --llm env 读它指的配置文件（同 python -m rodit.ops）
 EXIT_REGRESSION, EXIT_NOT_RUN, EXIT_DEGRADED, EXIT_INTERRUPTED = 1, 2, 3, 130
 BANNER = "!! "  # 这一轮不算数时提示行的开头
 DEFAULTS_WARNING = (
     f"注意：没有 --config，也没有环境变量 {CONFIG_ENV}，按内置默认值跑。配置指纹和用 "
-    "config/rodit.yaml 的部署对不上，这次的结果不能当上线依据（record-eval 会说和线上不一致）；"
+    "config/rodit.yaml 的部署对不上，这次的结果不能当上线依据（那样的部署不认这次结论）；"
     "要当依据，加 --config config/rodit.yaml 重跑。"
 )
 STAGE_SHORT = {"route": "路由", "retrieve": "检索", "generate": "生成", "qa": "质检"}
@@ -1251,7 +1252,7 @@ def _seconds(text: str) -> float:
 
 EXIT_CODES_HELP = (
     "退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完（配置错误、基线读不了或不能当基线、"
-    "--json 的路径写不进去、连通性检查没过、连续多条用例的大模型调用全部失败而停下、最后写不进 "
+    "--json 的路径写不进去、连通性检查没过、连续多条用例的调用都用不上而停下、最后写不进 "
     "JSON、跑完了但回归比较没有做成）；"
     "3 这一轮没有有效评到模型（--llm env：调用失败、被截断、读不出的用例超过上限，报告照常给出，"
     "JSON 不覆盖已有的文件、改写到旁边的 .invalid.json，同时有指标下降也是 3；"
@@ -1297,7 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "--llm env 时这一轮没有有效评到模型也不返回 3（JSON 里 health.valid 照旧是 false），"
-            f"连续 {STOP_AFTER_FAILED_CASES} 条用例调用全部失败时也不提前停下"
+            f"连续 {STOP_AFTER_FAILED_CASES} 条用例的调用没有一次用得上时也不提前停下"
         ),
     )
     parser.add_argument(
