@@ -21,12 +21,27 @@ RODIT_LLM_PRICE_INPUT_PER_1K / RODIT_LLM_PRICE_OUTPUT_PER_1K（每 1000 token �
 请求里的买家消息、商品、依据来自合成演示世界（rodit.testing.fixtures，全部手造），大小和评测时相当，
 没有个人信息。一共 vote_samples + qa_vote_samples + 1 次调用（默认 5 次），不重试，不计入评测用量；
 生成最先发，头一次请求的一次性开销（DNS、代理建连、模型服务预热）不去占判断层那 1 秒的超时。
-哪一次调用失败、回了空文本、被 max_tokens 截断，或者回答用该环节自己的解析读不出，都算没过：抛
+哪一次调用失败、回了空文本、被 max_tokens 截断，回答里有不止一个顶层 JSON 对象（先写了草稿或
+推理，rodit.eval.health.json_object_count），或者回答用该环节自己的解析读不出，都算没过：抛
 PreflightFailed，说明里有是哪种请求、失败原因（HTTP 状态码和错误代码读 LLMError 的 status / kind /
 code，不解析消息）、实测耗时和配置的超时、每种原因的下一步。通过时返回摘要：每种请求的调用次数、
 耗时、超时（耗时超过超时的 70% 时提醒），和网络路径（via_proxy：请求是不是经环境里配置的代理
 发出去的，§12.1 的耗时要看这条路径）。python -m rodit.eval --skip-preflight 跳过检查（只在调试时
 用）；python -m rodit.eval.compare 只调路由判断层，用 run_preflight(route_request=…) 只查路由。
+
+整条链路的检查（不是只查路由的那种）还按每条消息的时间预算（config.latency，§12.1）把账算一遍——
+评测里引擎用 deadline_scope 包住每条消息，单次调用各自不超时也可能整条来不及：
+- 调用成功、耗时却超过这次请求自己的超时：超时没有被端到端执行，评测里这种请求不会作废，而是把
+  时间预算耗光——算没过；
+- 几种请求都过了之后，用量到的耗时算（路由 = 最慢的一票，不走大模型判断层时按 0；生成 = 那一次
+  调用；质检 = 最慢的一票；B = latency.message_budget_s，F = latency.min_llm_remaining_s）：
+  路由 ≥ B − F（不会调生成）、生成 > min(generation.timeout_s, B − 路由)（评测里实际的超时，比
+  generation.timeout_s 小时在摘要里一并写出）、路由 + 生成 > B − F（不会调质检）、
+  路由 + 生成 + 质检 > B（质检结论迟到、不采用）——哪一条成立都算没过。后两条也不只是提醒：
+  两种情况下模型草稿都没有可用的质检结论，整轮跑完也是无效的（health 的 budget_unjudged；迟到的
+  结论在健康度里还未必看得出来），而重试一次检查只要几次调用。
+只按量到的数字算，不给检查的请求套截止时间（检查自己的耗时会把它吃掉）。头一次调用可能偏慢，
+会把某一个耗时量大：说明里写明可以再试一次。
 """
 
 from __future__ import annotations
@@ -52,6 +67,7 @@ from rodit.core.ports import LLMClient, LLMRequest, LLMResponse
 from rodit.core.questions import QA_MODEL, QA_QUESTIONS
 from rodit.core.states import build_qa_state
 from rodit.decision import build_decision_provider, build_llm_provider, parse_sample
+from rodit.eval.health import json_object_count
 from rodit.eval.perf import Pricing
 from rodit.generation import build_generation_request, parse_generation_output
 from rodit.llm import OpenAICompatibleClient, urllib_transport
@@ -83,8 +99,9 @@ _SLOW_EFFECTS = {
     QA: "质检不可用，模型草稿不放行",
     GENERATE: "这条草稿作废，退回 FAQ / 模板",
 }
-# 没过的原因：LLMErrorKind 里的各类，加上这里自己判的四种
+# 没过的原因：LLMErrorKind 里的各类，加上这里自己判的几种
 UNKNOWN, EMPTY, TRUNCATED, UNPARSEABLE = "error", "empty", "truncated", "unparseable"
+AMBIGUOUS, OVERTIME, BUDGET = "ambiguous", "overtime", "budget"
 _CAUSE_LABELS = {
     "timeout": "超时",
     "rate_limit": "被限流",
@@ -104,6 +121,9 @@ _THINKING_HINT = (
     "（thinking: {type: disabled} 或 enable_thinking: false，例子见 config/rodit.yaml）"
 )
 _NOT_EVIDENCE = "这样的配置指纹和线上不同，结论不能当上线依据"
+_COLD_CALL = (
+    "头一次调用可能偏慢（冷启动：DNS、代理建连、模型服务预热），会把某一个耗时量大，可以先再试一次"
+)
 _MAYBE_OCCASIONAL = (
     "  - 同一种请求里有的调用过了、有的没过：也可能是偶发的，可以再试一次；反复出现的话，"
     "整轮评测里这种请求也会按这个比例失败。"
@@ -303,7 +323,8 @@ def _error_text(error: LLMError) -> str:
 
 
 def _call_problem(call: _Call) -> _Problem | None:
-    """调用层面的问题：失败、被 max_tokens 截断、回了空文本。"""
+    """调用层面的问题：失败、被 max_tokens 截断、回了空文本、JSON 模式的回答里不止一个对象
+    （解析器取到的未必是模型最后给的那个，所以排在各环节自己的解析之前）。"""
     if call.error is not None:
         return _Problem(_cause_of(call.error), _error_text(call.error))
     assert call.response is not None
@@ -313,6 +334,10 @@ def _call_problem(call: _Call) -> _Problem | None:
         return _Problem(TRUNCATED, f"输出被 max_tokens 截断（finish_reason 是 length）{tail}")
     if blank:
         return _Problem(EMPTY, "调用成功，但回的正文是空的")
+    if call.request.json_mode and (objects := json_object_count(call.response.text)) > 1:
+        return _Problem(
+            AMBIGUOUS, f"回答里有 {objects} 个 JSON 对象，分不清哪个才是答案（只该有一个）"
+        )
     return None
 
 
@@ -463,12 +488,83 @@ def _check_all(probe: _Probe, config: EngineConfig) -> list[_Shape]:
     return shapes
 
 
+def _flag_overtime(shapes: list[_Shape]) -> None:
+    """调用成功、耗时却超过这次请求自己的超时：记成这种请求的问题（只在整条链路的检查里用）。"""
+    for shape in shapes:
+        for call in shape.calls:
+            timeout = call.request.timeout_s
+            if call.error is None and timeout is not None and call.seconds > timeout:
+                text = (
+                    f"调用成功，但用了 {call.seconds:.2f} 秒，超过这次请求的超时 {timeout:g} 秒："
+                    "超时没有被端到端执行"
+                )
+                shape.problems.append(_Problem(OVERTIME, text))
+
+
+def _slowest(shapes: list[_Shape], name: str) -> float:
+    """这种请求最慢的一次调用的耗时（秒）；没有检查（不走大模型）时按 0 算。"""
+    return max((c.seconds for s in shapes if s.name == name for c in s.calls), default=0.0)
+
+
+def _effective_generation_timeout(shapes: list[_Shape], config: EngineConfig) -> float:
+    """评测里生成请求实际的超时：generation.timeout_s 和路由之后剩下的时间预算里较小的
+    （generation.prompt 里的 clamp_timeout）。按量到的路由耗时算，不真的套截止时间。"""
+    left = config.latency.message_budget_s - _slowest(shapes, ROUTE)
+    return max(min(config.generation.timeout_s, left), 0.0)
+
+
+def _budget_lines(shapes: list[_Shape], config: EngineConfig) -> list[str]:
+    """几种请求都过了之后，按每条消息的时间预算算一遍（见模块说明）：来不及时返回说明
+    （头一行是预算和量到的耗时，第二行是最先卡住的那一步），来得及返回空列表。"""
+    budget, floor = config.latency.message_budget_s, config.latency.min_llm_remaining_s
+    route, gen, qa = (_slowest(shapes, name) for name in (ROUTE, GENERATE, QA))
+    effective = _effective_generation_timeout(shapes, config)
+    if route >= budget - floor:
+        reason = (
+            f"路由用了 {route:.2f} 秒，之后剩下的时间（{budget:g} − {route:.2f} 秒）"
+            f"不比 {floor:g} 秒多：评测里路由之后不会再调生成，每条用例都只有 FAQ / 模板，"
+            "没有模型草稿"
+        )
+    elif gen > effective:
+        reason = (
+            f"生成用了 {gen:.2f} 秒，评测里这次调用的超时是 {effective:.2f} 秒"
+            f"（generation.timeout_s {config.generation.timeout_s:g} 秒和路由之后剩下的 "
+            f"{budget:g} − {route:.2f} 秒里较小的）：评测里生成会超时，草稿作废"
+        )
+    elif route + gen > budget - floor:
+        reason = (
+            f"路由加生成用了 {route + gen:.2f} 秒，之后剩下的时间"
+            f"（{budget:g} − {route + gen:.2f} 秒）不到 {floor:g} 秒："
+            "评测里生成之后不会调质检，模型草稿没有质检结论、不放行"
+        )
+    elif route + gen + qa > budget:
+        reason = (
+            f"路由、生成、质检加起来 {route + gen + qa:.2f} 秒，超过 {budget:g} 秒："
+            "评测里质检的结论在截止时间之后才到、不采用，模型草稿不放行"
+        )
+    else:
+        return []
+    skipped = any(s.name == ROUTE and s.skipped is not None for s in shapes)
+    routing = "路由不走大模型（按 0 秒算）" if skipped else f"路由 {route:.2f} 秒"
+    return [
+        f"  时间预算：每条消息 {budget:g} 秒（latency.message_budget_s），剩下不到 {floor:g} 秒"
+        f"就不再调大模型（latency.min_llm_remaining_s）；一条消息先后等{routing}、"
+        f"生成 {gen:.2f} 秒、质检 {qa:.2f} 秒（各取上面最慢的一次）",
+        f"    - {reason}。",
+    ]
+
+
 def _unit(shape: _Shape) -> str:
     return "票" if shape.name != GENERATE and len(shape.calls) > 1 else "次"
 
 
-def _shape_lines(shape: _Shape, *, show_result: bool) -> list[str]:
-    """一种请求的说明：调用次数、耗时、超时；没过时逐项列原因；有调用成功但偏慢时提醒。"""
+def _shape_lines(
+    shape: _Shape, *, show_result: bool, budgeted: bool = False, effective: float | None = None
+) -> list[str]:
+    """一种请求的说明：调用次数、耗时、超时；没过时逐项列原因；有调用成功但偏慢时提醒。
+
+    budgeted：这次检查算不算每条消息的时间预算（整条链路的检查算，只查路由的不算）；
+    effective：评测里这种请求实际的超时（受时间预算限制），比配置的小时写在配置的旁边。"""
     label = _LABELS[shape.name]
     if shape.skipped is not None:
         return [f"  {label}：没有检查——{shape.skipped}"]
@@ -481,7 +577,12 @@ def _shape_lines(shape: _Shape, *, show_result: bool) -> list[str]:
     if shape.calls:
         spent = " / ".join(f"{c.seconds:.2f}" for c in sorted(shape.calls, key=lambda c: c.seconds))
         parts.append(f"耗时 {spent} 秒")
-    if timeout is not None:
+    if timeout is not None and effective is not None and effective < timeout:
+        parts.append(
+            f"单次超时 {timeout:g} 秒（{knob}；评测里受 latency.message_budget_s 限制，"
+            f"路由之后实际只有 {effective:.2f} 秒）"
+        )
+    elif timeout is not None:
         parts.append(f"单次超时 {timeout:g} 秒（{knob}）")
     lines = [f"  {label}（{count}）：{'，'.join(parts)}"]
     for problem, n in Counter(shape.problems).items():
@@ -489,12 +590,17 @@ def _shape_lines(shape: _Shape, *, show_result: bool) -> list[str]:
     if shape.verdict is not None:
         lines.append(f"    - {shape.verdict.text}")
     answered = [c.seconds for c in shape.calls if c.error is None]
-    if timeout is not None and answered and max(answered) > SLOW_SHARE * timeout:
-        lines.append(
-            f"    注意：最慢的一{unit}用了 {max(answered):.2f} 秒，超过单次超时 {timeout:g} 秒的 "
-            f"{SLOW_SHARE:.0%}——整轮评测里这种请求会间歇性超时（{_SLOW_EFFECTS[shape.name]}）。"
-            f"要放宽就另写 --config 调大 {knob}（{_NOT_EVIDENCE}）。"
-        )
+    if timeout is None or not answered or max(answered) <= SLOW_SHARE * timeout:
+        return lines
+    if budgeted and max(answered) > timeout:
+        return lines  # 比超时还慢不是"间歇性超时"：上面已经按没过列出来了（_flag_overtime）
+    # 只调大单次超时、不调大每条消息的时间预算，慢的那些用例会改成被预算截断
+    knobs = f"{knob}（和 latency.message_budget_s）" if budgeted else knob
+    lines.append(
+        f"    注意：最慢的一{unit}用了 {max(answered):.2f} 秒，超过单次超时 {timeout:g} 秒的 "
+        f"{SLOW_SHARE:.0%}——整轮评测里这种请求会间歇性超时（{_SLOW_EFFECTS[shape.name]}）。"
+        f"要放宽就另写 --config 调大 {knobs}（{_NOT_EVIDENCE}）。"
+    )
     return lines
 
 
@@ -529,6 +635,7 @@ def _next_step(cause: str, client: object, config: EngineConfig) -> str:
             f"被限流（HTTP 429）：账号的并发或速率上限低于一条消息要的量（路由 {votes} 票同时发）。"
             "提高限额，或用 --config 把 decision.vote_samples 调小"
             f"（{_NOT_EVIDENCE}）；有的服务额度用完也回 429，先看一眼余额。"
+            "--min-interval 只是把用例和用例隔开（速率上限用得上），降不了一条消息里同时发的票数。"
         ),
         "auth": f"密钥无效或没有权限：检查{key}里的密钥是不是这个接口、这个模型的。",
         "billing": "余额或额度用完：充值或换一个有额度的账号，再调也是一样。",
@@ -537,7 +644,8 @@ def _next_step(cause: str, client: object, config: EngineConfig) -> str:
             "不支持；也可能是模型名不对，或者不接受这次的 temperature / max_tokens——对照上面的"
             "错误代码，检查模型名（RODIT_LLM_MODEL 或 llm.model）和 --config 里的 "
             "decision.vote_temperature、decision.qa_vote_samples（只投一票时温度是 0）、"
-            "generation.temperature。"
+            "generation.temperature。JSON 模式是一直开着的，没有配置能关：拒的是它的话，换一个"
+            "支持 JSON 模式的模型或接口（服务方另有开启 JSON 输出的参数时，写进 llm.extra_body）。"
         ),
         "content_filter": (
             "被模型服务的内容安全拦截：检查用的是合成的客服对话，换一个模型或问服务方。"
@@ -574,6 +682,25 @@ def _next_step(cause: str, client: object, config: EngineConfig) -> str:
             "回答读不出来：确认模型支持 JSON 模式、照提示词只输出 JSON；开着思考模式时也常这样——"
             f"{_THINKING_HINT}。"
         ),
+        AMBIGUOUS: (
+            "回答里不止一个 JSON 对象：模型把草稿或推理过程也写进了回答，解析时取到的未必是它"
+            f"最后给的那个，评测把这样的回答算作用不上——{_THINKING_HINT}；"
+            "关不掉的话，换一个照 JSON 模式只输出一个对象的模型或接口。"
+        ),
+        OVERTIME: (
+            "调用成功但比自己的超时还慢：这不是偶发的超时——超时没有被端到端执行（客户端没有在"
+            "到点时掐断这次请求），整轮评测里这种请求不会按超时作废，而是把每条消息的时间预算"
+            "（latency.message_budget_s）耗光，后面的环节被预算截断。"
+            f"{_COLD_CALL}；一直这样就换更快的模型或接口，或者另写一份 --config 把单次超时和 "
+            f"latency.message_budget_s 一起调大——{_NOT_EVIDENCE}。"
+        ),
+        BUDGET: (
+            "时间预算不够：每次调用各自都没超时，但一条消息要先后等路由、生成、质检，按量到的"
+            "耗时放不进 latency.message_budget_s——整轮评测里模型草稿会被时间预算截断，量到的"
+            f"不是模型的回答。{_COLD_CALL}（生成最先发，最容易被量大）；反复这样的话，"
+            "想先探一探模型，就另写一份 --config 把 latency.message_budget_s（最大 30 秒）调大、"
+            f"单次超时按需要一起调——{_NOT_EVIDENCE}；再看上面的网络路径，请求是不是绕了代理。"
+        ),
     }
     return steps[cause]
 
@@ -591,7 +718,9 @@ def run_preflight(
       路由判断层，--llm env 一律用 build_llm_provider 按 config.decision 组装，传这一轮要发的
       第一条请求）；
     - timer：量耗时用的单调时钟（秒），测试里注入假的。
-    没过抛 PreflightFailed；通过返回摘要，一行一条。"""
+    没过抛 PreflightFailed；通过返回摘要，一行一条。每条消息的时间预算（比超时还慢的成功调用、
+    路由 + 生成 + 质检放不放得进 latency.message_budget_s）只在整条链路的检查里算，给了
+    route_request 时不算。"""
     config = config or EngineConfig()
     probe = _Probe(client, timer)
     if route_request is None:
@@ -600,9 +729,26 @@ def run_preflight(
         provider = build_llm_provider(config.decision, purpose="route", llm=probe)
         shapes = [_check_judge(ROUTE, probe, provider, route_request)]
     calls = probe.count()
+    budgeted = route_request is None  # 整条链路才有每条消息的时间预算；只查路由的不算
+    if budgeted:
+        _flag_overtime(shapes)
     failed = [shape for shape in shapes if shape.failed]
-    body = [line for shape in shapes for line in _shape_lines(shape, show_result=bool(failed))]
-    if not failed:
+    late = _budget_lines(shapes, config) if budgeted and not failed else []
+    body = [
+        line
+        for shape in shapes
+        for line in _shape_lines(
+            shape,
+            show_result=bool(failed),
+            budgeted=budgeted,
+            effective=(
+                _effective_generation_timeout(shapes, config)
+                if budgeted and shape.name == GENERATE
+                else None
+            ),
+        )
+    ]
+    if not failed and not late:
         return [
             f"大模型连通性检查通过：按这次评测要发的请求试了 {calls} 次调用"
             "（合成数据，不计入评测用量）",
@@ -610,6 +756,21 @@ def run_preflight(
             _path_line(client),
         ]
     checked = sum(1 for shape in shapes if shape.skipped is None)
+    if late:
+        raise PreflightFailed(
+            "\n".join(
+                [
+                    f"大模型连通性检查失败：按这次评测要发的请求试了 {checked} 种、{calls} 次调用"
+                    "（合成数据），每次调用都答上了，但按每条消息的时间预算算下来来不及，"
+                    "评测没有开跑。",
+                    *body,
+                    *late,
+                    _path_line(client),
+                    "下一步：",
+                    f"  - {_next_step(BUDGET, client, config)}",
+                ]
+            )
+        )
     names = "、".join(_LABELS[shape.name] for shape in failed)
     problems = [p for shape in failed for p in (*shape.problems, shape.verdict) if p is not None]
     causes = list(dict.fromkeys(p.cause for p in problems))  # 每种原因只说一次，按出现的先后
