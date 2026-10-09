@@ -110,7 +110,7 @@ from rodit.eval.jev_transport import (
     JevTimeout,
     transport_from_env,
 )
-from rodit.eval.llm_env import describe_endpoint, describe_model, preflight
+from rodit.eval.llm_env import describe_endpoint, describe_model, run_preflight
 from rodit.eval.runner import _seed_history, select_cases
 from rodit.feedback.metrics import percentile
 from rodit.routing.policy import vote_threshold
@@ -1763,10 +1763,11 @@ def main(
                 specs.append(classifier_spec(args.classifier))
             elif name == INCLOUD_LLM:
                 llm = client_factory() if client_factory is not None else env_client(config)
-                try:
-                    preflight(llm)
-                except LLMError as e:  # 客户端的错误信息里已经抹掉了密钥
-                    raise RuntimeError(f"大模型连通性检查失败：{e}") from None
+                # 连通性检查：这个命令只调路由判断层，就拿这一轮要发的第一条请求（合成评测集）
+                # 按 llm_spec 同样的组装试一次；没过抛 PreflightFailed，走下面的 RuntimeError 分支
+                first = compare_cases[0].request.model_copy(deep=True)
+                for line in run_preflight(llm, config, route_request=first):
+                    print(line, file=err, flush=True)
                 specs.append(llm_spec(llm, config))
             else:
                 transport, model = (jev_factory or transport_from_env)()
