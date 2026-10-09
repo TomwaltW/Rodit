@@ -8,6 +8,7 @@ import io
 import json
 import math
 import socket
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -262,6 +263,107 @@ def test_segmented_content_is_joined(api_key):
 
 
 @pytest.mark.parametrize(
+    ("parts", "expected"),
+    [
+        # 思考段不拼在回答前面
+        (
+            [
+                {"type": "reasoning", "text": '先拟一版 {"answer": "草稿"}'},
+                {"type": "text", "text": '{"answer": "亲，在的~"}'},
+            ],
+            '{"answer": "亲，在的~"}',
+        ),
+        (
+            [
+                {"type": "thinking", "thinking": "买家问的是快递"},  # 思考段没有 text 也不碍事
+                {"text": "亲，"},  # 没写 type：当文本段
+                {"type": "text", "text": "发中通~"},
+            ],
+            "亲，发中通~",
+        ),
+        ([{"type": "reasoning", "text": "还没想完"}], ""),  # 只有思考：回答是空的
+    ],
+)
+def test_segmented_content_joins_only_text_parts(api_key, parts, expected):
+    body = ok_body()
+    body["choices"][0]["message"]["content"] = parts
+    resp = client(FakeTransport(body=body)).complete(req())
+    assert resp.text == expected
+    assert (resp.input_tokens, resp.output_tokens, resp.finish_reason) == (321, 17, "stop")
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [],
+        ["亲，在的~"],  # 不是分段
+        [{"type": "text", "text": None}],
+        [{"type": "text"}, {"type": "text", "text": "在的~"}],
+    ],
+)
+def test_segmented_content_without_readable_text_is_malformed(api_key, parts):
+    body = ok_body()
+    body["choices"][0]["message"]["content"] = parts
+    with pytest.raises(LLMError, match="没有文本内容") as ei:
+        client(FakeTransport(body=body)).complete(req())
+    assert cause(ei.value) == (200, "malformed", None)
+
+
+_REAL = '{"answer": "亲，默认发中通快递哦~", "cited": [1]}'
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        # 思考里有一份完整的 JSON 草稿：只交出后面真正的回答
+        (
+            f'<think>先拟一版：{{"answer": "草稿：这个我再确认一下", "cited": []}}</think>{_REAL}',
+            _REAL,
+        ),
+        (
+            f"<think>\n格式是 {{answer, cited}}，注意 }} 要配对 {{\n</think>\n\n{_REAL}",
+            f"\n\n{_REAL}",
+        ),
+        (f"\n  <THINK>想一下</Think>{_REAL}", _REAL),  # 前面有空白、大小写不一
+        (f"<think>一</think>\n<think>二</think>{_REAL}", _REAL),  # 连着两块
+        ('<think>想到一半 {"answer": "草稿"', ""),  # 没有收尾：输出在思考里被截断
+        ("<think>想完了，没有回答</think>", ""),
+        ("<think></think>", ""),
+        # 只看开头：正文里后面提到这个标签，原样不动
+        (f"{_REAL}\n<think>事后补一句</think>", f"{_REAL}\n<think>事后补一句</think>"),
+        ("亲，页面上的 <think> 是模型的思考标记哦~", "亲，页面上的 <think> 是模型的思考标记哦~"),
+        ("亲 <think>不在开头</think> 在的~", "亲 <think>不在开头</think> 在的~"),
+        ("<thinking>别的标签不管</thinking>好的", "<thinking>别的标签不管</thinking>好的"),
+        ("  亲，在的~\n", "  亲，在的~\n"),  # 没有思考块：一个字符都不动
+    ],
+)
+def test_leading_think_block_is_not_returned_as_the_answer(api_key, content, expected):
+    """开着思考模式、又把思考内容放在 content 里的模型：思考内容不能当回答交给调用方
+    （里面的 JSON 草稿会被判断层、生成当成回答读走）。用量和 finish_reason 不变。"""
+    body = ok_body(text=content)
+    resp = client(FakeTransport(body=body)).complete(req(json_mode=True))
+    assert resp.text == expected
+    assert (resp.input_tokens, resp.output_tokens, resp.finish_reason) == (321, 17, "stop")
+
+
+def test_think_block_cut_by_max_tokens_is_an_empty_truncated_answer(api_key):
+    body = ok_body(text='<think>先拟一版 {"answer": "草稿"} 再')
+    body["choices"][0]["finish_reason"] = "length"
+    resp = client(FakeTransport(body=body)).complete(req(max_tokens=17))
+    assert (resp.text, resp.finish_reason) == ("", "length")
+    assert (resp.input_tokens, resp.output_tokens) == (321, 17)
+
+
+def test_think_block_in_segmented_content_is_dropped_too(api_key):
+    body = ok_body()
+    body["choices"][0]["message"]["content"] = [
+        {"type": "text", "text": '<think>{"answer": "草'},
+        {"type": "text", "text": f'稿"}}</think>{_REAL}'},
+    ]
+    assert client(FakeTransport(body=body)).complete(req()).text == _REAL
+
+
+@pytest.mark.parametrize(
     ("given", "expected"),
     [
         ("stop", "stop"),
@@ -285,16 +387,52 @@ def test_finish_reason_absent_is_none(api_key):
     assert client(FakeTransport(body=body)).complete(req()).finish_reason is None
 
 
-@pytest.mark.parametrize("text", ["", "   ", '{"answer": "亲，这款'])
+@pytest.mark.parametrize("text", ["", "   ", '{"answer": "亲，这款', None])
 def test_truncated_or_empty_output_is_returned_with_its_tokens(api_key, text):
     """被 max_tokens 截断（finish_reason length）、文本是空的：照常返回，不抛异常。token 已经花了，
-    抛异常的话这次调用按 0 token 计量；这一票算不算数由调用方定（判断层、生成各有各的处理）。"""
+    抛异常的话这次调用按 0 token 计量；这一票算不算数由调用方定（判断层、生成各有各的处理）。
+    截断时 content 是 null（思考模型把额度花在思考上）和空字符串是同一件事。"""
     body = ok_body(text=text)
     body["choices"][0]["finish_reason"] = "length"
     body["usage"] = {"prompt_tokens": 100, "completion_tokens": 304}
     resp = client(FakeTransport(body=body)).complete(req(max_tokens=304))
-    assert (resp.text, resp.finish_reason) == (text, "length")
+    assert (resp.text, resp.finish_reason) == (text or "", "length")
     assert (resp.input_tokens, resp.output_tokens) == (100, 304)
+
+
+def test_truncated_output_without_a_content_field_is_returned_with_its_tokens(api_key):
+    body = ok_body()
+    body["choices"][0] = {
+        "message": {"role": "assistant", "reasoning_content": "想到一半"},
+        "finish_reason": "length",
+    }
+    body["usage"] = {"prompt_tokens": 100, "completion_tokens": 304}
+    resp = client(FakeTransport(body=body)).complete(req(max_tokens=304))
+    assert (resp.text, resp.finish_reason) == ("", "length")
+    assert (resp.input_tokens, resp.output_tokens) == (100, 304)
+
+
+@pytest.mark.parametrize(
+    ("message", "reason"),
+    [
+        ({"content": None}, "stop"),
+        ({"content": None}, None),
+        ({"content": None}, "tool_calls"),
+        ({}, "stop"),
+        ({"content": 3}, "length"),  # 截断，但 content 不是"没给"：照旧算格式不对
+        ({"content": []}, "length"),
+        ("text", "length"),  # message 不是对象
+        (None, "length"),
+    ],
+)
+def test_null_content_that_is_not_a_truncation_stays_malformed(api_key, message, reason):
+    body = ok_body()
+    body["choices"][0] = {"message": message, "finish_reason": reason}
+    body["error"] = {"code": "EmptyOutput", "message": "原文"}
+    with pytest.raises(LLMError, match="没有文本内容") as ei:
+        client(FakeTransport(body=body)).complete(req())
+    # 模型服务给的代码照带（和"没有 choices"那一处一样）
+    assert cause(ei.value) == (200, "malformed", "EmptyOutput")
 
 
 def _lp(token: str, p: float, top: list[tuple[str, float]] | None = None) -> dict[str, Any]:
@@ -538,6 +676,16 @@ def test_unreadable_body_is_malformed_and_keeps_the_status(api_key, status, body
     assert cause(ei.value) == expected
 
 
+@pytest.mark.parametrize("status", ["200", "429", None, 200.0, True, (200,)])
+@pytest.mark.parametrize("body", [None, {"error": {"code": "x"}}, ["not", "a", "dict"]])
+def test_status_that_is_not_an_int_is_malformed(api_key, status, body):
+    """传输层没按约定给整数状态码：报 LLMError（调用方照常降级），不是 TypeError。
+    状态码不可信，不带。"""
+    with pytest.raises(LLMError, match="状态码不是整数") as ei:
+        client(FakeTransport(status=status, body=body)).complete(req())
+    assert cause(ei.value) == (None, "malformed", None)
+
+
 def test_error_object_in_a_200_body_gives_the_vendor_code(api_key):
     """有的模型服务出错时也回 HTTP 200，错误放在响应体的 error 里：读不出回答（malformed），
     代码照样带上，不然只看得到"没有 choices"。"""
@@ -589,6 +737,111 @@ def test_llm_error_from_the_transport_keeps_its_cause(api_key, raised, expected)
     assert cause(ei.value) == expected
     assert str(ei.value) == str(raised).replace(KEY, "***")
     assert ei.value.__cause__ is None
+
+
+class GatewayThrottled(LLMError):
+    """平台云通道自己定义的错误：构造函数只收一个消息（这个分支以前就是这么调的）。"""
+
+    def __init__(self, msg: str) -> None:
+        super().__init__(msg)
+
+
+class GatewayTimeout(LLMTimeout):
+    def __init__(self, msg: str) -> None:
+        super().__init__(msg)
+
+
+class BareGatewayError(LLMError):
+    """没调基类的构造函数：没有 status / kind / code 这几个属性。"""
+
+    def __init__(self, msg: str) -> None:
+        Exception.__init__(self, msg)
+
+
+class PassThroughGatewayError(LLMError):
+    pass
+
+
+class NoMessageGatewayError(LLMError):
+    """构造函数不收消息：没法按原类型重建。"""
+
+    def __init__(self) -> None:
+        super().__init__(f"通道拒绝 Bearer {KEY}", status=403, kind="auth", code="denied")
+
+
+class NoMessageGatewayTimeout(LLMTimeout):
+    def __init__(self) -> None:
+        super().__init__(f"通道超时 Bearer {KEY}", status=504, code=f"gw:{KEY}")
+
+
+def _with(error: LLMError, **attrs: Any) -> LLMError:
+    for name, value in attrs.items():
+        setattr(error, name, value)
+    return error
+
+
+@pytest.mark.parametrize(
+    ("make", "rebuilt", "expected"),
+    [
+        (lambda: GatewayThrottled(f"too many Bearer {KEY}"), GatewayThrottled, (None, None, None)),
+        # 构造之后才补上的原因也照带
+        (
+            lambda: _with(GatewayThrottled("通道限流"), status=429, kind="rate_limit", code=KEY),
+            GatewayThrottled,
+            (429, "rate_limit", "***"),
+        ),
+        (lambda: GatewayTimeout(f"通道超时 {KEY}"), GatewayTimeout, (None, "timeout", None)),
+        (lambda: BareGatewayError(f"通道故障 {KEY}"), BareGatewayError, (None, None, None)),
+        (
+            lambda: PassThroughGatewayError("通道故障", status=503, kind="server", code="down"),
+            PassThroughGatewayError,
+            (503, "server", "down"),
+        ),
+        # kind 不认识、status 不是整数：不带（LLMError 的构造函数不收不认识的 kind）
+        (
+            lambda: _with(LLMError("通道限流", code="busy"), kind="throttled", status="429"),
+            LLMError,
+            (None, None, "busy"),
+        ),
+        (
+            lambda: _with(GatewayThrottled("通道限流"), kind="throttled", status=True),
+            GatewayThrottled,
+            (None, None, None),
+        ),
+        (lambda: _with(LLMTimeout("通道超时"), kind="slow"), LLMTimeout, (None, "timeout", None)),
+        # 没法按原类型重建：退成普通的 LLMError / LLMTimeout，消息和原因照带
+        (NoMessageGatewayError, LLMError, (403, "auth", "denied")),
+        (NoMessageGatewayTimeout, LLMTimeout, (504, "timeout", "gw:***")),
+    ],
+    ids=[
+        "one-arg",
+        "one-arg-with-cause",
+        "one-arg-timeout",
+        "skips-init",
+        "pass-through",
+        "unknown-kind",
+        "one-arg-unknown-kind",
+        "timeout-unknown-kind",
+        "no-message",
+        "no-message-timeout",
+    ],
+)
+def test_llm_error_subclass_from_the_transport_is_still_an_llm_error(
+    api_key, make, rebuilt, expected
+):
+    """传输层抛的是 LLMError 的子类（平台云通道自己定义的）：不管它的构造函数长什么样，
+    complete() 抛出去的都得是 LLMError——TypeError / AttributeError / ValueError 漏出去的话，
+    路由、生成都不当它是模型故障，这条消息就没有关键词规则 / FAQ / 模板兜底了（§12.2）。"""
+    raised = make()
+    with pytest.raises(LLMError) as ei:
+        client(FakeTransport(exc=raised)).complete(req())
+    assert type(ei.value) is rebuilt and ei.value is not raised
+    assert cause(ei.value) == expected
+    assert str(ei.value) == str(raised).replace(KEY, "***")
+    assert isinstance(ei.value, LLMTimeout) == isinstance(raised, LLMTimeout)
+    # 原始异常不链在后面：打印 traceback 的地方也看不到没抹过的消息
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__
+    assert KEY not in "".join(traceback.format_exception(ei.value))
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])

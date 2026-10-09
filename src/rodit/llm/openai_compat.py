@@ -18,13 +18,27 @@ base_url / model 由部署配置决定，代码里不写死。实现 core.ports.
     5xx server；3xx redirect；连不上 network；响应读不出来（不是 JSON 对象、没有 choices、
     没有文本）malformed；finish_reason 是 content_filter / sensitive → content_filter；
     密钥没设或不能用 → config。
-  - status：HTTP 状态码。非 2xx 时带；响应读不出来（malformed）时也照带，哪怕是 200。
-    没收到响应（超时、连不上、密钥不能用）就没有；内容安全拦截也不带，评测按 kind 归类。
+  - status：HTTP 状态码。非 2xx 时带；传输层交回了（状态码, 响应体）而响应读不出来（malformed）
+    时也照带，哪怕是 200。没有的情况：没收到响应（超时、连不上、密钥不能用）；传输层直接抛
+    ValueError（默认传输层收到 2xx、但响应体不是 JSON 对象时就是这样；请求还没发出去就抛的
+    ValueError，比如地址里有非 ASCII 字符，也归在 malformed）；传输层交回的状态码不是整数
+    （也是 malformed）；内容安全拦截也不带，评测按 kind 归类。
   - code：响应体里的 error.code，没有就用 error.type；抹掉密钥、最多 64 个字符，
     不取 error.message（原文可能回显提示词里的买家文字）。
-  传输层自己抛的 LLMError 按原类型重抛，这三项照带（code 同样抹掉密钥）。
+  传输层自己抛的 LLMError（包括它的子类，比如平台云通道自己定义的）抹掉密钥后按原类型重抛，
+  这三项照带（code 同样抹掉密钥；status 不是整数、kind 不在 LLMErrorKind 里的不带）。子类的
+  构造函数不收这三项时只传消息、再把原因补上；连这样也建不了，退成普通的 LLMTimeout / LLMError。
+  不管哪种，抛出去的都是 LLMError，调用方照常降级。
 - finish_reason：接口返回什么就填进 LLMResponse.finish_reason（没给是 None）。被 max_tokens 截断
   （length）、文本是空的都照常返回，不抛异常：token 已经花了要照常计量，算不算数由调用方定。
+  截断时 content 是 null 或者没有这一项（思考模型把 max_tokens 花在思考上，有的服务这时不给
+  空字符串）是同一件事：返回空文本、finish_reason length、用量照填。别的情况下 content 是 null
+  仍然是 malformed。
+- 思考内容不当回答交出去：文本开头（前面只有空白）是 <think>（不分大小写）时，去掉到对应的
+  </think> 为止的部分，只留后面的；一直没有 </think>（输出在思考里被截断）时回答是空文本。
+  只看开头：回答正文里后面提到这个标签不动。content 是分段列表时只拼 type 是 text 或者没写
+  type 的段，reasoning / thinking 之类的段不拼；一段能拼的都没有时是空文本。用量和
+  finish_reason 不受影响。
 - json_mode → response_format {"type": "json_object"}；usage → input_tokens / output_tokens。
 - extra_body：模型服务特有的请求参数（如关闭思考模式），并入每次请求，标准字段优先。取值来自
   配置的 llm.extra_body（core.config.LLMConfig：算进配置指纹，不放密钥），由组装客户端的地方
@@ -47,22 +61,26 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from rodit.core.errors import LLMError, LLMErrorKind, LLMTimeout
+from rodit.core.errors import LLM_ERROR_KINDS, LLMError, LLMErrorKind, LLMTimeout
 from rodit.core.ports import LLMRequest, LLMResponse
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], tuple[int, dict[str, Any]]]
 """transport(url, headers, body, timeout_s) → (HTTP 状态码, 解析后的 JSON 响应体)。
 
 超时抛 TimeoutError；网络错误抛 OSError 等；2xx 但响应体不是 JSON 对象时抛 ValueError；
-非 2xx 返回状态码和能解析出来的响应体（解析不了就是空 dict）。"""
+非 2xx 返回状态码和能解析出来的响应体（解析不了就是空 dict）。状态码必须是整数，不是的话
+客户端报 LLMError（malformed）。也可以自己抛 LLMError 或它的子类（带不带失败原因都行）。"""
 
 _SKIP_CHARS = " \t\r\n\"'`{}[]:,"
 _FILTERED = frozenset({"content_filter", "sensitive"})  # 模型服务的内容安全拦截
+_THINK_OPEN = re.compile(r"\s*<think>", re.IGNORECASE)
+_THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
 
 
 def _parse_body(raw: bytes) -> dict[str, Any]:
@@ -130,6 +148,33 @@ def _error_code(body: Mapping[str, Any], key: str) -> str | None:
     if not isinstance(err, dict):
         return None
     return _short_code(err.get("code"), key) or _short_code(err.get("type"), key)
+
+
+def _scrubbed_copy(e: LLMError, key: str) -> LLMError:
+    """传输层自己抛的 LLMError：抹掉密钥后的副本，失败原因照带。能按原类型建就按原类型；
+    子类的构造函数不收 status / kind / code（这条分支以前只传一个消息）时按原类型只传消息、
+    再把原因补上；连这样也建不了，退成普通的 LLMTimeout / LLMError。原因用 getattr 读：子类
+    没调基类的构造函数时没有这几个属性。status 不是整数的不带；kind 不认识的不传
+    （LLMTimeout 于是回到默认的 timeout）。"""
+    msg = _scrub(str(e), key)
+    status, kind = getattr(e, "status", None), getattr(e, "kind", None)
+    cause: dict[str, Any] = {
+        "status": status if isinstance(status, int) and not isinstance(status, bool) else None,
+        "code": _short_code(getattr(e, "code", None), key),
+    }
+    if isinstance(kind, str) and kind in LLM_ERROR_KINDS:
+        cause["kind"] = kind
+    try:
+        return type(e)(msg, **cause)
+    except Exception:  # 子类的构造函数和基类不一样
+        pass
+    try:
+        copy = type(e)(msg)
+        copy.status, copy.code = cause["status"], cause["code"]
+        copy.kind = cause.get("kind", getattr(copy, "kind", None))
+        return copy
+    except Exception:
+        return (LLMTimeout if isinstance(e, LLMTimeout) else LLMError)(msg, **cause)
 
 
 def _http_kind(status: int) -> LLMErrorKind:
@@ -214,10 +259,23 @@ def _text_content(content: Any) -> str | None:
     if isinstance(content, str):
         return content
     if isinstance(content, list):  # 少数服务返回分段内容 [{"type": "text", "text": ...}]
-        parts = [p.get("text") for p in content if isinstance(p, dict)]
-        if parts and all(isinstance(p, str) for p in parts):
+        # 只拼文本段（type 是 text 或没写）：reasoning / thinking 段是思考内容，不是回答
+        segments = [p for p in content if isinstance(p, dict)]
+        parts = [p.get("text") for p in segments if p.get("type") in (None, "text")]
+        if segments and all(isinstance(p, str) for p in parts):
             return "".join(parts)
     return None
+
+
+def _without_leading_think(text: str) -> str:
+    """去掉开头的思考块（<think>…</think>，不分大小写；连着几块都去掉），只留后面的回答。
+    没有 </think>（输出在思考里被截断）时回答是空的。只看开头：正文里后面提到这个标签不动。"""
+    while (opened := _THINK_OPEN.match(text)) is not None:
+        closed = _THINK_CLOSE.search(text, opened.end())
+        if closed is None:
+            return ""
+        text = text[closed.end() :]
+    return text
 
 
 class OpenAICompatibleClient:
@@ -331,9 +389,7 @@ class OpenAICompatibleClient:
                 self.endpoint, headers, self.build_payload(request), timeout
             )
         except LLMError as e:  # 传输层自己抛的：抹掉密钥后按原类型重抛，失败原因照带
-            raise type(e)(
-                _scrub(str(e), key), status=e.status, kind=e.kind, code=_short_code(e.code, key)
-            ) from None
+            raise _scrubbed_copy(e, key) from None
         except TimeoutError:
             raise LLMTimeout(f"大模型调用超时（{timeout:g} 秒）") from None
         except Exception as e:
@@ -348,6 +404,8 @@ class OpenAICompatibleClient:
     # ---------------------------------------------------------------- 响应
 
     def _parse(self, status: int, body: Any, request: LLMRequest, key: str) -> LLMResponse:
+        if isinstance(status, bool) or not isinstance(status, int):
+            raise LLMError("大模型响应格式不对：状态码不是整数", kind="malformed")
         if not isinstance(body, dict):
             raise LLMError("大模型响应格式不对：不是 JSON 对象", status=status, kind="malformed")
         if not 200 <= status < 300:
@@ -372,12 +430,26 @@ class OpenAICompatibleClient:
             raise LLMError("大模型输出被内容安全策略拦截", kind="content_filter")
         message = choice.get("message")
         text = _text_content(message.get("content")) if isinstance(message, dict) else None
+        if (
+            text is None
+            and reason == "length"
+            and isinstance(message, dict)
+            and message.get("content") is None
+        ):
+            # 输出额度在出正文之前就用完了（思考模型把 max_tokens 花在思考上）：有的服务这时
+            # content 是 null 而不是 ""。同一件事同样处理：照常返回、照常计量
+            text = ""
         if text is None:
-            raise LLMError("大模型响应格式不对：没有文本内容", status=status, kind="malformed")
+            raise LLMError(
+                "大模型响应格式不对：没有文本内容",
+                status=status,
+                kind="malformed",
+                code=_error_code(body, key),
+            )
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         model = body.get("model")
         return LLMResponse(
-            text=text,
+            text=_without_leading_think(text),  # 思考内容不当回答交出去
             model=model if isinstance(model, str) and model else self.model,
             input_tokens=_non_negative_int(usage.get("prompt_tokens")),
             output_tokens=_non_negative_int(usage.get("completion_tokens")),
