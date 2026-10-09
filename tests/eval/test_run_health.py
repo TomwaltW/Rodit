@@ -233,6 +233,7 @@ def test_a_healthy_run_is_valid_and_exits_zero(tmp_path):
     assert "类型准确率分开看：判断层路由 12 条 100.0%；退回关键词规则 0 条；" in run.out
     assert "路由丢票的用例" not in run.out and "没有参与校准" not in run.out
     assert "退出码 3" not in run.err
+    assert "[12/12]" in run.err and "票算数" not in run.err and "降级" not in run.err
 
 
 def test_offline_runs_have_no_health_block():
@@ -329,6 +330,43 @@ def test_forty_percent_of_routing_votes_rate_limited(tmp_path):
     assert "路由丢票的用例 5 条（算得上的票 / 发出的票；" in run.out
     assert all(f"{ids[i]} 2/3" in run.out for i in one_lost)
     assert "失败的 15 次调用按 0 token 计" in run.out
+    # 进度：丢一票的那几条当场看得出来
+    assert run.err.count("（失败 1），路由只有 2/3 票算数") == 5
+    assert run.err.count("降级：decision") == 5
+
+
+def test_forty_percent_of_all_calls_rate_limited(tmp_path):
+    """路由、生成、质检的调用都有四成上下被限流（HTTP 429）：路由票照上面的安排，生成和质检按到达的
+    先后（每 5 次里的第 3、5 次）。并行的两条生成请求谁先到不一定，所以生成、质检只核对它们和用量
+    对得上。"""
+    arrivals: Counter[str] = Counter()
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "route":
+            return _forty_percent(request, case, nth)
+        arrivals[request.purpose] += 1
+        return _rejected(429, "rate_limit") if arrivals[request.purpose] % 5 in (0, 3) else None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    assert not health.valid and run.out.count(INVALID) == 2
+    # 路由和只限流路由票时一样：生成、质检的失败不影响路由
+    assert (health.overall.route_fallback, health.overall.route_lost_votes) == (5, 5)
+    assert health.reasons[0].startswith("路由：12 条里有 5 条（41.7%）没用上判断层")
+    assert any("至少有一票没算上" in reason for reason in health.reasons)
+    usage = run.data["usage"]
+    assert list(health.by_purpose) == list(usage["by_purpose"]) == ["route", "generate", "qa"]
+    for purpose, p in health.by_purpose.items():  # 健康度和 §14 用量数的是同一批调用
+        assert p.calls == usage["by_purpose"][purpose]["calls"]
+        assert p.failed == usage["by_purpose"][purpose]["errors"] == sum(p.errors.values())
+        assert set(p.errors) <= {"http_429", "LLMError"} and p.timeouts == 0
+    assert health.by_purpose["route"].failed == 15 and health.by_purpose["generate"].failed > 0
+    assert 0.3 <= usage["errors"] / usage["calls"] <= 0.5
+    overall = health.overall
+    assert overall.qa_unavailable <= overall.qa_judged
+    assert overall.generation_unusable <= overall.generation_attempted
+    assert f"失败的 {usage['errors']} 次调用按 0 token 计" in run.out
 
 
 def test_calibration_uses_only_judge_routed_cases(tmp_path):
@@ -411,7 +449,9 @@ def test_one_unreadable_vote_per_case_leaves_no_degraded_code(tmp_path):
     ]
     assert len(run.cases_where(route_votes=3, route_votes_usable=2)) == 12
     assert "路由丢票的用例 12 条" in run.out and f"{PICKED[0].id} 2/3" in run.out
-    assert "降级" not in run.err  # 进度行里也没有：只有健康度看得出来
+    # 进度行里没有失败、没有降级，只有丢票看得出来
+    assert "降级" not in run.err and "（失败" not in run.err
+    assert run.err.count("，路由只有 2/3 票算数") == 12
     # 丢票的上限比退回关键词规则的宽（10%）：12 条里丢 1 条不算问题
     one = _run(
         tmp_path, lambda r, case, nth: "嗯" if (r.purpose, case, nth) == ("route", 0, 1) else None
@@ -539,13 +579,16 @@ def test_an_invalid_run_outranks_a_baseline_regression(tmp_path):
 def test_help_and_module_docstring_list_the_exit_codes():
     import rodit.eval.cli as cli
 
-    text = build_parser().format_help()
-    for word in ("--allow-degraded", "--max-degraded", "--min-interval", "退出码：0 正常；1 回归"):
+    def squeezed(text: str) -> str:  # argparse 按终端宽度在空格处折行：去掉空白再比
+        return "".join(text.split())
+
+    text = squeezed(build_parser().format_help())
+    for word in ("--allow-degraded", "--max-degraded", "--min-interval", "退出码：0正常；1回归"):
         assert word in text, word
-    assert "3 这一轮没有有效评到模型" in text and "130 被中断" in text
-    doc = cli.__doc__ or ""
-    assert "退出码：0 正常；1 回归比较有指标下降；2 " in doc
-    assert "3 这一轮没有有效评到模型" in doc and "130 被中断" in doc
+    assert "3这一轮没有有效评到模型" in text and "130被中断" in text
+    doc = squeezed(cli.__doc__ or "")
+    assert "退出码：0正常；1回归比较有指标下降；2没有跑或没有跑完" in doc
+    assert "3这一轮没有有效评到模型" in doc and "130被中断" in doc
 
 
 # ================================================================ 连续失败提前停下、中断

@@ -35,9 +35,9 @@
 （判断层照常给出结果，但有一票没算上）、质检判断层不可用、生成没有可用草稿、引擎异常各有几条，
 每个用途的调用里失败（按原因分开）、被截断、为空、用不上的各有几次，实际做出路由的判断层。
 超过上限（默认 2%，至少容许 1 条；--max-degraded 改这一次的上限）这一轮就不算数：文本报告开头和
-上线门槛旁边写明原因，退出码 3。--allow-degraded 把这个退出码改回 0（JSON 里的 valid 照旧是
-false）。连续 8 条用例的大模型调用全部失败（抛 LLMError / LLMTimeout）时提前停下（退出码 2，
-不出报告）；--allow-degraded 时不停。
+上线门槛旁边写明原因，退出码 3。--allow-degraded 时不因此返回 3（没有回归就是 0；JSON 里的
+valid 照旧是 false）。连续 8 条用例的大模型调用全部失败（抛 LLMError / LLMTimeout）时提前停下
+（退出码 2，不出报告）；--allow-degraded 时不停。
 --min-interval 秒数：相邻两条用例的开始至少隔这么久（限流时用，等待不计入耗时）。
 
 部分评测：--intent 只跑某个问题类型，--limit N 用 --seed 随机抽 N 条（可复现）。
@@ -1143,7 +1143,7 @@ EXIT_CODES_HELP = (
     "退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完（配置错误、--json 的路径写不进去、"
     "连通性检查没过、连续多条用例的大模型调用全部失败而停下、最后写不进 JSON）；"
     "3 这一轮没有有效评到模型（--llm env：调用失败、被截断、读不出的用例超过上限，报告和 JSON "
-    "照常写出；--allow-degraded 时为 0）；130 被中断（结果没有保存）"
+    "照常写出，同时有指标下降也是 3；--allow-degraded 时不返回 3）；130 被中断（结果没有保存）"
 )
 
 
@@ -1183,8 +1183,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-degraded",
         action="store_true",
         help=(
-            "--llm env 时这一轮没有有效评到模型也返回 0（默认退出码 3；JSON 里 health.valid 照旧是 "
-            f"false），连续 {STOP_AFTER_FAILED_CASES} 条用例调用全部失败时也不提前停下"
+            "--llm env 时这一轮没有有效评到模型也不返回 3（JSON 里 health.valid 照旧是 false），"
+            f"连续 {STOP_AFTER_FAILED_CASES} 条用例调用全部失败时也不提前停下"
         ),
     )
     parser.add_argument(
@@ -1264,9 +1264,13 @@ def _progress_printer(err: TextIO) -> Progress:
         ms = trace.latency_ms.get("total")
         failed = sum(1 for c in trace.llm_calls if c.get("error"))
         calls = f"，大模型调用 {len(trace.llm_calls)} 次" + (f"（失败 {failed}）" if failed else "")
-        # 降级标记也打出来：有响应却用不上（被截断、读不出）时没有失败的调用，只有这里看得出不对
+        # 丢票和降级标记也打出来：有响应却用不上（被截断、读不出）时没有失败的调用，丢一票连降级
+        # 都没有——几百条跑完才在报告里发现就晚了
+        votes = trace.stats("route")
+        lost = f"，路由只有 {votes.usable}/{votes.calls} 票算数" if _lost_votes(trace) else ""
         degraded = f"，降级：{'、'.join(trace.degraded)}" if trace.degraded else ""
-        print(f"[{index}/{total}] {case.id} {_ms(ms)} 毫秒{calls}{degraded}", file=err, flush=True)
+        line = f"[{index}/{total}] {case.id} {_ms(ms)} 毫秒{calls}{lost}{degraded}"
+        print(line, file=err, flush=True)
 
     return show
 
