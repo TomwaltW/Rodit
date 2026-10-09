@@ -14,7 +14,8 @@
     题型和回答校验 core.decision、路由 / 质检的 state（core.states、core.pii、qa.masking）。
     质检一直用大模型判断层，分类器路由时也比较这一项）；
   - 路由判断层（decision_provider）和路由分类器模型文件的 SHA-256（classifier 路由时）；
-  - 大模型：模型名和接口地址（只留协议和主机）。
+  - 大模型：模型名和接口地址（只留协议和主机；端口是协议的默认端口时不写，https://主机 和
+    https://主机:443 是同一个接口）。
   模块按名字排序、按 importlib 找到源文件来算。列表以外的代码（阈值判断、质检硬规则……）
   改了指纹不变：它们的改动靠代码版本留痕（git，拿得到时；部署镜像里没有 .git 时由环境变量
   RODIT_GIT_SHA 提供），代码版本只作记录，same_setup 不比较。
@@ -31,7 +32,13 @@
 - 评测结论（EvalVerdict）：python -m rodit.ops record-eval --report 报告.json 从报告里取出
   指纹、测试集判定（§13.2 事实正确、合规满分率 ≥ 95%）、回归比较结果、用的大模型，记成系统事件
   eval.verdict（shop_id 为空，不属于任何店铺）。只收完整的评测（不收 --intent / --limit 的
-  部分评测，要有测试集）。
+  部分评测，要有测试集；条数要等于评测集这个 split 的条数，跑到一半停下的不收）。
+- 运行健康度（rodit.eval.health）：真实大模型跑的评测，调用失败、被截断、读不出时链路按 §12.2
+  降级，照样跑完、给出一组数字，量的却是兜底逻辑。这样的报告不收：按报告 health 里的计数用固定的
+  DEFAULT_CEILING / LOST_VOTE_CEILING 重新算一遍 assess（不看报告自己写的 valid、reasons、
+  ceiling），给出原因的抛 ModelNotEvaluated；计数和报告对不上的也不收。收下的结论带着这些计数
+  （EvalVerdict.health_overall / health_test），describe_verdict 写出来。离线替身不调大模型，
+  没有健康度可看，照旧。
 - 测试集依据（test_set_evidence）：上线状态、验收报告从 eval.verdict 里挑指纹和线上一致
   （same_setup：除代码版本外每一项都一样）、用真实大模型（--llm env）跑的最近一次结论：测试集
   达标且回归没有下降算通过。离线替身的结论只作回归基线（rodit.eval.cli 的说明），不算上线
@@ -48,7 +55,7 @@ import importlib.util
 import json
 import os
 import subprocess
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from functools import lru_cache
 from importlib import resources
@@ -64,6 +71,7 @@ from rodit.core.config import EngineConfig, config_fingerprint, llm_endpoint
 from rodit.core.enums import ProviderName
 from rodit.core.models import AuditEvent
 from rodit.core.questions import QA_QUESTIONS_VER, ROUTER_QUESTIONS_VER
+from rodit.eval.health import DEFAULT_CEILING, LOST_VOTE_CEILING, HealthCounts, assess
 from rodit.feedback.rollout import TestSetEvidence
 
 GIT_SHA_ENV = "RODIT_GIT_SHA"
@@ -94,6 +102,8 @@ JUDGE_PROMPT_MODULES: tuple[str, ...] = (
 """判断层提示词的版本（judge_prompt_version）算哪些模块的源码。"""
 GIT_TIMEOUT_S = 5
 SHORT = 12  # 报告、原因里显示的指纹长度
+DEFAULT_PORTS = {"https": 443, "http": 80}
+"""协议的默认端口：接口地址里写不写都是同一个接口（endpoint_of 不写）。"""
 
 HOW_TO_RECORD = (
     "用线上配置和线上的大模型跑 python -m rodit.eval --llm env --config <部署配置> --json 报告.json"
@@ -117,7 +127,8 @@ class EvalFingerprint(_Model):
     judge_prompt_ver: str | None = None  # 判断层提示词的版本（judge_prompt_version）
     decision_provider: str | None = None  # 路由判断层（ProviderName 的值）
     llm_model: str | None = None  # 大模型的模型名
-    llm_endpoint: str | None = None  # 大模型接口的协议和主机（端口），没有路径、用户名密码
+    # 大模型接口的协议和主机（不是默认端口时带端口），没有路径、用户名密码
+    llm_endpoint: str | None = None
     git_sha: str | None = None
     git_dirty: bool | None = None  # 有没有提交的改动（环境变量给的版本为 None）
     classifier_sha256: str | None = None  # 路由分类器模型文件（classifier 路由时）
@@ -230,16 +241,19 @@ def judge_prompt_version() -> str | None:
 
 def endpoint_of(base_url: str | None) -> str | None:
     """接口地址只留协议和主机（端口）：去掉用户名密码、路径、查询参数（和
-    eval.llm_env.describe_endpoint 同一口径）。没有主机时返回 None。"""
+    eval.llm_env.describe_endpoint 同一口径）。端口是这个协议的默认端口（DEFAULT_PORTS：https 的
+    443、http 的 80）时不写：https://主机 和 https://主机:443 是同一个接口，比较时要相等。
+    没有主机时返回 None。"""
     if not base_url:
         return None
     parts = urlsplit(base_url.strip())
     if not parts.hostname:
         return None
     try:
-        port = f":{parts.port}" if parts.port else ""
+        number = parts.port
     except ValueError:  # 端口不是数字：不显示
-        port = ""
+        number = None
+    port = f":{number}" if number and number != DEFAULT_PORTS.get(parts.scheme) else ""
     return f"{parts.scheme}://{parts.hostname}{port}"
 
 
@@ -403,6 +417,23 @@ class EvalVerdict(_Model):
     gate_passes: bool
     baseline_passed: bool | None = None  # 没做回归比较为 None
     report_sha256: str
+    # 运行健康度的计数（rodit.eval.health）：全部用例、测试集。真实大模型跑的才有；离线替身跑的、
+    # 以前记下的结论没有（None）
+    health_overall: HealthCounts | None = None
+    health_test: HealthCounts | None = None
+
+
+class ModelNotEvaluated(ValueError):
+    """报告里的这一轮没有有效评到大模型（rodit.eval.health.assess 给出了原因），不能记成评测结论。
+    reasons 是 assess 的原因，一句一条；异常说明里把它们都写上。"""
+
+    def __init__(self, reasons: Sequence[str]) -> None:
+        self.reasons = list(reasons)
+        super().__init__(self.reasons)
+
+    def __str__(self) -> str:
+        head = "这一轮没有有效评到大模型（量到的是降级后的兜底逻辑），不能记成评测结论："
+        return head + "".join(self.reasons)
 
 
 class _Digest(BaseModel):
@@ -429,20 +460,75 @@ class _BaselineDigest(_Digest):
     passed: bool
 
 
+class _CountsDigest(HealthCounts):
+    """报告的 health 里一组计数：字段照 HealthCounts，多出来的键不管。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class _HealthDigest(_Digest):
+    """报告的 health（rodit.eval.health.RunHealth 的 JSON）里 record-eval 用到的部分：只要计数。
+    valid、reasons、ceiling 不读（_run_health 重新算）；评测命令行以后加的字段不管。"""
+
+    overall: _CountsDigest
+    test: _CountsDigest | None = None
+
+
 class _ReportDigest(_Digest):
-    split: str
+    split: Literal["dev", "test", "all"]
     n: int
     intent: str | None = None
     limit: int | None = None
     gate: _GateDigest | None = None
     llm: _LLMDigest
+    health: Any = None  # 运行健康度：只有真实大模型跑的报告才看（_run_health）
     baseline: _BaselineDigest | None = None
     fingerprint: EvalFingerprint | None = None
 
 
+def _bad_fields(e: ValidationError, *prefix: str) -> str:
+    """校验没过的字段（a.b.c 的写法，去重、排序），prefix 是它们在报告里的上一级。"""
+    return "、".join(
+        sorted({".".join(str(p) for p in (*prefix, *err["loc"])) for err in e.errors()})
+    )
+
+
+def _run_health(
+    health: Any, *, split: str, n: int, test_n: int
+) -> tuple[HealthCounts, HealthCounts]:
+    """真实大模型跑的报告的 health →（全部用例的计数，测试集的计数）。split、n、test_n 是这份报告的
+    split、条数和测试集条数。读不出来、和报告对不上的抛 ValueError；这一轮没有有效评到大模型的抛
+    ModelNotEvaluated——按固定的 DEFAULT_CEILING / LOST_VOTE_CEILING 重新算 assess，报告里的
+    valid、reasons、ceiling 不作数（评测时可以放宽上限，记成上线依据时不行）。"""
+    try:
+        block = _HealthDigest.model_validate(health)
+    except ValidationError as e:
+        fields = _bad_fields(e, "health")
+        raise ValueError(f"不是完整的评测报告（字段不对：{fields}）") from None
+    overall, test = block.overall, block.test
+    if test is None and split == "test":
+        test = overall  # 只跑测试集：全部用例就是测试集
+    if overall.cases != n or test is None or test.cases != test_n:
+        seen = "没有计数" if test is None else f" {test.cases} 条"
+        raise ValueError(
+            f"报告里的运行健康度（health）和这份报告对不上（health：全部 {overall.cases} 条、"
+            f"测试集{seen}；报告：全部 {n} 条、测试集 {test_n} 条）："
+            "用本版本的 python -m rodit.eval --llm env --json 重新跑"
+        )
+    reasons = assess(overall, test, ceiling=DEFAULT_CEILING, lost_vote_ceiling=LOST_VOTE_CEILING)
+    if reasons:
+        raise ModelNotEvaluated(reasons)
+    return HealthCounts(**overall.model_dump()), HealthCounts(**test.model_dump())
+
+
 def verdict_from_report(data: Any, *, raw: bytes | None = None) -> EvalVerdict:
     """评测报告（--json 的内容，已解析）→ 结论。raw 是文件原文（算报告的 SHA-256；没给时按
-    规范化的 JSON 算）。不能作为测试集依据的报告抛 ValueError（原因写明）。"""
+    规范化的 JSON 算）。不能作为测试集依据的报告抛 ValueError（原因写明）：不是完整的评测
+    （部分评测、没有测试集、条数和评测集对不上），或者真实大模型跑的那一轮没有有效评到模型
+    （ModelNotEvaluated，见 _run_health）。离线替身跑的不看运行健康度。"""
+    # 只有这里用评测集：线上服务 import 本模块（上线状态）时不必加载它
+    from rodit.eval.dataset import cases
+
     if not isinstance(data, Mapping):
         raise ValueError("不是评测报告（应为 python -m rodit.eval --json 的输出）")
     if not data.get("fingerprint"):
@@ -450,13 +536,23 @@ def verdict_from_report(data: Any, *, raw: bytes | None = None) -> EvalVerdict:
     try:
         digest = _ReportDigest.model_validate(dict(data))
     except ValidationError as e:
-        fields = "、".join(sorted({".".join(str(p) for p in err["loc"]) for err in e.errors()}))
-        raise ValueError(f"不是完整的评测报告（字段不对：{fields}）") from None
+        raise ValueError(f"不是完整的评测报告（字段不对：{_bad_fields(e)}）") from None
     if digest.intent is not None or digest.limit is not None:
         raise ValueError("部分评测（--intent / --limit）不能作为上线结论：请跑完整的评测集")
     if digest.gate is None or digest.split == "dev":
         raise ValueError("报告里没有测试集判定：要用 --split test 或 all（§13.1 留出的测试集）")
+    size = len(cases(digest.split))
+    if digest.n != size:
+        raise ValueError(
+            f"报告不完整：评测集 {digest.split} 共 {size} 条，报告里是 {digest.n} 条"
+            "（评测没有跑完，或者跑的不是这一版评测集）：请把完整的评测集跑完"
+        )
     assert digest.fingerprint is not None
+    health_overall = health_test = None
+    if digest.llm.mode == "env" and digest.health is not None:
+        health_overall, health_test = _run_health(
+            digest.health, split=digest.split, n=digest.n, test_n=digest.gate.n
+        )
     if raw is None:
         raw = json_bytes(data)
     return EvalVerdict(
@@ -473,6 +569,8 @@ def verdict_from_report(data: Any, *, raw: bytes | None = None) -> EvalVerdict:
         gate_passes=digest.gate.passes,
         baseline_passed=digest.baseline.passed if digest.baseline is not None else None,
         report_sha256=hashlib.sha256(raw).hexdigest(),
+        health_overall=health_overall,
+        health_test=health_test,
     )
 
 
@@ -513,8 +611,26 @@ def _when(at: datetime) -> str:
     return f"{at.astimezone(CST):%Y-%m-%d %H:%M}"
 
 
+def describe_health(c: HealthCounts) -> str:
+    """一组运行健康度计数的说明，每项是"出问题的条数/分母"：路由退回（关键词规则）、质检不可用、
+    生成没有可用草稿这三项总是写；路由丢票、引擎异常、被时间预算截断有才写。"""
+    parts = [
+        f"路由退回 {c.route_fallback}/{c.cases}",
+        f"质检不可用 {c.qa_unavailable}/{c.qa_judged}",
+        f"生成没有可用草稿 {c.generation_unusable}/{c.generation_attempted}",
+    ]
+    rarer = (
+        ("路由丢票", c.route_lost_votes),
+        ("引擎异常", c.engine_errors),
+        ("被时间预算截断", c.budget_cut),
+    )
+    parts += [f"{label} {count}/{c.cases}" for label, count in rarer if count]
+    return "、".join(parts)
+
+
 def describe_verdict(at: datetime, v: EvalVerdict) -> str:
-    """结论的一句话说明（中文，没有买家数据）。"""
+    """结论的一句话说明（中文，没有买家数据）。带运行健康度的结论（真实大模型跑的）最后写上
+    全部用例的计数（describe_health）。"""
     model = v.model or "未知模型"
     text = (
         f"{_when(at)} 的评测（{model}，测试集 {v.test_n} 条）：事实正确 {_pct(v.factual)}、"
@@ -523,7 +639,10 @@ def describe_verdict(at: datetime, v: EvalVerdict) -> str:
     if v.baseline_passed is False:
         text += "；和基线比有指标下降（§13.5）"
     passed = v.gate_passes and v.baseline_passed is not False
-    return text + ("，达标" if passed else "，没达标")
+    text += "，达标" if passed else "，没达标"
+    if v.health_overall is not None:
+        text += f"；运行健康度：{describe_health(v.health_overall)}"
+    return text
 
 
 def test_set_evidence(events: Iterable[AuditEvent], running: EvalFingerprint) -> TestSetEvidence:
@@ -580,7 +699,9 @@ __all__ = [
     "LLM_MODEL_ENV",
     "EvalFingerprint",
     "EvalVerdict",
+    "ModelNotEvaluated",
     "current_fingerprint",
+    "describe_health",
     "describe_verdict",
     "differences",
     "endpoint_of",

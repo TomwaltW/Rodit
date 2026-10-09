@@ -133,6 +133,43 @@ def test_running_llm_follows_the_production_rule():
         assert endpoint_of(url) == describe_endpoint(type("C", (), {"base_url": url})())
 
 
+@pytest.mark.parametrize(
+    ("url", "endpoint"),
+    [
+        ("https://llm.example.invalid:443/v1", "https://llm.example.invalid"),
+        ("https://llm.example.invalid/v1", "https://llm.example.invalid"),
+        ("http://10.0.0.8:80/v1", "http://10.0.0.8"),
+        ("http://10.0.0.8/v1", "http://10.0.0.8"),
+        ("HTTPS://LLM.Example.invalid:443", "https://llm.example.invalid"),
+        (" https://user:pw@llm.example.invalid:443/v1?x=1\n", "https://llm.example.invalid"),
+        # 不是这个协议的默认端口：照写
+        ("https://llm.example.invalid:8443/v1", "https://llm.example.invalid:8443"),
+        ("https://llm.example.invalid:80/v1", "https://llm.example.invalid:80"),
+        ("http://llm.example.invalid:443/v1", "http://llm.example.invalid:443"),
+        ("http://10.0.0.8:8080/v1", "http://10.0.0.8:8080"),
+    ],
+)
+def test_endpoint_of_leaves_out_the_default_port(url: str, endpoint: str):
+    assert endpoint_of(url) == endpoint
+
+
+def test_an_explicit_default_port_is_the_same_endpoint():
+    """部署的地址写了 :443、评测时没写（或者反过来）：是同一个接口，评测结论照样算数；
+    换了端口才是另一个接口。"""
+    cfg = EngineConfig()
+    plain = current_fingerprint(cfg, environ=LLM_ENV)
+    explicit_url = "https://llm.example.invalid:443/v1"
+    explicit = current_fingerprint(cfg, environ={**LLM_ENV, LLM_BASE_URL_ENV: explicit_url})
+    assert plain.llm_endpoint == explicit.llm_endpoint == "https://llm.example.invalid"
+    assert same_setup(plain, explicit)
+    assert evidence(verdict_for(plain), explicit).passed is True
+    assert evidence(verdict_for(explicit), plain).passed is True
+    other_url = "https://llm.example.invalid:8443/v1"
+    other = current_fingerprint(cfg, environ={**LLM_ENV, LLM_BASE_URL_ENV: other_url})
+    ev = evidence(verdict_for(plain), other)
+    assert ev.passed is None and "https://llm.example.invalid:8443" in (ev.reason or "")
+
+
 def test_the_eval_client_follows_the_production_rule(monkeypatch):
     """配置钉了模型 B、评测机器的环境变量是模型 A：评测用 B（和线上一样），记下的也是 B。"""
     monkeypatch.setenv(LLM_BASE_URL_ENV, "https://llm-a.example.invalid/v1")
