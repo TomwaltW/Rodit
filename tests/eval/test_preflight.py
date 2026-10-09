@@ -293,14 +293,16 @@ def test_summary_lists_calls_latencies_timeouts_and_the_network_path():
         "  网络路径：不确定经没经代理（不是直接走 HTTP 的客户端，或者注入了 transport）",
     ]
     assert len(fake.calls) == 5  # 不重试、不遍历评测集
+    # 生成最先发（摘要照旧按链路的顺序列）：头一次请求的一次性开销不去占判断层 1 秒的超时
+    assert [r.purpose for r in fake.calls] == ["generate", "route", "route", "route", "qa"]
 
 
 def test_a_latency_above_70_percent_of_the_timeout_is_a_warning_not_a_failure():
     clock = ThreadClock()
-    model = scripted(clock, latency={"route": [0.2, 0.8, 0.2], "qa": 0.7, "generate": 1.9})
+    model = scripted(clock, latency={"route": [0.2, 0.8, 0.2], "qa": 0.5, "generate": 1.9})
     summary = run_preflight(_fake(model), timer=clock)
     warnings = [line.strip() for line in summary if "注意：" in line]
-    # 路由 0.80 > 1 × 70%；质检 0.70 正好不算；生成 1.90 > 2.5 × 70%
+    # 路由 0.80 > 1 × 70%；质检 0.50 没到；生成 1.90 > 2.5 × 70%
     assert len(warnings) == 2
     assert warnings[0].startswith("注意：最慢的一票用了 0.80 秒，超过单次超时 1 秒的 70%")
     assert "间歇性超时" in warnings[0] and "调大 decision.timeout_s" in warnings[0]
@@ -308,6 +310,9 @@ def test_a_latency_above_70_percent_of_the_timeout_is_a_warning_not_a_failure():
     assert warnings[1].startswith("注意：最慢的一次用了 1.90 秒，超过单次超时 2.5 秒的 70%")
     assert "调大 generation.timeout_s" in warnings[1]
     assert summary.index("    " + warnings[0]) == 2  # 紧跟在路由那一行后面
+
+    exactly = scripted(clock, latency={"route": 0.7})  # 正好 70%：不提醒
+    assert not any("注意：" in line for line in run_preflight(_fake(exactly), timer=clock))
 
 
 @pytest.mark.parametrize("provider", ["classifier", "rules"])
@@ -412,6 +417,7 @@ def test_slow_judge_calls_fail_with_the_latency_next_to_the_timeout():
     assert "  生成（1 次）：通过，耗时 1.20 秒，单次超时 2.5 秒（generation.timeout_s）" in lines
     (step,) = lines[lines.index("下一步：") + 1 :]
     for part in (
+        "可以先再试一次",
         "decision.timeout_s / generation.timeout_s",
         "--config",
         "不能当上线依据",

@@ -19,7 +19,8 @@ RODIT_LLM_PRICE_INPUT_PER_1K / RODIT_LLM_PRICE_OUTPUT_PER_1K（每 1000 token �
 - 生成：真实的生成提示词（generation.temperature / max_tokens / timeout_s），输出用生成环节自己的
   解析检查。
 请求里的买家消息、商品、依据来自合成演示世界（rodit.testing.fixtures，全部手造），大小和评测时相当，
-没有个人信息。一共 vote_samples + qa_vote_samples + 1 次调用（默认 5 次），不重试，不计入评测用量。
+没有个人信息。一共 vote_samples + qa_vote_samples + 1 次调用（默认 5 次），不重试，不计入评测用量；
+生成最先发，头一次请求的一次性开销（DNS、代理建连、模型服务预热）不去占判断层那 1 秒的超时。
 哪一次调用失败、回了空文本、被 max_tokens 截断，或者回答用该环节自己的解析读不出，都算没过：抛
 PreflightFailed，说明里有是哪种请求、失败原因（HTTP 状态码和错误代码读 LLMError 的 status / kind /
 code，不解析消息）、实测耗时和配置的超时、每种原因的下一步。通过时返回摘要：每种请求的调用次数、
@@ -436,9 +437,14 @@ def _synthetic_requests(
 
 
 def _check_all(probe: _Probe, config: EngineConfig) -> list[_Shape]:
-    """python -m rodit.eval 的三种请求：路由、质检、生成（一种没过也接着查完，一次看全）。"""
+    """python -m rodit.eval 的三种请求：路由、质检、生成（一种没过也接着查完，一次看全）。
+
+    生成最先发，返回的顺序照旧按链路排：这个进程头一次请求多付的一次性开销（DNS、代理建连、
+    模型服务预热）落在超时最宽、只有一次调用的生成请求上；判断层的请求在它之后发，量到的是
+    平时的耗时，不会因为头一次慢就超时。"""
     decision = config.decision
     route_request, qa_request, generation_request = _synthetic_requests(config)
+    generation = _check_generation(probe, generation_request)
     not_llm = f"不走大模型判断层（decision.provider 是 {decision.provider.value}）"
     shapes: list[_Shape] = []
     if _judged_by_llm(decision, ROUTE):
@@ -453,7 +459,7 @@ def _check_all(probe: _Probe, config: EngineConfig) -> list[_Shape]:
         shapes.append(_check_judge(QA, probe, provider, qa_request))
     else:
         shapes.append(_Shape(QA, skipped=f"这份配置的质检{not_llm}"))
-    shapes.append(_check_generation(probe, generation_request))
+    shapes.append(generation)
     return shapes
 
 
@@ -513,9 +519,10 @@ def _next_step(cause: str, client: object, config: EngineConfig) -> str:
     votes = config.decision.vote_samples
     steps = {
         "timeout": (
-            "超时：从这台机器调这个接口，单次请求比配置的超时慢。想先探一探模型，就另写一份把 "
-            "decision.timeout_s / generation.timeout_s（和 latency.message_budget_s）调大的 YAML，"
-            f"用 --config 跑——{_NOT_EVIDENCE}；再看上面的网络路径，请求是不是绕了代理。"
+            "超时：从这台机器调这个接口，单次请求比配置的超时慢（可以先再试一次：模型服务刚被"
+            "调用时可能还在预热）。一直超时的话，想先探一探模型，就另写一份把 decision.timeout_s / "
+            "generation.timeout_s（和 latency.message_budget_s）调大的 YAML，用 --config 跑——"
+            f"{_NOT_EVIDENCE}；再看上面的网络路径，请求是不是绕了代理。"
             "环境变量 RODIT_LLM_TIMEOUT_S 管不到这些请求。"
         ),
         "rate_limit": (
