@@ -2,6 +2,7 @@
 
 - 直接回答、附带追问两条大模型草稿并行生成，按原顺序收回（结果和逐条生成一样）；
 - 剩余时间不够调一次大模型（core.budget.llm_allowed）→ 不调，退回 FAQ / 模板；
+  本来要写大模型草稿才记一笔（core.budget.note_llm_skipped），FAQ / 模板占满名额的不记；
 - 到截止时间还没返回的草稿丢掉，已经返回的照用；单次调用的超时不超过剩余时间；
 - 工作线程带着调用方的店铺范围（大模型成本按店铺归属，§12.4）和截止时间。
 """
@@ -10,6 +11,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -215,3 +218,124 @@ def test_unexpected_error_still_raises(world, ev, route):
     with pytest.raises(RuntimeError, match="boom"):
         generate(FakeLLMClient(boom), world, ev, route)
     assert threads and threading.get_ident() not in threads  # 错误出在工作线程里，照样抛给调用方
+
+
+# ================================================================ 时间不够没调：告诉引擎
+
+
+@contextmanager
+def short_of_time(clock: Monotonic) -> Iterator[None]:
+    """还剩 0.5 秒，下限 0.8 秒：没过期，但来不及调一次大模型。"""
+    with budget.deadline_scope(4.5, min_llm_remaining_s=0.8, now=clock):
+        clock.t += 4.0
+        yield
+
+
+def test_skip_is_noted_when_a_model_draft_was_wanted(world, ev, route):
+    llm = FakeLLMClient(lambda r: reply(DIRECT))
+    clock = Monotonic()
+    with short_of_time(clock), budget.llm_skip_scope() as skip:
+        assert not budget.llm_allowed() and not budget.expired()
+        drafts = generate(llm, world, ev, route)
+    assert drafts == [] and llm.calls == []
+    assert skip.skipped is True
+
+
+def test_skip_is_noted_when_templates_leave_a_slot_for_the_model(world, ev, route):
+    """模板先占一个名额，剩下的名额本来要给大模型：没调也算（退回的模板照常返回）。"""
+    rule = ev.platform_rule(PlatformRuleKey.APPLY_AFTERSALE, "在订单页点「申请售后」发起")
+    bundle = EvidenceBundle(evidences=[ev.policy(PolicyKey.SEVEN_DAY_RETURN), rule])
+    llm = FakeLLMClient(lambda r: reply(DIRECT))
+    clock = Monotonic()
+    with short_of_time(clock), budget.llm_skip_scope() as skip:
+        drafts = DefaultAnswerGenerator(llm, CFG).generate(
+            make_context("退货怎么申请", world), route(Intent.RETURN_POLICY), bundle
+        )
+    assert [d.template_id for d in drafts] == [T.APPLY_AFTERSALE] and llm.calls == []
+    assert skip.skipped is True
+
+
+def test_skip_is_noted_once_the_deadline_has_passed(world, ev, route):
+    llm = FakeLLMClient(lambda r: reply(DIRECT))
+    clock = Monotonic()
+    with budget.deadline_scope(4.5, min_llm_remaining_s=0.8, now=clock):
+        clock.t += 10
+        with budget.llm_skip_scope() as skip:
+            assert generate(llm, world, ev, route) == []
+    assert skip.skipped is True and llm.calls == []
+
+
+def test_no_skip_when_faq_fills_the_slots(world, ev, route):
+    """FAQ 直答：本来就不调大模型，时间再紧也不算少了东西。"""
+    faq = ev.faq("发什么快递", score=CFG.faq_direct_min_score, faq_id=7)
+    llm = FakeLLMClient(responses=[])
+    clock = Monotonic()
+    with short_of_time(clock), budget.llm_skip_scope() as skip:
+        drafts = DefaultAnswerGenerator(llm, CFG).generate(
+            make_context("发什么快递呀", world),
+            route(Intent.SHIPPING_POLICY),
+            EvidenceBundle(evidences=[faq, ev.policy(PolicyKey.COURIER)]),
+        )
+    assert [d.kind for d in drafts] == [DraftKind.FAQ] and llm.calls == []
+    assert skip.skipped is False
+
+
+def test_no_skip_when_templates_answer(world, ev, route):
+    llm = FakeLLMClient(responses=[])
+    clock = Monotonic()
+    with short_of_time(clock), budget.llm_skip_scope() as skip:
+        greeting = DefaultAnswerGenerator(llm, CFG).generate(
+            make_context("在吗", world), route(Intent.GREETING), EvidenceBundle()
+        )
+        clarify = DefaultAnswerGenerator(llm, CFG).generate(
+            make_context("这个是纯棉的吗？", world),
+            route(Intent.PRODUCT_SPEC),
+            EvidenceBundle(clarify_question="请问您问的是哪一款呢？"),
+        )
+        nothing = DefaultAnswerGenerator(llm, CFG).generate(
+            make_context("这个是纯棉的吗？", world), route(Intent.PRODUCT_SPEC), EvidenceBundle()
+        )
+    assert [d.kind for d in greeting] == [DraftKind.TEMPLATE]
+    assert [d.kind for d in clarify] == [DraftKind.TEMPLATE]
+    assert nothing == []  # 没有依据：不推荐，也不是时间的问题
+    assert skip.skipped is False and llm.calls == []
+
+
+def test_no_skip_when_a_template_takes_the_only_slot(world, ev, route):
+    """只要一条推荐、模板已经占了：没有名额给大模型，不记。"""
+    rule = ev.platform_rule(PlatformRuleKey.APPLY_AFTERSALE, "在订单页点「申请售后」发起")
+    bundle = EvidenceBundle(evidences=[ev.policy(PolicyKey.SEVEN_DAY_RETURN), rule])
+    llm = FakeLLMClient(responses=[])
+    clock = Monotonic()
+    with short_of_time(clock), budget.llm_skip_scope() as skip:
+        drafts = DefaultAnswerGenerator(llm, CFG).generate(
+            make_context("退货怎么申请", world, config_update={"suggestion_count": 1}),
+            route(Intent.RETURN_POLICY),
+            bundle,
+        )
+    assert [d.template_id for d in drafts] == [T.APPLY_AFTERSALE] and llm.calls == []
+    assert skip.skipped is False
+
+
+def test_no_skip_with_time_to_spare_or_without_a_deadline(world, ev, route):
+    llm = FakeLLMClient(lambda r: reply(FOLLOWUP if is_followup(r) else DIRECT))
+    with budget.llm_skip_scope() as no_deadline:
+        assert len(generate(llm, world, ev, route)) == 2
+    clock = Monotonic()
+    with budget.deadline_scope(4.5, min_llm_remaining_s=0.8, now=clock):
+        clock.t += 1.0
+        with budget.llm_skip_scope() as in_time:
+            assert len(generate(llm, world, ev, route)) == 2
+    assert no_deadline.skipped is False and in_time.skipped is False
+    assert len(llm.calls) == 4
+
+
+def test_failed_or_unparseable_model_output_is_not_a_skip(world, ev, route):
+    """调了但失败 / 读不出来不是"时间不够没调"：不记（引擎不记 budget）。"""
+    clock = Monotonic()
+    with budget.deadline_scope(4.5, min_llm_remaining_s=0.8, now=clock):
+        with budget.llm_skip_scope() as failed:
+            assert generate(FakeLLMClient(lambda r: LLMError("接口失败")), world, ev, route) == []
+        with budget.llm_skip_scope() as garbled:
+            assert generate(FakeLLMClient(lambda r: "不是 JSON"), world, ev, route) == []
+    assert failed.skipped is False and garbled.skipped is False

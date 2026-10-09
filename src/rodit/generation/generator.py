@@ -25,6 +25,8 @@ SOOTHE（规则 3）先放一条安抚话术，剩下的名额按上面的顺序
 - 几条大模型草稿（直接回答、附带追问）并行生成，按原顺序收回：和逐条调用的结果一样——
   前面一条调用失败（LLMError）就不用后面的，前面一条是追问（need_clarify）也不用后面的；
 - 剩余时间不够调一次大模型（core.budget.llm_allowed() 为 False）→ 不调，退回 FAQ / 模板；
+  还有名额要写大模型草稿时才算"没调"，用 core.budget.note_llm_skipped() 记一笔，引擎据此给
+  这一条记 budget 降级；FAQ / 模板已经占满名额、本来就不用大模型的不记；
 - 最多等到截止时间：到点还没返回的草稿丢掉（线程在后台跑完，结果不用），照常退回模板；
 - 单次调用的超时不超过剩余时间（prompt.build_generation_request 里 clamp_timeout）。
 没有截止时间（离线任务、测试）时等全部返回。
@@ -252,8 +254,12 @@ class DefaultAnswerGenerator:
         retry_feedback: list[str] | None,
     ) -> list[Draft]:
         variants = _LLM_VARIANTS[: max(slots, 0)]
-        if not variants or not budget.llm_allowed():
-            return []  # 没有名额，或剩余时间不够调一次大模型：退回 FAQ / 模板（§12.2）
+        if not variants:
+            return []  # 没有名额：本来就不用大模型
+        if not budget.llm_allowed():
+            # 剩余时间不够调一次大模型：退回 FAQ / 模板（§12.2），并告诉引擎这一条少了大模型草稿
+            budget.note_llm_skipped()
+            return []
         requests = [
             build_generation_request(
                 ctx,

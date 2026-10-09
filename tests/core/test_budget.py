@@ -18,6 +18,8 @@ from rodit.core.budget import (
     deadline_scope,
     expired,
     llm_allowed,
+    llm_skip_scope,
+    note_llm_skipped,
     remaining,
     submit_in_context,
 )
@@ -182,11 +184,14 @@ def test_public_names():
         "BackgroundWork",
         "background_scope",
         "Deadline",
+        "LLMSkip",
         "clamp_timeout",
         "current_deadline",
         "deadline_scope",
         "expired",
         "llm_allowed",
+        "llm_skip_scope",
+        "note_llm_skipped",
         "remaining",
         "submit_in_context",
     }
@@ -262,3 +267,64 @@ def test_negative_llm_floor_rejected():
             pass
     d = Deadline.until(1003.0, now=Mono(), min_llm_remaining_s=0.5)
     assert d.min_llm_remaining_s == 0.5 and "min_llm_remaining_s" in repr(d)
+
+
+# ================================================================ 时间不够没调大模型的记录
+
+
+def test_note_llm_skipped_marks_the_enclosing_scope_only():
+    note_llm_skipped()  # 不在 llm_skip_scope 里：什么都不做
+    with llm_skip_scope() as untouched:
+        pass
+    assert untouched.skipped is False and "False" in repr(untouched)
+    with llm_skip_scope() as skip:
+        assert skip.skipped is False
+        note_llm_skipped()
+        assert skip.skipped is True
+    with llm_skip_scope() as fresh:  # 每次进入一份新的，不带上一次的
+        assert fresh is not skip and fresh.skipped is False
+    note_llm_skipped()  # 退出后恢复：没有记录可记
+    assert fresh.skipped is False and untouched.skipped is False
+
+
+def test_nested_llm_skip_scope_records_on_the_innermost():
+    with llm_skip_scope() as outer:
+        with llm_skip_scope() as inner:
+            note_llm_skipped()
+        assert inner.skipped is True and outer.skipped is False
+        note_llm_skipped()  # 内层退出后恢复外层的
+        assert outer.skipped is True
+
+
+def test_llm_skip_scope_restores_on_exception():
+    with llm_skip_scope() as outer:
+        with pytest.raises(RuntimeError):
+            with llm_skip_scope():
+                raise RuntimeError("boom")
+        note_llm_skipped()
+    assert outer.skipped is True
+
+
+def test_llm_skip_scopes_in_parallel_workers_do_not_mix():
+    """引擎里并行的几条分条各在自己的线程里进入：一条记了，另一条和提交方都看不到。"""
+    entered = threading.Barrier(2, timeout=5)
+
+    def part(skips: bool) -> bool:
+        with llm_skip_scope() as skip:
+            entered.wait()  # 两条都进了各自的范围再往下
+            if skips:
+                note_llm_skipped()
+            return skip.skipped
+
+    with ThreadPoolExecutor(max_workers=2) as pool, llm_skip_scope() as submitter:
+        first = submit_in_context(pool, part, True)
+        second = submit_in_context(pool, part, False)
+        assert (first.result(), second.result()) == (True, False)
+    assert submitter.skipped is False
+
+
+def test_note_llm_skipped_from_a_worker_reaches_the_submitter_scope():
+    """范围里提交的任务带着这份记录（submit_in_context 复制上下文）：任务里记的，提交方看得到。"""
+    with ThreadPoolExecutor(max_workers=1) as pool, llm_skip_scope() as skip:
+        submit_in_context(pool, note_llm_skipped).result()
+    assert skip.skipped is True
