@@ -29,9 +29,16 @@ from rodit.core.enums import Platform
 from rodit.core.errors import LLMError
 from rodit.core.pii import mask_pii
 from rodit.core.ports import AuditLog, ConversationRepository, LLMClient, LLMRequest, LLMResponse
-from rodit.core.questions import Q_INTENT, QA_QUESTIONS, ROUTER_VOTE_QUESTIONS
+from rodit.core.questions import QA_QUESTIONS, ROUTER_QUESTIONS, ROUTER_VOTE_QUESTIONS
 from rodit.decision.voting import parse_sample
-from rodit.eval.runner import CallStats, EngineLike
+from rodit.eval.health import json_object_count
+from rodit.eval.runner import (
+    CAUSE_EMPTY,
+    CAUSE_TRUNCATED,
+    CAUSE_UNREADABLE,
+    CallStats,
+    EngineLike,
+)
 from rodit.generation import parse_generation_output
 from rodit.llm import MeteredLLMClient
 from rodit.testing.fakes import FakeClock
@@ -84,11 +91,17 @@ class DraftRecorder:
 
 
 def _readable(purpose: str, text: str) -> bool:
-    """这个环节的解析器读不读得出东西：路由要读得出主要问题（intent）这一票——别的问题、追问
-    答没答不看，置信度是按 intent 的有效票算的（§13.3）；质检五个问题都要读得出（少一个，
-    判断层就答不全）；生成要解析得出回答（§5.4 的 JSON）。别的用途不判断。"""
+    """这个环节的解析器读不读得出东西：路由要每个必答的问题（ROUTER_QUESTIONS：类型、要不要转
+    人工、情绪、是不是多个问题）都读得出——判断层每个问题都要有效票，哪一个不够都会退回关键词规则，
+    和连通性检查（llm_env._vote_problem）一条规则；追问（second_intent）答没答不看。质检五个问题都
+    要读得出（少一个，判断层就答不全）；生成要解析得出回答（§5.4 的 JSON）。别的用途不判断。
+    路由、质检、生成的回答里顶层的 JSON 对象不止一个（比如先写了一份草稿、后面才是最终答案）时一律
+    算读不出：解析器取到的未必是模型最后给的那个（health.json_object_count）。"""
+    if purpose in ("route", "qa", "generate") and json_object_count(text) > 1:
+        return False
     if purpose == "route":
-        return Q_INTENT in parse_sample(ROUTER_VOTE_QUESTIONS, text)
+        votes = parse_sample(ROUTER_VOTE_QUESTIONS, text)
+        return all(key in votes for key in ROUTER_QUESTIONS)
     if purpose == "qa":
         return len(parse_sample(QA_QUESTIONS, text)) == len(QA_QUESTIONS)
     if purpose == "generate":
@@ -99,20 +112,24 @@ def _readable(purpose: str, text: str) -> bool:
     return True
 
 
-def _worth(purpose: str, response: LLMResponse) -> dict[str, int]:
-    """一次有响应的调用记哪几项（runner.CallStats 的字段）。finish_reason 用 getattr 读：
-    别的 LLMClient 实现返回的对象不一定有这个字段。"""
+def _worth(purpose: str, response: LLMResponse) -> tuple[dict[str, int], str | None]:
+    """一次有响应的调用记哪几项（runner.CallStats 的字段），和用不上时的原因（只记一种：截断 >
+    空回答 > 读不出；用得上时为 None）。finish_reason 用 getattr 读：别的 LLMClient 实现返回的对象
+    不一定有这个字段。"""
     truncated = getattr(response, "finish_reason", None) == FINISH_TRUNCATED
     empty = not response.text.strip()
     usable = not empty and _readable(purpose, response.text)
     if purpose in ("route", "qa"):  # 判断层的一票：被截断的不算数，哪怕碰巧读得出
         usable = usable and not truncated
-    return {
+    counts = {
         "truncated": int(truncated),
         "empty": int(empty),
         "usable": int(usable),
         "unusable": int(not usable),
     }
+    if usable:
+        return counts, None
+    return counts, CAUSE_TRUNCATED if truncated else CAUSE_EMPTY if empty else CAUSE_UNREADABLE
 
 
 class CallRecorder:
@@ -121,7 +138,8 @@ class CallRecorder:
     - 调用抛 LLMError / LLMTimeout：failed（别的异常是代码缺陷，照常抛出，只记进 calls）；
     - 有响应：finish_reason 是 length 记 truncated，文本为空记 empty（两样可以同时有）；
       再看用不用得上——路由、质检的一票被截断、为空或读不出（_readable）都算作废，生成只看解析不
-      解析得出回答——用得上记 usable，否则记 unusable。
+      解析得出回答——用得上记 usable，否则记 unusable，另按原因记一笔（unusable_causes：
+      截断 / 空回答 / 读不出，一次调用只记一种；连续失败提前停下时报给操作的人）。
     只有计数，不留提示词和输出。线程安全（路由投票会并发调用同一个客户端）。
     """
 
@@ -129,6 +147,7 @@ class CallRecorder:
         self._inner = inner
         self._lock = threading.Lock()
         self._stats: dict[str, CallStats] = {}
+        self._causes: dict[str, int] = {}
 
     @property
     def model(self) -> str:
@@ -146,10 +165,13 @@ class CallRecorder:
             self._add(purpose, failed=1)
             raise
         try:
-            counts = _worth(purpose, response)
+            counts, cause = _worth(purpose, response)
         except Exception:  # noqa: BLE001 — 记录不能改变调用结果：判断不了就当用不上
-            counts = {"unusable": 1}
+            counts, cause = {"unusable": 1}, CAUSE_UNREADABLE
         self._add(purpose, **counts)
+        if cause is not None:
+            with self._lock:
+                self._causes[cause] = self._causes.get(cause, 0) + 1
         return response
 
     def _add(self, purpose: str, **counts: int) -> None:
@@ -162,12 +184,17 @@ class CallRecorder:
         with self._lock:
             return dict(self._stats)
 
+    def unusable_causes(self) -> dict[str, int]:
+        """有响应但用不上的调用，原因 → 次数（各用途合计）。"""
+        with self._lock:
+            return dict(self._causes)
+
 
 @dataclass
 class DemoHarness:
     """runner.EvalHarness 的实现：一个全新的演示单元（每条用例一套，互不影响）。
 
-    - audit：单元自己的审计，读 engine.result（质检原因等）；
+    - audit：单元自己的审计，读 engine.result（质检原因等）和 engine.qa（判断层判过几份草稿）；
     - usage：只有接大模型时有，本用例的 llm.usage 事件；
     - drafts：只有接大模型时有，本用例的模型草稿；
     - calls：只有接大模型时有，本用例每个用途的调用结果。

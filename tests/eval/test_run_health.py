@@ -10,8 +10,8 @@
 生成、送判断层质检；12 条里容许出问题的是 1 条（health.allowed(12, 0.02)）。
 这里的故障都算开跑之后才出现的（一开始就有的问题归连通性检查管，rodit.eval.llm_env.preflight），
 所以一律带 --skip-preflight：不依赖连通性检查发什么请求；只有"一次调用都不发"的那几条不带。
-失败原因的标签（health.error_label）要等 llm.usage 的 detail 带上 kind / status / code 才细分
-（rodit.llm.metering，任务 A）；在那之前是异常类型名。这里两种都认，只核对它确实来自 detail。
+失败原因的标签（health.error_label）按 llm.usage 的 detail 里的 kind / status / code 细分
+（rodit.llm.metering 写的）：这里核对的是细分之后的标签，退回成异常类型名就是回归。
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from rodit.core.questions import (
     Q_NEED_HUMAN,
     Q_PLATFORM_VIOLATION,
     Q_PROMISE_RISK,
+    Q_SECOND_INTENT,
     Q_TONE,
 )
 from rodit.engine import AssistEngine
@@ -66,6 +67,9 @@ from rodit.eval.harness import CallRecorder, llm_harness
 from rodit.eval.health import DEFAULT_CEILING, RunHealth, allowed, assess, error_label
 from rodit.eval.runner import (
     BACKGROUND_WAIT_S,
+    CAUSE_EMPTY,
+    CAUSE_TRUNCATED,
+    CAUSE_UNREADABLE,
     CallStats,
     CaseTrace,
     EvalAborted,
@@ -91,6 +95,13 @@ QA_PASS = {
     Q_PROMISE_RISK: {"answer": "否", "p": 0.05},
     Q_PLATFORM_VIOLATION: {"answer": "否", "p": 0.02},
     Q_TONE: {"score": 3},
+}
+
+ROUTE_VOTE = {  # 路由的一票：四个必答的问题都答了
+    Q_INTENT: {"choice": "greeting"},
+    Q_NEED_HUMAN: {"answer": "否", "p": 0.05},
+    Q_EMOTION: {"score": 0},
+    Q_MULTI_INTENT: {"answer": "否", "p": 0.05},
 }
 
 Fault = Callable[[LLMRequest, int, int], Any]
@@ -162,7 +173,7 @@ class Run:
     out: str
     err: str
     data: dict[str, Any] | None  # --json 写出的完整结果；没写出来为 None
-    client: FakeLLMClient
+    client: Any  # 默认是 FakeLLMClient
 
     @property
     def health(self) -> RunHealth:
@@ -174,8 +185,9 @@ class Run:
         return [c for c in self.data["cases"] if all(c[k] == v for k, v in fields.items())]
 
 
-def _run(tmp_path: Path, fault: Fault | None = None, *extra: str) -> Run:
-    client = FakeLLMClient(handler=Vendor(fault), model=MODEL)
+def _run(tmp_path: Path, fault: Fault | None = None, *extra: str, client: Any = None) -> Run:
+    """client 给了就用它（包在假模型外面的慢客户端、接了脚本化传输层的真实客户端），fault 不用。"""
+    client = client or FakeLLMClient(handler=Vendor(fault), model=MODEL)
     target = tmp_path / "report.json"
     out, err = io.StringIO(), io.StringIO()
     argv = [*ARGV, *extra, "--json", str(target)]
@@ -268,9 +280,8 @@ def test_every_routing_call_rejected(tmp_path):
     assert health.routed_by == {"rules": 12}
     route = health.by_purpose["route"]
     assert (route.calls, route.failed, route.unusable) == (36, 36, 0)
-    # 失败原因来自 llm.usage 的 detail：带了状态码就是 http_400:<代码>，否则是异常类型名
-    assert sum(route.errors.values()) == 36
-    assert set(route.errors) <= {"http_400:unsupported_parameter", "LLMError"}
+    # 失败原因来自 llm.usage 的 detail：状态码加模型服务的错误代码
+    assert route.errors == {"http_400:unsupported_parameter": 36}
     assert run.data["usage"]["error_types"] == route.errors
     assert health.by_purpose["generate"].failed == health.by_purpose["qa"].failed == 0
     # 报告头还写着配置的判断层，逐条和健康度写的是实际的
@@ -333,7 +344,7 @@ def test_forty_percent_of_routing_votes_rate_limited(tmp_path):
     assert health.routed_by == {"incloud_llm": 7, "rules": 5}
     route = health.by_purpose["route"]
     assert (route.calls, route.failed) == (36, 15)  # 36 票里丢 15 票：约四成
-    assert sum(route.errors.values()) == 15 and set(route.errors) <= {"http_429", "LLMError"}
+    assert route.errors == {"http_429": 15}
     assert [r.split("（")[0] for r in health.reasons] == [
         "路由：12 条里有 5 条",  # 退回关键词规则
         "路由：12 条里有 5 条",  # 丢票
@@ -381,7 +392,7 @@ def test_forty_percent_of_all_calls_rate_limited(tmp_path):
     for purpose, p in health.by_purpose.items():  # 健康度和 §14 用量数的是同一批调用
         assert p.calls == usage["by_purpose"][purpose]["calls"]
         assert p.failed == usage["by_purpose"][purpose]["errors"] == sum(p.errors.values())
-        assert set(p.errors) <= {"http_429", "LLMError"} and p.timeouts == 0
+        assert set(p.errors) <= {"http_429"} and p.timeouts == 0
     assert health.by_purpose["route"].failed == 15 and health.by_purpose["generate"].failed > 0
     assert 0.3 <= usage["errors"] / usage["calls"] <= 0.5
     overall = health.overall
@@ -525,7 +536,7 @@ def test_qa_judge_unavailable(tmp_path):
     assert health.test is not None and health.test.qa_unavailable == 4
     qa = health.by_purpose["qa"]
     assert qa.calls == qa.failed == qa.timeouts == 5
-    assert sum(qa.errors.values()) == 5 and set(qa.errors) <= {"timeout", "LLMTimeout"}
+    assert qa.errors == {"timeout": 5}
     assert health.reasons[0] == (
         "质检：有草稿送检的 5 条里有 5 条（100.0%）质检判断层不可用（只跑了硬规则），上限 1 条。"
     )
@@ -625,11 +636,11 @@ def test_stops_after_eight_consecutive_cases_whose_calls_all_failed(tmp_path):
     assert STOP_AFTER_FAILED_CASES == 8
     assert "[8/12]" in run.err and "[9/12]" not in run.err  # 第 8 条跑完就停，后面的没有调用
     last = run.err.strip().splitlines()[-1]
-    assert last.startswith("评测中止：连续 8 条用例的大模型调用全部失败（")
+    assert last.startswith("评测中止：连续 8 条用例的大模型调用没有一次用得上（")
     assert "跑到第 8 / 12 条停下：没有生成报告，也没有保存结果" in last
     assert "--allow-degraded" in last and "--min-interval" in last
     failed = len(run.client.calls)  # 8 条用例发出的调用，全部失败
-    assert f"（http_429 ×{failed}）" in last or f"（LLMError ×{failed}）" in last
+    assert f"（http_429 ×{failed}）" in last
     assert list(tmp_path.iterdir()) == []  # 没有报告，也没有留下临时文件
     # --allow-degraded：不停，跑完出报告
     full = _run(tmp_path, _outage, "--allow-degraded")
@@ -647,8 +658,9 @@ def test_a_case_that_gets_through_resets_the_count(tmp_path):
 
 
 def test_run_eval_stop_is_opt_in_and_counts_only_llm_failures():
-    """runner.run_eval 默认不停（evaluate 直接调用时照旧出报告）；只有调用抛 LLMError / LLMTimeout
-    才算失败，没调过大模型的用例不打断连续计数。"""
+    """runner.run_eval 默认不停（evaluate 直接调用时照旧出报告）；调用抛 LLMError / LLMTimeout
+    算失败（有响应但用不上的也算，见后面"连续用不上也停"），调用抛了别的异常的不算，没调过大模型的
+    用例不打断连续计数。"""
     client = FakeLLMClient(handler=Vendor(_outage), model=MODEL)
     report = evaluate("all", limit=12, seed=3, llm=client)
     assert report.n == 12 and report.health is not None and not report.health.valid
@@ -666,13 +678,22 @@ def test_run_eval_stop_is_opt_in_and_counts_only_llm_failures():
     assert not CaseTrace().all_calls_failed  # 没调过大模型
 
 
+def _run_interrupted(tmp_path: Path, fault: Fault) -> Run:
+    """故障里抛的是真的 KeyboardInterrupt。main() 要是没接住，pytest 会把它当成有人按了 Ctrl-C，
+    整个会话停在这里、后面的测试都不跑：在这里接住，让这一条测试失败。"""
+    try:
+        return _run(tmp_path, fault)
+    except KeyboardInterrupt:
+        pytest.fail("main() 让 KeyboardInterrupt 漏了出来")
+
+
 def test_keyboard_interrupt_reports_progress_and_saves_nothing(tmp_path):
     def fault(request: LLMRequest, case: int, nth: int):
         if case == 5:  # 第 6 条用例跑到一半按了 Ctrl-C
             raise KeyboardInterrupt
         return None
 
-    run = _run(tmp_path, fault)
+    run = _run_interrupted(tmp_path, fault)
     assert run.code == 130 and run.out == "" and run.data is None
     last = run.err.strip().splitlines()[-1]
     assert (
@@ -684,7 +705,7 @@ def test_keyboard_interrupt_reports_progress_and_saves_nothing(tmp_path):
     def at_once(request: LLMRequest, case: int, nth: int):
         raise KeyboardInterrupt
 
-    early = _run(tmp_path, at_once)
+    early = _run_interrupted(tmp_path, at_once)
     assert early.code == 130 and "评测被中断：还没有跑完一条，结果没有保存" in early.err
 
 
@@ -823,7 +844,9 @@ def test_trace_case_waits_for_background_work_before_reading_usage():
 
 def test_min_interval_spaces_the_starts_of_consecutive_cases(monkeypatch):
     naps: list[float] = []
-    monkeypatch.setattr(runner.time, "sleep", naps.append)
+    # 换的是 runner 自己等的那个名字，不是全进程的 time.sleep：evaluate() 结尾查 git 版本时
+    # subprocess 等子进程退出也在调 time.sleep，那些调用不该算进来
+    monkeypatch.setattr(runner, "_sleep", naps.append)
     out = io.StringIO()
     argv = ["--limit", "4", "--min-interval", "30", "--json"]
     assert main(argv, out=out, err=io.StringIO()) == 0
@@ -894,8 +917,11 @@ def test_served_models_are_shown_and_a_different_name_is_flagged(tmp_path):
     run = _run(tmp_path)
     calls = run.data["usage"]["calls"]
     assert run.data["usage"]["served_models"] == {MODEL: calls}
-    assert f"模型服务回显的模型名（成功的调用）：{MODEL} ×{calls}" in run.out
-    assert "回显的模型名和配置的" not in run.out
+    # 和配置的名字一样时不说"回显"：接口不回显的话，客户端填的就是配置的名字
+    assert (
+        f"计量记下的模型名（成功的调用；接口不回显时记的是配置的名字）：{MODEL} ×{calls}" in run.out
+    )
+    assert "回显" not in run.out.replace("接口不回显时记的是配置的名字", "")
     vendor = Vendor()
     snapshot = f"{MODEL}-2026-09-01"  # 配置的名字是别名，接口回显的是具体版本
 
@@ -913,8 +939,8 @@ def test_served_models_are_shown_and_a_different_name_is_flagged(tmp_path):
     usage = run.data["usage"]
     assert usage["served_models"] == {snapshot: usage["calls"] - usage["errors"]}
     assert run.data["llm"]["model"] == run.data["fingerprint"]["llm_model"] == MODEL
-    assert f"模型服务回显的模型名（成功的调用）：{snapshot} ×" in run.out
-    assert f"注意：回显的模型名和配置的 {MODEL} 不一样（配置的可能只是别名）" in run.out
+    assert f"计量记下的模型名（成功的调用；接口不回显时记的是配置的名字）：{snapshot} ×" in run.out
+    assert f"注意：接口回显的模型名和配置的 {MODEL} 不一样（配置的可能只是别名）" in run.out
 
 
 # ================================================================ 完整结果：先验证、原子写、写得出
@@ -1126,19 +1152,29 @@ def test_env_client_sends_the_configured_extra_body(monkeypatch):
 
 def test_call_recorder_counts_what_each_response_was_worth():
     intent = {Q_INTENT: {"choice": "greeting"}}
-    cut = LLMResponse(text=json.dumps(intent), finish_reason="length")
+    full = dict(ROUTE_VOTE)
+    cut = LLMResponse(text=json.dumps(full), finish_reason="length")
+    draft_then_final = json.dumps(full) + "\n" + json.dumps(full)
+    answer = {"answer": "亲，在的", "evidence_ids": []}
     answers: list[tuple[str, Any]] = [
-        ("route", intent),  # 只答了主要问题：这一票算数
-        ("route", {Q_NEED_HUMAN: {"answer": "否", "p": 0.1}}),  # 没答主要问题：作废
+        ("route", full),  # 四个必答的问题都答了：这一票算数
+        ("route", {**full, Q_SECOND_INTENT: {"choice": "无"}}),  # 追问答没答都行
+        ("route", intent),  # 只答了类型：判断层别的问题没有票，作废
+        ("route", {k: v for k, v in full.items() if k != Q_INTENT}),  # 没答类型：作废
         ("route", "好的，这位买家是在问物流。"),  # 不是 JSON：作废
         ("route", cut),  # 被 max_tokens 截断：作废，哪怕碰巧读得出
         ("route", LLMResponse(text="  ", finish_reason="stop")),  # 空：作废
+        ("route", LLMResponse(text="", finish_reason="length")),  # 截断而且是空的：原因记截断
+        ("route", draft_then_final),  # 两个顶层 JSON 对象（草稿 + 最终答案）：作废
         ("route", LLMTimeout("合成的故障：超时")),
         ("qa", dict(QA_PASS)),
         ("qa", {k: v for k, v in QA_PASS.items() if k != Q_TONE}),  # 少答一题：用不上
-        ("generate", {"answer": "亲，在的", "evidence_ids": []}),
+        ("qa", json.dumps(QA_PASS) + json.dumps(QA_PASS)),  # 两个对象：用不上
+        ("generate", answer),
         ("generate", "抱歉，我没办法按这个格式回答。"),  # 解析不出回答
         ("generate", LLMResponse(text='{"answer": "亲，在的"}', finish_reason="length")),
+        ("generate", '{"answer": "草稿"}\n' + json.dumps(answer, ensure_ascii=False)),  # 两个对象
+        ("generate", "{} " + json.dumps(answer, ensure_ascii=False)),  # 空对象不算一个
         ("other", "OK"),
     ]
     fake = FakeLLMClient(responses=[answer for _, answer in answers], model=MODEL)
@@ -1151,13 +1187,18 @@ def test_call_recorder_counts_what_each_response_was_worth():
             recorder.complete(_request(purpose))
     stats = recorder.stats()
     assert stats["route"] == CallStats(
-        calls=6, failed=1, truncated=1, empty=1, unusable=4, usable=1
+        calls=10, failed=1, truncated=2, empty=2, unusable=7, usable=2
     )
-    assert stats["qa"] == CallStats(calls=2, unusable=1, usable=1)
+    assert stats["qa"] == CallStats(calls=3, unusable=2, usable=1)
     # 生成：被截断但解析得出回答的照常用得上（生成器也会用它）
-    assert stats["generate"] == CallStats(calls=3, truncated=1, unusable=1, usable=2)
+    assert stats["generate"] == CallStats(calls=5, truncated=1, unusable=2, usable=3)
     assert stats["other"] == CallStats(calls=1, usable=1)
     assert recorder.model == MODEL and len(fake.calls) == len(answers)
+    # 用不上的每次调用记一种原因（截断 > 空回答 > 读不出），加起来就是 unusable 的总数
+    causes = recorder.unusable_causes()
+    assert causes == {CAUSE_TRUNCATED: 2, CAUSE_EMPTY: 1, CAUSE_UNREADABLE: 8}
+    assert sum(causes.values()) == sum(s.unusable for s in stats.values()) == 11
+    assert (CAUSE_TRUNCATED, CAUSE_EMPTY, CAUSE_UNREADABLE) == ("截断", "空回答", "读不出")
 
 
 def test_call_recorder_never_changes_the_outcome():
@@ -1167,15 +1208,20 @@ def test_call_recorder_never_changes_the_outcome():
         def complete(self, request: LLMRequest) -> Any:
             if request.purpose == "qa":
                 raise ValueError("合成的缺陷")
-            return SimpleNamespace(text=json.dumps({Q_INTENT: {"choice": "greeting"}}))
+            if request.purpose == "generate":
+                return SimpleNamespace(text=None)  # 连文本都不是：判断不了，当用不上
+            return SimpleNamespace(text=json.dumps(ROUTE_VOTE))
 
     recorder = CallRecorder(Odd())  # type: ignore[arg-type]
     response = recorder.complete(_request("route"))  # 响应对象没有 finish_reason 也照常
-    assert json.loads(response.text) == {Q_INTENT: {"choice": "greeting"}}
+    assert json.loads(response.text) == ROUTE_VOTE
     assert recorder.stats()["route"] == CallStats(calls=1, usable=1)
     with pytest.raises(ValueError):  # 不是 LLMError：照常抛出，不算模型服务的失败
         recorder.complete(_request("qa"))
     assert recorder.stats()["qa"] == CallStats(calls=1)
+    assert recorder.complete(_request("generate")).text is None  # 原样交回去
+    assert recorder.stats()["generate"] == CallStats(calls=1, unusable=1)
+    assert recorder.unusable_causes() == {CAUSE_UNREADABLE: 1}
 
 
 def test_llm_harness_records_calls_per_case():
@@ -1231,3 +1277,730 @@ def test_health_error_labels_come_from_the_usage_detail():
     }
     assert (route.truncated, route.empty, route.unusable) == (1, 0, 1)
     assert health["qa"].errors == {"LLMError": 1} and list(health) == ["route", "qa"]
+
+
+# ================================================================ 计数的口径：草稿有没有被判过
+
+# 抽到的 12 条里调大模型生成的有 5 条：4 条并行发两种话术（直接回答、带追问），1 条只发直接回答
+# 那一种——所以正常的一轮是 9 次生成调用；两种话术的草稿不一样时是 9 次质检调用。
+FOLLOWUP = "再在结尾追问一个问题"  # 只有带追问的那种话术（with_followup）的生成提示词里有
+REWRITE = "上次回答未通过质检"  # 只有质检不通过之后重写的生成提示词里有
+ASKS_BACK = "请问您还想了解哪方面呢"
+QA_REJECT = {**QA_PASS, Q_GROUNDED: {"answer": "否", "p": 0.1}}
+UNUSED = "（没有用上：没有拿到质检判断层的结论）"
+
+
+def _prompt(request: LLMRequest) -> str:
+    return "".join(m.content for m in request.messages)
+
+
+def _two_drafts(vendor: Vendor, request: LLMRequest) -> dict[str, Any]:
+    """两种话术写出不一样的草稿（默认的假模型两种话术答的一样，引擎只送检一份）：带追问的那一种
+    结尾多一句问话，于是每条生成用例有两份草稿并行送检，质检请求也认得出判的是哪一份。"""
+    answer = json.loads(vendor.answer(request))
+    if FOLLOWUP in _prompt(request):
+        answer["answer"] += f"，{ASKS_BACK}"
+    return answer
+
+
+def test_first_generation_variant_fails_and_the_second_answer_is_thrown_away(tmp_path):
+    """生成器并行发两种话术、按先后处理：第一种（直接回答）调用失败，就不用后面的，带追问那一种
+    答得再好也被丢掉。这条用例没有大模型草稿送到质检：算进 generation_unusable，哪怕它有一次
+    生成调用"用得上"。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "generate" and FOLLOWUP not in _prompt(request):
+            return _rejected(429, "rate_limit")
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    generate = health.by_purpose["generate"]
+    assert (generate.calls, generate.failed, generate.unusable) == (9, 5, 0)  # 带追问的 4 次答上了
+    assert generate.errors == {"http_429": 5}
+    overall = health.overall
+    assert (overall.generation_attempted, overall.generation_unusable) == (5, 5)
+    assert health.test is not None and health.test.generation_unusable == 4
+    assert "qa" not in health.by_purpose  # 一次质检判断层都没调：没有模型草稿可判
+    assert (overall.qa_judged, overall.qa_unavailable, overall.budget_cut) == (0, 0, 0)
+    assert run.data["degraded_counts"] == {}  # 引擎不记降级：只有这里的计数看得出来
+    assert health.reasons[0] == (
+        "生成：调过大模型生成的 5 条里有 5 条（100.0%）"
+        "没有大模型草稿送到质检（生成调用失败，或输出解析不了），上限 1 条。"
+    )
+    assert "生成没有可用草稿 5 / 5（调过大模型生成的）" in run.out
+    # 失败清单：被丢掉的那份草稿还列着，但写明没有用上
+    with_drafts = [f for f in run.data["failures"] if f["drafts"]]
+    assert with_drafts and all(f["drafts_unused"] for f in with_drafts)
+    assert all(len(f["drafts"]) == 1 for f in with_drafts)
+    assert run.out.count(f"    模型草稿 1{UNUSED}：") == len(with_drafts)
+
+
+def test_losing_only_the_second_generation_variant_is_not_counted(tmp_path):
+    """只有带追问的那一种失败：第一种照常送检、照常推荐，这条用例是模型答的。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "generate" and FOLLOWUP in _prompt(request):
+            return _rejected(429, "rate_limit")
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 0, run.err
+    health = _check_rule(run)
+    generate = health.by_purpose["generate"]
+    assert (generate.calls, generate.failed) == (9, 4)
+    assert health.valid and health.overall.generation_unusable == 0
+    assert (health.overall.qa_judged, health.overall.qa_unavailable) == (5, 0)
+    assert health.by_purpose["qa"].calls == 5
+    assert UNUSED not in run.out
+    assert not any(f["drafts_unused"] for f in run.data["failures"])
+
+
+def test_a_rewrite_that_fails_after_a_judged_draft_is_not_counted(tmp_path):
+    """第一份草稿判断层判了、没通过，带原因重写的那次生成调用失败：模型的草稿是判过的，
+    不算"没有草稿送到质检"。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "qa":
+            return dict(QA_REJECT)
+        if request.purpose == "generate" and REWRITE in _prompt(request):
+            return _rejected(429, "rate_limit")
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 0, run.err
+    health = _check_rule(run)
+    generate, qa = health.by_purpose["generate"], health.by_purpose["qa"]
+    assert (generate.calls, generate.failed) == (18, 9)  # 第一轮 9 次照常，重写的 9 次失败
+    assert (qa.calls, qa.failed, qa.unusable) == (5, 0, 0)
+    overall = health.overall
+    assert health.valid
+    assert (overall.generation_attempted, overall.generation_unusable) == (5, 0)
+    assert (overall.qa_judged, overall.qa_unavailable) == (5, 0)
+    assert UNUSED not in run.out  # 草稿是判断层判过的：不写"没有用上"
+    assert any(f["drafts"] and f["qa_reasons"] for f in run.data["failures"])
+
+
+def test_an_unparseable_first_variant_with_a_good_second_is_not_counted(tmp_path):
+    """第一种话术的输出解析不了（调用没有失败）：生成器跳过它，用后面那一份，照常送检。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "generate" and FOLLOWUP not in _prompt(request):
+            return "抱歉，我没办法按这个格式回答。"
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 0, run.err
+    health = _check_rule(run)
+    assert health.by_purpose["generate"].unusable == 5
+    # 两种话术都发的 4 条不算；只发直接回答那一种的 1 条确实没有可用草稿，照算（在上限之内）
+    assert health.valid and health.overall.generation_unusable == 1
+    assert health.by_purpose["qa"].calls == health.overall.qa_judged == 4
+
+
+def test_one_of_two_qa_calls_failing_is_not_qa_unavailable(tmp_path):
+    """两份草稿并行送检，其中一份的质检调用超时：引擎记 decision:qa，但另一份是判断层判过、照常
+    推荐的。这条用例不算"质检判断层不可用"；那次失败在调用那一行看得到。"""
+    vendor = Vendor()
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "generate":
+            return _two_drafts(vendor, request)
+        if request.purpose == "qa" and ASKS_BACK in _prompt(request):
+            return LLMTimeout("合成的故障：超时")
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 0, run.err
+    health = _check_rule(run)
+    qa = health.by_purpose["qa"]
+    assert (qa.calls, qa.failed, qa.errors) == (9, 4, {"timeout": 4})
+    assert run.data["degraded_counts"] == {"decision:qa": 4}
+    assert health.valid
+    assert (health.overall.qa_judged, health.overall.qa_unavailable) == (5, 0)
+    assert "质检判断层不可用 0 / 5（有草稿送检的）" in run.out
+    assert "  质检：调用 9，失败 4（timeout ×4）；" in run.out
+    marked = [c for c in run.data["cases"] if "decision:qa" in c["degraded"]]
+    assert len(marked) == 4 and all(c["has_suggestion"] for c in marked)
+    assert UNUSED not in run.out
+
+
+def test_every_qa_call_of_two_drafts_failing_is_qa_unavailable(tmp_path):
+    vendor = Vendor()
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "generate":
+            return _two_drafts(vendor, request)
+        return LLMTimeout("合成的故障：超时") if request.purpose == "qa" else None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    qa = health.by_purpose["qa"]
+    assert (qa.calls, qa.failed) == (9, 9)
+    assert (health.overall.qa_judged, health.overall.qa_unavailable) == (5, 5)
+    assert health.overall.generation_unusable == 0  # 草稿送到了质检，是质检没判成
+    assert health.reasons[0].startswith(
+        "质检：有草稿送检的 5 条里有 5 条（100.0%）质检判断层不可用"
+    )
+    # 草稿只过了硬规则，没有放行：失败清单里同样写明没有用上
+    assert f"    模型草稿 1{UNUSED}：" in run.out
+
+
+# ================================================================ 被时间预算截断：有没有草稿判完
+
+
+class Stalling:
+    """包在假模型外面的客户端：stall(请求) 为真的调用先不返回，等评测来等后台调用时才放行——那时
+    handle() 已经按时间预算返回了（和上面 SlowGeneration 一个办法，不靠睡眠）。"""
+
+    model = MODEL
+
+    def __init__(self, stall: Callable[[LLMRequest], bool], fault: Fault | None = None) -> None:
+        self.inner = FakeLLMClient(handler=Vendor(fault), model=MODEL)
+        self.stall = stall
+        self.release = threading.Event()
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        if self.stall(request):
+            self.release.wait(timeout=30)
+        return self.inner.complete(request)
+
+
+def _run_on_a_tight_budget(tmp_path: Path, monkeypatch, client: Stalling) -> Run:
+    original = AssistEngine.wait_background
+
+    def releasing(self: AssistEngine, shop_id: str, timeout: float | None = None) -> bool:
+        client.release.set()  # 评测在 handle() 返回之后才来等：这时才放卡住的调用返回
+        try:
+            return original(self, shop_id, timeout)
+        finally:
+            client.release.clear()  # 下一条用例重新卡
+
+    monkeypatch.setattr(AssistEngine, "wait_background", releasing)
+    config = tmp_path / "budget.yaml"
+    config.write_text(
+        "latency:\n  message_budget_s: 1.0\n  min_llm_remaining_s: 0.1\n", encoding="utf-8"
+    )
+    try:
+        return _run(tmp_path, None, "--config", str(config), client=client)
+    finally:
+        client.release.set()
+
+
+def test_a_budget_cut_before_any_draft_was_judged_is_counted(tmp_path, monkeypatch):
+    """质检调用到截止时间还没答完：引擎不等它，这条用例没有一份草稿拿到判断层的结论。那次调用
+    后来答完了、读得出来（CallRecorder 记它"用得上"），但结论引擎没有用——所以按引擎自己的
+    engine.qa 审计数，不按调用记录数。budget_cut 本身照旧不算问题，budget_unjudged 才算。"""
+    client = Stalling(lambda request: request.purpose == "qa")
+    run = _run_on_a_tight_budget(tmp_path, monkeypatch, client)
+    assert run.code == 3
+    health = _check_rule(run)
+    qa = health.by_purpose["qa"]
+    assert (qa.calls, qa.failed, qa.unusable) == (5, 0, 0) and health.late_calls == 5
+    overall = health.overall
+    assert (overall.budget_cut, overall.budget_unjudged) == (5, 5)
+    assert health.test is not None and health.test.budget_unjudged == 4
+    assert (overall.generation_unusable, overall.qa_unavailable) == (0, 0)
+    assert overall.route_fallback == 0
+    assert run.data["degraded_counts"] == {"budget": 5}
+    cut = "被时间预算截断、没有大模型草稿过完质检，上限 1 条。"
+    assert health.reasons == [
+        f"时间预算：12 条里有 5 条（41.7%）{cut}",
+        f"测试集：时间预算：6 条里有 4 条（66.7%）{cut}",
+    ]
+    assert "被时间预算截断 5（其中没有草稿过完质检判断层的 5）；" in run.out
+    assert f"    模型草稿 1{UNUSED}：" in run.out
+
+
+def test_a_budget_cut_during_a_rewrite_stays_neutral(tmp_path, monkeypatch):
+    """第一份草稿判断层判过（没通过），重写的那次生成调用到截止时间还没返回：被时间预算截断，但
+    模型的草稿是判过的——照实展示，不算"没评到模型"。"""
+
+    def reject(request: LLMRequest, case: int, nth: int):
+        return dict(QA_REJECT) if request.purpose == "qa" else None
+
+    client = Stalling(lambda r: r.purpose == "generate" and REWRITE in _prompt(r), reject)
+    run = _run_on_a_tight_budget(tmp_path, monkeypatch, client)
+    assert run.code == 0, run.err
+    health = _check_rule(run)
+    overall = health.overall
+    assert health.valid and (overall.budget_cut, overall.budget_unjudged) == (5, 0)
+    assert (overall.qa_judged, overall.qa_unavailable, overall.generation_unusable) == (5, 0, 0)
+    assert health.by_purpose["qa"].calls == 5
+    assert lines_starting(run.out, "运行健康度：有效")
+    assert "被时间预算截断 5（其中没有草稿过完质检判断层的 0）；" in run.out
+    assert UNUSED not in run.out
+    assert run.data["latency"]["limited_by_budget"] is True
+
+
+def lines_starting(out: str, head: str) -> list[str]:
+    return [line for line in out.splitlines() if line.startswith(head)]
+
+
+def test_health_counts_follow_the_engine_record_of_judged_drafts():
+    """_health_counts 的几条规则，直接用过程数据核对（各种丢草稿的情形见上面的整轮测试）。"""
+    from rodit.eval.cli import _health_counts
+
+    ok = CallStats(calls=2, usable=2)
+    half = CallStats(calls=2, failed=1, usable=1)
+    judged = CallStats(calls=1, usable=1)
+    traces = [
+        # 被截断，判断层判过一份：中性
+        CaseTrace(degraded=["budget"], calls={"generate": ok, "qa": judged}, judged_drafts=1),
+        # 被截断，质检调用后来答完了，但结论引擎没有用
+        CaseTrace(degraded=["budget"], calls={"generate": ok, "qa": judged}, judged_drafts=0),
+        # 被截断时第一种话术失败：归时间预算管，不重复算进生成
+        CaseTrace(degraded=["budget"], calls={"generate": half}, judged_drafts=0),
+        # 没被截断，第一种话术失败、没有质检调用：生成没有草稿送到质检
+        CaseTrace(calls={"generate": half}, judged_drafts=0),
+        # 两次质检调用失败一次：不算质检不可用
+        CaseTrace(degraded=["decision:qa"], calls={"generate": ok, "qa": half}, judged_drafts=1),
+        # 质检调用全失败
+        CaseTrace(
+            degraded=["decision:qa"],
+            calls={"generate": ok, "qa": CallStats(calls=2, failed=2)},
+            judged_drafts=0,
+        ),
+        CaseTrace(),  # 没调大模型的用例
+    ]
+    counts = _health_counts(traces)
+    assert (counts.cases, counts.budget_cut, counts.budget_unjudged) == (7, 3, 2)
+    assert (counts.generation_attempted, counts.generation_unusable) == (6, 1)
+    assert (counts.qa_judged, counts.qa_unavailable) == (4, 1)
+    # harness 没有审计（judged_drafts 是 None）：退回去看质检调用有没有读得出的
+    bare = [
+        CaseTrace(degraded=["budget"], calls={"qa": judged}),
+        CaseTrace(degraded=["budget"], calls={"qa": CallStats(calls=1, unusable=1)}),
+        CaseTrace(degraded=["budget"]),
+    ]
+    assert _health_counts(bare).budget_unjudged == 2
+
+
+def test_trace_case_reads_judged_drafts_from_the_qa_audit():
+    case = PICKED[0]
+    shop_id = getattr(fixtures, case.shop)
+    audit = InMemoryAuditSink()
+
+    def record(action: AuditAction, detail: dict[str, Any]) -> None:
+        audit.record(
+            AuditEvent(
+                shop_id=shop_id,
+                actor="system",
+                action=action.value,
+                detail=detail,
+                created_at=datetime(2026, 10, 9, 10, 0, tzinfo=CST),
+            )
+        )
+
+    engine = SimpleNamespace(handle=lambda msg: None)
+    harness = SimpleNamespace(engine=engine, audit=audit)
+    assert trace_case(harness, case, None).judged_drafts == 0  # type: ignore[arg-type]
+    record(AuditAction.QA, {"checked": 2, "model_checked": 1})  # 一条消息拆成两个问题：两条
+    record(AuditAction.QA, {"checked": 1, "model_checked": 2})
+    record(AuditAction.QA, {"checked": 1, "model_checked": True})  # 不是条数：不算
+    record(AuditAction.QA, {"checked": 1})
+    assert trace_case(harness, case, None).judged_drafts == 3  # type: ignore[arg-type]
+    without_audit = trace_case(SimpleNamespace(engine=engine), case, None)  # type: ignore[arg-type]
+    assert without_audit.judged_drafts is None and without_audit.unusable_causes == {}
+
+
+# ================================================================ 一票算不算数、回答里有几个对象
+
+
+def _intent_only(request: LLMRequest) -> dict[str, Any]:
+    intent = EXPECTED.get(_buyer_text(request), Intent.OTHER)
+    return {Q_INTENT: {"choice": intent.value}}
+
+
+def test_votes_that_answer_intent_only_are_not_usable(tmp_path):
+    """每一票都只答了问题类型：判断层别的必答问题没有票，退回关键词规则。调用那一行和逐条的票数
+    要和这件事对得上（以前只看类型读不读得出，写的是"用不上 0"、3/3 票算数）。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        return _intent_only(request) if request.purpose == "route" else None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    route = health.by_purpose["route"]
+    assert (route.calls, route.failed, route.unusable) == (36, 0, 36)
+    assert (route.truncated, route.empty) == (0, 0)
+    assert health.overall.route_fallback == 12 and health.routed_by == {"rules": 12}
+    assert len(run.cases_where(route_provider="rules", route_votes=3, route_votes_usable=0)) == 12
+    assert "  路由：调用 36，失败 0；有响应的里面被截断 0、为空 0、用不上 36" in run.out
+
+
+def test_one_intent_only_vote_per_case_is_a_lost_vote(tmp_path):
+    """每条用例有一票只答了类型：判断层照常给出结果（别的问题还有两票），但这一票没算全——
+    计入丢票，逐条写 2/3。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        return _intent_only(request) if (request.purpose, nth) == ("route", 1) else None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    assert health.overall.route_fallback == 0 and health.routed_by == {"incloud_llm": 12}
+    assert health.overall.route_lost_votes == 12
+    assert health.by_purpose["route"].unusable == 12
+    assert len(run.cases_where(route_votes=3, route_votes_usable=2)) == 12
+    assert run.err.count("，路由只有 2/3 票算数") == 12
+
+
+def _draft_then_final(vendor: Vendor, request: LLMRequest, draft: dict[str, Any]) -> str:
+    """思考过程里先写了一份完整的 JSON 草稿，后面才是最终答案：解析器取的是前一个。"""
+    final = vendor.answer(request)
+    final = final if isinstance(final, str) else json.dumps(final, ensure_ascii=False)
+    return f"<think>先写个草稿：{json.dumps(draft, ensure_ascii=False)}</think>\n{final}"
+
+
+def test_routing_answers_with_a_draft_object_before_the_final_one(tmp_path):
+    """每一票都是"草稿 + 最终答案"两个 JSON 对象：判断层读到的是草稿，没有退回、没有降级。
+    一条回答里顶层对象不止一个就算用不上：三票都丢，这一轮不算数。"""
+    vendor = Vendor()
+    draft = {**ROUTE_VOTE, Q_INTENT: {"choice": Intent.OTHER.value}}
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "route":
+            return _draft_then_final(vendor, request, draft)
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    assert health.overall.route_fallback == 0 and health.routed_by == {"incloud_llm": 12}
+    assert run.data["degraded_counts"].get("decision") is None
+    route = health.by_purpose["route"]
+    assert (route.calls, route.failed, route.unusable) == (36, 0, 36)
+    assert health.overall.route_lost_votes == 12
+    assert len(run.cases_where(route_votes=3, route_votes_usable=0)) == 12
+    assert "路由丢票的用例 12 条" in run.out and f"{PICKED[0].id} 0/3" in run.out
+    assert any("至少有一票没算上" in reason for reason in health.reasons)
+
+
+def test_generation_answers_with_a_draft_object_before_the_final_one(tmp_path):
+    """生成的回答是"草稿 + 最终答案"：生成器用的是草稿（照常送检、可能照常推荐），量到的不是模型
+    最后给的回答——这样的调用算用不上，这条用例算没有可用草稿。"""
+    vendor = Vendor()
+    draft = {"answer": "草稿：这个我再确认一下", "evidence_ids": []}
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "generate":
+            return _draft_then_final(vendor, request, draft)
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    generate = health.by_purpose["generate"]
+    assert generate.calls == generate.unusable > 0 and generate.failed == 0
+    assert (health.overall.generation_attempted, health.overall.generation_unusable) == (5, 5)
+    assert health.by_purpose["qa"].calls > 0  # 草稿照常送了检：引擎那边看不出任何问题
+    assert "decision" not in run.data["degraded_counts"]
+    assert health.reasons[0].startswith("生成：调过大模型生成的 5 条里有 5 条（100.0%）")
+
+
+def test_qa_answers_with_two_objects_are_listed_as_unusable(tmp_path):
+    """质检的回答有两个对象：这次调用记用不上（调用那一行看得到）。"""
+    vendor = Vendor()
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "qa":
+            return _draft_then_final(vendor, request, dict(QA_REJECT))
+        return None
+
+    run = _run(tmp_path, fault)
+    qa = _check_rule(run).by_purpose["qa"]
+    assert qa.calls == qa.unusable > 0 and qa.failed == 0
+    assert f"有响应的里面被截断 0、为空 0、用不上 {qa.unusable}" in run.out
+
+
+# ================================================================ 连续用不上也停（不只是调用失败）
+
+
+def _all_answers(response: Callable[[], Any]) -> Fault:
+    return lambda request, case, nth: response()
+
+
+@pytest.mark.parametrize(
+    ("response", "label"),
+    [
+        (lambda: LLMResponse(text="", model=MODEL, finish_reason="stop"), CAUSE_EMPTY),
+        (
+            lambda: LLMResponse(
+                text="", model=MODEL, input_tokens=900, output_tokens=304, finish_reason="length"
+            ),
+            CAUSE_TRUNCATED,
+        ),
+        (lambda: "好的，我想一想。", CAUSE_UNREADABLE),
+    ],
+    ids=["empty", "truncated", "unreadable"],
+)
+def test_stops_when_no_call_is_usable_although_none_failed(tmp_path, response, label):
+    """每次调用都是 HTTP 200，但回答是空的 / 被截断 / 读不出：没有一次调用失败，链路每条都在走兜底，
+    而每次调用照常计费。连续 8 条没有一次用得上就停，原因写进中止的那句话。"""
+    run = _run(tmp_path, _all_answers(response))
+    assert run.code == 2 and run.out == "" and run.data is None
+    assert "[8/12]" in run.err and "[9/12]" not in run.err and "（失败" not in run.err
+    last = run.err.strip().splitlines()[-1]
+    assert last.startswith("评测中止：连续 8 条用例的大模型调用没有一次用得上（")
+    assert f"（{label} ×{len(run.client.calls)}），跑到第 8 / 12 条停下" in last
+    assert "原因没有记下来" not in last
+    # --allow-degraded：不停，跑完出报告（这一轮照样不算数）
+    full = _run(tmp_path, _all_answers(response), "--allow-degraded")
+    assert full.code == 0 and full.data["n"] == 12 and not full.health.valid
+    assert full.health.overall.route_fallback == 12
+
+
+def test_abort_labels_mix_failed_and_unusable_calls():
+    """失败的调用按失败原因的标签，有响应但用不上的按截断 / 空回答 / 读不出：加起来是这几条用例的
+    全部调用。别的异常（代码缺陷）不算模型服务的问题，不计入连续条数。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "route":
+            return _rejected(429, "rate_limit") if nth == 1 else ""
+        return LLMResponse(text="{", model=MODEL, finish_reason="length")
+
+    client = FakeLLMClient(handler=Vendor(fault), model=MODEL)
+    with pytest.raises(EvalAborted) as exc:
+        evaluate("all", limit=12, seed=3, llm=client, stop_after_failed=3)
+    aborted = exc.value
+    assert (aborted.finished, aborted.streak) == (3, 3)
+    assert sum(aborted.labels.values()) == len(client.calls)
+    assert aborted.labels["http_429"] == 3 and aborted.labels[CAUSE_EMPTY] == 6
+    assert set(aborted.labels) <= {"http_429", CAUSE_EMPTY, CAUSE_TRUNCATED}
+    assert set(runner.UNUSABLE_CAUSES) == {CAUSE_TRUNCATED, CAUSE_EMPTY, CAUSE_UNREADABLE}
+    shown = "、".join(f"{label} ×{n}" for label, n in aborted.labels.items())
+    assert str(aborted).startswith(
+        f"连续 3 条用例的大模型调用没有一次用得上（{shown}），跑到第 3 / 12 条"
+    )
+    unusable, cut = CallStats(calls=3, unusable=3), CallStats(calls=2, failed=1, unusable=1)
+    assert unusable.all_failed and cut.all_failed
+    assert CaseTrace(calls={"route": unusable, "generate": cut}).all_calls_failed
+    assert not CallStats(calls=3, unusable=2, usable=1).all_failed
+    assert not CallStats(calls=3, failed=1, unusable=1).all_failed  # 还有一次抛了别的异常
+    assert not CallStats().all_failed
+
+
+# ================================================================ 引擎异常：每个标记都算
+
+
+def test_pipeline_error_codes_are_the_engine_stage_codes():
+    from rodit.eval.cli import PIPELINE_ERROR_CODES
+
+    # 引擎多了一个环节的标记时这里要跟着改：漏掉一个，那一环每条都出意外的一轮也会算"有效"
+    assert PIPELINE_ERROR_CODES == {
+        "engine",
+        "router",
+        "understanding",
+        "retriever",
+        "generator",
+        "qa",
+        "storage",
+        "knowledge",
+        "audit",
+        "tenant_isolation",
+    }
+
+
+@pytest.mark.parametrize(
+    "code",
+    [  # 写成字面量，不从 PIPELINE_ERROR_CODES 取：从集合里删掉一个，它自己这一条不能跟着消失
+        "engine",
+        "router",
+        "understanding",
+        "retriever",
+        "generator",
+        "qa",
+        "storage",
+        "knowledge",
+        "audit",
+        "tenant_isolation",
+    ],
+)
+def test_each_pipeline_error_code_counts_as_an_engine_error(code):
+    from rodit.eval.cli import _health_counts
+
+    other = ["budget", "decision", "decision:qa", "tool:order", "vision"]  # 这些不算引擎异常
+    counts = _health_counts([CaseTrace(degraded=[code]), CaseTrace(degraded=other)])
+    assert counts.engine_errors == 1 and counts.cases == 2
+
+
+def test_a_qa_stage_that_crashes_is_not_a_valid_run(tmp_path):
+    """质检这一环抛了不该抛的异常：引擎记 qa（不是 decision:qa），草稿是有的——质检不可用、生成
+    没有可用草稿两项都是 0，只有引擎异常这一项让这一轮不算数。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "qa":
+            raise RuntimeError("合成的故障：不是模型服务的失败")
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    assert run.data["degraded_counts"] == {"qa": 5}
+    overall = health.overall
+    assert (overall.engine_errors, overall.qa_unavailable, overall.generation_unusable) == (5, 0, 0)
+    assert health.reasons[0] == "引擎：12 条里有 5 条（41.7%）引擎异常，上限 1 条。"
+    assert all(reason.split("：")[-2].endswith("引擎") for reason in health.reasons)
+
+
+# ================================================================ §12.1：不算数的一轮不写"达标"
+
+
+def _routing_rejected(request: LLMRequest, case: int, nth: int):
+    return _rejected(400, "bad_request") if request.purpose == "route" else None
+
+
+def test_latency_is_not_called_within_target_when_the_run_is_not_valid(tmp_path):
+    """路由调用全部被拒（失败得很快）：耗时量到的是兜底路径。调大模型的环节和端到端不写"达标"，
+    JSON 里也不说达标；不调大模型的环节照旧。"""
+    not_evaluated = "不算数（见运行健康度）"
+    for extra in ((), ("--allow-degraded",)):
+        run = _run(tmp_path, _routing_rejected, *extra)
+        assert not run.health.valid
+        assert _row(run.out, "端到端").endswith(f"≤ 5000 {not_evaluated}")
+        for label, target in (("路由  ", 1000), ("生成  ", 2500), ("质检  ", 1000)):
+            row = _row(run.out, label)
+            assert f"≤ {target} {not_evaluated}" in row and "达标" not in row
+        assert _row(run.out, "检索与工具").endswith("≤ 500 达标")
+        lat = run.data["latency"]
+        assert lat["e2e_p95_within_target"] is None and lat["not_evaluated"] is True
+        assert lat["limited_by_budget"] is False
+        within = {key: stage["within_target"] for key, stage in lat["stages"].items()}
+        assert within == {
+            "understand": None,
+            "route": None,
+            "retrieve": True,
+            "generate": None,
+            "qa": None,
+            "total": None,
+        }
+        assert lat["stages"]["total"]["p95"] < 5000  # 数字照实留着，只是不下结论
+        assert (
+            "这一轮没有有效评到模型（见运行健康度）：路由、生成、质检和端到端的耗时量到的是兜底路径"
+        ) in run.out
+    healthy = _run(tmp_path)
+    assert healthy.data["latency"]["not_evaluated"] is False
+    assert not_evaluated not in healthy.out and "兜底路径" not in healthy.out
+    offline = evaluate("test", limit=3)  # 离线替身没有"评没评到模型"这回事
+    assert offline.latency.not_evaluated is False
+    assert offline.latency.e2e_p95_within_target is True
+
+
+# ================================================================ §13.3：没有样本 ≠ 达不到
+
+
+def test_calibration_without_judge_routed_samples_says_so(tmp_path):
+    """路由全部退回关键词规则：没有一条样本参与校准。不能写成"达不到目标准确率"（那是在说模型），
+    ECE 也不是 0。"""
+    run = _run(tmp_path, _routing_rejected)
+    cal, rel = run.data["calibration"], run.data["reliability"]
+    assert cal["n_samples"] == 0 and cal["left_out_fallback"] == 6
+    assert cal["support"] and set(cal["support"].values()) == {0}
+    assert set(cal["support"]) == set(cal["thresholds"])
+    assert (rel["n_samples"], rel["ece"], rel["bins"]) == (0, None, [])
+    lines = run.out.splitlines()
+    for intent in cal["thresholds"]:
+        assert f"{intent:<18}没有样本（这个类型的用例都没参与校准）" in lines
+    assert "达不到目标准确率" not in run.out
+    assert "可靠性（0 条，不含没参与的 12 条）：ECE = —" in lines
+    # 一部分退回：只有样本全没了的类型写"没有样本"
+    partial = _run(tmp_path, _forty_percent)
+    support = partial.data["calibration"]["support"]
+    assert sum(support.values()) == partial.data["calibration"]["n_samples"] == 4
+    assert partial.out.count("没有样本（这个类型的用例都没参与校准）") == sum(
+        1 for n in support.values() if n == 0
+    )
+    assert isinstance(partial.data["reliability"]["ece"], float)
+
+
+def test_calibration_still_says_unreachable_when_there_are_samples():
+    client = FakeLLMClient(handler=Vendor(), model=MODEL)
+    report = evaluate("all", limit=12, seed=3, llm=client)
+    cal = report.calibration
+    assert cal.support is not None and sum(cal.support.values()) == cal.n_samples == 6
+    assert report.reliability.ece is not None and "ECE = 0.0000" in render_text(report)
+    intent = next(iter(cal.thresholds))
+    unreachable = cal.model_copy(update={"thresholds": {**cal.thresholds, intent: None}})
+    text = render_text(report.model_copy(update={"calibration": unreachable}))
+    assert f"{intent:<18}达不到目标准确率" in text and "没有样本" not in text
+    old = unreachable.model_copy(update={"support": None})  # 没有这一项的旧报告：照旧
+    text = render_text(report.model_copy(update={"calibration": old}))
+    assert f"{intent:<18}达不到目标准确率" in text and "没有样本" not in text
+
+
+# ================================================================ 真实客户端 + 脚本化的传输层
+
+
+class ScriptedTransport:
+    """OpenAICompatibleClient 的传输层替身（不联网）：把请求体还原成 LLMRequest 交给 Vendor 作答，
+    再包成 /chat/completions 的响应体。响应体里没有 model（有的模型服务不回显）；fault 返回
+    LLMResponse 时照它的 finish_reason 填。"""
+
+    def __init__(self, fault: Fault | None = None) -> None:
+        self.vendor = Vendor(fault)
+        self.lock = threading.Lock()
+        self.calls = 0
+
+    @staticmethod
+    def _purpose(prompt: str) -> str:
+        if '请只输出 JSON：{"answer"' in prompt:
+            return "generate"
+        return "qa" if f'"{Q_GROUNDED}"' in prompt else "route"
+
+    def __call__(self, url: str, headers: Any, body: dict[str, Any], timeout_s: float):
+        messages = [LLMMessage(role=m["role"], content=m["content"]) for m in body["messages"]]
+        purpose = self._purpose("".join(m.content for m in messages))
+        request = LLMRequest(purpose=purpose, messages=messages)  # type: ignore[arg-type]
+        with self.lock:
+            self.calls += 1
+            answer = self.vendor(request)
+        reason = "stop"
+        if isinstance(answer, LLMResponse):
+            answer, reason = answer.text, answer.finish_reason
+        message = {"role": "assistant", "content": _as_text(answer)}
+        return 200, {
+            "choices": [{"index": 0, "message": message, "finish_reason": reason}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+        }
+
+
+def test_finish_reason_length_from_the_real_client_reaches_the_health_block(tmp_path, monkeypatch):
+    """从响应体的 finish_reason 到报告里的"被截断"，中间每一环都是真的：OpenAICompatibleClient
+    解析响应、计量、CallRecorder、判断层丢掉这一票、健康度计数。每条用例的第一票是完整、读得出的
+    回答，只是 finish_reason 是 length。"""
+    from rodit.llm import OpenAICompatibleClient
+
+    monkeypatch.setenv("RODIT_LLM_API_KEY", "sk-synthetic-not-a-real-key")  # 合成的假密钥
+    vendor = Vendor()
+
+    def cut_first_vote(request: LLMRequest, case: int, nth: int):
+        if (request.purpose, nth) == ("route", 1):
+            return LLMResponse(text=_as_text(vendor.answer(request)), finish_reason="length")
+        return None
+
+    transport = ScriptedTransport(cut_first_vote)
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example.invalid/v1", model=MODEL, transport=transport
+    )
+    run = _run(tmp_path, client=client)
+    assert run.code == 3
+    health = _check_rule(run)
+    route = health.by_purpose["route"]
+    assert (route.calls, route.failed, route.errors) == (36, 0, {})
+    assert (route.truncated, route.empty, route.unusable) == (12, 0, 12)
+    assert health.overall.route_fallback == 0 and health.overall.route_lost_votes == 12
+    assert len(run.cases_where(route_votes=3, route_votes_usable=2)) == 12
+    assert "  路由：调用 36，失败 0；有响应的里面被截断 12、为空 0、用不上 12" in run.out
+    assert health.by_purpose["generate"].truncated == health.by_purpose["qa"].truncated == 0
+    usage = run.data["usage"]
+    assert usage["calls"] == transport.calls and usage["errors"] == 0
+    assert usage["input_tokens"] == 100 * transport.calls
+    # 响应体里没有 model：记下的是配置的名字，报告不说这是模型服务回显的
+    assert usage["served_models"] == {MODEL: transport.calls}
+    assert f"计量记下的模型名（成功的调用；接口不回显时记的是配置的名字）：{MODEL} ×" in run.out
+    assert "回显的模型名和配置的" not in run.out
+    assert run.data["llm"]["endpoint"] == "https://llm.example.invalid"

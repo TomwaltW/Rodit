@@ -10,6 +10,9 @@ rodit.feedback.metrics.qa_report 同一口径（分位数也用那里的最近�
 （4.5 秒）就返回，所以端到端永远超不过 5 秒的目标——模型服务再慢，表现出来的也只是超时次数和
 被截断的用例，不是"超标"。所以各环节另记到超时才结束的调用数；有用例被预算截断或有调用超时时，
 端到端 P95 没超标也不算达标（within_target 为 None），照实说这个数受时间预算限制。
+这一轮没有有效评到模型时（rodit.eval.health：调用失败、读不出，链路走了兜底逻辑）也一样：调大模型
+的环节（路由、生成、质检）和端到端量到的是兜底路径的耗时，没超标也不算达标（within_target 为
+None，not_evaluated 为 True）；超标的照旧是超标。
 
 用量：每次大模型调用一条 llm.usage 审计（rodit.llm.MeteredLLMClient：purpose、model、
 input_tokens、output_tokens、latency_ms，失败时另有 error = 异常类型名，知道原因时还有
@@ -20,7 +23,8 @@ kind / status / code）。按用途（route / generate / qa）汇总 token、调
 折算每店每月用量：评测集的问题类型分布和真实咨询不同，只作量级参考。
 合计里少了什么也照实记：失败的调用按 0 token 计（请求发出去了，模型服务可能照常计费），按同用途
 成功调用的平均值另给一个估算（failed_tokens_estimate，只是估算）；成功却 0 token 的调用是接口没有
-返回用量（zero_usage_calls）；served_models 是接口回显的模型名（配置的可能只是别名）。
+返回用量（zero_usage_calls）；served_models 是计量记下的模型名（接口回显的；接口不回显时记的是
+配置的名字，两种情况从这里分不出来）。
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ STAGE_TARGETS_MS: dict[str, int | None] = {
     "total": E2E_P95_TARGET_MS,
 }
 PURPOSES = ("route", "generate", "qa")  # 大模型调用的用途（LLMRequest.purpose）
+MODEL_STAGES = (*PURPOSES, "total")  # 耗时取决于大模型的环节（环节名和用途同名），加上端到端
 PURPOSE_LABELS = {"route": "路由", "generate": "生成", "qa": "质检", "other": "其他"}
 MESSAGES_PER_SHOP_DAY = 900  # §14 单店用量估算示例：每天 900 次推荐
 DAYS_PER_MONTH = 30
@@ -71,7 +76,8 @@ class StageLatency(_Model):
     p95: float | None = None
     max: float | None = None
     target_ms: int | None = None  # §12.1 目标（对照 P95）；None 表示没有单列目标
-    # 没有目标或没有数据时为 None；端到端受时间预算限制而 P95 没超标时也是 None（见模块说明）
+    # 没有目标或没有数据时为 None；端到端受时间预算限制而 P95 没超标时也是 None；这一轮没有有效
+    # 评到模型时，调大模型的环节和端到端没超标同样是 None（见模块说明）
     within_target: bool | None = None
     # 这个环节的大模型调用数，和其中到超时才结束的（路由 / 生成 / 质检；别的环节不调大模型）
     llm_calls: int = 0
@@ -81,12 +87,15 @@ class StageLatency(_Model):
 class LatencyReport(_Model):
     n: int  # 有耗时数据的用例数
     stages: dict[str, StageLatency]
-    # 推荐出现（端到端）P95 ≤ 5 秒；limited_by_budget 而 P95 没超标时为 None（不能算达标）
+    # 推荐出现（端到端）P95 ≤ 5 秒；limited_by_budget 或 not_evaluated 而 P95 没超标时为 None
+    # （不能算达标）
     e2e_p95_within_target: bool | None = None
     budget_cut: int = 0  # 被时间预算截断的用例数（降级标记里有 budget）
     llm_timeouts: int = 0  # 到超时才结束的大模型调用数（各用途合计）
     # 有用例被预算截断，或有调用到超时才结束：端到端耗时被截短了，不是模型服务的真实耗时
     limited_by_budget: bool = False
+    # 这一轮没有有效评到模型（health.valid 为 False）：调大模型的环节和端到端量到的是兜底路径
+    not_evaluated: bool = False
 
 
 def _number(value: Any) -> float | None:
@@ -106,10 +115,13 @@ def latency_report(
     calls: Sequence[Mapping[str, Any]] = (),
     *,
     budget_cut: int = 0,
+    evaluated: bool = True,
 ) -> LatencyReport:
     """per_case：每条用例的 latency_ms（没有结果的用例传空 dict，不计入）。
     calls：这些用例全部的 llm.usage 审计 detail（离线替身没有）；budget_cut：被时间预算截断的
-    用例数。后两项只用来标明耗时有没有被截短（见模块说明），不改分位数。"""
+    用例数。后两项只用来标明耗时有没有被截短（见模块说明），不改分位数。
+    evaluated：这一轮算不算评到了模型（health.valid；离线替身没有这回事，传 True）。False 时
+    MODEL_STAGES 没超标也不算达标。"""
     rows = [row for row in per_case if row]
     made = Counter(_purpose(d) for d in calls)
     timed_out = Counter(_purpose(d) for d in calls if is_timeout(d))
@@ -123,6 +135,8 @@ def latency_report(
         within = None if target is None or p95 is None else p95 <= target
         if stage == "total" and limited and within:
             within = None  # 被截短的数没超过目标，说明不了什么
+        if stage in MODEL_STAGES and not evaluated and within:
+            within = None  # 量到的是兜底路径，不是模型：没超过目标也说明不了什么
         stages[stage] = StageLatency(
             label=STAGE_LABELS[stage],
             count=len(values),
@@ -141,6 +155,7 @@ def latency_report(
         budget_cut=budget_cut,
         llm_timeouts=timeouts,
         limited_by_budget=limited,
+        not_evaluated=not evaluated,
     )
 
 
@@ -205,7 +220,8 @@ class UsageReport(_Model):
     zero_usage_calls: int = 0  # 各用途 zero_usage_calls 之和
     # 各用途 failed_tokens_estimate 之和（只是估算，不是计量）；有用途估不出时只加估得出的
     failed_tokens_estimate: float | None = None
-    # 接口回显的模型名 → 成功调用数（失败的调用没有回显）；配置的模型名可能只是别名
+    # 计量记下的模型名 → 成功调用数（失败的调用不算）。接口回显了就是回显的那个（配置的可能只是
+    # 别名）；接口不回显时客户端填的是配置的名字，所以和配置的一样不等于"模型服务确认过"
     served_models: dict[str, int] = Field(default_factory=dict)
 
 
@@ -328,6 +344,7 @@ def usage_report(
 __all__ = [
     "DAYS_PER_MONTH",
     "MESSAGES_PER_SHOP_DAY",
+    "MODEL_STAGES",
     "PURPOSE_LABELS",
     "STAGES",
     "STAGE_LABELS",
