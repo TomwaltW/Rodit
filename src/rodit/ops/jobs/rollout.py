@@ -3,8 +3,13 @@
 
     record-eval --report 报告.json [--config YAML]
         把 python -m rodit.eval --json 的完整评测报告记成 eval.verdict 系统事件（§13.5；
-        rodit.eval.fingerprint）。部分评测（--intent / --limit）、没有测试集判定、没有配置指纹的
-        报告不收（退出码 2，什么都不写）。顺带说明报告的指纹和线上（部署配置：--config，其次
+        rodit.eval.fingerprint）。部分评测（--intent / --limit）、没有测试集判定、没有配置指纹、
+        条数和评测集对不上（没跑完）的报告不收（退出码 2，什么都不写）。真实大模型跑的报告还要
+        "评到了模型"：按报告里的运行健康度（rodit.eval.health）用固定的上限重新判定，路由退回
+        关键词规则、质检判断层不可用、生成没有可用草稿……超过上限的不收，原因逐条打出来（退出码
+        同样是 2）；报告里没有运行健康度的（旧版本生成的）也不收，要用本版本重新跑。
+        收下的结论带着这些计数，记录时打出来（全部用例和测试集）。
+        顺带说明报告的指纹和线上（部署配置：--config，其次
         RODIT_CONFIG，都没有时是内置默认值；大模型、分类器按部署规则取配置和环境变量
         RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_CLASSIFIER_PATH）一致不一致、哪几项不一致：
         上线状态只认一致的、真实大模型跑的结论。
@@ -166,7 +171,9 @@ def record_eval(
     environ: Mapping[str, str] | None = None,
 ) -> int:
     from rodit.eval.fingerprint import (
+        ModelNotEvaluated,
         current_fingerprint,
+        describe_health,
         describe_verdict,
         differences,
         verdict_event,
@@ -182,12 +189,22 @@ def record_eval(
         data = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise ValueError(f"评测报告 {path} 不是 JSON") from None
-    verdict = verdict_from_report(data, raw=raw)
+    try:
+        verdict = verdict_from_report(data, raw=raw)
+    except ModelNotEvaluated as exc:
+        # 原因逐条打出来（日志里也有一份，是连成一句的）；照旧由 run 记日志、返回退出码 2
+        print("没有记录评测结论：这一轮没有有效评到大模型（量到的是降级后的兜底逻辑）", file=out)
+        for reason in exc.reasons:
+            print(f"- {reason}", file=out)
+        raise
     at = clock.now()
     audit.record(verdict_event(verdict, at=at, actor=SYSTEM_ACTOR))
     fp = verdict.fingerprint
     code = fp.git_sha[:12] if fp.git_sha else "未知"
     print(f"已记录评测结论（eval.verdict）：{describe_verdict(at, verdict)}", file=out)
+    if verdict.health_test is not None:
+        test = verdict.health_test
+        print(f"其中测试集 {test.cases} 条：{describe_health(test)}", file=out)
     model = fp.llm_model or "未知"
     print(
         f"配置指纹 {fp.config_fingerprint[:12]}，路由问题 {fp.router_questions_ver}，"

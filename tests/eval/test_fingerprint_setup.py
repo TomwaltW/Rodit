@@ -20,8 +20,10 @@ import rodit
 from rodit.app.offline import EvidenceEchoLLM
 from rodit.core.clock import CST
 from rodit.core.config import EngineConfig, load_config
-from rodit.core.enums import ProviderName
+from rodit.core.enums import Intent, ProviderName
+from rodit.core.pii import mask_pii
 from rodit.core.ports import LLMRequest
+from rodit.core.questions import Q_INTENT
 from rodit.decision import ClassifierProvider, RuleProvider
 from rodit.eval import fingerprint as fp_module
 from rodit.eval.cli import env_client, main
@@ -33,6 +35,7 @@ from rodit.eval.fingerprint import (
     EvalFingerprint,
     EvalVerdict,
     current_fingerprint,
+    describe_verdict,
     endpoint_of,
     generation_version,
     judge_prompt_version,
@@ -43,13 +46,16 @@ from rodit.eval.fingerprint import (
     verdict_event,
     verdict_from_report,
 )
+from rodit.eval.health import DEFAULT_CEILING
 from rodit.eval.llm_env import describe_endpoint
-from rodit.testing.fakes import FakeLLMClient, scripted_judge_llm
+from rodit.testing.fakes import FakeLLMClient, judge_buyer_text, scripted_judge_llm
 
 T0 = datetime(2026, 9, 25, 10, 0, tzinfo=CST)
 BASE_URL = "https://llm.example.invalid/v1"
 LLM_ENV = {LLM_BASE_URL_ENV: BASE_URL, LLM_MODEL_ENV: "synthetic-model"}
 SHIPPED_CONFIG = Path(__file__).resolve().parents[2] / "config" / "rodit.yaml"
+# 用例的买家消息（判断层 state 里是遮挡过个人信息的）→ 标注的问题类型
+LABELLED = {mask_pii(c.text): c.expected_intent for c in cases("all")}
 
 
 def with_provider(config: EngineConfig, provider: ProviderName) -> EngineConfig:
@@ -131,6 +137,43 @@ def test_running_llm_follows_the_production_rule():
     assert running_llm(EngineConfig(), {}) == (None, None)
     for url in (BASE_URL, "http://10.0.0.8:8080/v1", "https://user:pw@h.example.invalid/v1"):
         assert endpoint_of(url) == describe_endpoint(type("C", (), {"base_url": url})())
+
+
+@pytest.mark.parametrize(
+    ("url", "endpoint"),
+    [
+        ("https://llm.example.invalid:443/v1", "https://llm.example.invalid"),
+        ("https://llm.example.invalid/v1", "https://llm.example.invalid"),
+        ("http://10.0.0.8:80/v1", "http://10.0.0.8"),
+        ("http://10.0.0.8/v1", "http://10.0.0.8"),
+        ("HTTPS://LLM.Example.invalid:443", "https://llm.example.invalid"),
+        (" https://user:pw@llm.example.invalid:443/v1?x=1\n", "https://llm.example.invalid"),
+        # 不是这个协议的默认端口：照写
+        ("https://llm.example.invalid:8443/v1", "https://llm.example.invalid:8443"),
+        ("https://llm.example.invalid:80/v1", "https://llm.example.invalid:80"),
+        ("http://llm.example.invalid:443/v1", "http://llm.example.invalid:443"),
+        ("http://10.0.0.8:8080/v1", "http://10.0.0.8:8080"),
+    ],
+)
+def test_endpoint_of_leaves_out_the_default_port(url: str, endpoint: str):
+    assert endpoint_of(url) == endpoint
+
+
+def test_an_explicit_default_port_is_the_same_endpoint():
+    """部署的地址写了 :443、评测时没写（或者反过来）：是同一个接口，评测结论照样算数；
+    换了端口才是另一个接口。"""
+    cfg = EngineConfig()
+    plain = current_fingerprint(cfg, environ=LLM_ENV)
+    explicit_url = "https://llm.example.invalid:443/v1"
+    explicit = current_fingerprint(cfg, environ={**LLM_ENV, LLM_BASE_URL_ENV: explicit_url})
+    assert plain.llm_endpoint == explicit.llm_endpoint == "https://llm.example.invalid"
+    assert same_setup(plain, explicit)
+    assert evidence(verdict_for(plain), explicit).passed is True
+    assert evidence(verdict_for(explicit), plain).passed is True
+    other_url = "https://llm.example.invalid:8443/v1"
+    other = current_fingerprint(cfg, environ={**LLM_ENV, LLM_BASE_URL_ENV: other_url})
+    ev = evidence(verdict_for(plain), other)
+    assert ev.passed is None and "https://llm.example.invalid:8443" in (ev.reason or "")
 
 
 def test_the_eval_client_follows_the_production_rule(monkeypatch):
@@ -297,9 +340,17 @@ def _train(path: Path, *, trained_at: datetime = datetime(2026, 9, 28, 10, 0, tz
     model.save(path, trained_at=trained_at)
 
 
+def _labelled_intent(request: LLMRequest) -> dict:
+    """路由的每一票都答用例标注的问题类型。"""
+    intent = LABELLED.get(judge_buyer_text(request), Intent.OTHER)
+    return {Q_INTENT: {"choice": intent.value}}
+
+
 def _env_llm() -> FakeLLMClient:
-    """--llm env 的替身：连通性检查回 OK，生成复述依据，路由 / 质检用脚本化的判断层。"""
-    judge, echo = scripted_judge_llm(), EvidenceEchoLLM()
+    """--llm env 的替身：连通性检查回 OK，生成复述依据，路由 / 质检用脚本化的判断层（路由答用例
+    标注的类型，质检全部通过）。每次调用都成功、都读得出来：这一轮没有降级，评到的是"模型"，
+    record-eval 才收。"""
+    judge, echo = scripted_judge_llm(route=_labelled_intent), EvidenceEchoLLM()
 
     def handler(request: LLMRequest):
         if request.purpose == "other":
@@ -311,13 +362,24 @@ def _env_llm() -> FakeLLMClient:
     return client
 
 
-def _eval(tmp_path: Path, *extra: str) -> EvalVerdict:
+def _eval(tmp_path: Path, *extra: str, split: str = "test") -> EvalVerdict:
     target = tmp_path / f"report{len(list(tmp_path.glob('report*.json')))}.json"
-    argv = ["--split", "test", "--llm", "env", *extra, "--json", str(target)]
+    argv = ["--split", split, "--llm", "env", *extra, "--json", str(target)]
     err = io.StringIO()
     assert main(argv, out=io.StringIO(), err=err, client_factory=_env_llm) == 0, err.getvalue()
     raw = target.read_bytes()
-    return verdict_from_report(json.loads(raw), raw=raw)
+    data = json.loads(raw)
+    if data["health"] is None:
+        # 评测命令行还没有填运行健康度（docs/架构与分工.md §4.4 的任务 C2）：这一轮没有降级、没有
+        # 失败的调用，补一份干净的。C2 合入后报告自带 health，这一段就用不上了，可以删掉
+        assert data["degraded_counts"] == {} and data["usage"]["errors"] == 0
+        data["health"] = {
+            "ceiling": DEFAULT_CEILING,
+            "overall": {"cases": data["n"]},
+            "test": {"cases": data["gate"]["n"]},
+            "valid": True,
+        }
+    return verdict_from_report(data, raw=raw)
 
 
 @pytest.fixture(scope="module")
@@ -373,6 +435,20 @@ def test_an_llm_routed_eval_is_not_evidence_for_a_classifier_deployment(tmp_path
     running = current_fingerprint(deployed, environ={**LLM_ENV, CLASSIFIER_PATH_ENV: str(clf)})
     ev = evidence(verdict, running)
     assert ev.passed is None and "路由判断层" in (ev.reason or "")
+
+
+def test_a_full_env_run_becomes_a_verdict_with_its_run_health(tmp_path):
+    """评测命令行跑完整个评测集（替身大模型，没有降级）→ 结论：条数对得上评测集，带着运行健康度的
+    计数（全部用例和测试集），能给同一套部署作测试集依据。"""
+    verdict = _eval(tmp_path, split="all")
+    assert (verdict.n, verdict.test_n) == (len(cases("all")), len(cases("test"))) == (324, 66)
+    overall, test = verdict.health_overall, verdict.health_test
+    assert overall is not None and test is not None
+    assert (overall.cases, test.cases) == (324, 66)
+    assert overall.route_fallback == overall.qa_unavailable == overall.generation_unusable == 0
+    assert "运行健康度：路由退回 0/324" in describe_verdict(T0, verdict)
+    ev = evidence(verdict, current_fingerprint(EngineConfig(), environ=LLM_ENV))
+    assert ev.reason is None and "路由退回 0/324" in ev.detail
 
 
 def test_offline_report_fingerprint_names_the_stand_in(tmp_path):

@@ -30,6 +30,7 @@ from rodit.core.enums import (
 )
 from rodit.core.models import AuditEvent, QualityReview, QualityScores, SuggestionRecord
 from rodit.eval.fingerprint import current_fingerprint, verdict_event, verdict_from_report
+from rodit.eval.health import DEFAULT_CEILING, HealthCounts, RunHealth, assess
 from rodit.ops import serve
 from rodit.ops.jobs import rollout as rollout_jobs
 from rodit.testing.fakes import FakeClock, make_message, parse_subscription, subscription_push
@@ -53,6 +54,33 @@ def parse(*argv: str):
     return serve._parser().parse_args(list(argv))  # noqa: SLF001 — 用部署入口同一个命令行
 
 
+def run_health(overall: dict | None = None, test: dict | None = None) -> dict:
+    """评测报告里的 health（rodit.eval.health.RunHealth 的 JSON；valid / reasons 像评测命令行那样按
+    assess 填）：默认是一轮干净的全量评测，overall / test 改全部用例、测试集的计数。"""
+    all_counts = HealthCounts(
+        **{"cases": 324, "qa_judged": 233, "generation_attempted": 250, **(overall or {})}
+    )
+    test_counts = HealthCounts(
+        **{"cases": 66, "qa_judged": 48, "generation_attempted": 52, **(test or {})}
+    )
+    reasons = assess(all_counts, test_counts)
+    return RunHealth(
+        ceiling=DEFAULT_CEILING,
+        overall=all_counts,
+        test=test_counts,
+        valid=not reasons,
+        reasons=reasons,
+    ).model_dump(mode="json")
+
+
+# 路由的判断层大面积调不通：全部用例里 105 条、测试集里 20 条退回了关键词规则
+DEGRADED = {"overall": {"route_fallback": 105}, "test": {"route_fallback": 20}}
+DEGRADED_REASONS = (
+    "路由：324 条里有 105 条（32.4%）没用上判断层（退回关键词规则），上限 6 条。",
+    "测试集：路由：66 条里有 20 条（30.3%）没用上判断层（退回关键词规则），上限 1 条。",
+)
+
+
 def eval_report(*, mode: str = "env", passes: bool = True, **over) -> dict:
     data = {
         "split": "all",
@@ -68,6 +96,8 @@ def eval_report(*, mode: str = "env", passes: bool = True, **over) -> dict:
             "passes": passes,
         },
         "llm": {"mode": mode, "model": "synthetic-model", "decision_provider": "incloud_llm"},
+        # 运行健康度只有真实大模型跑的报告才有（离线替身不调大模型）
+        "health": run_health() if mode == "env" else None,
         "fingerprint": current_fingerprint(EngineConfig(), environ=LLM_ENV).model_dump(mode="json"),
         "cases": [],
     }
@@ -96,6 +126,31 @@ def test_record_eval_writes_a_system_event(tmp_path: Path):
     assert event.detail["gate_passes"] is True and event.detail["llm_mode"] == "env"
     assert "一致" in out.getvalue() and "达标" in out.getvalue()
     assert "不一致" not in out.getvalue()
+    # 运行健康度的计数记进结论，记录时打出来（全部用例和测试集）
+    assert event.detail["health_overall"] == HealthCounts(
+        cases=324, qa_judged=233, generation_attempted=250
+    ).model_dump(mode="json")
+    assert event.detail["health_test"]["cases"] == 66
+    assert "路由退回 0/324、质检不可用 0/233、生成没有可用草稿 0/250" in out.getvalue()
+    assert "测试集 66 条：路由退回 0/66、质检不可用 0/48、生成没有可用草稿 0/52" in out.getvalue()
+
+
+def test_record_eval_refuses_a_run_that_did_not_evaluate_the_model(tmp_path: Path, caplog):
+    """真实大模型跑的评测、分数过了门槛，但路由大面积退回了关键词规则（量到的是兜底逻辑，不是模型）：
+    不记，原因逐条打出来，退出码和别的不能用的报告一样是 2。"""
+    caplog.set_level(logging.INFO)
+    path = tmp_path / "e.json"
+    degraded = eval_report(health=run_health(**DEGRADED))
+    assert degraded["gate"]["passes"] is True
+    path.write_text(json.dumps(degraded, ensure_ascii=False), encoding="utf-8")
+    audit, out = InMemoryAuditSink(), io.StringIO()
+    args = parse("record-eval", "--report", str(path))
+    assert rollout_jobs.run(args, LLM_ENV, audit=audit, clock=FakeClock(NOW), out=out) == 2
+    assert audit.list_system_events() == []
+    head, *reasons = out.getvalue().splitlines()
+    assert "没有记录" in head and "没有有效评到大模型" in head and "已记录" not in out.getvalue()
+    assert reasons == [f"- {reason}" for reason in DEGRADED_REASONS]
+    assert all(reason in caplog.text for reason in DEGRADED_REASONS)  # 日志里也有
 
 
 def test_record_eval_warns_when_the_deployed_config_differs(tmp_path: Path):
@@ -118,6 +173,9 @@ def test_record_eval_warns_when_the_deployed_config_differs(tmp_path: Path):
         (json.dumps(eval_report(limit=10)), "部分评测"),
         (json.dumps(eval_report(fingerprint=None)), "配置指纹"),
         (json.dumps(eval_report(split="dev", gate=None)), "测试集"),
+        (json.dumps(eval_report(n=300)), "报告不完整"),  # 跑到一半停下的
+        (json.dumps(eval_report(mode="offline", n=300)), "报告不完整"),
+        (json.dumps(eval_report(health=None)), "没有运行健康度"),  # 旧版本生成的真实大模型报告
         ("not json", "不是 JSON"),
         (None, "读不了"),
     ],
@@ -513,6 +571,47 @@ def test_record_eval_on_postgres(ops_env, ops_pg_dsn, monkeypatch, tmp_path: Pat
     assert event.detail["fingerprint"]["config_fingerprint"] == config_fingerprint(EngineConfig())
     assert event.detail["llm_mode"] == "offline" and event.detail["split"] == "test"
     assert "离线替身" in printed
+    # 离线替身不调大模型：没有运行健康度，照收（只作回归基线）
+    assert event.detail["health_overall"] is None and "运行健康度" not in printed
+
+
+@pytest.mark.pg
+def test_record_eval_on_postgres_refuses_a_degraded_run_and_keeps_the_health_of_a_good_one(
+    ops_env, ops_pg_dsn, monkeypatch, tmp_path: Path, capsys
+):
+    """真实大模型跑的报告 → record-eval → PostgreSQL。模型没被有效评到的：退出码 2、原因打出来、
+    库里什么都不写；评到了的：写下结论和运行健康度的计数，上线状态的测试集依据用得上。"""
+    from rodit.storage import Database, PgAuditLog
+
+    db = Database(ops_pg_dsn)
+    db.migrate()
+    monkeypatch.setenv("RODIT_DATABASE_DSN", ops_pg_dsn)
+    audit = PgAuditLog(db)
+
+    degraded = tmp_path / "degraded.json"
+    degraded.write_text(
+        json.dumps(eval_report(health=run_health(**DEGRADED)), ensure_ascii=False), encoding="utf-8"
+    )
+    capsys.readouterr()
+    assert serve.main(["record-eval", "--report", str(degraded)]) == 2
+    printed = capsys.readouterr()
+    assert "没有记录" in printed.out and "已记录" not in printed.out
+    for reason in DEGRADED_REASONS:
+        assert f"- {reason}" in printed.out and reason in printed.err  # 标准输出和日志里都有
+    assert audit.list_system_events(action=AuditAction.EVAL_VERDICT.value) == []
+
+    healthy = tmp_path / "healthy.json"
+    healthy.write_text(json.dumps(eval_report(), ensure_ascii=False), encoding="utf-8")
+    assert serve.main(["record-eval", "--report", str(healthy)]) == 0
+    printed = capsys.readouterr()
+    [event] = audit.list_system_events(action=AuditAction.EVAL_VERDICT.value)
+    assert event.shop_id is None and event.detail["llm_mode"] == "env"
+    assert event.detail["health_overall"] == run_health()["overall"]
+    assert event.detail["health_test"] == run_health()["test"]
+    assert "路由退回 0/324、质检不可用 0/233" in printed.out and "测试集 66 条" in printed.out
+    assert "一致" in printed.out and "不一致" not in printed.out
+    evidence = app_rollout.eval_evidence(audit, EngineConfig(), environ=LLM_ENV)
+    assert evidence.passed is True and "路由退回 0/324、质检不可用 0/233" in evidence.detail
 
 
 @pytest.mark.pg
