@@ -432,6 +432,11 @@ def test_openai_client_failures_are_metered_with_their_cause(
         ("好的", "stop", {}),
         ('{"intent": "logis', "length", {"finish_reason": "length"}),
         ("", "length", {"finish_reason": "length", "empty": True}),
+        # 截断时 content 是 null（思考模型把额度花在思考上）：和空字符串一样，token 不丢
+        (None, "length", {"finish_reason": "length", "empty": True}),
+        # 输出在思考块里被截断：思考内容不算回答，是空的
+        ('<think>先拟一版 {"intent": "logis', "length", {"finish_reason": "length", "empty": True}),
+        ("<think>想完了，没有回答</think>", "stop", {"empty": True}),
     ],
 )
 def test_openai_client_truncation_is_metered_with_its_tokens(
