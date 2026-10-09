@@ -1658,8 +1658,8 @@ def _draft_then_final(vendor: Vendor, request: LLMRequest, draft: dict[str, Any]
 
 
 def test_routing_answers_with_a_draft_object_before_the_final_one(tmp_path):
-    """每一票都是"草稿 + 最终答案"两个 JSON 对象：判断层读到的是草稿，没有退回、没有降级。
-    一条回答里顶层对象不止一个就算用不上：三票都丢，这一轮不算数。"""
+    """每一票都是"草稿 + 最终答案"两个 JSON 对象：分不清哪个算数，判断层不计这样的票（以前读到的
+    是草稿）。三票都丢，路由退回关键词规则，这一轮不算数。"""
     vendor = Vendor()
     draft = {**ROUTE_VOTE, Q_INTENT: {"choice": Intent.OTHER.value}}
 
@@ -1671,14 +1671,12 @@ def test_routing_answers_with_a_draft_object_before_the_final_one(tmp_path):
     run = _run(tmp_path, fault)
     assert run.code == 3
     health = _check_rule(run)
-    assert health.overall.route_fallback == 0 and health.routed_by == {"incloud_llm": 12}
-    assert run.data["degraded_counts"].get("decision") is None
+    assert health.overall.route_fallback == 12 and health.routed_by == {"rules": 12}
+    assert run.data["degraded_counts"].get("decision") == 12
     route = health.by_purpose["route"]
     assert (route.calls, route.failed, route.unusable) == (36, 0, 36)
-    assert health.overall.route_lost_votes == 12
     assert len(run.cases_where(route_votes=3, route_votes_usable=0)) == 12
-    assert "路由丢票的用例 12 条" in run.out and f"{PICKED[0].id} 0/3" in run.out
-    assert any("至少有一票没算上" in reason for reason in health.reasons)
+    assert any("没用上判断层" in reason for reason in health.reasons)
 
 
 def test_generation_answers_with_a_draft_object_before_the_final_one(tmp_path):

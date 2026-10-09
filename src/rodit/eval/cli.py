@@ -153,7 +153,16 @@ from rodit.eval.perf import (
     latency_report,
     usage_report,
 )
-from rodit.eval.runner import CaseTrace, EvalAborted, Progress, run_eval, select_cases
+from rodit.eval.runner import (
+    CAUSE_EMPTY,
+    CAUSE_TRUNCATED,
+    CAUSE_UNREADABLE,
+    CaseTrace,
+    EvalAborted,
+    Progress,
+    run_eval,
+    select_cases,
+)
 from rodit.eval.scoring import DIMENSIONS, CaseScore, summarize
 from rodit.llm import OpenAICompatibleClient
 from rodit.routing import NO_PROVIDER
@@ -546,10 +555,11 @@ def _health_counts(traces: Sequence[CaseTrace]) -> HealthCounts:
         qa_judged=sum(
             1 for t in traces if t.stats("qa").calls or DEGRADED_DECISION_QA in t.degraded
         ),
-        # 送检的草稿一条也没拿到判断层的结论才算：两份草稿并行送检、只有一份没判成的，另一份是
+        # 送检的草稿一条也没拿到判断层的结论才算（按引擎自己的质检记录，不按调用读不读得出：
+        # 质检投多票时读得出一票不等于有结论）：两份草稿并行送检、只有一份没判成的，另一份是
         # 判断层判过的，不算（那一次失败在 by_purpose 的 failed 里看得到）
         qa_unavailable=sum(
-            1 for t in traces if DEGRADED_DECISION_QA in t.degraded and not t.stats("qa").usable
+            1 for t in traces if DEGRADED_DECISION_QA in t.degraded and _no_judged_draft(t)
         ),
         generation_attempted=len(attempted),
         generation_unusable=sum(1 for t in attempted if _generation_unusable(t)),
@@ -1199,11 +1209,13 @@ def render_text(report: EvalCliReport) -> str:
         _render_baseline(report.baseline, add)
     if report.fingerprint is not None:
         add("")
-        _render_fingerprint(report.fingerprint, add)
+        _render_fingerprint(
+            report.fingerprint, add, recordable=report.health is None or report.health.valid
+        )
     return "\n".join(lines)
 
 
-def _render_fingerprint(fp: EvalFingerprint, add: Add) -> None:
+def _render_fingerprint(fp: EvalFingerprint, add: Add, *, recordable: bool = True) -> None:
     code = fp.git_sha[:12] if fp.git_sha else "未知"
     if fp.git_dirty:
         code += "（有未提交的改动）"
@@ -1216,7 +1228,13 @@ def _render_fingerprint(fp: EvalFingerprint, add: Add) -> None:
         f"判断层提示词 {fp.judge_prompt_ver or '未知'}，"
         f"判断层 {fp.decision_provider or '未知'}{classifier}，大模型 {model}{where}，代码 {code}）"
     )
-    add("记录这次的结论（完整评测才行）：python -m rodit.ops record-eval --report <--json 的文件>")
+    if recordable:
+        add(
+            "记录这次的结论（完整评测才行）："
+            "python -m rodit.ops record-eval --report <--json 的文件>"
+        )
+    else:
+        add("这一轮没有有效评到模型：record-eval 不收这份报告")
 
 
 # ================================================================ 命令行
@@ -1583,12 +1601,12 @@ def _abort_hint(labels: Any) -> str:
         )
     if "billing" in kinds:
         hints.append("余额或额度用完（HTTP 402）要充值或换有额度的账号，放慢重跑没有用")
-    if kinds & {"auth", "bad_request", "malformed", "unusable"}:
+    if kinds & {"auth", "bad_request", "malformed", "unusable", CAUSE_UNREADABLE}:
         hints.append(
             "请求被拒或响应读不出来的，不带 --skip-preflight 重跑一次——连通性检查会先说明是"
             "哪一种请求、什么原因"
         )
-    if kinds & {"truncated", "empty", "length"}:
+    if kinds & {"truncated", "empty", "length", CAUSE_TRUNCATED, CAUSE_EMPTY}:
         hints.append(f"回答被截断或为空的，{THINKING_HINT}")
     if not hints:
         return "先解决失败的原因再重跑"

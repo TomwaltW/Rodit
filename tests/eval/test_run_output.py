@@ -384,11 +384,16 @@ def test_the_abort_hint_follows_the_failure_labels():
     assert "--min-interval" in slow and "充值" not in slow and "--skip-preflight" not in slow
     paid = _abort_hint({"http_402:insufficient_balance": 30})
     assert "充值" in paid and "--min-interval" not in paid
-    for labels in ({"http_400:invalid_request": 9}, {"malformed": 9}, {"http_401": 9}):
+    for labels in (
+        {"http_400:invalid_request": 9},
+        {"malformed": 9},
+        {"http_401": 9},
+        {"读不出": 9},
+    ):
         hint = _abort_hint(labels)
         assert "不带 --skip-preflight 重跑一次" in hint and "连通性检查" in hint
         assert "--min-interval" not in hint
-    for labels in ({"truncated": 8}, {"empty": 8}):
+    for labels in ({"truncated": 8}, {"empty": 8}, {"截断": 8}, {"空回答": 8}):
         hint = _abort_hint(labels)
         assert "思考模式" in hint and "llm.extra_body" in hint and "--min-interval" not in hint
     both = _abort_hint({"http_429": 3, "http_402": 21})

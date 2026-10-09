@@ -193,6 +193,25 @@ def build_judge_messages(request: DecisionRequest) -> list[LLMMessage]:
     return [LLMMessage(role="system", content=SYSTEM_PROMPT), LLMMessage(role="user", content=user)]
 
 
+def _json_objects(text: str) -> int:
+    """回答里顶层的 JSON 对象有几个（能解析、不是空对象的才算）。和 rodit.eval.health 的
+    json_object_count 同一口径：判断层不依赖评测包，这里自己数。要求只输出一个 JSON 对象，
+    多于一个的回答不计票。"""
+    decoder, count, i = json.JSONDecoder(), 0, 0
+    while True:
+        i = text.find("{", i)
+        if i < 0:
+            return count
+        try:
+            value, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(value, dict) and value:
+            count += 1
+        i = end
+
+
 class InCloudLLMProvider:
     """平台云内大模型 + 自一致性投票（实现 core.decision.DecisionProvider）。
 
@@ -275,6 +294,9 @@ class InCloudLLMProvider:
                 lost.append(LOST_TRUNCATED)  # 截到一半的回答不解析：里面凑得出的片段不能当答案
             elif not r.text.strip():
                 lost.append(LOST_EMPTY)
+            elif _json_objects(r.text) > 1:
+                # 先写了一份草稿、后面才是答案：分不清哪个算数，这一票不要（取第一个会按草稿判）
+                lost.append(LOST_UNREADABLE)
             else:
                 responses.append(r)
         if not responses:

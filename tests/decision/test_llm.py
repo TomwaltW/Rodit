@@ -341,6 +341,20 @@ def test_blank_response_is_a_lost_vote():
     assert intent.probabilities == {"stock": 1.0}
 
 
+def test_an_answer_with_two_json_objects_is_a_lost_vote():
+    """先写一份草稿、后面才是答案（两个顶层 JSON 对象）：分不清哪个算数，这一票不计——
+    以前取第一个，判的是草稿。"""
+    good = _vote("stock")
+    draft = json.dumps(_vote("other"), ensure_ascii=False)
+    two = LLMResponse(text=draft + "\n最终答案：" + json.dumps(good, ensure_ascii=False))
+    error = _decision_error(FakeLLMClient(lambda r: two), samples=1, temperature=0.0)
+    assert str(error) == "大模型判断全部失败（1 次：读不出 1）"
+    # 三票里一票是这样的：另外两票照常计
+    llm = FakeLLMClient(responses=[two, good, good])
+    intent = _provider(llm, min_votes=2).decide(_request()).choice(Q_INTENT)
+    assert intent.probabilities == {"stock": 1.0}
+
+
 def test_all_votes_lost_names_each_cause_with_its_count():
     timeout = LLMTimeout("大模型调用超时（1 秒）")
     llm = FakeLLMClient(responses=[timeout, timeout, _cut(_vote("stock"))])

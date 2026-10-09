@@ -33,7 +33,7 @@ uv run pytest          # 跑测试
 uv run ruff check .    # lint
 ```
 
-基线：`uv run pytest` → 见最近一次交付报告（Phase 2 / 3 收尾和客户演示站合并、复审修复之后为 `5055 passed, 2 skipped`；跳过的 2 条是镜像里没有 promtool 时的告警规则检查。PostgreSQL 和浏览器冒烟测试要跑起来才算数：先 `bash scripts/dev-pg.sh`，镜像自带 Node 版 Playwright）。
+基线：`uv run pytest` → 见最近一次交付报告。真实大模型评测前的加固合入之后，本机（macOS，`bash scripts/dev-pg.sh` 起的 Docker PostgreSQL、按它打印的那行 `export RODIT_TEST_PG_DSN=…`，没有 Playwright）是 `5709 passed, 10 skipped`：跳过的是 8 条浏览器冒烟测试和 2 条没有 promtool 时的告警规则检查；云端镜像（自带 Playwright）上这一轮还没跑过，此前是 `5055 passed, 2 skipped`。PostgreSQL 和浏览器冒烟测试要跑起来才算数：先 `bash scripts/dev-pg.sh`；几个进程同时跑测试时各起各的实例（`RODIT_DEV_PG_NAME` / `RODIT_DEV_PG_PORT`），不要共用。
 
 云端镜像自带 PostgreSQL 16 和 Redis 7，但默认不启动。PostgreSQL 用 `bash scripts/dev-pg.sh`
 （启动服务并给当前用户建角色，之后 psql / psycopg 直接连）；Redis 用 `service redis-server start`。
