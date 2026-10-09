@@ -96,6 +96,28 @@ def test_latency_report_marks_values_cut_short_by_timeouts_or_the_budget():
     assert not is_timeout({"error": "LLMError", "kind": "rate_limit"}) and not is_timeout({})
 
 
+def test_latency_report_withholds_the_verdict_when_the_model_was_not_evaluated():
+    """这一轮没有有效评到模型（evaluated=False）：调大模型的环节和端到端量到的是兜底路径，
+    没超标也不算达标（None）；不调大模型的环节、超标的照旧，分位数不改。"""
+    rows = [{"understand": 1, "route": 3, "retrieve": 20, "generate": 0, "qa": 0, "total": 30}] * 20
+    valid = latency_report(rows)
+    assert not valid.not_evaluated and valid.e2e_p95_within_target is True
+    assert all(valid.stages[k].within_target is True for k in ("route", "generate", "qa"))
+    report = latency_report(rows, evaluated=False)
+    assert report.not_evaluated and not report.limited_by_budget
+    assert report.e2e_p95_within_target is None
+    for key in ("route", "generate", "qa", "total"):
+        assert report.stages[key].within_target is None and report.stages[key].target_ms
+        assert report.stages[key].p95 == valid.stages[key].p95
+    assert report.stages["retrieve"].within_target is True  # 检索不调大模型：照旧
+    assert report.stages["understand"].within_target is None  # 本来就没有目标
+    slow = latency_report([{"route": 1500, "retrieve": 900, "total": 6000}], evaluated=False)
+    assert slow.stages["route"].within_target is False  # 超标就是超标
+    assert slow.stages["retrieve"].within_target is False
+    assert slow.e2e_p95_within_target is False
+    assert latency_report([], evaluated=False).e2e_p95_within_target is None
+
+
 # ---------------------------------------------------------------- §14 用量与成本
 
 

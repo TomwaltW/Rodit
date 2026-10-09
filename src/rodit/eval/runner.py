@@ -8,15 +8,17 @@
 和 engine.result 审计里的 latency_ms 是同一份，§12.1）、降级标记、质检不通过的原因
 （engine.result 审计的 qa_reasons，已脱敏）、实际做出路由的判断层；harness 带计量和记录时
 （接真实大模型，见 rodit.eval.harness），还有每次大模型调用的用量（llm.usage 审计的 detail，
-§14）、模型草稿，和每个用途的调用结果（CallStats：失败、被截断、空、读不出，报告的运行健康度用）。
+§14）、模型草稿，和每个用途的调用结果（CallStats：失败、被截断、空、读不出，报告的运行健康度用）；
+harness 带审计时还有判断层判过几份草稿（engine.qa 审计的 model_checked 之和）。
 
 读计量之前先等引擎留在后台的调用做完（到截止时间被丢下、还在跑的，engine.wait_background）：
 它们的 llm.usage 是 handle() 返回之后才写的，不等就漏了（§14 少算）；迟到的条数记在
 CaseTrace.late_calls。等待在 handle() 之外，不计入耗时。
 
 两个只给真实大模型用的开关（默认都关）：min_interval_s 让相邻两条用例的开始至少隔这么久
-（限流时用；等待同样在 handle() 之外）；stop_after_failed 在连续这么多条用例的大模型调用全部失败时
-停下（EvalAborted）——接口整个不可用时不必把剩下的几百条跑完。
+（限流时用；等待同样在 handle() 之外）；stop_after_failed 在连续这么多条用例的大模型调用没有一次
+用得上时停下（EvalAborted）——调用失败，或者有响应但被截断、是空的、读不出（HTTP 200 的这几种同样算：
+思考模型把 max_tokens 用完时每次调用都照常计费）。接口整个不可用时不必把剩下的几百条跑完。
 """
 
 from __future__ import annotations
@@ -40,6 +42,15 @@ from rodit.eval.scoring import CaseScore, EvalReport, score_case, summarize
 from rodit.testing import fixtures
 from rodit.testing.fakes import make_message
 from rodit.testing.fixtures import DemoWorld
+
+CAUSE_TRUNCATED = "截断"  # 有响应但用不上的调用，原因分三种（一次调用只记一种，按这个先后）：
+CAUSE_EMPTY = "空回答"  # 被 max_tokens 截断；文本是空的；
+CAUSE_UNREADABLE = "读不出"  # 这个环节的解析器读不出要的东西（含一条回答里有几个 JSON 对象）
+UNUSABLE_CAUSES = (CAUSE_TRUNCATED, CAUSE_EMPTY, CAUSE_UNREADABLE)
+"""EvalAborted.labels 里除了失败原因的标签（rodit.eval.health.error_label）还会出现的键。"""
+
+_sleep = time.sleep
+"""min_interval_s 用它等。测试换的是这个名字，不是全进程的 time.sleep（子进程等待等别处也在用）。"""
 
 BACKGROUND_WAIT_S = 10.0
 """一条用例跑完后最多等引擎的后台调用这么久（它们各自到单次调用的超时就结束，默认 1–2.5 秒）；
@@ -72,7 +83,9 @@ class CallStats:
 
     @property
     def all_failed(self) -> bool:
-        return self.calls > 0 and self.failed == self.calls
+        """调过，而且没有一次用得上：每一次不是失败，就是有响应但用不上（被截断、空、读不出）。
+        调用抛了别的异常（代码缺陷，只记进 calls）的不算：那不是模型服务的问题。"""
+        return self.calls > 0 and self.failed + self.unusable == self.calls
 
 
 @dataclass
@@ -90,22 +103,28 @@ class CaseTrace:
     route_provider: str | None = None
     calls: dict[str, CallStats] = field(default_factory=dict)  # 用途 → 调用结果；harness 没记时为空
     late_calls: int = 0  # handle() 返回之后才写进来的 llm.usage 条数（已经在 llm_calls 里）
+    # 有响应但用不上的调用，按原因（UNUSABLE_CAUSES）计数，各用途合计；harness 没记时为空
+    unusable_causes: dict[str, int] = field(default_factory=dict)
+    # 这条用例里拿到质检判断层结论的草稿数（engine.qa 审计 model_checked 之和：判断层不可用的、
+    # 到截止时间结论被丢掉的都不在内）；harness 没有审计时为 None
+    judged_drafts: int | None = None
 
     def stats(self, purpose: str) -> CallStats:
         return self.calls.get(purpose, CallStats())
 
     @property
     def all_calls_failed(self) -> bool:
-        """这条用例调过大模型，而且每一次都失败了（没调过大模型的不算）。"""
+        """这条用例调过大模型，而且没有一次用得上（CallStats.all_failed；没调过大模型的不算）。"""
         made = [s for s in self.calls.values() if s.calls]
         return bool(made) and all(s.all_failed for s in made)
 
 
 class EvalAborted(Exception):
-    """连续多条用例的大模型调用全部失败，评测提前停下（run_eval 的 stop_after_failed）。
+    """连续多条用例的大模型调用没有一次用得上，评测提前停下（run_eval 的 stop_after_failed）。
 
-    finished 是已经跑完的条数（含触发停下的那几条），labels 是这几条里失败原因的分布
-    （rodit.eval.health.error_label）。消息是给操作的人看的一句话，不含提示词和模型输出。"""
+    finished 是已经跑完的条数（含触发停下的那几条），labels 是这几条里每次调用没用上的原因：
+    失败的按 rodit.eval.health.error_label，有响应但用不上的按 UNUSABLE_CAUSES（截断 / 空回答 /
+    读不出）。消息是给操作的人看的一句话，不含提示词和模型输出。"""
 
     def __init__(self, *, finished: int, total: int, streak: int, labels: dict[str, int]) -> None:
         self.finished = finished
@@ -114,8 +133,8 @@ class EvalAborted(Exception):
         self.labels = dict(labels)
         seen = "、".join(f"{label} ×{n}" for label, n in labels.items()) or "原因没有记下来"
         super().__init__(
-            f"连续 {streak} 条用例的大模型调用全部失败（{seen}），跑到第 {finished} / {total} 条"
-            "停下：没有生成报告，也没有保存结果"
+            f"连续 {streak} 条用例的大模型调用没有一次用得上（{seen}），"
+            f"跑到第 {finished} / {total} 条停下：没有生成报告，也没有保存结果"
         )
 
 
@@ -237,12 +256,16 @@ def trace_case(harness: EvalHarness, case: EvalCase, result: EngineResult | None
             wait(shop_id, BACKGROUND_WAIT_S)
         late = len(_usage_calls(usage)) - on_time
     qa_reasons: list[str] = []
+    judged_drafts: int | None = None
     audit = getattr(harness, "audit", None)
     if audit is not None:
         events = audit.list_events(shop_id, action=AuditAction.RESULT.value)
         if events:
             raw = events[-1].detail.get(ResultKey.QA_REASONS.value) or []
             qa_reasons = [str(r) for r in raw] if isinstance(raw, list) else []
+        # 一条消息拆成几个问题时每个问题一条 engine.qa；每条用例一套全新的审计，全加起来就是这一条的
+        checks = audit.list_events(shop_id, action=AuditAction.QA.value)
+        judged_drafts = sum(_count(e.detail.get("model_checked")) for e in checks)
     recorder = getattr(harness, "drafts", None)
     call_recorder = getattr(harness, "calls", None)
     route = result.route if result is not None else None
@@ -256,11 +279,25 @@ def trace_case(harness: EvalHarness, case: EvalCase, result: EngineResult | None
         route_provider=route.provider if route is not None else None,
         calls=call_recorder.stats() if call_recorder is not None else {},
         late_calls=max(0, late),
+        unusable_causes=_unusable_causes(call_recorder),
+        judged_drafts=judged_drafts,
     )
 
 
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _unusable_causes(call_recorder: Any) -> dict[str, int]:
+    read = getattr(call_recorder, "unusable_causes", None)  # 别的记录器不一定有
+    return dict(read()) if callable(read) else {}
+
+
 def _failure_labels(traces: Sequence[CaseTrace]) -> dict[str, int]:
+    """这几条用例里每次调用没用上的原因 → 次数：失败的调用，加上有响应但用不上的。"""
     labels = Counter(error_label(d) for t in traces for d in t.llm_calls if d.get("error"))
+    for t in traces:
+        labels.update(t.unusable_causes)
     return dict(labels.most_common())
 
 
@@ -287,7 +324,7 @@ def run_eval(
             # 在 handle() 之外等：不计入这条或上一条的耗时（§12.1 的数字不受影响）
             wait = min_interval_s - (time.monotonic() - started)
             if wait > 0:
-                time.sleep(wait)
+                _sleep(wait)
         started = time.monotonic()
         harness = make_harness()
         result = run_case(harness, case)

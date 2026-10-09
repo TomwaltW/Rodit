@@ -127,6 +127,7 @@ from rodit.eval.llm_env import (
 from rodit.eval.perf import (
     DAYS_PER_MONTH,
     MESSAGES_PER_SHOP_DAY,
+    MODEL_STAGES,
     PURPOSE_LABELS,
     CaseUsage,
     LatencyReport,
@@ -225,6 +226,9 @@ class Calibration(_Model):
     samples_split: str  # 校准用的是哪部分数据
     n_samples: int  # 参与校准的条数：只算配置的判断层做出的路由
     thresholds: dict[str, ThresholdPick | None]
+    # 真实类型 → 参与校准的条数。阈值是 None 时靠它分清"没有样本"（0 条：这个类型的用例都没参与
+    # 校准）和"达不到目标准确率"；旧报告没有这一项，为 None
+    support: dict[str, int] | None = None
     # 这部分数据里没参与校准的：退回了关键词规则的（置信度不是一个刻度）、没有路由结果的
     left_out_fallback: int = 0
     left_out_no_route: int = 0
@@ -233,7 +237,7 @@ class Calibration(_Model):
 class Reliability(_Model):
     n_samples: int
     bins: list[ReliabilityBin]
-    ece: float
+    ece: float | None  # 期望校准误差；一条样本都没有时为 None（算不出来，不是 0）
     left_out_fallback: int = 0  # 同 Calibration，范围是全部用例
     left_out_no_route: int = 0
 
@@ -289,6 +293,9 @@ class Failure(_Model):
     no_suggestion_reason: str | None
     # 模型草稿（含质检不通过后重写的；已脱敏、去重；只有接大模型时有）
     drafts: list[str] = Field(default_factory=list)
+    # 有模型草稿，但这条用例没有一份草稿拿到质检判断层的结论（生成的第一种话术调用失败、后面的被
+    # 生成器丢掉；判断层质检不可用；被时间预算截断……）：列出来的草稿没有用上
+    drafts_unused: bool = False
     qa_reasons: list[str] = Field(default_factory=list)  # 质检不通过的原因（已脱敏）
     degraded: list[str] = Field(default_factory=list)
     latency_ms: dict[str, int] = Field(default_factory=dict)
@@ -401,6 +408,7 @@ def _failure(
         answer=cards[0].text if cards else None,
         no_suggestion_reason=result.no_suggestion_reason if result is not None else None,
         drafts=list(dict.fromkeys(trace.drafts)),  # 一次生成的几条候选常常相同，只列一次
+        drafts_unused=bool(trace.drafts) and _no_judged_draft(trace),
         qa_reasons=list(trace.qa_reasons),
         degraded=list(trace.degraded),
         latency_ms=dict(trace.latency_ms),
@@ -456,8 +464,8 @@ def _llm_info(
 
 
 def _lost_votes(trace: CaseTrace) -> int:
-    """路由用了判断层、却没算上的票数（调用失败、被截断、为空、读不出主要问题）。
-    退回关键词规则的用例不在这里数（那是 route_fallback）。"""
+    """路由用了判断层、却没算上的票数（调用失败、被截断、为空、有必答的问题读不出，见
+    harness._readable）。退回关键词规则的用例不在这里数（那是 route_fallback）。"""
     if not _judge_routed(trace.route_provider, trace.degraded):
         return 0
     votes = trace.stats("route")
@@ -481,12 +489,40 @@ PIPELINE_ERROR_CODES = frozenset(
 """带这些降级标记的用例，链路上有一环出了意外（抛了不该抛的异常、存储或知识库不可用……），
 这一条量到的不是模型：计入 HealthCounts.engine_errors。评测跑在内存里的演示单元上，正常的一轮
 一条也不该有（离线替身的基线就是 0）。判断层不可用（decision / decision:qa）另有各自的计数，
-时间预算截断（budget）、平台工具降级（tool:…）不在这里。"""
+时间预算截断（budget）、平台工具降级（tool:…）不在这里。图片理解出意外的标记（vision，
+engine.images）也不在：评测集没有带图片的用例，一轮评测里出不了这个标记。"""
+
+
+def _no_judged_draft(trace: CaseTrace) -> bool:
+    """这条用例没有一份草稿拿到质检判断层的结论。按引擎自己的记录（engine.qa 审计的
+    model_checked，runner.trace_case 读进 judged_drafts）：CallRecorder 分不出来——质检调用可以在
+    截止时间之后才答完，那个结论引擎没有用。harness 没有审计时才退回去看质检调用有没有读得出的。"""
+    if trace.judged_drafts is not None:
+        return trace.judged_drafts == 0
+    return not trace.stats("qa").usable
+
+
+def _generation_unusable(trace: CaseTrace) -> bool:
+    """调了生成，却没有大模型草稿送到质检（HealthCounts.generation_unusable）：
+    - 生成的回答没有一条解析得出来（或者调用全失败）；
+    - 或者有调用失败 / 用不上，而且这条用例一次质检判断层都没调——生成器按话术的先后处理并行的
+      几次调用，前面一种调用失败就不用后面的（generation.generator），后一种答得再好也被丢掉，
+      CallRecorder 却记它"用得上"。只有后一种话术失败、重写失败的用例都调过质检，不算；
+      被时间预算截断的也不算（那是 budget_unjudged）。
+    一条消息拆成几个问题时按整条用例看：只丢了其中一个问题的草稿，这里看不出来。"""
+    generate = trace.stats("generate")
+    if not generate.calls:
+        return False
+    if not generate.usable:
+        return True
+    lost = generate.failed or generate.unusable
+    return bool(lost) and not trace.stats("qa").calls and DEGRADED_BUDGET not in trace.degraded
 
 
 def _health_counts(traces: Sequence[CaseTrace]) -> HealthCounts:
     """一组用例的计数（各项的含义见 rodit.eval.health.HealthCounts）。降级标记是引擎给的，
-    丢票、有没有送检、有没有可用草稿是 harness 的 CallRecorder 记的。"""
+    丢票、有没有送检、有没有可用草稿是 harness 的 CallRecorder 记的，判断层判过几份草稿是引擎的
+    engine.qa 审计记的。"""
     attempted = [t for t in traces if t.stats("generate").calls]
     return HealthCounts(
         cases=len(traces),
@@ -496,11 +532,19 @@ def _health_counts(traces: Sequence[CaseTrace]) -> HealthCounts:
         qa_judged=sum(
             1 for t in traces if t.stats("qa").calls or DEGRADED_DECISION_QA in t.degraded
         ),
-        qa_unavailable=sum(1 for t in traces if DEGRADED_DECISION_QA in t.degraded),
+        # 送检的草稿一条也没拿到判断层的结论才算：两份草稿并行送检、只有一份没判成的，另一份是
+        # 判断层判过的，不算（那一次失败在 by_purpose 的 failed 里看得到）
+        qa_unavailable=sum(
+            1 for t in traces if DEGRADED_DECISION_QA in t.degraded and not t.stats("qa").usable
+        ),
         generation_attempted=len(attempted),
-        generation_unusable=sum(1 for t in attempted if not t.stats("generate").usable),
+        generation_unusable=sum(1 for t in attempted if _generation_unusable(t)),
         engine_errors=sum(1 for t in traces if PIPELINE_ERROR_CODES.intersection(t.degraded)),
         budget_cut=sum(1 for t in traces if DEGRADED_BUDGET in t.degraded),
+        # 已经有草稿判过、只是重写被截断的不在这里
+        budget_unjudged=sum(
+            1 for t in traces if DEGRADED_BUDGET in t.degraded and _no_judged_draft(t)
+        ),
     )
 
 
@@ -618,9 +662,11 @@ def evaluate(
     calib_samples, calib_fallback, calib_no_route = _samples(calib_scores, by_id, run.traces)
     intents = sorted({str(by_id[s.case_id].expected_intent) for s in calib_scores})
     thresholds = calibrate(calib_samples, intents, target_precision=target_precision)
+    support = Counter(sample.true for sample in calib_samples)
 
     all_samples, all_fallback, all_no_route = _samples(scores, by_id, run.traces)
-    bins, ece = reliability(all_samples) if all_samples else ([], 0.0)
+    # 一条样本都没有时 ECE 算不出来：记 None，不记 0（0 读起来像"校准得很好"）
+    bins, ece = reliability(all_samples) if all_samples else ([], None)
     report = summarize(scores, selected, gate=GATE)
     traces = [run.traces[s.case_id] for s in scores]
     metered = any(t.metered for t in traces)
@@ -641,6 +687,7 @@ def evaluate(
             samples_split=calib_split,
             n_samples=len(calib_samples),
             thresholds=thresholds,
+            support={intent: support.get(intent, 0) for intent in intents},
             left_out_fallback=calib_fallback,
             left_out_no_route=calib_no_route,
         ),
@@ -665,6 +712,7 @@ def evaluate(
             [t.latency_ms for t in traces],
             [d for t in traces for d in t.llm_calls],
             budget_cut=sum(1 for t in traces if DEGRADED_BUDGET in t.degraded),
+            evaluated=health is None or health.valid,
         ),
         usage=usage_report([t.llm_calls for t in traces], pricing) if metered else None,
         degraded_counts=dict(Counter(d for t in traces for d in t.degraded).most_common()),
@@ -741,6 +789,7 @@ def _stage_breakdown(latency: dict[str, int]) -> str:
 
 VIA_PROXY_LABELS = {True: "经本机代理", False: "直连", None: "未知"}
 LIMITED_BY_BUDGET = "受时间预算限制"
+NOT_EVALUATED = "不算数（见运行健康度）"
 
 
 def _share(count: int, total: int) -> str:
@@ -751,8 +800,13 @@ def _stage_verdict(key: str, stage: StageLatency, lat: LatencyReport) -> str:
     if stage.target_ms is None:
         return "—"
     if stage.within_target is None:
-        # 端到端：没有数据，或者那个数被时间预算截短了——后一种不能写"达标"
-        limited = key == "total" and lat.limited_by_budget and stage.p95 is not None
+        # 没有数据；或者这一轮没有有效评到模型（调大模型的环节、端到端量到的是兜底路径）；或者
+        # 端到端那个数被时间预算截短了——后两种都不能写"达标"
+        if stage.p95 is None:
+            return f"≤ {stage.target_ms}"
+        if lat.not_evaluated and key in MODEL_STAGES:
+            return f"≤ {stage.target_ms} {NOT_EVALUATED}"
+        limited = key == "total" and lat.limited_by_budget
         return f"≤ {stage.target_ms}{' ' + LIMITED_BY_BUDGET if limited else ''}"
     return f"≤ {stage.target_ms} {'达标' if stage.within_target else '超标'}"
 
@@ -781,6 +835,11 @@ def _render_latency(report: EvalCliReport, add: Add) -> None:
                 f"（{_share(stage.llm_timeouts, stage.llm_calls)}）"
             )
         add(row)
+    if lat.not_evaluated:
+        add(
+            "这一轮没有有效评到模型（见运行健康度）：路由、生成、质检和端到端的耗时量到的是兜底路径"
+            "（调用失败得快，没调成的环节记 0），不是模型正常工作时的耗时，没超过目标也不能算达标"
+        )
     if lat.limited_by_budget:
         add(
             f"端到端{LIMITED_BY_BUDGET}：有 {lat.budget_cut} 条用例被时间预算截断、"
@@ -870,11 +929,12 @@ def _render_usage_caveats(report: EvalCliReport, usage: UsageReport, add: Add) -
         )
     if usage.served_models:
         names = "、".join(f"{name} ×{n}" for name, n in usage.served_models.items())
-        add(f"模型服务回显的模型名（成功的调用）：{names}")
+        # 接口不回显模型名时客户端填的是配置的名字：和配置的一样不等于模型服务确认过这个名字
+        add(f"计量记下的模型名（成功的调用；接口不回显时记的是配置的名字）：{names}")
         configured = report.llm.model
         if configured and any(name != configured for name in usage.served_models):
             add(
-                f"注意：回显的模型名和配置的 {configured} 不一样（配置的可能只是别名）："
+                f"注意：接口回显的模型名和配置的 {configured} 不一样（配置的可能只是别名）："
                 "这次量的是回显的那个版本，请记下来——别名以后改指向别的版本，配置指纹看不出来"
             )
 
@@ -892,8 +952,9 @@ def _render_failure(f: Failure, add: Add) -> None:
         add(f"    推荐：{f.answer}")
     elif f.no_suggestion_reason:
         add(f"    没有推荐：{f.no_suggestion_reason}")
+    unused = "（没有用上：没有拿到质检判断层的结论）" if f.drafts_unused else ""
     for i, draft in enumerate(f.drafts, 1):
-        add(f"    模型草稿 {i}：{draft}")
+        add(f"    模型草稿 {i}{unused}：{draft}")
     shown = f.no_suggestion_reason if f.answer is None else None
     for reason in f.qa_reasons:
         if not shown or reason not in shown:  # "没有推荐"里已经写了的原因不重复
@@ -956,7 +1017,8 @@ def _counts_line(name: str, c: HealthCounts) -> str:
     return (
         f"{name} {c.cases} 条：路由退回关键词规则 {c.route_fallback}、"
         f"路由丢票 {c.route_lost_votes}、"
-        f"引擎异常 {c.engine_errors}、被时间预算截断 {c.budget_cut}；"
+        f"引擎异常 {c.engine_errors}、被时间预算截断 {c.budget_cut}"
+        f"（其中没有草稿过完质检判断层的 {c.budget_unjudged}）；"
         f"质检判断层不可用 {c.qa_unavailable} / {c.qa_judged}（有草稿送检的）；"
         f"生成没有可用草稿 {c.generation_unusable} / {c.generation_attempted}（调过大模型生成的）"
     )
@@ -1086,7 +1148,9 @@ def render_text(report: EvalCliReport) -> str:
             "它们的置信度是按更少的票算的，刻度更粗；丢票多的话这里的阈值要打折扣看"
         )
     for intent, pick in cal.thresholds.items():
-        if pick is None:
+        if pick is None and cal.support is not None and not cal.support.get(intent):
+            add(f"{intent:<18}没有样本（这个类型的用例都没参与校准）")
+        elif pick is None:
             add(f"{intent:<18}达不到目标准确率")
         else:
             add(
@@ -1096,7 +1160,7 @@ def render_text(report: EvalCliReport) -> str:
     rel = report.reliability
     rel_left_out = rel.left_out_fallback + rel.left_out_no_route
     without = f"，不含没参与的 {rel_left_out} 条" if rel_left_out else ""
-    add(f"可靠性（{rel.n_samples} 条{without}）：ECE = {rel.ece:.4f}")
+    add(f"可靠性（{rel.n_samples} 条{without}）：ECE = {_num(rel.ece)}")
     for b in rel.bins:
         add(
             f"  [{b.lower:.1f}, {b.upper:.1f}{']' if b.upper == 1.0 else ')'}  n={b.count:<3}"
