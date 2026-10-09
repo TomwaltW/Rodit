@@ -26,6 +26,7 @@ from rodit.eval.health import (
     allowed,
     assess,
     error_label,
+    json_object_count,
 )
 
 ROUTE_EXAMPLE = "路由：324 条里有 105 条（32.4%）没用上判断层（退回关键词规则），上限 6 条。"
@@ -86,6 +87,7 @@ def test_models_have_the_agreed_fields_and_defaults():
             "generation_unusable": 0,
             "engine_errors": 0,
             "budget_cut": 0,
+            "budget_unjudged": 0,
         },
     )
     minimal = RunHealth(ceiling=DEFAULT_CEILING, overall=HealthCounts(cases=324), valid=True)
@@ -255,9 +257,14 @@ def test_the_documented_example_sentence():
             "generation_unusable",
             6,
             "生成：调过大模型生成的 304 条里有 7 条（2.3%）"
-            "没有一条可用草稿（调用全失败，或输出全都解析不了），上限 6 条。",
+            "没有大模型草稿送到质检（生成调用失败，或输出解析不了），上限 6 条。",
         ),
         ("engine_errors", 6, "引擎：324 条里有 7 条（2.2%）引擎异常，上限 6 条。"),
+        (
+            "budget_unjudged",
+            6,
+            "时间预算：324 条里有 7 条（2.2%）被时间预算截断、没有大模型草稿过完质检，上限 6 条。",
+        ),
         (
             "route_lost_votes",
             32,
@@ -275,6 +282,7 @@ def test_reasons_come_in_a_fixed_order():
     reasons = assess(
         _counts(
             route_lost_votes=40,
+            budget_unjudged=8,
             engine_errors=9,
             generation_unusable=30,
             qa_unavailable=20,
@@ -286,6 +294,7 @@ def test_reasons_come_in_a_fixed_order():
         "质检：有草稿送检的 153 条里有 20 条",
         "生成：调过大模型生成的 304 条里有 30 条",
         "引擎：324 条里有 9 条",
+        "时间预算：324 条里有 8 条",
         "路由：324 条里有 40 条",
     ]
     assert all(r.endswith(" 条。") and "上限 " in r and "%）" in r for r in reasons)
@@ -309,14 +318,19 @@ def test_the_test_split_is_judged_separately_and_prefixed():
         generation_attempted=60,
         generation_unusable=2,
         engine_errors=2,
+        budget_unjudged=2,
     )
     reasons = assess(_counts(), every)
-    assert len(reasons) == 5 and all(r.startswith("测试集：") for r in reasons)
+    assert len(reasons) == 6 and all(r.startswith("测试集：") for r in reasons)
     assert reasons[1] == (
         "测试集：质检：有草稿送检的 31 条里有 2 条（6.5%）"
         "质检判断层不可用（只跑了硬规则），上限 1 条。"
     )
     assert reasons[4] == (
+        "测试集：时间预算：66 条里有 2 条（3.0%）"
+        "被时间预算截断、没有大模型草稿过完质检，上限 1 条。"
+    )
+    assert reasons[5] == (
         "测试集：路由：66 条里有 7 条（10.6%）"
         "至少有一票没算上（调用失败、被截断、读不出），上限 6 条。"
     )
@@ -355,7 +369,7 @@ def test_zero_denominators():
     ]
     assert assess(HealthCounts(cases=10, generation_unusable=1)) == [
         "生成：调过大模型生成的 0 条里有 1 条（—）"
-        "没有一条可用草稿（调用全失败，或输出全都解析不了），上限 0 条。"
+        "没有大模型草稿送到质检（生成调用失败，或输出解析不了），上限 0 条。"
     ]
     assert assess(HealthCounts(cases=0, route_fallback=1, engine_errors=1, route_lost_votes=1)) == [
         "路由：0 条里有 1 条（—）没用上判断层（退回关键词规则），上限 0 条。",
@@ -364,10 +378,45 @@ def test_zero_denominators():
     ]
 
 
-def test_budget_cuts_never_invalidate_a_run():
-    """时间预算截断是 §12.1 的正常行为：照实展示，不算"模型没被评到"。"""
+def test_budget_cuts_alone_never_invalidate_a_run():
+    """时间预算截断是 §12.1 的正常行为：照实展示，本身不算"模型没被评到"。"""
     assert assess(_counts(budget_cut=324), HealthCounts(cases=66, budget_cut=66)) == []
     assert assess(_counts(budget_cut=324), ceiling=0.0, lost_vote_ceiling=0.0) == []
+
+
+def test_budget_cuts_before_any_judged_draft_do():
+    """截在生成或质检完成之前、没有一条大模型草稿判完的用例，量到的不是模型的回答：超过上限不算数。
+    没调过生成、没有草稿送检时别的分母都是 0，只有这一条规则看得见。"""
+    silent = _counts(budget_cut=324, budget_unjudged=324, qa_judged=0, generation_attempted=0)
+    assert assess(silent) == [
+        "时间预算：324 条里有 324 条（100.0%）被时间预算截断、没有大模型草稿过完质检，上限 6 条。"
+    ]
+    assert assess(_counts(budget_cut=40, budget_unjudged=6)) == []  # 其余是重写被截断：不算
+    test = HealthCounts(cases=66, budget_cut=3, budget_unjudged=2)
+    assert assess(_counts(), test) == [
+        "测试集：时间预算：66 条里有 2 条（3.0%）"
+        "被时间预算截断、没有大模型草稿过完质检，上限 1 条。"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "count"),
+    [
+        ('{"intent": {"choice": "stock"}, "emotion": {"score": 0}}', 1),  # 嵌套的不单独算
+        ('好的，结果如下：\n```json\n{"answer": "亲，有货"}\n```', 1),
+        ('{"answer": "尺码表里写着 {M: 100-115 斤}"}', 1),  # 字符串里的花括号不算
+        ('格式是 {问题名: {...}}，答案：{"answer": "好"}', 1),  # 解析不了的花括号跳过
+        ('{"intent": {"choice": "other"}}\n最终答案：{"intent": {"choice": "stock"}}', 2),
+        ('<think>先写个草稿 {"answer": "草稿"}</think>{"answer": "亲，有货"}', 2),
+        ('[{"answer": "一"}, {"answer": "二"}]', 2),
+        ("{} 和 {}", 0),  # 空对象不算
+        ("只有文字，没有 JSON", 0),
+        ("", 0),
+        ('{"answer": "没写完', 0),
+    ],
+)
+def test_json_object_count(text: str, count: int):
+    assert json_object_count(text) == count
 
 
 # ================================================================ error_label

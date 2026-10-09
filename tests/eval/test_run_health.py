@@ -499,7 +499,7 @@ def test_every_generation_output_unparseable(tmp_path):
     assert "decision" not in run.data["degraded_counts"] and run.data["usage"]["errors"] == 0
     assert health.reasons[0] == (
         "生成：调过大模型生成的 5 条里有 5 条（100.0%）"
-        "没有一条可用草稿（调用全失败，或输出全都解析不了），上限 1 条。"
+        "没有大模型草稿送到质检（生成调用失败，或输出解析不了），上限 1 条。"
     )
     assert "生成没有可用草稿 5 / 5（调过大模型生成的）" in run.out
     # 生成调用全部失败（限流）也一样算没有可用草稿

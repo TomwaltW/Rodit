@@ -12,10 +12,12 @@
 
 纯数据和纯函数：只用 pydantic 和标准库，不 import rodit 的其他模块。这一块里只有计数、比例和
 失败原因的标签（error_label），没有买家数据、没有密钥、没有模型服务的错误消息原文。
+json_object_count 是评测和连通性检查共用的小工具：一条回答里顶层的 JSON 对象不止一个时算"用不上"。
 """
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -58,18 +60,23 @@ class HealthCounts(_Model):
     route_lost_votes: int = Field(default=0, ge=0)
     # 有草稿送过质检判断层的用例数（qa_unavailable 的分母）
     qa_judged: int = Field(default=0, ge=0)
-    # 质检判断层不可用（降级标记里有 decision:qa）
+    # 质检判断层不可用：送检的草稿一条也没拿到判断层的结论（降级标记里有 decision:qa，而且这条
+    # 用例的质检调用没有一次读得出来）。两份草稿里只有一份没判成的不算：另一份是判断层判过的
     qa_unavailable: int = Field(default=0, ge=0)
     # 调过大模型生成的用例数（generation_unusable 的分母）
     generation_attempted: int = Field(default=0, ge=0)
-    # 调了生成，却没有一条可用草稿（调用全失败，或输出全都解析不了）
+    # 调了生成，却没有大模型草稿送到质检：生成的调用失败（第一种话术失败时生成器不用后面的），
+    # 或输出全都解析不了。被时间预算截断的不在这里，见 budget_unjudged
     generation_unusable: int = Field(default=0, ge=0)
     # 引擎异常：链路上有一环出了意外（降级标记里有 engine、router、understanding、retriever、
     # generator、qa、storage、knowledge、audit、tenant_isolation 之一，
     # 见 eval.cli.PIPELINE_ERROR_CODES）
     engine_errors: int = Field(default=0, ge=0)
-    # 被时间预算截断（降级标记里有 budget）：照实展示，不算"模型没被评到"
+    # 被时间预算截断（降级标记里有 budget）：照实展示，本身不算"模型没被评到"
     budget_cut: int = Field(default=0, ge=0)
+    # 其中没有一条大模型草稿拿到质检判断层结论的（截在生成或质检完成之前）：这一条量到的不是
+    # 模型的回答，超过上限这一轮不算数。已经有草稿判过、只是重写被截断的不在这里
+    budget_unjudged: int = Field(default=0, ge=0)
 
 
 class RunHealth(_Model):
@@ -116,12 +123,14 @@ def _reasons(c: HealthCounts, ceiling: float, lost_vote_ceiling: float) -> list[
     attempted = f"调过大模型生成的 {c.generation_attempted} 条里"
     fallback = "没用上判断层（退回关键词规则）"
     no_judge = "质检判断层不可用（只跑了硬规则）"
-    no_draft = "没有一条可用草稿（调用全失败，或输出全都解析不了）"
+    no_draft = "没有大模型草稿送到质检（生成调用失败，或输出解析不了）"
+    cut = "被时间预算截断、没有大模型草稿过完质检"
     lost = "至少有一票没算上（调用失败、被截断、读不出）"
     check(c.route_fallback, c.cases, ceiling, "路由", cases, fallback)
     check(c.qa_unavailable, c.qa_judged, ceiling, "质检", judged, no_judge)
     check(c.generation_unusable, c.generation_attempted, ceiling, "生成", attempted, no_draft)
     check(c.engine_errors, c.cases, ceiling, "引擎", cases, "引擎异常")
+    check(c.budget_unjudged, c.cases, ceiling, "时间预算", cases, cut)
     check(c.route_lost_votes, c.cases, lost_vote_ceiling, "路由", cases, lost)
     return out
 
@@ -136,17 +145,39 @@ def assess(
     """这一轮算不算"评到了模型"：返回不算数的原因，空列表表示算数。
 
     全部用例看一遍，给了 test 时测试集再单独看一遍（句子前面加"测试集："）。超过上限就有一条原因：
-    - route_fallback、engine_errors：上限 allowed(cases, ceiling)；
+    - route_fallback、engine_errors、budget_unjudged：上限 allowed(cases, ceiling)；
     - qa_unavailable：上限 allowed(qa_judged, ceiling)；
     - generation_unusable：上限 allowed(generation_attempted, ceiling)；
     - route_lost_votes：上限 allowed(cases, lost_vote_ceiling)。
-    budget_cut 不产生原因（§12.1 的时间预算是正常行为，照实展示就行）。每句都写明条数、分母、
-    占比和上限，例如"路由：324 条里有 105 条（32.4%）没用上判断层（退回关键词规则），上限 6 条。"
+    budget_cut 本身不产生原因（§12.1 的时间预算是正常行为，照实展示就行）；其中连一条大模型草稿都
+    没判完的（budget_unjudged）才算：那几条量到的不是模型的回答。每句都写明条数、分母、占比和上限，
+    例如"路由：324 条里有 105 条（32.4%）没用上判断层（退回关键词规则），上限 6 条。"
     """
     reasons = _reasons(overall, ceiling, lost_vote_ceiling)
     if test is not None:
         reasons += [f"测试集：{r}" for r in _reasons(test, ceiling, lost_vote_ceiling)]
     return reasons
+
+
+def json_object_count(text: str) -> int:
+    """一段模型输出里有几个顶层的 JSON 对象（能解析、不是空对象的才算；嵌在别的对象里的、
+    字符串里的花括号不算，解析不了的花括号跳过）。
+
+    要求输出 JSON 的请求，正常的回答里只有一个。有两个以上（比如先写了一份草稿、后面才是最终
+    答案）时解析器取的未必是模型最后给的那个：评测把这样的回答算作"用不上"，连通性检查也不放行。"""
+    decoder, count, i = json.JSONDecoder(), 0, 0
+    while True:
+        i = text.find("{", i)
+        if i < 0:
+            return count
+        try:
+            value, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(value, dict) and value:
+            count += 1
+        i = end
 
 
 def _text(value: Any) -> str:
@@ -187,4 +218,5 @@ __all__ = [
     "allowed",
     "assess",
     "error_label",
+    "json_object_count",
 ]

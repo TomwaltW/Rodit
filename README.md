@@ -14,7 +14,8 @@ uv sync                          # 装依赖（Python ≥ 3.11）
 uv run pytest                    # 全部测试（不联网；PostgreSQL 测试连不上时自动跳过）
 uv run ruff check . && uv run ruff format --check .
 
-bash scripts/dev-pg.sh           # 可选：启动本机 PostgreSQL，跑存储层测试
+bash scripts/dev-pg.sh           # 可选：启动本机 PostgreSQL，跑存储层测试（macOS 上是 Docker 里的一次性实例，
+                                 # 按它打印的那一行 export RODIT_TEST_PG_DSN=… 之后再跑 pytest）
 uv run python -m rodit.app.demo  # 用合成数据跑方案 §11 的核心流程（不需要任何密钥）
 uv run python -m rodit.showcase  # 客户演示站 http://127.0.0.1:8100/（不用登录，见下一节）
 uv run python -m rodit.api       # 本地接口 + 模式 C 网页工具 http://127.0.0.1:8000/assist、商家控制台 /console、
@@ -69,26 +70,77 @@ OpenAI 兼容模型走完整链路：路由、质检按 `EngineConfig.decision` 
 
 ```bash
 # 密钥只放本地 .env（已 gitignore）或云端环境的密钥设置；不要写进仓库、命令行历史或云端环境变量
-set -a; source .env; set +a      # 提供 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_LLM_API_KEY（可选 RODIT_LLM_TIMEOUT_S）
+set -a; source .env; set +a      # 提供 RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_LLM_API_KEY
+export NO_PROXY="$NO_PROXY,模型服务的主机名"   # 本机开着代理时：让模型服务直连（见下面"代理"）
 
-uv run python -m rodit.eval --llm env --limit 10 --seed 1          # 先随机抽 10 条试跑（省钱）
-uv run python -m rodit.eval --llm env --intent size_advice         # 只跑一个问题类型
-uv run python -m rodit.eval --llm env --json ~/rodit-evals/llm.json \
-    --price-input 0.002 --price-output 0.008                       # 全量 + 完整结果 + 成本估算
-uv run python -m rodit.eval --llm env --baseline ~/rodit-evals/llm.json --tolerance 0.02  # §13.5 回归
+# 1. 试跑：放宽超时，先看模型本身答得怎么样、要多久（这份配置的指纹和部署不同，结果不当上线依据）
+uv run python -m rodit.eval --llm env --config ~/rodit-evals/explore.yaml --limit 10 --seed 1
+# 2. 按部署配置的全量 + 完整结果 + 成本估算（要当上线依据的就是这一份）
+uv run python -m rodit.eval --llm env --config config/rodit.yaml --json ~/rodit-evals/llm.json \
+    --price-input 0.002 --price-output 0.008
+# 3. §13.5 回归；只跑一个问题类型
+uv run python -m rodit.eval --llm env --config config/rodit.yaml --baseline ~/rodit-evals/llm.json --tolerance 0.02
+uv run python -m rodit.eval --llm env --config config/rodit.yaml --intent size_advice
 ```
 
-- 报告在离线评测的各节（§13.2 评分与上线门槛、§13.3 阈值校准）之外，还有 §12.1 耗时（各环节和端到端的
-  P50 / P95，对照目标）、§14 用量（按路由 / 生成 / 质检分的 token、失败次数，给了单价时的成本，
-  按 §14 示例口径折算的每店月用量）、降级统计；失败清单里有模型草稿和质检原因（已脱敏）。
+试跑用的配置放仓库外，只写要改的项，其余是默认值：
+
+```yaml
+# ~/rodit-evals/explore.yaml
+decision: {timeout_s: 8}          # 路由 / 质检单次调用的超时（部署是 1 秒，§12.1）
+generation: {timeout_s: 8}        # 生成（部署是 2.5 秒）
+latency: {message_budget_s: 30}   # 每条消息的时间预算（部署是 4.5 秒）
+llm:
+  extra_body: {thinking: {type: disabled}}   # 模型默认开思考模式时要关掉；写法因模型服务而异，见下
+```
+
+- **模型服务特有的参数**写在配置的 `llm.extra_body` 里，原样并入每次请求。现在境内的模型大多默认开思考模式，
+  不关的话回答被 max_tokens 截断或为空、耗时也长；关法因模型服务而异（常见的是
+  `{thinking: {type: disabled}}` 或 `{enable_thinking: false}`，以模型服务的文档为准，`config/rodit.yaml` 里有
+  注释掉的例子）。这一项算进配置指纹：评测时关了思考，部署的配置里也要有同样的一行；不放密钥；
+  客户端自己填的字段（model、messages、temperature、max_tokens、stream、response_format、logprobs、
+  top_logprobs）不能写在这里。接口地址里不能带用户名密码（`https://用户:密码@主机` 的写法），认证只用 API key。
+- **连通性检查**：开跑前按这次评测的配置把要发的请求各试一次（路由的 3 票、质检 1 次、生成 1 次，合成数据，
+  不计入用量）。哪一次调用失败、回了空文本、被 max_tokens 截断或读不出来，就不开跑（退出码 2），说明里有是哪种
+  请求、失败原因（HTTP 状态码和模型服务给的错误代码）、实测耗时和配置的超时、下一步怎么办；通过时打印各环节的
+  耗时（超过超时的 70% 会提醒）和请求是否经代理。报告和日志里没有密钥，接口地址只显示主机名。
+  `--skip-preflight` 跳过检查（只在调试时用）。
+- **超时**：评测里的每个请求带的是各环节自己的超时（`decision.timeout_s`、`generation.timeout_s`）和每条消息的
+  时间预算（`latency.message_budget_s`），`RODIT_LLM_TIMEOUT_S` 管不到它们。要放宽只能换 `--config`，而换了
+  配置指纹就变了：放宽超时跑出来的数字用来了解模型，不能当上线依据。
+- **运行健康度**：调用失败、被截断、读不出时链路按 §12.2 降级，评测照样跑完，但那组数字量的是兜底逻辑，不是
+  模型。报告里（文本和 JSON 的 `health`）写明：路由退回关键词规则、路由丢票、质检判断层不可用、生成没有可用
+  草稿、引擎异常各有几条，每个用途的调用里失败（按原因分开，如 `http_429`、`http_400:<错误代码>`、
+  `timeout`）、被截断、为空、读不出的各有几次，实际做出路由的是哪个判断层。任何一项超过上限（2%，路由丢票
+  10%，至少容许 1 条）这一轮就不算数：报告开头和上线门槛旁边写明原因，退出码 3，JSON 照常写出。
+  `--allow-degraded` 不因此返回 3（JSON 里的 `valid` 照旧是 false）；`--max-degraded 0.05` 改这一次的上限。
+  连续 8 条用例的大模型调用全部失败时提前停下（退出码 2，不出报告）；`--min-interval 秒数` 让相邻两条用例的
+  开始至少隔这么久（限流时用，等待不计入耗时）。
+- **报告**在离线评测的各节（§13.2 评分与上线门槛、§13.3 阈值校准）之外，还有 §12.1 耗时（各环节和端到端的
+  P50 / P95，对照目标；各环节有多少调用到超时才结束；有用例被时间预算截断或有调用超时时端到端不写"达标"，
+  那个数被截短了；耗时是从这台机器、经这条网络路径测的）、§14 用量（按路由 / 生成 / 质检分的 token 和失败
+  次数，失败的调用不在合计里、另给估算；接口没返回用量、回显的模型名和配置的不一样都会写明；给了单价时的
+  成本，按 §14 示例口径折算的每店月用量）、降级统计；失败清单里有模型草稿和质检原因（已脱敏）。§13.3 的阈值
+  校准只用配置的判断层做出的路由（退回关键词规则的用例不参与，报告里写明排除了几条）。
+- **代理**：客户端走环境里配置的 HTTP(S) 代理。本机开着代理时，模型服务的请求多绕一跳，§12.1 的耗时和 1 秒的
+  路由超时都会受影响：把模型服务的主机名加进 `NO_PROXY`（或 `NO_PROXY='*'`；另设了小写的 `no_proxy` 时以小写
+  的为准）。只删掉 `HTTPS_PROXY` 不可靠：macOS 上 urllib 会退回系统的代理设置。
 - 单价是每 1000 token 的价格，也可以用环境变量 `RODIT_LLM_PRICE_INPUT_PER_1K` / `RODIT_LLM_PRICE_OUTPUT_PER_1K`；
-  不给只报 token。`--config config/rodit.yaml` 可以换引擎配置（投票次数、超时、阈值）做对比。
-- `--json out.json` 写完整结果（逐条的类型、评分、耗时、用量；放仓库外，不提交），`--json` 不带路径时输出到
-  标准输出。
+  不给只报 token。
+- `--config` 不给时用环境变量 `RODIT_CONFIG` 指的文件；两样都没有就按内置默认值跑，并提醒：配置指纹和用
+  `config/rodit.yaml` 的部署对不上（那份文件多了店铺默认值两节），结果不能当上线依据。
+- `--json out.json` 写完整结果（逐条的类型、评分、耗时、用量；放仓库外，不提交），路径开跑前先验证写得进去，
+  跑完先写 JSON 再出文本报告；`--json` 不带路径时输出到标准输出。
   `--baseline` 只比较两次都有的用例：类型准确率、路由、事实正确、合规满分率（全部和其中的测试集）任一项比基线低超过
-  容差（默认 0，§13.5 指标不下降）时退出码为 1；配置错误（缺环境变量、连通性检查失败等）退出码为 2。
-- 跑之前先发一个几个 token 的连通性检查请求，地址、模型、密钥不对时直接报错。报告和日志里没有密钥，
-  接口地址只显示主机名。`--seed` 只决定 `--limit` 抽哪几条，不发给模型（路由投票要靠采样的随机性，§6.4）。
+  容差（默认 0，§13.5 指标不下降；真实模型的路由投票有随机性，回归时给容差）时退出码为 1。
+- 退出码：0 正常；1 指标比基线下降超过容差；2 没有跑或没有跑完（配置错误、`--json` 的路径写不进去、连通性检查
+  没过、连续 8 条用例的调用全部失败而停下）；3 这一轮没有有效评到模型（报告和 JSON 照常写出，同时有回归也是 3）；
+  130 被中断（结果没有保存）。`--seed` 只决定 `--limit` 抽哪几条，不发给模型（路由投票要靠采样的随机性，§6.4）。
+- **当上线依据**（§13.2、§13.4）：评测用的 `--config` 要和部署的是同一份（镜像里是 `/app/config/rodit.yaml`），
+  `RODIT_LLM_BASE_URL` / `RODIT_LLM_MODEL` 也一致；然后在单元里（连得上它的数据库的地方）跑
+  `python -m rodit.ops record-eval --report llm.json`。部分评测（`--intent` / `--limit`）、条数和评测集对不上的、
+  没有运行健康度或健康度不过关的报告它不收（退出码 2，写明原因）。`llm.public_name` / `llm.filing_no` 也在配置
+  指纹里：先填好再跑要当依据的那一轮，否则填的那天之前的结论就对不上了。
 
 ## 生产组装需要的环境变量
 
@@ -292,7 +344,10 @@ FAQ / 模板；超时的只留已经通过质检的 FAQ / 模板卡片，降级�
   开始之前、发送在窗口里的也一样（配对时往前多看 7 天），所以上线状态、验收报告列出的 ID 都能确认；
 - 某周登记的"0 条"要在那一周结束之后登记才算那一周的依据，周中登记的是"暂定"，要复核人员周末后再确认一次；
 - `python -m rodit.eval --json 结果.json` 带配置指纹；`record-eval --report 结果.json` 把结论记下来，
-  指纹和运行中的配置一致时才算测试集门槛的依据（离线替身的结论不算）。指纹包括配置、判断层问题版本、
+  指纹和运行中的配置一致时才算测试集门槛的依据（离线替身的结论不算）。真实大模型跑的报告还要带运行健康度
+  （`health`）：没有这一块的（旧版本生成、或没跑完）、条数和评测集对不上的、按固定上限（2%，路由丢票 10%）
+  重新算下来大模型没有被有效评到的，`record-eval` 不收（退出码 2，逐条写明原因；评测时用 `--max-degraded`
+  放宽过上限也一样）；收下的结论里带着健康度的计数，上线状态里看得到。指纹包括配置（含 `llm.extra_body`）、判断层问题版本、
   路由用的判断层（分类器时还有模型文件的 SHA-256）、大模型名称和接口主机、生成环节的版本（`rodit.generation`
   整个包和依据行格式、类型名等进提示词的 `core` 模块）、判断层提示词的版本（`decision.llm` 的提示词、
   `decision.voting` 的输出解析、路由 / 质检的 state）：换模型（哪怕只改环境变量）、换分类器文件、改提示词都要
