@@ -12,9 +12,10 @@ import time
 from datetime import timedelta
 from typing import Any
 
-from engine_support import Kit, make_route, qa_pass
+from engine_support import Kit, bundle_of, make_route, policy_evidence, qa_pass
 
 from rodit.core import budget
+from rodit.core import evidence as E
 from rodit.core.audit import (
     DEGRADED_BUDGET,
     DEGRADED_TENANT_ISOLATION,
@@ -24,16 +25,27 @@ from rodit.core.audit import (
     AuditAction,
 )
 from rodit.core.config import EngineConfig, LatencyConfig
-from rodit.core.enums import DraftKind, Intent, Mode, RouteAction
+from rodit.core.enums import (
+    INTENT_LABELS,
+    DraftKind,
+    EvidenceSource,
+    Intent,
+    Mode,
+    Platform,
+    RouteAction,
+)
 from rodit.core.errors import TenantIsolationError
-from rodit.core.models import Draft, EngineResult
+from rodit.core.models import Draft, EngineResult, Evidence
 from rodit.engine.engine import (
     LATENCY_KEYS,
     REASON_BUDGET,
+    REASON_NO_DRAFT,
     REASON_TENANT,
     TENANT_STAGE_RETRIEVE,
     TENANT_STAGE_UNDERSTAND,
 )
+from rodit.generation import DefaultAnswerGenerator
+from rodit.testing.fakes import FakeLLMClient
 from rodit.testing.fixtures import SHOP_A
 
 SHIP = "亲，现货付款后 48 小时内发货哦~"
@@ -353,3 +365,225 @@ def test_since_received_on_the_failure_path(kit: Kit) -> None:
     result = kit.engine().handle(msg)
     assert result is not None and result.degraded == ["engine"]
     assert result.latency_ms[LATENCY_SINCE_RECEIVED] == 2000
+
+
+# ================================================================ 剩余时间不够、生成没调大模型
+#
+# 用真的生成器（DefaultAnswerGenerator）+ 假大模型：替身生成器不看时间预算。
+# 检索替身拨时钟：路由、检索之后还剩 0.5 秒，少于 latency.min_llm_remaining_s（0.8 秒），没过期。
+
+MODEL_ANSWER = "亲，现货付款后 48 小时内发货哦"
+LEFT_S = 0.5
+APPLY_TEXT = "亲，申请售后的方法：在订单页点「申请售后」发起。"
+
+
+def model_llm() -> FakeLLMClient:
+    return FakeLLMClient(
+        lambda r: {
+            "answer": MODEL_ANSWER,
+            "evidence_ids": ["policy:ship_time"],
+            "need_clarify": False,
+        }
+    )
+
+
+def leave_after_retrieve(kit: Kit, clock: Monotonic, left_s: float = LEFT_S) -> None:
+    """检索用掉时间：之后只剩 left_s 秒。"""
+    original = kit.retriever.retrieve
+    assert 0 < left_s < kit.config.latency.min_llm_remaining_s
+
+    def retrieve(ctx, route):  # type: ignore[no-untyped-def]
+        clock.advance(kit.config.latency.message_budget_s - left_s)
+        return original(ctx, route)
+
+    kit.retriever.retrieve = retrieve  # type: ignore[method-assign]
+
+
+def faq_evidence(answer: str = SHIP, faq_id: int = 3, score: float = 0.99) -> Evidence:
+    return Evidence(
+        id=E.faq(faq_id),
+        source=EvidenceSource.FAQ,
+        label=E.faq_label("什么时候发货"),
+        content=answer,
+        data={"question": "什么时候发货", "answer": answer, "faq_id": faq_id},
+        score=score,
+    )
+
+
+def apply_rule_evidence() -> Evidence:
+    key = E.PlatformRuleKey.APPLY_AFTERSALE
+    text = "在订单页点「申请售后」发起"
+    return Evidence(
+        id=E.platform_rule(Platform.TAOBAO, key),
+        source=EvidenceSource.PLATFORM,
+        label=E.platform_rule_label(Platform.TAOBAO, key),
+        content=text,
+        data={"key": str(key), "text": text},
+    )
+
+
+def test_generation_skipped_for_lack_of_time_is_marked_budget(kit: Kit) -> None:
+    """要写大模型草稿、剩余时间不够：不调大模型，这一条记 budget（和质检那边一样）。"""
+    clock, llm_client = Monotonic(), model_llm()
+    leave_after_retrieve(kit, clock)
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, monotonic=clock, generator=generator)
+    assert llm_client.calls == []  # 没有调大模型
+    assert kit.gate.calls == []  # 没有草稿可判
+    assert result.suggestions == []
+    assert result.degraded == [DEGRADED_BUDGET]
+    assert result.no_suggestion_reason == REASON_BUDGET
+    assert result.latency_ms["total"] < kit.config.latency.message_budget_s * 1000
+    detail = result_detail(kit)
+    assert detail["degraded"] == [DEGRADED_BUDGET]
+    assert detail[RESULT_BUDGET_EXCEEDED] is True
+    assert set(detail) == {*RESULT_DETAIL_KEYS, RESULT_BUDGET_EXCEEDED}
+    assert detail["qa_checked"] == 0 and detail["qa_failed"] == 0
+    [generated] = kit.events(AuditAction.GENERATE)  # 生成照常留痕：0 份草稿
+    assert generated.detail["drafts"] == 0
+
+
+def test_generation_with_time_to_spare_is_unchanged(kit: Kit) -> None:
+    clock, llm_client = Monotonic(), model_llm()
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, monotonic=clock, generator=generator)
+    assert len(llm_client.calls) == 2  # 直接回答 + 附带追问
+    assert [(c.kind, c.text) for c in result.suggestions] == [(DraftKind.LLM, MODEL_ANSWER)]
+    assert result.degraded == [] and result.no_suggestion_reason is None
+    assert tuple(result_detail(kit)) == RESULT_DETAIL_KEYS  # 没有 budget_exceeded
+
+
+def test_faq_answer_short_of_time_is_not_marked(kit: Kit) -> None:
+    """FAQ 直答占了名额、本来就不调大模型：时间再紧也不记 budget。"""
+    clock, llm_client = Monotonic(), model_llm()
+    kit.retriever.bundles[Intent.SHIPPING_POLICY] = bundle_of(faq_evidence(), policy_evidence())
+    leave_after_retrieve(kit, clock)
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, monotonic=clock, generator=generator)
+    assert llm_client.calls == []
+    assert [(c.kind, c.text) for c in result.suggestions] == [(DraftKind.FAQ, SHIP)]
+    assert result.degraded == []
+    assert tuple(result_detail(kit)) == RESULT_DETAIL_KEYS
+
+
+def test_template_answer_short_of_time_is_not_marked(kit: Kit) -> None:
+    clock, llm_client = Monotonic(), model_llm()
+    kit.router.decide = make_route(Intent.GREETING)
+    leave_after_retrieve(kit, clock)
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, "在吗", monotonic=clock, generator=generator)
+    assert llm_client.calls == []
+    assert [c.kind for c in result.suggestions] == [DraftKind.TEMPLATE]
+    assert result.degraded == []
+    assert tuple(result_detail(kit)) == RESULT_DETAIL_KEYS
+
+
+def test_nothing_to_write_short_of_time_is_not_marked(kit: Kit) -> None:
+    """生成器没有大模型草稿要写（这里：只要一条推荐、模板占了）：不记 budget。"""
+    clock, llm_client = Monotonic(), model_llm()
+    kit.set_shop_config(SHOP_A, suggestion_count=1)
+    kit.router.decide = make_route(Intent.RETURN_POLICY)
+    kit.retriever.bundles[Intent.RETURN_POLICY] = bundle_of(
+        policy_evidence("seven_day_return", "支持七天无理由退货"), apply_rule_evidence()
+    )
+    leave_after_retrieve(kit, clock)
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, "退货怎么申请", monotonic=clock, generator=generator)
+    assert llm_client.calls == []
+    assert [(c.kind, c.text) for c in result.suggestions] == [(DraftKind.TEMPLATE, APPLY_TEXT)]
+    assert result.degraded == []
+
+
+def test_template_fallback_is_kept_but_the_case_is_marked(kit: Kit) -> None:
+    """模板之外还有名额要给大模型、时间不够没调：模板卡片照出，这一条仍记 budget。"""
+    clock, llm_client = Monotonic(), model_llm()
+    kit.router.decide = make_route(Intent.RETURN_POLICY)
+    kit.retriever.bundles[Intent.RETURN_POLICY] = bundle_of(
+        policy_evidence("seven_day_return", "支持七天无理由退货"), apply_rule_evidence()
+    )
+    leave_after_retrieve(kit, clock)
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, "退货怎么申请", monotonic=clock, generator=generator)
+    assert llm_client.calls == []
+    assert [(c.kind, c.text) for c in result.suggestions] == [(DraftKind.TEMPLATE, APPLY_TEXT)]
+    assert result.degraded == [DEGRADED_BUDGET]
+    assert result.no_suggestion_reason is None
+    assert result_detail(kit)[RESULT_BUDGET_EXCEEDED] is True
+    assert all(not c.prefill for c in result.suggestions)
+    assert all(not c.risk_hints for c in result.suggestions)  # budget 不进卡片的风险提示
+
+
+def test_skipped_generation_blocks_auto_reply_and_transfers(kit: Kit) -> None:
+    """全自动：少了大模型草稿 = 时间预算降级，不自动回复、转人工（§12.2）；来得及时照常。"""
+    kit.set_shop_config(SHOP_A, auto_reply_enabled=True, auto_reply_schedule="always")
+    kit.router.decide = make_route(Intent.SHIPPING_POLICY, confidence=0.97, auto_eligible=True)
+    llm_client = model_llm()
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+
+    in_time = kit.engine(monotonic=Monotonic(), generator=generator).handle(
+        kit.msg("什么时候发货", mode=Mode.AUTO)
+    )
+    assert in_time is not None and in_time.degraded == []
+    assert in_time.auto_reply is not None and in_time.transfer_to_human is False
+
+    clock = Monotonic()
+    leave_after_retrieve(kit, clock)
+    llm_client.calls.clear()
+    short = kit.engine(monotonic=clock, generator=generator).handle(
+        kit.msg("发货要多久", mode=Mode.AUTO)
+    )
+    assert short is not None and llm_client.calls == []
+    assert short.degraded == [DEGRADED_BUDGET]
+    assert short.auto_reply is None and short.transfer_to_human is True
+
+
+def test_skipped_generation_marks_only_its_own_part(kit: Kit) -> None:
+    """多问题分条：一条是 FAQ 直答、一条要大模型。时间不够时只有后一条被截断。"""
+    clock, llm_client = Monotonic(), model_llm()
+    kit.router.decide = split_route(Intent.SHIPPING_POLICY, Intent.INVOICE_GIFT)
+    kit.retriever.bundles[Intent.SHIPPING_POLICY] = bundle_of(faq_evidence(), policy_evidence())
+    kit.retriever.bundles[Intent.INVOICE_GIFT] = bundle_of(
+        policy_evidence("invoice", "支持开电子发票")
+    )
+    original = kit.retriever.retrieve
+    lock, moved = threading.Lock(), []
+
+    def retrieve(ctx, route):  # type: ignore[no-untyped-def]
+        with lock:  # 两条并行检索：时钟只拨一次
+            if not moved:
+                moved.append(True)
+                clock.advance(kit.config.latency.message_budget_s - LEFT_S)
+        return original(ctx, route)
+
+    kit.retriever.retrieve = retrieve  # type: ignore[method-assign]
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, "什么时候发货，能开发票吗", monotonic=clock, generator=generator)
+    assert llm_client.calls == []
+    assert [(c.intent, c.kind) for c in result.suggestions] == [
+        (Intent.SHIPPING_POLICY, DraftKind.FAQ)
+    ]
+    assert result.degraded == [DEGRADED_BUDGET]
+    assert [a for a in result.alerts if REASON_BUDGET in a] == [
+        f"「{INTENT_LABELS[Intent.INVOICE_GIFT]}」没有推荐：{REASON_BUDGET}"
+    ]
+
+
+def test_generation_that_returns_nothing_in_time_is_not_marked(kit: Kit) -> None:
+    """对照：生成器没给草稿、但不是因为时间（这里：大模型输出读不出来）→ 不记 budget。"""
+    clock = Monotonic()
+    llm_client = FakeLLMClient(lambda r: "不是 JSON")
+    generator = DefaultAnswerGenerator(llm_client, kit.config.generation)
+    result = handle(kit, monotonic=clock, generator=generator)
+    assert len(llm_client.calls) == 2
+    assert result.suggestions == [] and result.degraded == []
+    assert result.no_suggestion_reason == REASON_NO_DRAFT
+
+
+def test_stub_generator_that_ignores_the_budget_is_not_marked(kit: Kit) -> None:
+    """引擎不自己猜：生成器没说"时间不够没调"，剩余时间再少也不因为生成记 budget。"""
+    clock = Monotonic()
+    leave_after_retrieve(kit, clock)
+    kit.generator.script = [[template("亲，我帮您查一下")]]
+    result = handle(kit, monotonic=clock)
+    assert [c.text for c in result.suggestions] == ["亲，我帮您查一下"]
+    assert result.degraded == []

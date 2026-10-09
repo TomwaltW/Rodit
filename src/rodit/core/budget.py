@@ -7,6 +7,9 @@
 包住（latency 是 EngineConfig.latency），各步骤用 remaining() / expired() 判断还来不来得及；
 生成、质检调大模型之前用 llm_allowed() 判断：剩余时间少于 min_llm_remaining_s 就不调，
 退回 FAQ / 模板。这个下限跟着截止时间走（contextvar），生成器、质检不用另外拿配置。
+生成器本来要写大模型草稿、因为剩余时间不够而没调时用 note_llm_skipped() 记一笔；引擎用
+llm_skip_scope() 包住这一次生成，据此给这一条记 budget 降级（没有名额、FAQ / 模板已经
+够了而不调大模型的不记）。
 
 - 截止时间放在 contextvar 里：同一线程里的调用都看得到；线程池里的任务要用 submit_in_context
   提交（contextvars.copy_context().run），才能看到提交时的截止时间（和 core.context.shop_scope
@@ -183,6 +186,47 @@ def llm_allowed() -> bool:
     return deadline is None or deadline.llm_allowed()
 
 
+class LLMSkip:
+    """llm_skip_scope 里的记录：skipped = 这段代码里有大模型调用因为剩余时间不够而没发。"""
+
+    __slots__ = ("skipped",)
+
+    def __init__(self) -> None:
+        self.skipped = False
+
+    def __repr__(self) -> str:
+        return f"LLMSkip(skipped={self.skipped})"
+
+
+_llm_skip: ContextVar[LLMSkip | None] = ContextVar("rodit_llm_skip", default=None)
+
+
+@contextmanager
+def llm_skip_scope() -> Iterator[LLMSkip]:
+    """这段代码里的 note_llm_skipped() 记到返回的 LLMSkip 上（每次进入一份新的；嵌套时只记到
+    最里面一层）。引擎包住一次生成：
+
+        with llm_skip_scope() as skip:
+            drafts = generator.generate(ctx, route, evidence)
+        if skip.skipped: ...  # 本来要调大模型，时间不够没调
+
+    记录跟着 contextvar 走：并行的几条分条各在自己的线程里进入，互不影响。"""
+    record = LLMSkip()
+    token = _llm_skip.set(record)
+    try:
+        yield record
+    finally:
+        _llm_skip.reset(token)
+
+
+def note_llm_skipped() -> None:
+    """本来要调大模型、因为 llm_allowed() 为 False 没调时记一笔。只在确实有调用要发的时候记
+    （没有名额、不需要大模型的不算）；不在 llm_skip_scope 里时什么都不做。"""
+    record = _llm_skip.get()
+    if record is not None:
+        record.skipped = True
+
+
 def clamp_timeout(timeout_s: float) -> float:
     """单次调用的超时不超过剩余预算：min(timeout_s, remaining())；没有截止时间时原样返回。"""
     left = remaining()
@@ -270,12 +314,15 @@ def submit_in_context(pool: Executor, fn: Callable[..., T], *args: Any, **kwargs
 __all__ = [
     "BackgroundWork",
     "Deadline",
+    "LLMSkip",
     "background_scope",
     "clamp_timeout",
     "current_deadline",
     "deadline_scope",
     "expired",
     "llm_allowed",
+    "llm_skip_scope",
+    "note_llm_skipped",
     "remaining",
     "submit_in_context",
 ]

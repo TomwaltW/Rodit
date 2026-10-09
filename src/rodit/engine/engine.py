@@ -25,6 +25,8 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
      不需要依据，不走这个判断；
    - 生成 → 每条草稿过质检 → 大模型草稿不通过时，带 QAResult.reasons 重新生成
      （最多 qa_gate.max_regenerations 次，§5.5、§11.5）→ 保留通过的草稿；
+     判断层质检不可用（QAResult.degraded）的草稿照旧不放行、原因照记，但不算重写的理由，
+     它的原因也不带进重写；
      FAQ / 模板草稿不通过说明标准回答本身有问题，不重写，丢弃并提醒客服（改知识库）；
      一条都没通过 → 不推荐，no_suggestion_reason 写质检原因（§5.5 给客服显示原因）；
      质检永远要跑（§5.5 每条推荐都要过两道关），计划里的 check 只是说明；
@@ -66,6 +68,9 @@ AssistEngine.handle(msg) 处理一条买家消息，所有工作都在 core.cont
 时间预算（§12.1、§12.2，core.budget）：每条消息在 deadline_scope(latency.message_budget_s,
 min_llm_remaining_s=latency.min_llm_remaining_s) 里处理（EngineConfig.latency）。
 - 生成器、质检自己判断还能不能调大模型（core.budget.llm_allowed），来不及就退回 FAQ / 模板；
+  生成器本来要写大模型草稿（FAQ / 模板之外还有名额）、因为剩余时间不够没调时告诉引擎
+  （core.budget.note_llm_skipped，引擎用 llm_skip_scope 包住每次生成），这一条和"大模型草稿
+  来不及送判断层质检"一样记 budget；FAQ / 模板已经占满名额、本来就不调大模型的不记；
 - 截止时间过了：不再检索、生成、重写；没做完的大模型草稿丢掉（生成器不再等它，引擎也不判它；
   截止之后才判完的大模型草稿同样丢掉），已经通过质检的 FAQ / 模板卡片保留；
   剩余时间不够再调一次大模型时，同样不重写、不送判断层质检；
@@ -929,7 +934,11 @@ class AssistEngine:
         return unit
 
     def _generate_and_check(self, ctx: ConversationContext, unit: _Unit) -> None:
-        """生成 → 质检 → 大模型草稿不通过带原因重写（§5.5、§11.5），受时间预算约束（§12.2）。
+        """生成 → 质检 → 大模型草稿不通过带原因重写（§5.5、§11.5），受时间预算约束（§12.2）；
+        判断层质检不可用的草稿不触发重写。
+
+        生成器本来要写大模型草稿、因为剩余时间不够（少于 latency.min_llm_remaining_s）没调时，
+        这一条记 budget（和来不及送判断层的草稿一样）；没有名额要写大模型草稿的不记。
 
         质检分批：还差 n 张卡片就先判接下来的 n 份草稿（并行），判哪些草稿和顺序执行一样。
         """
@@ -947,16 +956,21 @@ class AssistEngine:
                 break
             t = time.perf_counter()
             drafts: list[Draft] | None = None
-            try:
-                drafts = list(self._generator.generate(ctx, route, bundle, retry_feedback=feedback))
-            except Exception as exc:  # noqa: BLE001 — 生成失败：保留已通过的（§12.2）
-                self._warn("generate", exc)
+            with budget.llm_skip_scope() as skip:
+                try:
+                    drafts = list(
+                        self._generator.generate(ctx, route, bundle, retry_feedback=feedback)
+                    )
+                except Exception as exc:  # noqa: BLE001 — 生成失败：保留已通过的（§12.2）
+                    self._warn("generate", exc)
             unit.add_latency("generate", t)
             if drafts is None:
                 unit.degrade(DEGRADED_GENERATOR)
                 generator_error = True
                 break
             unit.audit(AuditAction.GENERATE, _generate_detail(route, drafts, regenerations))
+            if skip.skipped:  # 生成器要写大模型草稿、剩余时间不够没调：这一条少了大模型草稿
+                unit.cut()
             if budget.expired():  # 生成器到截止时间才返回：没做完的大模型草稿已经丢掉
                 unit.cut()
 
