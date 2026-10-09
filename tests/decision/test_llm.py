@@ -10,7 +10,7 @@ import pytest
 
 from rodit.core.context import current_shop_id, shop_scope
 from rodit.core.decision import ChoiceQuestion, DecisionRequest, NoulQuestion, ScoreQuestion
-from rodit.core.errors import DecisionError, LLMError, LLMTimeout
+from rodit.core.errors import LLM_ERROR_KINDS, DecisionError, LLMError, LLMTimeout
 from rodit.core.ports import LLMRequest, LLMResponse
 from rodit.core.questions import (
     Q_EMOTION,
@@ -23,15 +23,22 @@ from rodit.core.questions import (
     QA_QUESTIONS,
     ROUTER_MODEL,
     ROUTER_QUESTIONS,
+    ROUTER_VOTE_QUESTIONS,
 )
 from rodit.core.states import build_router_state
-from rodit.decision.llm import SYSTEM_PROMPT, InCloudLLMProvider, build_judge_messages
+from rodit.decision.llm import (
+    ERROR_KIND_LABELS,
+    SYSTEM_PROMPT,
+    InCloudLLMProvider,
+    build_judge_messages,
+)
 from rodit.decision.voting import (
     choice_distribution,
     extract_json_object,
     parse_noul_vote,
     parse_sample,
 )
+from rodit.llm import OpenAICompatibleClient
 from rodit.testing.fakes import FakeLLMClient, make_context
 from rodit.testing.fixtures import SHOP_B, build_demo_world
 
@@ -90,7 +97,7 @@ def test_llm_request_fields():
     assert call.json_mode is True
     assert call.temperature == 0.0
     assert call.timeout_s == 0.8
-    assert call.want_logprobs is True  # 只有一个单选题时读取选项概率
+    assert call.want_logprobs is False  # JSON 模式下读不出选项概率：不请求
     assert call.shop_id == SHOP_B  # 成本归属（§12.4）
 
 
@@ -210,6 +217,253 @@ def test_logprobs_override_vote_shares():
 
     intent = _provider(FakeLLMClient(log_handler), samples=3).decide(_request()).choice(Q_INTENT)
     assert intent.probabilities == pytest.approx({"stock": 2 / 3, "price_promo": 1 / 3})
+
+
+# ---------------------------------------------------------------- 不请求选项概率（logprobs）
+
+
+@pytest.mark.parametrize(
+    "questions",
+    [
+        ROUTER_QUESTIONS,
+        ROUTER_VOTE_QUESTIONS,
+        QA_QUESTIONS,
+        {"q_pick": ChoiceQuestion(instructions="选一个", criteria={"a": None, "b": None})},
+    ],
+    ids=["route", "route_votes", "qa", "single_choice"],
+)
+def test_judge_requests_never_ask_for_logprobs(questions):
+    """判断层的请求都是 JSON 模式：输出里第一个有内容的 token 是键名，读不出选项概率，一律不请求
+    （不支持 logprobs 的接口可能把整个请求拒掉）。"""
+    request = DecisionRequest(model="m", state={"synthetic": True}, questions=dict(questions))
+    llm = FakeLLMClient(lambda r: "{}")  # 替身不作答：这里只看发出去的请求
+    with pytest.raises(DecisionError):
+        _provider(llm, samples=1, temperature=0.0).decide(request)
+    (call,) = llm.calls
+    assert call.json_mode is True
+    assert call.want_logprobs is False
+
+
+def _completion(text: str, *, logprobs: bool) -> dict:
+    """OpenAI 格式的响应体（合成）。logprobs=True 时带上选项概率：JSON 模式下第一个有内容的位置是
+    键名 intent，它的候选里混进了一个和选项同名的 token（other，概率十万分之一）。"""
+    choice: dict = {"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+    if logprobs:
+        choice["logprobs"] = {
+            "content": [
+                {"token": '{"', "logprob": -0.01, "top_logprobs": []},
+                {
+                    "token": "intent",
+                    "logprob": math.log(0.999),
+                    "top_logprobs": [
+                        {"token": "intent", "logprob": math.log(0.999)},
+                        {"token": "other", "logprob": math.log(1e-5)},
+                    ],
+                },
+            ]
+        }
+    return {"model": "synthetic-served", "choices": [choice], "usage": {}}
+
+
+@pytest.mark.parametrize("vendor", ["rejects_logprobs", "honours_logprobs"])
+def test_real_client_sends_no_logprobs_so_the_votes_decide(monkeypatch, vendor):
+    """经真实客户端（假 transport，不联网）：请求体里没有 logprobs / top_logprobs。
+    不支持的接口不再把每一次路由调用都拒掉；照给的接口也没有机会让键名位置上一个和选项同名的
+    候选（归一化之后成了 1.0）盖过三张一致的票。"""
+    monkeypatch.setenv("RODIT_LLM_API_KEY", "sk-synthetic-test-key-not-real-0002")
+    bodies: list[dict] = []
+    answer = json.dumps(_vote("size_advice"), ensure_ascii=False)
+
+    def transport(url, headers, body, timeout_s):
+        bodies.append(body)
+        asked = "logprobs" in body or "top_logprobs" in body
+        if asked and vendor == "rejects_logprobs":
+            return 400, {"error": {"type": "invalid_request_error", "code": "invalid_parameter"}}
+        return 200, _completion(answer, logprobs=asked)
+
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example.invalid/v1", model="synthetic", transport=transport
+    )
+    intent = _provider(client).decide(_request()).choice(Q_INTENT)
+    assert (intent.choice, intent.confidence) == ("size_advice", 1.0)
+    assert intent.probabilities == {"size_advice": 1.0}
+    assert len(bodies) == 3
+    for body in bodies:
+        assert "logprobs" not in body and "top_logprobs" not in body
+        assert body["response_format"] == {"type": "json_object"}
+
+
+# ---------------------------------------------------------------- 没算上的票（截断、空回答、失败）
+
+
+def _cut(vote: dict) -> LLMResponse:
+    """被 max_tokens 截断的回答（finish_reason 是 length）。文本故意给成完整的 JSON：
+    即使读得出来也不能解析、不能计票。"""
+    return LLMResponse(text=json.dumps(vote, ensure_ascii=False), finish_reason="length")
+
+
+def _decision_error(llm, **kw) -> DecisionError:
+    with pytest.raises(DecisionError) as e:
+        _provider(llm, **kw).decide(_request())
+    return e.value
+
+
+def test_truncated_response_is_a_lost_vote_and_is_not_parsed():
+    cut = _cut(_vote("stock", need="是", p=0.9, emotion=4, multi="是"))
+    llm = FakeLLMClient(responses=[cut, _vote("size_advice"), _vote("size_advice")])
+    resp = _provider(llm).decide(_request())
+    assert resp.choice(Q_INTENT).probabilities == {"size_advice": 1.0}  # 只数没被截断的两票
+    assert resp.noul(Q_NEED_HUMAN) == 0.0
+    assert resp.score(Q_EMOTION) == 0.0
+    assert resp.noul(Q_MULTI_INTENT) == 0.0
+
+
+def test_truncated_response_does_not_vote_on_the_followup_either():
+    """追问按票和主要问题配对：被截断的那一票不出"无"，也不出第二个问题。"""
+    request = DecisionRequest(
+        model=ROUTER_MODEL, state=_request().state, questions=ROUTER_VOTE_QUESTIONS
+    )
+    second = {"second_intent": {"choice": "shipping_policy"}}
+    cut = _cut({**_vote("size_advice", multi="是"), **second})
+    whole = {**_vote("size_advice", multi="是"), "second_intent": {"choice": "stock"}}
+    llm = FakeLLMClient(responses=[cut, whole, whole])
+    resp = _provider(llm).decide(request)
+    assert resp.choice("second_intent").probabilities == {"stock": 1.0}
+
+
+def test_blank_response_is_a_lost_vote():
+    llm = FakeLLMClient(responses=[LLMResponse(text=" \n"), LLMResponse(text=""), _vote("stock")])
+    error = _decision_error(llm, min_votes=2)
+    assert str(error) == "问题 'intent' 只有 1 张有效票，少于 2（3 次：空回答 2）"
+    # 够票时照常出结果，空回答只是少一票
+    llm = FakeLLMClient(responses=[LLMResponse(text=""), _vote("stock"), _vote("stock")])
+    intent = _provider(llm, min_votes=2).decide(_request()).choice(Q_INTENT)
+    assert intent.probabilities == {"stock": 1.0}
+
+
+def test_all_votes_lost_names_each_cause_with_its_count():
+    timeout = LLMTimeout("大模型调用超时（1 秒）")
+    llm = FakeLLMClient(responses=[timeout, timeout, _cut(_vote("stock"))])
+    error = _decision_error(llm)
+    assert str(error) == "大模型判断全部失败（3 次：超时 2、截断 1）"
+    assert error.__cause__ is timeout  # 调用失败的那一票照旧挂在异常链上
+
+
+def test_all_votes_truncated_or_blank_have_no_call_error_to_chain():
+    llm = FakeLLMClient(responses=[_cut(_vote()), _cut(_vote()), LLMResponse(text="")])
+    error = _decision_error(llm)
+    assert str(error) == "大模型判断全部失败（3 次：截断 2、空回答 1）"
+    assert error.__cause__ is None
+    # 质检只采一次：被截断就是整次判断不可用
+    error = _decision_error(FakeLLMClient(lambda r: _cut(_vote())), samples=1, temperature=0.0)
+    assert str(error) == "大模型判断全部失败（1 次：截断 1）"
+    # 输出额度全花在思考上：文本是空的、finish_reason 是 length，算截断（提示的是 max_tokens）
+    spent = LLMResponse(text="", finish_reason="length")
+    error = _decision_error(FakeLLMClient(lambda r: spent), samples=1, temperature=0.0)
+    assert str(error) == "大模型判断全部失败（1 次：截断 1）"
+
+
+def test_quorum_message_tells_unreadable_votes_from_lost_ones():
+    """回答完整、但这道题读不出有效票的算"读不出"，和调用失败、截断分开数。"""
+    unreadable = _vote()
+    unreadable[Q_EMOTION] = {"score": "很生气"}
+    llm = FakeLLMClient(responses=[unreadable, unreadable, _vote()])
+    error = _decision_error(llm, min_votes=2)
+    assert str(error) == "问题 'emotion' 只有 1 张有效票，少于 2（3 次：读不出 2）"
+    llm = FakeLLMClient(responses=[unreadable, unreadable, unreadable])
+    error = _decision_error(llm)
+    assert str(error) == "问题 'emotion' 的所有投票都无效（3 次：读不出 3）"
+    # 三票三种去向；票数一样时按原因名排，写法固定
+    llm = FakeLLMClient(responses=[LLMTimeout("超时"), _cut(_vote()), unreadable])
+    error = _decision_error(llm)
+    assert str(error) == "问题 'emotion' 的所有投票都无效（3 次：截断 1、读不出 1、超时 1）"
+    assert error.__cause__ is None  # 有效票不够的报错不挂某一次调用的异常：原因都在消息里
+
+
+class _BareLLMError(LLMError):
+    """没有 status / kind / code 的替身（不调 LLMError.__init__）。"""
+
+    def __init__(self, msg: str) -> None:
+        Exception.__init__(self, msg)
+
+
+class _BareLLMTimeout(LLMTimeout):
+    def __init__(self, msg: str) -> None:
+        Exception.__init__(self, msg)
+
+
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (LLMTimeout("x"), "超时"),
+        (LLMError("x", kind="network"), "连不上"),
+        (LLMError("x", kind="malformed"), "响应格式不对"),
+        (LLMError("x", kind="config"), "本地配置不对"),
+        (LLMError("x", status=503, kind="server"), "模型服务出错（HTTP 503）"),
+        (
+            LLMError("x", status=401, kind="auth", code="invalid_api_key"),
+            "密钥无效或没有权限（HTTP 401，invalid_api_key）",
+        ),
+        (
+            LLMError("x", status=429, kind="rate_limit", code="rate_limit_exceeded"),
+            "限流（HTTP 429，rate_limit_exceeded）",
+        ),
+        (  # 429 既用来限流也用来报额度用完：靠 kind 分开
+            LLMError("x", status=429, kind="billing", code="insufficient_quota"),
+            "余额或额度用完（HTTP 429，insufficient_quota）",
+        ),
+        (LLMError("x", status=402, kind="billing"), "余额或额度用完（HTTP 402）"),
+        (
+            LLMError("x", status=400, kind="bad_request", code=1210),  # type: ignore[arg-type]
+            "请求被拒（HTTP 400，1210）",
+        ),
+        (LLMError("x", status=418), "HTTP 418"),  # 没有 kind：只有状态码
+        (LLMError("x", status=400, code="  bad\nparam "), "HTTP 400（bad param）"),
+        (LLMError("x", code="quota"), "LLMError（quota）"),
+        (LLMError("x", code="c" * 200), "LLMError（" + "c" * 64 + "）"),  # 错误代码截短
+        (LLMError("x", status=True, code=""), "LLMError"),  # type: ignore[arg-type]
+        (LLMError("x"), "LLMError"),  # 什么都没带：只有异常类型
+        (_BareLLMError("x"), "_BareLLMError"),
+        (_BareLLMTimeout("x"), "超时"),
+    ],
+)
+def test_call_failure_is_named_from_the_error_attributes(error, cause):
+    llm = FakeLLMClient(lambda r: error)
+    raised = _decision_error(llm, samples=1, temperature=0.0)
+    assert str(raised) == f"大模型判断全部失败（1 次：{cause} 1）"
+
+
+def test_every_llm_error_kind_has_a_label():
+    assert set(ERROR_KIND_LABELS) == set(LLM_ERROR_KINDS)
+    assert len(set(ERROR_KIND_LABELS.values())) == len(LLM_ERROR_KINDS)  # 各说各的，不重名
+
+
+def test_failure_messages_never_carry_model_or_vendor_text():
+    """消息里只有票数、原因的类别和 LLMError 上的状态码 / 错误代码：没有异常消息、没有模型输出。"""
+    secret = "买家留的手机 13812345678"
+    errors = [
+        LLMError(secret, status=429, kind="rate_limit", code="rate_limit_exceeded"),
+        LLMError(secret, status=429, kind="rate_limit", code="rate_limit_exceeded"),
+        LLMResponse(text=secret + '{"intent"', finish_reason="length"),
+    ]
+    error = _decision_error(FakeLLMClient(responses=errors))
+    limited = "限流（HTTP 429，rate_limit_exceeded）"
+    assert str(error) == f"大模型判断全部失败（3 次：{limited} 2、截断 1）"
+    unreadable = FakeLLMClient(lambda r: secret)
+    assert str(_decision_error(unreadable)) == "问题 'intent' 的所有投票都无效（3 次：读不出 3）"
+
+
+def test_responses_without_a_finish_reason_attribute_still_count():
+    """替身给的回答没有 finish_reason 这一项时照常解析、计票。"""
+
+    def handler(r: LLMRequest) -> LLMResponse:
+        response = LLMResponse(text=json.dumps(_vote("stock")))
+        del response.__dict__["finish_reason"]
+        assert not hasattr(response, "finish_reason")
+        return response
+
+    intent = _provider(FakeLLMClient(handler)).decide(_request()).choice(Q_INTENT)
+    assert intent.probabilities == {"stock": 1.0}
 
 
 # ---------------------------------------------------------------- 宽容解析
@@ -352,7 +606,7 @@ def test_qa_questions_use_the_same_provider():
     assert resp.noul(Q_GROUNDED) == pytest.approx(0.95)
     assert resp.score(Q_TONE) == 3
     assert llm.calls[0].purpose == "qa"
-    assert llm.calls[0].want_logprobs is False  # 没有单选题
+    assert llm.calls[0].want_logprobs is False  # 判断层一律不请求选项概率
 
 
 def test_generic_questions_work():
