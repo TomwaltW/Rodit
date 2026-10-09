@@ -36,9 +36,11 @@
 - 运行健康度（rodit.eval.health）：真实大模型跑的评测，调用失败、被截断、读不出时链路按 §12.2
   降级，照样跑完、给出一组数字，量的却是兜底逻辑。这样的报告不收：按报告 health 里的计数用固定的
   DEFAULT_CEILING / LOST_VOTE_CEILING 重新算一遍 assess（不看报告自己写的 valid、reasons、
-  ceiling），给出原因的抛 ModelNotEvaluated；报告里没有 health（旧版本生成的、没跑完的）、
+  ceiling），给出原因的抛 ModelNotEvaluated（被时间预算截断本身不算，截断时没有一条大模型草稿
+  过完质检的 budget_unjudged 超过上限才算）；报告里没有 health（旧版本生成的、没跑完的）、
   计数和报告对不上的也不收。收下的结论带着这些计数（EvalVerdict.health_overall / health_test），
-  describe_verdict 写出来。离线替身不调大模型，没有健康度可看，照旧。
+  describe_verdict 写出来；以前记下的结论里没有后加的计数（如 budget_unjudged）时按 0 读。
+  离线替身不调大模型，没有健康度可看，照旧。
 - 测试集依据（test_set_evidence）：上线状态、验收报告从 eval.verdict 里挑指纹和线上一致
   （same_setup：除代码版本外每一项都一样）、用真实大模型（--llm env）跑的最近一次结论：测试集
   达标且回归没有下降算通过。离线替身的结论只作回归基线（rodit.eval.cli 的说明），不算上线
@@ -109,6 +111,8 @@ HOW_TO_RECORD = (
     "用线上配置和线上的大模型跑 python -m rodit.eval --llm env --config <部署配置> --json 报告.json"
     "（环境变量 RODIT_LLM_* 和部署一致；分类器路由时加 --classifier <线上的模型文件>），"
     "再 python -m rodit.ops record-eval --report 报告.json"
+    "（record-eval 也要带部署的 --config / RODIT_CONFIG 和 RODIT_LLM_*：它拿自己这个进程的配置当"
+    "线上来比，没给时比的是内置默认值）"
 )
 
 
@@ -618,7 +622,8 @@ def _when(at: datetime) -> str:
 
 def describe_health(c: HealthCounts) -> str:
     """一组运行健康度计数的说明，每项是"出问题的条数/分母"：路由退回（关键词规则）、质检不可用、
-    生成没有可用草稿这三项总是写；路由丢票、引擎异常、被时间预算截断有才写。"""
+    生成没有可用草稿这三项总是写；路由丢票、引擎异常、被时间预算截断、截断时没有草稿过完质检
+    （budget_unjudged，被时间预算截断的一部分）有才写。"""
     parts = [
         f"路由退回 {c.route_fallback}/{c.cases}",
         f"质检不可用 {c.qa_unavailable}/{c.qa_judged}",
@@ -628,6 +633,7 @@ def describe_health(c: HealthCounts) -> str:
         ("路由丢票", c.route_lost_votes),
         ("引擎异常", c.engine_errors),
         ("被时间预算截断", c.budget_cut),
+        ("截断时没有草稿过完质检", c.budget_unjudged),
     )
     parts += [f"{label} {count}/{c.cases}" for label, count in rarer if count]
     return "、".join(parts)

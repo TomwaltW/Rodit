@@ -19,7 +19,7 @@ from rodit.app import rollout as app_rollout
 from rodit.app.demo import build_demo_unit
 from rodit.core.audit import AuditAction, InMemoryAuditSink
 from rodit.core.clock import CST
-from rodit.core.config import EngineConfig, config_fingerprint
+from rodit.core.config import EngineConfig, config_fingerprint, load_config
 from rodit.core.enums import (
     DraftKind,
     Intent,
@@ -124,8 +124,9 @@ def test_record_eval_writes_a_system_event(tmp_path: Path):
     assert event.shop_id is None and event.created_at == NOW and event.actor == "system"
     assert event.detail["fingerprint"]["config_fingerprint"] == config_fingerprint(EngineConfig())
     assert event.detail["gate_passes"] is True and event.detail["llm_mode"] == "env"
-    assert "一致" in out.getvalue() and "达标" in out.getvalue()
-    assert "不一致" not in out.getvalue()
+    assert "达标" in out.getvalue()
+    # 没有 --config、没有 RODIT_CONFIG：比的是内置默认值，不是部署，不说"一致"（见下面专门的用例）
+    assert "一致" not in out.getvalue() and "只能和内置默认值" in out.getvalue()
     # 运行健康度的计数记进结论，记录时打出来（全部用例和测试集）
     assert event.detail["health_overall"] == HealthCounts(
         cases=324, qa_judged=233, generation_attempted=250
@@ -151,6 +152,85 @@ def test_record_eval_refuses_a_run_that_did_not_evaluate_the_model(tmp_path: Pat
     assert "没有记录" in head and "没有有效评到大模型" in head and "已记录" not in out.getvalue()
     assert reasons == [f"- {reason}" for reason in DEGRADED_REASONS]
     assert all(reason in caplog.text for reason in DEGRADED_REASONS)  # 日志里也有
+
+
+def _record(tmp_path: Path, report: dict, *argv: str, environ: dict | None = None):
+    """record-eval 跑一次：返回（退出码，输出的最后一行——说和线上比的结果的那一行，记下的事件）。"""
+    path = tmp_path / "recorded.json"
+    path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    audit, out = InMemoryAuditSink(), io.StringIO()
+    args = parse("record-eval", "--report", str(path), *argv)
+    code = rollout_jobs.run(args, environ or LLM_ENV, audit=audit, clock=FakeClock(NOW), out=out)
+    last = out.getvalue().splitlines()[-1] if out.getvalue() else ""
+    return code, last, audit
+
+
+def test_record_eval_on_built_in_defaults_does_not_speak_for_the_deployment(tmp_path: Path):
+    """没有 --config、没有 RODIT_CONFIG 时本任务手里只有内置默认值，镜像却是用 config/rodit.yaml
+    启动的（配置指纹不同）：和默认值比出来的结果，两头都不能说成"上线状态用 / 不用这次结论"。
+    说清楚比的是什么、部署是另一个配置指纹、由 serve 自己判断；结论照样记下，退出码照旧是 0。"""
+    shipped = Path(__file__).resolve().parents[2] / rollout_jobs.SHIPPED_CONFIG
+    deployed = load_config(shipped)
+    assert config_fingerprint(deployed) != config_fingerprint(EngineConfig())  # 提示里这么说的
+    on_defaults = eval_report()
+    on_shipped = eval_report(
+        fingerprint=current_fingerprint(deployed, environ=LLM_ENV).model_dump(mode="json")
+    )
+
+    # 按内置默认值跑的评测：以前这里说"一致：上线状态用这次结论"，而镜像的部署并不用它
+    code, last, audit = _record(tmp_path, on_defaults)
+    assert code == 0 and len(audit.list_system_events()) == 1
+    assert "一致" not in last and "上线状态用这次结论" not in last
+    assert last.startswith("注意：没有 --config，也没有 RODIT_CONFIG，这里没法和部署比")
+    assert "只能和内置默认值" in last and "对得上" in last and "按内置默认值跑的" in last
+    assert "镜像用 config/rodit.yaml 启动，配置指纹和内置默认值不同" in last
+    assert "由 serve 按它自己的 RODIT_CONFIG 和 RODIT_LLM_* 判断" in last
+    assert "--config" in last and "再跑一次 record-eval" in last
+    assert app_rollout.eval_evidence(audit, deployed, environ=LLM_ENV).passed is None
+
+    # 按部署配置跑的评测：以前这里说"不一致，上线状态不会用这次结论"，而部署是用它的
+    code, last, audit = _record(tmp_path, on_shipped)
+    assert code == 0 and len(audit.list_system_events()) == 1
+    assert "一致" not in last and "不会用这次结论" not in last
+    assert "只能和内置默认值" in last and "对不上（配置指纹）" in last
+    assert "这不说明上线状态不用这次结论" in last and "config/rodit.yaml" in last
+    assert app_rollout.eval_evidence(audit, deployed, environ=LLM_ENV).passed is True
+
+    # 给了部署配置（--config 或 RODIT_CONFIG，镜像里是后一种）：比的就是部署，照旧明说
+    for argv, environ in (
+        (("--config", str(shipped)), LLM_ENV),
+        ((), {**LLM_ENV, "RODIT_CONFIG": str(shipped)}),
+    ):
+        code, last, _ = _record(tmp_path, on_shipped, *argv, environ=environ)
+        assert code == 0
+        assert last == f"和线上（部署配置 {shipped}）一致：上线状态用这次结论判断测试集门槛"
+        code, last, _ = _record(tmp_path, on_defaults, *argv, environ=environ)
+        assert code == 0 and last.startswith(f"注意：和线上（部署配置 {shipped}）不一致（配置指纹")
+        assert last.endswith("上线状态不会用这次结论判断测试集门槛")
+
+    # 离线替身的报告：照旧只说它不作上线依据
+    code, last, _ = _record(tmp_path, eval_report(mode="offline"))
+    assert code == 0 and last == "离线替身跑的评测只作回归基线，上线状态不会用它判断测试集门槛"
+
+
+def test_record_eval_refuses_a_run_cut_by_the_time_budget_before_any_draft_was_judged(
+    tmp_path: Path,
+):
+    """被时间预算截断、没有一条大模型草稿过完质检的用例超过上限：不记（退出码 2）；在上限以内的
+    记下，计数打出来。"""
+    cut = {"budget_cut": 315, "budget_unjudged": 315}
+    cut_test = {"budget_cut": 64, "budget_unjudged": 64}
+    code, _, audit = _record(tmp_path, eval_report(health=run_health(overall=cut, test=cut_test)))
+    assert code == 2 and audit.list_system_events() == []
+    few = {"budget_cut": 9, "budget_unjudged": 4}
+    path = tmp_path / "few.json"
+    path.write_text(json.dumps(eval_report(health=run_health(overall=few))), encoding="utf-8")
+    audit, out = InMemoryAuditSink(), io.StringIO()
+    args = parse("record-eval", "--report", str(path))
+    assert rollout_jobs.run(args, LLM_ENV, audit=audit, clock=FakeClock(NOW), out=out) == 0
+    [event] = audit.list_system_events(action=AuditAction.EVAL_VERDICT.value)
+    assert event.detail["health_overall"]["budget_unjudged"] == 4
+    assert "被时间预算截断 9/324、截断时没有草稿过完质检 4/324" in out.getvalue()
 
 
 def test_record_eval_warns_when_the_deployed_config_differs(tmp_path: Path):
@@ -609,7 +689,9 @@ def test_record_eval_on_postgres_refuses_a_degraded_run_and_keeps_the_health_of_
     assert event.detail["health_overall"] == run_health()["overall"]
     assert event.detail["health_test"] == run_health()["test"]
     assert "路由退回 0/324、质检不可用 0/233" in printed.out and "测试集 66 条" in printed.out
-    assert "一致" in printed.out and "不一致" not in printed.out
+    # 这个进程没有 --config、没有 RODIT_CONFIG：比的是内置默认值，不替部署说"一致"
+    assert "一致" not in printed.out and "只能和内置默认值" in printed.out
+    assert "对得上" in printed.out and "由 serve 按它自己的 RODIT_CONFIG" in printed.out
     evidence = app_rollout.eval_evidence(audit, EngineConfig(), environ=LLM_ENV)
     assert evidence.passed is True and "路由退回 0/324、质检不可用 0/233" in evidence.detail
 

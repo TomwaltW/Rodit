@@ -21,6 +21,7 @@ from rodit.app.offline import EvidenceEchoLLM
 from rodit.core.clock import CST
 from rodit.core.config import EngineConfig, load_config
 from rodit.core.enums import Intent, ProviderName
+from rodit.core.errors import LLMError
 from rodit.core.pii import mask_pii
 from rodit.core.ports import LLMRequest
 from rodit.core.questions import Q_INTENT
@@ -34,6 +35,7 @@ from rodit.eval.fingerprint import (
     LLM_MODEL_ENV,
     EvalFingerprint,
     EvalVerdict,
+    ModelNotEvaluated,
     current_fingerprint,
     describe_verdict,
     endpoint_of,
@@ -55,6 +57,16 @@ LLM_ENV = {LLM_BASE_URL_ENV: BASE_URL, LLM_MODEL_ENV: "synthetic-model"}
 SHIPPED_CONFIG = Path(__file__).resolve().parents[2] / "config" / "rodit.yaml"
 # 用例的买家消息（判断层 state 里是遮挡过个人信息的）→ 标注的问题类型
 LABELLED = {mask_pii(c.text): c.expected_intent for c in cases("all")}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _no_config_env():
+    """这里的 --llm env 评测都不给 --config：操作的人的 shell 里要是设了 RODIT_CONFIG（部署和镜像
+    都设），评测会去读它，配置指纹就和这里按内置默认值算的线上对不上。整个模块期间拿掉、结束后放回。
+    模块级：classifier_eval 是模块级 fixture，函数级的 monkeypatch 来不及。"""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("RODIT_CONFIG", raising=False)
+        yield
 
 
 def with_provider(config: EngineConfig, provider: ProviderName) -> EngineConfig:
@@ -442,6 +454,81 @@ def test_a_full_env_run_becomes_a_verdict_with_its_run_health(tmp_path):
     assert "运行健康度：路由退回 0/324" in describe_verdict(T0, verdict)
     ev = evidence(verdict, current_fingerprint(EngineConfig(), environ=LLM_ENV))
     assert ev.reason is None and "路由退回 0/324" in ev.detail
+
+
+# ================================================================ 评测命令行 → 结论（接缝）
+
+SEAM_ARGV = ["--split", "test", "--llm", "env", "--skip-preflight", "--allow-degraded"]
+
+
+def _routing_rejected() -> FakeLLMClient:
+    """和 _env_llm 一样，只是路由的每一次调用都被模型服务拒绝（如接口不认某个参数，HTTP 400）：
+    每条用例的路由都退回关键词规则。"""
+    healthy = _env_llm()
+
+    def handler(request: LLMRequest):
+        if request.purpose == "route":
+            return LLMError("合成的故障：HTTP 400", status=400, kind="bad_request")
+        return healthy.complete(request)
+
+    client = FakeLLMClient(handler=handler, model="synthetic-model")
+    client.base_url = BASE_URL  # type: ignore[attr-defined]
+    return client
+
+
+def _seam_report(tmp_path: Path, name: str, factory) -> tuple[dict, bytes, str]:
+    """真的跑一遍评测命令行（整个测试集，条数对得上评测集），返回写出的报告（解析过的、原文）
+    和标准错误。--allow-degraded：没评到模型也跑完、退出码 0、报告照常写出——能递给 record-eval
+    的降级报告就是这么来的。"""
+    target = tmp_path / f"{name}.json"
+    err = io.StringIO()
+    code = main(
+        [*SEAM_ARGV, "--json", str(target)], out=io.StringIO(), err=err, client_factory=factory
+    )
+    assert code == 0, err.getvalue()
+    raw = target.read_bytes()
+    return json.loads(raw), raw, err.getvalue()
+
+
+def test_a_degraded_report_written_by_the_cli_is_refused_as_a_verdict(tmp_path):
+    """接缝：评测命令行数出来的，就是 record-eval 判的。路由调用全部被拒的一轮，命令行自己写出的
+    报告（不是手搭的 health）交给 verdict_from_report：不收（ModelNotEvaluated），原因是命令行
+    报告里的那几条；同样的参数、每次调用都成功的一轮照收。"""
+    data, raw, err = _seam_report(tmp_path, "degraded", _routing_rejected)
+    size = len(cases("test"))
+    assert data["n"] == data["gate"]["n"] == size == 66  # 完整的测试集：不是因为条数被拒
+    assert "加了 --allow-degraded，退出码不因此改变" in err
+    block = data["health"]
+    assert block["valid"] is False
+    assert block["overall"]["cases"] == size and block["overall"]["route_fallback"] == size
+    with pytest.raises(ModelNotEvaluated) as exc:
+        verdict_from_report(data, raw=raw)
+    routing = "路由：66 条里有 66 条（100.0%）没用上判断层（退回关键词规则），上限 1 条。"
+    assert routing in exc.value.reasons and f"测试集：{routing}" in exc.value.reasons
+    # 命令行按默认上限给的原因，读报告的一方重新算出来的是同一组
+    assert exc.value.reasons == block["reasons"]
+
+    data, raw, err = _seam_report(tmp_path, "healthy", _env_llm)
+    assert data["health"]["valid"] is True and "没有有效评到模型" not in err
+    verdict = verdict_from_report(data, raw=raw)
+    assert (verdict.n, verdict.test_n, verdict.llm_mode) == (size, size, "env")
+    assert verdict.health_overall is not None and verdict.health_overall == verdict.health_test
+    assert verdict.health_overall.cases == size and verdict.health_overall.route_fallback == 0
+    assert evidence(verdict, current_fingerprint(EngineConfig(), environ=LLM_ENV)).reason is None
+
+
+def test_a_relaxed_ceiling_at_evaluation_time_does_not_reach_the_verdict(tmp_path):
+    """接缝的另一头：评测时用 --max-degraded 放宽上限，命令行自己说这一轮算数（valid），报告里
+    写着放宽了的 ceiling；记成结论时按固定的默认上限重新算，照样不收。"""
+    target = tmp_path / "relaxed.json"
+    argv = [*SEAM_ARGV, "--max-degraded", "1.0", "--json", str(target)]
+    err = io.StringIO()
+    code = main(argv, out=io.StringIO(), err=err, client_factory=_routing_rejected)
+    assert code == 0, err.getvalue()
+    data = json.loads(target.read_bytes())
+    assert data["health"]["valid"] is True and data["health"]["ceiling"] == 1.0
+    with pytest.raises(ModelNotEvaluated, match="没用上判断层（退回关键词规则），上限 1 条"):
+        verdict_from_report(data)
 
 
 def test_offline_report_fingerprint_names_the_stand_in(tmp_path):
