@@ -388,6 +388,16 @@ def test_budget_cuts_never_invalidate_a_run():
         ({"error": "LLMError", "status": 402, "code": 1113}, "http_402:1113"),  # 数字代码
         ({"error": "LLMError", "status": 500, "code": "  "}, "http_500"),
         ({"error": "LLMError", "status": 503, "code": None}, "http_503"),
+        # 状态码是 2xx 的失败（HTTP 200 但读不出回答、或响应体里带着错误对象）：按 kind 标，
+        # 有 code 接上；连 kind 都没有才退回 http_<状态码>
+        ({"error": "LLMError", "kind": "malformed", "status": 200}, "malformed"),
+        (
+            {"error": "LLMError", "kind": "malformed", "status": 200, "code": "1301"},
+            "malformed:1301",
+        ),
+        ({"error": "LLMError", "kind": "content_filter", "status": 200}, "content_filter"),
+        ({"error": "LLMError", "status": 200}, "http_200"),
+        ({"error": "LLMError", "status": 204, "code": "x"}, "http_204:x"),
         # 没有状态码：别的 kind（code 不单独成键）
         ({"error": "LLMError", "kind": "network"}, "network"),
         ({"error": "LLMError", "kind": "malformed", "code": "no_choices"}, "malformed"),

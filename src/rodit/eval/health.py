@@ -64,7 +64,9 @@ class HealthCounts(_Model):
     generation_attempted: int = Field(default=0, ge=0)
     # 调了生成，却没有一条可用草稿（调用全失败，或输出全都解析不了）
     generation_unusable: int = Field(default=0, ge=0)
-    # 引擎异常（降级标记里有 engine）
+    # 引擎异常：链路上有一环出了意外（降级标记里有 engine、router、understanding、retriever、
+    # generator、qa、storage、knowledge、audit、tenant_isolation 之一，
+    # 见 eval.cli.PIPELINE_ERROR_CODES）
     engine_errors: int = Field(default=0, ge=0)
     # 被时间预算截断（降级标记里有 budget）：照实展示，不算"模型没被评到"
     budget_cut: int = Field(default=0, ge=0)
@@ -158,14 +160,20 @@ def _text(value: Any) -> str:
 def error_label(detail: Mapping[str, Any]) -> str:
     """一次失败调用的 llm.usage 审计 detail → PurposeHealth.errors 的键。
 
-    按顺序：kind 是 timeout → "timeout"；有 status → "http_<状态码>"，有 code 时再接 ":<code>"；
-    有别的 kind → kind；都没有 → detail["error"]（异常类型名），连它也没有 → "unknown"。"""
+    按顺序：kind 是 timeout → "timeout"；有 status 而且不是 2xx → "http_<状态码>"，有 code 时再接
+    ":<code>"；有别的 kind → kind（status 是 2xx 时有 code 也接上：HTTP 200 但响应读不出来、或
+    响应体里带着错误对象，标成 "malformed" / "malformed:<code>"，不标成 "http_200"）；都没有 →
+    detail["error"]（异常类型名），连它也没有 → "unknown"。"""
     kind = _text(detail.get("kind"))
     if kind == "timeout":
         return "timeout"
     status = detail.get("status")
+    code = _text(detail.get("code"))
     if isinstance(status, int) and not isinstance(status, bool):
-        code = _text(detail.get("code"))
+        if not 200 <= status < 300:
+            return f"http_{status}:{code}" if code else f"http_{status}"
+        if kind:
+            return f"{kind}:{code}" if code else kind
         return f"http_{status}:{code}" if code else f"http_{status}"
     return kind or _text(detail.get("error")) or "unknown"
 

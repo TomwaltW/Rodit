@@ -160,6 +160,44 @@ def test_constructor_validation(kwargs):
         OpenAICompatibleClient(**args)
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://svcuser:URLPASSWORD@llm.example.invalid/v1",  # 没写端口：密码会被当成端口
+        "https://svcuser:URLPASSWORD@llm.example.invalid:8443/v1",
+        "https://svcuser@llm.example.invalid/v1",
+        "http://:URLPASSWORD@llm.example.invalid/v1",
+        "https://svcuser:URLPASSWORD@llm.example.invalid",
+        "https://svcuser:URLPASSWORD@llm.example.invalid?sig=QUERYSECRET",
+    ],
+)
+def test_base_url_with_userinfo_is_rejected_without_echoing_it(monkeypatch, base_url):
+    """地址里带用户名密码：默认出口（urllib）用不了，没写端口时还把密码当成端口打在报错里。
+    构造时就拒绝，消息里不带地址的任何一部分。"""
+    with pytest.raises(ValueError, match="base_url") as direct:
+        OpenAICompatibleClient(base_url=base_url, model="m")
+    monkeypatch.setenv("RODIT_LLM_BASE_URL", f" {base_url}\n")
+    monkeypatch.setenv("RODIT_LLM_MODEL", "m")
+    with pytest.raises(ValueError, match="base_url") as from_env:
+        OpenAICompatibleClient.from_env(transport=FakeTransport())
+    for error in (direct.value, from_env.value):
+        for part in ("svcuser", "URLPASSWORD", "QUERYSECRET", "llm.example.invalid", "8443"):
+            assert part not in str(error)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://llm.example.invalid/v1/@tenant",
+        "https://llm.example.invalid/v1?user=a@b",
+        "https://llm.example.invalid?user=a@b",
+        "https://llm.example.invalid/v1#a@b",
+    ],
+)
+def test_at_sign_after_the_host_is_not_userinfo(base_url):
+    assert OpenAICompatibleClient(base_url=base_url, model="m").base_url == base_url
+
+
 def test_from_env(monkeypatch):
     monkeypatch.setenv("RODIT_LLM_BASE_URL", BASE)
     monkeypatch.setenv("RODIT_LLM_MODEL", "qwen-synthetic")
@@ -683,10 +721,8 @@ def test_api_key_cannot_leak_in_an_escaped_form(monkeypatch, exc):
     assert str(ei.value).startswith("大模型接口调用失败：")
 
 
-URL_SECRETS = ("svcuser", "URLPASSWORD", "PATHSECRET", "QUERYSECRET")
-SECRET_URL = (
-    "https://svcuser:URLPASSWORD@llm.example.invalid:8443/v1/tenant-PATHSECRET?sig=QUERYSECRET"
-)
+URL_SECRETS = ("PATHSECRET", "QUERYSECRET")
+SECRET_URL = "https://llm.example.invalid:8443/v1/tenant-PATHSECRET?sig=QUERYSECRET"
 
 
 @pytest.mark.parametrize(
@@ -710,7 +746,7 @@ SECRET_URL = (
 )
 def test_transport_errors_never_echo_the_base_url(api_key, make_exc):
     """传输层的异常文字常带着请求地址（requests / httpx 的连接错误、http.client 的 InvalidURL）：
-    地址里的路径、查询参数、用户名密码都不能进消息。"""
+    地址里的路径、查询参数都不能进消息（带用户名密码的地址构造时就拒绝了）。"""
 
     def transport(url, headers, body, timeout_s):
         raise make_exc(url)
@@ -753,11 +789,9 @@ def no_network(monkeypatch):
         "https://llm.example.invalid/v1/tenant-PATHSECRET x?sig=QUERYSECRET",
         "http://llm.example.invalid/v1/tenant-PATHSECRET x?sig=QUERYSECRET",
         "https://llm.example.invalid/v1/tenant-PATHSECRET\nx?sig=QUERYSECRET",
-        # 带用户名密码、没写端口：密码被当成端口，报"端口不是数字"时原样打出来
-        "https://svcuser:URLPASSWORD@llm.example.invalid/v1",
-        "https://llm.example.invalid:PORTSECRET/v1",
+        "https://llm.example.invalid:PORTSECRET/v1",  # 报"端口不是数字"时把端口那一段打出来
     ],
-    ids=["https-space", "http-space", "newline", "userinfo-without-port", "bad-port"],
+    ids=["https-space", "http-space", "newline", "bad-port"],
 )
 def test_default_transport_never_echoes_the_base_url(no_network, api_key, base_url):
     c = OpenAICompatibleClient(base_url=base_url, model="m")

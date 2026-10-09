@@ -395,12 +395,13 @@ _FAILED = {"model": "configured", "input_tokens": 0, "output_tokens": 0}
             {"error": "LLMError", "kind": "content_filter"},
             "content_filter",
         ),
-        # 思考模式没关时常见的形态：content 是 null。读不出回答，状态码照带
+        # 思考模式没关时常见的形态：content 是 null。读不出回答，状态码照带；报告里的标签按原因
+        # （malformed），不写成 http_200
         (
             (200, _choice(None, "stop")),
             "sk-synthetic-meter",
             {"error": "LLMError", "kind": "malformed", "status": 200},
-            "http_200",
+            "malformed",
         ),
     ],
     ids=[

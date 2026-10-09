@@ -289,6 +289,27 @@ def test_every_routing_call_rejected(tmp_path):
     assert "降级：decision" in run.err and "这一轮没有有效评到模型（退出码 3）" in run.err
 
 
+def test_a_route_stage_that_crashes_is_not_a_valid_run(tmp_path):
+    """路由这一环抛了不该抛的异常（不是 LLMError，比如客户端自己的 bug）：引擎记 router，这一条没有
+    路由结果。量到的不是模型：按引擎异常计，这一轮不算数。"""
+
+    def fault(request: LLMRequest, case: int, nth: int):
+        if request.purpose == "route":
+            raise RuntimeError("合成的故障：不是模型服务的失败")
+        return None
+
+    run = _run(tmp_path, fault)
+    assert run.code == 3
+    health = _check_rule(run)
+    assert not health.valid
+    assert (health.overall.engine_errors, health.test.engine_errors) == (12, 6)
+    assert health.overall.route_fallback == 0  # 没有退回关键词规则：根本没有路由结果
+    assert health.routed_by == {"none": 12}
+    assert "引擎：12 条里有 12 条（100.0%）引擎异常，上限 1 条。" in health.reasons
+    assert "测试集：引擎：6 条里有 6 条（100.0%）引擎异常，上限 1 条。" in health.reasons
+    assert run.data["degraded_counts"] == {"router": 12}
+
+
 def _forty_percent(request: LLMRequest, case: int, nth: int):
     """四成的路由票被限流（HTTP 429），按用例和票排定：每 5 条里两条丢两票以上（退回关键词
     规则）、两条丢一票（判断层照常给出结果）、一条不丢。"""

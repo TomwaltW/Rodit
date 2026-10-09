@@ -627,15 +627,16 @@ def test_401_names_the_key_variable_and_never_the_key(monkeypatch):
 
 def test_real_client_errors_are_reported_without_key_or_credentials(monkeypatch):
     """真实客户端 + 脚本化的 transport：接口拒绝 response_format 时三种请求都没过；说明里没有密钥，
-    接口地址只留主机。（客户端把 HTTP 状态码放进 LLMError.status 之前，这里只有它给的说明文字。）"""
+    接口地址只留主机（路径、查询参数不带；地址里写用户名密码的客户端构造不出来）。"""
     monkeypatch.setenv("RODIT_LLM_API_KEY", KEY)
     refusal = {"error": {"type": "invalid_request_error", "code": "response_format_unsupported"}}
     vendor = Vendor(lambda purpose, body: (400, refusal) if "response_format" in body else None)
-    client = vendor.client("https://user:pw@llm.example.invalid:8443/v1")
+    client = vendor.client("https://llm.example.invalid:8443/v1/tenant-PATHSECRET?sig=QUERYSECRET")
     message = _failure(client)
     assert "路由、质检、生成没过，评测没有开跑" in message.splitlines()[0]
     assert "- 3 票：" in message and message.count("- 1 次：") == 2
-    assert KEY not in message and "user:pw" not in message
+    assert KEY not in message
+    assert "PATHSECRET" not in message and "QUERYSECRET" not in message
     assert len(vendor.seen) == 5
 
 
@@ -824,7 +825,8 @@ def test_eval_cli_reports_the_failed_check_and_does_not_run():
     )
     assert code == 2 and out.getvalue() == ""
     log = err.getvalue()
-    assert log.startswith("评测没有运行：大模型连通性检查失败：")
+    # 没给 --config 时前面先有一条"按内置默认值跑"的提醒；检查没过的说明另起一行
+    assert any(line.startswith("评测没有运行：大模型连通性检查失败：") for line in log.splitlines())
     assert "llm.extra_body" in log and "Traceback" not in log
     assert len(fake.calls) == 5
 
@@ -876,17 +878,6 @@ def _urllib_sets_a_proxy(url: str) -> bool:
         (
             {"HTTPS_PROXY": PROXY, "NO_PROXY": "llm.example.invalid"},
             "https://llm.example.invalid:8443/v1",
-            False,
-        ),
-        # 地址里带用户名密码时 urllib 拿 "user:pw@主机" 去对免代理名单：整名对不上，后缀对得上
-        (
-            {"HTTPS_PROXY": PROXY, "NO_PROXY": "llm.example.invalid"},
-            "https://user:pw@llm.example.invalid/v1",
-            True,
-        ),
-        (
-            {"HTTPS_PROXY": PROXY, "NO_PROXY": ".example.invalid"},
-            "https://user:pw@llm.example.invalid/v1",
             False,
         ),
         # 只给 http 配了代理：https 的接口直连

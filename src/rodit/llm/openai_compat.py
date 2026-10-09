@@ -8,6 +8,7 @@ base_url / model 由部署配置决定，代码里不写死。实现 core.ports.
   密钥不出现在 repr、异常消息、日志里：传输层自己抛的 LLMError 先抹掉密钥；别的异常只报类型名，
   不带异常的文字——里面可能有转义过的密钥（http.client 报请求头不合法时把整个头值打出来，
   按原文抹不掉）、接口地址的路径和查询参数、代理地址。
+- 接口地址：base_url 不能带用户名和密码（用户名:密码@主机），构造时就拒绝，报错里不带地址。
 - 超时：request.timeout_s 优先，否则用构造时的 timeout_s（路由 ≤ 1 秒由调用方传入，§12.1）。
 - 错误（§12.2 调用方据此退回 FAQ / 模板）：超时 → LLMTimeout；HTTP 429 / 5xx / 其他非 2xx、
   网络错误、响应格式不对 → LLMError。不重试：延迟预算紧，降级比重试更可控。
@@ -146,6 +147,15 @@ def _http_kind(status: int) -> LLMErrorKind:
     return "bad_request"
 
 
+def _has_userinfo(url: str) -> bool:
+    """地址的主机部分前面有没有"用户名[:密码]@"。主机部分到第一个 / ? # 为止（urllib 也这么切）；
+    后面路径、查询参数里的 @ 不算。url 已经确认以 http:// 或 https:// 开头。"""
+    authority = url.split("://", 1)[1]
+    for stop in "/?#":
+        authority = authority.split(stop, 1)[0]
+    return "@" in authority
+
+
 def _exception_types(e: BaseException) -> str:
     """异常的类型名，不带异常的文字。urllib 的 URLError 把真正的原因放在 reason 里，
     那一层的类型名也带上（"URLError（ConnectionRefusedError）"），不然域名解析不了、连接被拒、
@@ -232,6 +242,12 @@ class OpenAICompatibleClient:
     ) -> None:
         if not base_url.startswith(("https://", "http://")):
             raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+        if _has_userinfo(base_url):
+            # 默认出口（urllib）用不了这种地址，没写端口时还会把密码当成端口、原样打在报错里。
+            # 消息里不带地址的任何一部分
+            raise ValueError(
+                "base_url 不能带用户名和密码（用户名:密码@主机 的写法）：认证只用 API key"
+            )
         if not model:
             raise ValueError("model 不能为空")
         if timeout_s <= 0:

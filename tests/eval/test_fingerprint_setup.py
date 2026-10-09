@@ -46,7 +46,6 @@ from rodit.eval.fingerprint import (
     verdict_event,
     verdict_from_report,
 )
-from rodit.eval.health import DEFAULT_CEILING
 from rodit.eval.llm_env import describe_endpoint
 from rodit.testing.fakes import FakeLLMClient, judge_buyer_text, scripted_judge_llm
 
@@ -135,7 +134,14 @@ def test_running_llm_follows_the_production_rule():
     only_model = EngineConfig.model_validate({"llm": {"model": "cfg-model"}})
     assert running_llm(only_model, env) == ("env-model", "https://env-llm.example.invalid:8443")
     assert running_llm(EngineConfig(), {}) == (None, None)
-    for url in (BASE_URL, "http://10.0.0.8:8080/v1", "https://user:pw@h.example.invalid/v1"):
+    for url in (
+        BASE_URL,
+        "http://10.0.0.8:8080/v1",
+        "https://user:pw@h.example.invalid/v1",
+        "https://h.example.invalid:443/v1",  # 默认端口：两处都不写
+        "http://10.0.0.8:80/v1",
+        "https://h.example.invalid:80/v1",  # 不是这个协议的默认端口：两处都保留
+    ):
         assert endpoint_of(url) == describe_endpoint(type("C", (), {"base_url": url})())
 
 
@@ -347,14 +353,12 @@ def _labelled_intent(request: LLMRequest) -> dict:
 
 
 def _env_llm() -> FakeLLMClient:
-    """--llm env 的替身：连通性检查回 OK，生成复述依据，路由 / 质检用脚本化的判断层（路由答用例
-    标注的类型，质检全部通过）。每次调用都成功、都读得出来：这一轮没有降级，评到的是"模型"，
-    record-eval 才收。"""
+    """--llm env 的替身：生成复述依据，路由 / 质检用脚本化的判断层（路由答用例标注的类型，评测集
+    以外的消息——连通性检查的合成会话——答 other；质检全部通过）。每次调用都成功、都读得出来：
+    这一轮没有降级，评到的是"模型"，record-eval 才收。"""
     judge, echo = scripted_judge_llm(route=_labelled_intent), EvidenceEchoLLM()
 
     def handler(request: LLMRequest):
-        if request.purpose == "other":
-            return "OK"
         return echo.complete(request) if request.purpose == "generate" else judge.complete(request)
 
     client = FakeLLMClient(handler=handler, model="synthetic-model")
@@ -368,18 +372,7 @@ def _eval(tmp_path: Path, *extra: str, split: str = "test") -> EvalVerdict:
     err = io.StringIO()
     assert main(argv, out=io.StringIO(), err=err, client_factory=_env_llm) == 0, err.getvalue()
     raw = target.read_bytes()
-    data = json.loads(raw)
-    if data["health"] is None:
-        # 评测命令行还没有填运行健康度（docs/架构与分工.md §4.4 的任务 C2）：这一轮没有降级、没有
-        # 失败的调用，补一份干净的。C2 合入后报告自带 health，这一段就用不上了，可以删掉
-        assert data["degraded_counts"] == {} and data["usage"]["errors"] == 0
-        data["health"] = {
-            "ceiling": DEFAULT_CEILING,
-            "overall": {"cases": data["n"]},
-            "test": {"cases": data["gate"]["n"]},
-            "valid": True,
-        }
-    return verdict_from_report(data, raw=raw)
+    return verdict_from_report(json.loads(raw), raw=raw)
 
 
 @pytest.fixture(scope="module")

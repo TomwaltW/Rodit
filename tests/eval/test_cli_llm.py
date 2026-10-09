@@ -269,8 +269,11 @@ def test_cli_env_mode_with_injected_client(tmp_path):
 
 
 def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_path):
-    """真实客户端 + 假 transport：地址、模型、超时来自环境变量；密钥只出现在请求头里。"""
-    monkeypatch.setenv("RODIT_LLM_BASE_URL", "https://user:pw@llm.example.invalid:8443/v1")
+    """真实客户端 + 假 transport：地址、模型、超时来自环境变量；密钥只出现在请求头里，
+    地址的路径不进报告。"""
+    monkeypatch.setenv(
+        "RODIT_LLM_BASE_URL", "https://llm.example.invalid:8443/v1/tenant-PATHSECRET"
+    )
     monkeypatch.setenv("RODIT_LLM_MODEL", "synthetic-model")
     monkeypatch.setenv("RODIT_LLM_API_KEY", FAKE_KEY)
     monkeypatch.setenv("RODIT_LLM_TIMEOUT_S", "7")
@@ -315,7 +318,8 @@ def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_pat
     )
     assert code == 0, err
     assert seen and all(
-        url == "https://user:pw@llm.example.invalid:8443/v1/chat/completions" for url, _, _ in seen
+        url == "https://llm.example.invalid:8443/v1/tenant-PATHSECRET/chat/completions"
+        for url, _, _ in seen
     )
     assert all(auth == f"Bearer {FAKE_KEY}" for _, auth, _ in seen)
     # 连通性检查发的就是评测要发的请求，各带各的超时：路由 3 票、质检 1 次是 decision.timeout_s
@@ -325,7 +329,7 @@ def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_pat
     assert 1.0 in {t for _, _, t in seen[5:]}  # 评测里的路由同样用 decision.timeout_s
     saved = path.read_text(encoding="utf-8")
     for text in (out, err, saved):
-        assert FAKE_KEY not in text and "user:pw" not in text
+        assert FAKE_KEY not in text and "PATHSECRET" not in text
     data = json.loads(saved)
     assert data["llm"]["endpoint"] == "https://llm.example.invalid:8443"
     assert data["llm"]["model"] == "synthetic-model"
@@ -346,6 +350,19 @@ def test_cli_env_mode_missing_configuration(monkeypatch):
     monkeypatch.delenv("RODIT_LLM_BASE_URL")
     code, _, err = _run(["--llm", "env"])
     assert code == 2 and "RODIT_LLM_BASE_URL" in err
+
+
+def test_cli_env_mode_refuses_a_base_url_with_userinfo(monkeypatch):
+    """地址里带用户名密码：客户端构造时就拒绝，报错里不带地址（以前要到发请求才出错，
+    没写端口时密码还会被打出来）。"""
+    monkeypatch.setenv("RODIT_LLM_BASE_URL", "https://user:pw@llm.example.invalid/v1")
+    monkeypatch.setenv("RODIT_LLM_MODEL", "synthetic-model")
+    monkeypatch.setenv("RODIT_LLM_API_KEY", FAKE_KEY)
+    code, out, err = _run(["--llm", "env"])
+    assert code == 2 and out == ""
+    assert "base_url" in err and "Traceback" not in err
+    for part in ("user:pw", "llm.example.invalid", FAKE_KEY):
+        assert part not in err
 
 
 def test_cli_env_mode_preflight_failure_stops_before_running():

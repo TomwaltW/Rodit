@@ -73,7 +73,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from rodit.app.offline import EvidenceEchoLLM
-from rodit.core.audit import DEGRADED_BUDGET
+from rodit.core.audit import DEGRADED_BUDGET, DEGRADED_TENANT_ISOLATION
 from rodit.core.config import EngineConfig, load_config
 from rodit.core.decision import DecisionProvider
 from rodit.core.enums import INTENT_LABELS, Intent, ProviderName
@@ -81,7 +81,19 @@ from rodit.core.errors import LLMError
 from rodit.core.models import EngineResult
 from rodit.core.ports import LLMClient
 from rodit.decision import ClassifierArtifactError, ClassifierProvider, RuleProvider
-from rodit.engine import DEGRADED_DECISION, DEGRADED_DECISION_QA, DEGRADED_ENGINE
+from rodit.engine import (
+    DEGRADED_AUDIT,
+    DEGRADED_DECISION,
+    DEGRADED_DECISION_QA,
+    DEGRADED_ENGINE,
+    DEGRADED_GENERATOR,
+    DEGRADED_KNOWLEDGE,
+    DEGRADED_QA,
+    DEGRADED_RETRIEVER,
+    DEGRADED_ROUTER,
+    DEGRADED_STORAGE,
+    DEGRADED_UNDERSTANDING,
+)
 from rodit.eval.baseline import METRIC_LABELS, BaselineCheck, compare_to_baseline, load_baseline
 from rodit.eval.calibration import (
     ReliabilityBin,
@@ -452,6 +464,26 @@ def _lost_votes(trace: CaseTrace) -> int:
     return votes.calls - votes.usable
 
 
+PIPELINE_ERROR_CODES = frozenset(
+    {
+        DEGRADED_ENGINE,
+        DEGRADED_ROUTER,
+        DEGRADED_UNDERSTANDING,
+        DEGRADED_RETRIEVER,
+        DEGRADED_GENERATOR,
+        DEGRADED_QA,
+        DEGRADED_STORAGE,
+        DEGRADED_KNOWLEDGE,
+        DEGRADED_AUDIT,
+        DEGRADED_TENANT_ISOLATION,
+    }
+)
+"""带这些降级标记的用例，链路上有一环出了意外（抛了不该抛的异常、存储或知识库不可用……），
+这一条量到的不是模型：计入 HealthCounts.engine_errors。评测跑在内存里的演示单元上，正常的一轮
+一条也不该有（离线替身的基线就是 0）。判断层不可用（decision / decision:qa）另有各自的计数，
+时间预算截断（budget）、平台工具降级（tool:…）不在这里。"""
+
+
 def _health_counts(traces: Sequence[CaseTrace]) -> HealthCounts:
     """一组用例的计数（各项的含义见 rodit.eval.health.HealthCounts）。降级标记是引擎给的，
     丢票、有没有送检、有没有可用草稿是 harness 的 CallRecorder 记的。"""
@@ -467,7 +499,7 @@ def _health_counts(traces: Sequence[CaseTrace]) -> HealthCounts:
         qa_unavailable=sum(1 for t in traces if DEGRADED_DECISION_QA in t.degraded),
         generation_attempted=len(attempted),
         generation_unusable=sum(1 for t in attempted if not t.stats("generate").usable),
-        engine_errors=sum(1 for t in traces if DEGRADED_ENGINE in t.degraded),
+        engine_errors=sum(1 for t in traces if PIPELINE_ERROR_CODES.intersection(t.degraded)),
         budget_cut=sum(1 for t in traces if DEGRADED_BUDGET in t.degraded),
     )
 
@@ -1409,8 +1441,15 @@ def main(
         if args.llm == "env":
             llm = client_factory() if client_factory is not None else env_client(config)
             if not args.skip_preflight:
+                checked = config
+                if route_provider is not None:  # --classifier：路由不走大模型判断层，不查路由
+                    base = config or EngineConfig()
+                    decision = base.decision.model_copy(
+                        update={"provider": ProviderName.CLASSIFIER}
+                    )
+                    checked = base.model_copy(update={"decision": decision})
                 try:
-                    summary = preflight(llm, config)
+                    summary = preflight(llm, checked)
                 except LLMError as e:  # 客户端的错误信息里已经抹掉了密钥
                     raise RuntimeError(f"大模型连通性检查失败：{e}") from None
                 for line in summary:  # 检查摘要；PreflightFailed 由下面的 RuntimeError 分支报出

@@ -267,6 +267,13 @@ def test_test_set_is_checked_only_with_a_matching_verdict(api: Api, monkeypatch)
         "n": 324,
         "gate": {"n": 66, "threshold": 0.95, "factual": 0.97, "compliance": 1.0, "passes": True},
         "llm": {"mode": "env", "model": "synthetic-model", "decision_provider": "incloud_llm"},
+        # 运行健康度（rodit.eval.health）：一轮干净的评测。真实大模型跑的报告没有这一块不收
+        "health": {
+            "ceiling": 0.02,
+            "overall": {"cases": 324},
+            "test": {"cases": 66},
+            "valid": True,
+        },
         "fingerprint": running.model_dump(mode="json"),
     }
     stale = {**report, "fingerprint": {**report["fingerprint"], "config_fingerprint": "0" * 64}}

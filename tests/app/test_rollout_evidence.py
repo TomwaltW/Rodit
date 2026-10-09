@@ -88,6 +88,13 @@ def report(service: AssistService, *, passes: bool = True, mode: str = "env", **
             "passes": passes,
         },
         "llm": {"mode": mode, "model": "synthetic-model", "decision_provider": "incloud_llm"},
+        # 运行健康度（rodit.eval.health）：一轮干净的评测。真实大模型跑的报告没有这一块不收
+        "health": {
+            "ceiling": 0.02,
+            "overall": {"cases": 324},
+            "test": {"cases": 66},
+            "valid": True,
+        },
         "fingerprint": fingerprint,
     }
 
