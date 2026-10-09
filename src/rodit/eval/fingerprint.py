@@ -36,9 +36,9 @@
 - 运行健康度（rodit.eval.health）：真实大模型跑的评测，调用失败、被截断、读不出时链路按 §12.2
   降级，照样跑完、给出一组数字，量的却是兜底逻辑。这样的报告不收：按报告 health 里的计数用固定的
   DEFAULT_CEILING / LOST_VOTE_CEILING 重新算一遍 assess（不看报告自己写的 valid、reasons、
-  ceiling），给出原因的抛 ModelNotEvaluated；计数和报告对不上的也不收。收下的结论带着这些计数
-  （EvalVerdict.health_overall / health_test），describe_verdict 写出来。离线替身不调大模型，
-  没有健康度可看，照旧。
+  ceiling），给出原因的抛 ModelNotEvaluated；报告里没有 health（旧版本生成的、没跑完的）、
+  计数和报告对不上的也不收。收下的结论带着这些计数（EvalVerdict.health_overall / health_test），
+  describe_verdict 写出来。离线替身不调大模型，没有健康度可看，照旧。
 - 测试集依据（test_set_evidence）：上线状态、验收报告从 eval.verdict 里挑指纹和线上一致
   （same_setup：除代码版本外每一项都一样）、用真实大模型（--llm env）跑的最近一次结论：测试集
   达标且回归没有下降算通过。离线替身的结论只作回归基线（rodit.eval.cli 的说明），不算上线
@@ -497,9 +497,14 @@ def _run_health(
     health: Any, *, split: str, n: int, test_n: int
 ) -> tuple[HealthCounts, HealthCounts]:
     """真实大模型跑的报告的 health →（全部用例的计数，测试集的计数）。split、n、test_n 是这份报告的
-    split、条数和测试集条数。读不出来、和报告对不上的抛 ValueError；这一轮没有有效评到大模型的抛
-    ModelNotEvaluated——按固定的 DEFAULT_CEILING / LOST_VOTE_CEILING 重新算 assess，报告里的
-    valid、reasons、ceiling 不作数（评测时可以放宽上限，记成上线依据时不行）。"""
+    split、条数和测试集条数。没有这一块、读不出来、和报告对不上的抛 ValueError；这一轮没有有效评到
+    大模型的抛 ModelNotEvaluated——按固定的 DEFAULT_CEILING / LOST_VOTE_CEILING 重新算 assess，
+    报告里的 valid、reasons、ceiling 不作数（评测时可以放宽上限，记成上线依据时不行）。"""
+    if health is None:
+        raise ValueError(
+            "报告里没有运行健康度（health）：是旧版本生成的，或者评测没有跑完，看不出大模型有没有被"
+            "有效评到。用本版本的 python -m rodit.eval --llm env --json 重新跑"
+        )
     try:
         block = _HealthDigest.model_validate(health)
     except ValidationError as e:
@@ -524,8 +529,8 @@ def _run_health(
 def verdict_from_report(data: Any, *, raw: bytes | None = None) -> EvalVerdict:
     """评测报告（--json 的内容，已解析）→ 结论。raw 是文件原文（算报告的 SHA-256；没给时按
     规范化的 JSON 算）。不能作为测试集依据的报告抛 ValueError（原因写明）：不是完整的评测
-    （部分评测、没有测试集、条数和评测集对不上），或者真实大模型跑的那一轮没有有效评到模型
-    （ModelNotEvaluated，见 _run_health）。离线替身跑的不看运行健康度。"""
+    （部分评测、没有测试集、条数和评测集对不上），或者真实大模型跑的报告里没有运行健康度、
+    那一轮没有有效评到模型（ModelNotEvaluated，见 _run_health）。离线替身跑的不看运行健康度。"""
     # 只有这里用评测集：线上服务 import 本模块（上线状态）时不必加载它
     from rodit.eval.dataset import cases
 
@@ -549,7 +554,7 @@ def verdict_from_report(data: Any, *, raw: bytes | None = None) -> EvalVerdict:
         )
     assert digest.fingerprint is not None
     health_overall = health_test = None
-    if digest.llm.mode == "env" and digest.health is not None:
+    if digest.llm.mode == "env":
         health_overall, health_test = _run_health(
             digest.health, split=digest.split, n=digest.n, test_n=digest.gate.n
         )

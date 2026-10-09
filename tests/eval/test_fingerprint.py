@@ -314,6 +314,17 @@ def test_a_health_block_that_cannot_be_read_or_is_not_about_this_report_is_refus
     assert not isinstance(exc.value, ModelNotEvaluated)
 
 
+def test_an_env_report_without_the_health_block_is_refused():
+    """真实大模型跑的报告里没有 health（旧版本的评测命令行生成的，或者评测没有跑完）：看不出模型
+    有没有被有效评到，不收，提示用本版本重新跑。"""
+    without_key = report()
+    del without_key["health"]
+    for data in (report(health=None), without_key):
+        with pytest.raises(ValueError, match="没有运行健康度") as exc:
+            verdict_from_report(data)
+        assert "重新跑" in str(exc.value) and not isinstance(exc.value, ModelNotEvaluated)
+
+
 def test_offline_reports_need_no_health_block():
     """离线替身不调大模型，没有运行健康度可看：和以前一样照收（只作回归基线），结论里不带计数。"""
     for block in (None, "不看", health(overall={"route_fallback": 324})):

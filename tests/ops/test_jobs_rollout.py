@@ -175,6 +175,7 @@ def test_record_eval_warns_when_the_deployed_config_differs(tmp_path: Path):
         (json.dumps(eval_report(split="dev", gate=None)), "测试集"),
         (json.dumps(eval_report(n=300)), "报告不完整"),  # 跑到一半停下的
         (json.dumps(eval_report(mode="offline", n=300)), "报告不完整"),
+        (json.dumps(eval_report(health=None)), "没有运行健康度"),  # 旧版本生成的真实大模型报告
         ("not json", "不是 JSON"),
         (None, "读不了"),
     ],
