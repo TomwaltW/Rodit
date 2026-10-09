@@ -35,7 +35,7 @@ from rodit.decision.llm import SYSTEM_PROMPT as JUDGE_SYSTEM_PROMPT
 from rodit.eval.cli import Failure, _render_failure, evaluate, main, render_text
 from rodit.eval.dataset import CASES, cases
 from rodit.eval.harness import UNPARSED_PREFIX, DraftRecorder, llm_harness
-from rodit.eval.llm_env import PreflightFailed, client_from_env
+from rodit.eval.llm_env import PREFLIGHT_QUESTION, PreflightFailed, client_from_env
 from rodit.eval.perf import Pricing
 from rodit.testing.fakes import FakeLLMClient
 
@@ -303,8 +303,11 @@ def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_pat
         url == "https://user:pw@llm.example.invalid:8443/v1/chat/completions" for url, _, _ in seen
     )
     assert all(auth == f"Bearer {FAKE_KEY}" for _, auth, _ in seen)
-    assert seen[0][2] == 7.0  # 连通性检查用客户端默认超时（RODIT_LLM_TIMEOUT_S）
-    assert 1.0 in {t for _, _, t in seen}  # 路由用 decision.timeout_s（§12.1 ≤ 1 秒）
+    # 连通性检查发的就是评测要发的请求，各带各的超时：路由 3 票、质检 1 次是 decision.timeout_s
+    # （§12.1 ≤ 1 秒），生成 1 次是 generation.timeout_s；客户端的默认超时
+    # （RODIT_LLM_TIMEOUT_S）用不上
+    assert sorted(t for _, _, t in seen[:5]) == [1.0, 1.0, 1.0, 1.0, 2.5]
+    assert 1.0 in {t for _, _, t in seen[5:]}  # 评测里的路由同样用 decision.timeout_s
     saved = path.read_text(encoding="utf-8")
     for text in (out, err, saved):
         assert FAKE_KEY not in text and "user:pw" not in text
@@ -312,7 +315,7 @@ def test_cli_env_mode_reads_environment_and_never_leaks_key(monkeypatch, tmp_pat
     assert data["llm"]["endpoint"] == "https://llm.example.invalid:8443"
     assert data["llm"]["model"] == "synthetic-model"
     calls = data["usage"]["calls"]
-    assert calls == len(seen) - 1  # 连通性检查不计入评测用量
+    assert calls == len(seen) - 5  # 连通性检查的 5 次请求不计入评测用量
     assert data["usage"]["input_tokens"] == 100 * calls
     assert data["usage"]["cost"] == pytest.approx(calls * (100 * 0.001 + 20 * 0.002) / 1000)
     assert "（https://llm.example.invalid:8443）" in out
@@ -334,8 +337,11 @@ def test_cli_env_mode_preflight_failure_stops_before_running():
     fake = FakeLLMClient(handler=lambda r: LLMError("大模型接口拒绝请求（HTTP 401）"))
     code, out, err = _run(["--llm", "env"], client_factory=lambda: fake)
     assert code == 2 and out == ""
-    assert "连通性检查失败" in err and "HTTP 401" in err
-    assert len(fake.calls) == 1  # 只打了一次检查请求
+    assert "评测没有运行：大模型连通性检查失败" in err and "HTTP 401" in err
+    assert "路由、质检、生成没过" in err and "Traceback" not in err
+    # 只发了检查用的 5 次请求（路由 3 票、质检、生成各 1 次），没有开跑，也没有重试
+    assert sorted(r.purpose for r in fake.calls) == ["generate", "qa", "route", "route", "route"]
+    assert all(PREFLIGHT_QUESTION in r.messages[-1].content for r in fake.calls)
 
 
 def test_cli_skip_preflight_sends_no_check_request():
@@ -343,7 +349,7 @@ def test_cli_skip_preflight_sends_no_check_request():
     model = ScriptedModel()
 
     def refuses_the_check(request: LLMRequest):
-        if request.purpose == "other":  # 连通性检查
+        if PREFLIGHT_QUESTION in request.messages[-1].content:  # 连通性检查用的合成会话
             return LLMError("合成的故障：检查请求被拒")
         return model(request)
 
@@ -355,7 +361,8 @@ def test_cli_skip_preflight_sends_no_check_request():
     skipped = FakeLLMClient(handler=refuses_the_check, model="synthetic-llm")
     code, out, err = _run([*argv, "--skip-preflight"], client_factory=lambda: skipped)
     assert code == 0, err
-    assert "连通性检查" not in err and not skipped.calls_for("other")
+    assert "连通性检查" not in err
+    assert not any(PREFLIGHT_QUESTION in r.messages[-1].content for r in skipped.calls)
     data = json.loads(out)
     assert data["n"] == 2 and len(skipped.calls) == data["usage"]["calls"] > 0  # 全是评测自己的请求
 
