@@ -8,7 +8,12 @@ import json
 import pytest
 
 from rodit.core.enums import Intent
-from rodit.eval.baseline import compare_to_baseline, load_baseline
+from rodit.eval.baseline import (
+    baseline_problems,
+    compare_to_baseline,
+    load_baseline,
+    read_baseline,
+)
 from rodit.eval.cli import evaluate, main, render_text
 from rodit.eval.dataset import CASES, cases
 from rodit.eval.llm_env import describe_endpoint, resolve_pricing
@@ -351,6 +356,59 @@ def test_load_baseline_errors(tmp_path):
     broken.write_text(json.dumps({"cases": [{"split": "dev"}]}), encoding="utf-8")
     with pytest.raises(ValueError, match="id"):
         load_baseline(broken)
+    binary = tmp_path / "binary.json"
+    binary.write_bytes(b"\xff\xfe\x00not text")
+    with pytest.raises(ValueError, match="不是 JSON"):
+        load_baseline(binary)
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"cases": [_row("a")], "n": 1}), encoding="utf-8")
+    assert load_baseline(good) == [_row("a")]
+    assert read_baseline(good) == {"cases": [_row("a")], "n": 1}  # 整份报告
+
+
+def _counts(cases: int = 100, **fields: int) -> dict[str, int]:
+    return {"cases": cases, "qa_judged": cases, "generation_attempted": cases, **fields}
+
+
+def test_baseline_problems_only_concern_runs_against_a_real_model():
+    """离线替身的基线（没有 health）照常能用；--llm env 的基线要有 health，而且按默认上限算数。"""
+    rows = [_row("a")]
+    assert baseline_problems({"cases": rows}) == []  # 手写的、很早的版本：没有 llm 也没有 health
+    assert baseline_problems({"cases": rows, "llm": {"mode": "offline"}, "health": None}) == []
+    env = {"cases": rows, "llm": {"mode": "env"}}
+    assert baseline_problems(env) == [
+        "没有运行健康度（health）：看不出那一轮有多少用例走了兜底逻辑"
+    ]
+    assert baseline_problems({**env, "health": None}) == baseline_problems(env)
+    healthy = {"overall": _counts(route_fallback=2), "test": _counts(20), "valid": True}
+    assert baseline_problems({**env, "health": healthy}) == []
+    # 带着 health 的报告就按 health 判，不管 llm 那一块在不在
+    degraded = {"overall": _counts(route_fallback=3), "test": None, "valid": False}
+    assert baseline_problems({"cases": rows, "health": degraded}) == [
+        "路由：100 条里有 3 条（3.0%）没用上判断层（退回关键词规则），上限 2 条。"
+    ]
+
+
+def test_baseline_problems_recompute_the_rule_at_the_default_ceilings():
+    env = {"cases": [_row("a")], "llm": {"mode": "env"}}
+    # 那一轮用 --max-degraded 放宽了上限：报告里的 valid 是 true，这里不信它
+    loose = {"ceiling": 0.5, "overall": _counts(qa_unavailable=30), "valid": True, "reasons": []}
+    assert baseline_problems({**env, "health": loose}) == [
+        "质检：有草稿送检的 100 条里有 30 条（30.0%）质检判断层不可用（只跑了硬规则），上限 2 条。"
+    ]
+    # 测试集单独看一遍；被时间预算截断、没有草稿判完的也算
+    test_only = {"overall": _counts(), "test": _counts(20, budget_unjudged=2)}
+    (reason,) = baseline_problems({**env, "health": test_only})
+    assert reason.startswith("测试集：时间预算：20 条里有 2 条")
+    # 以后的版本多写了字段：不因此读不了；以前的版本少写的按 0 算
+    later = {"overall": {"cases": 50, "a_later_counter": 9}, "by_purpose": {"x": {}}, "extra": 1}
+    assert baseline_problems({**env, "health": later}) == []
+    # 读不出来的 health：不能当基线
+    for broken in ("oops", {}, {"overall": None}, {"overall": {"cases": -1}}, {"overall": [1]}):
+        assert baseline_problems({**env, "health": broken}) == ["运行健康度（health）读不出来"]
+    assert baseline_problems({**env, "health": {"overall": _counts(), "test": "x"}}) == [
+        "运行健康度（health）读不出来"
+    ]
 
 
 # ---------------------------------------------------------------- 离线模式的命令行

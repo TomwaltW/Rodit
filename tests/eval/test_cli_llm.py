@@ -454,12 +454,14 @@ def test_cli_baseline_detects_regression_on_common_cases(tmp_path):
     assert code == 0, err
     size = [c for c in cases() if c.expected_intent == Intent.SIZE_ADVICE]
     worse = frozenset([next(c.id for c in size if c.split == "dev")])  # 一条开发集用例答错
-    code, out, _ = _run(
+    code, out, err = _run(
         ["--llm", "env", "--intent", "size_advice", "--baseline", str(base)],
         client_factory=lambda: _fake(wrong=worse),
     )
     assert code == 1
-    assert "== §13.5 回归比较（基线 base.json" in out and "↓回归" in out and "退出码 1" in out
+    assert "== §13.5 回归比较（基线 base.json" in out and "↓回归" in out and "不能上线" in out
+    # 退出码由进程在标准错误里说实际返回的那个；报告里不写（不算数的一轮返回的是 3）
+    assert "退出码" not in out and "回归比较有指标下降超过容差（退出码 1）" in err
     # 容差放宽到超过一条用例的比例：不算回归
     code, out, _ = _run(
         ["--llm", "env", "--intent", "size_advice", "--baseline", str(base), "--tolerance", "0.5"],
