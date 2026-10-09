@@ -7,25 +7,32 @@ handle() 对合法消息永不抛错；每条处理过的消息恰好一条 engi
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
 from engine_support import Kit, make_route, qa_pass
 
 from rodit.core.audit import AuditAction
+from rodit.core.config import DecisionConfig, QAGateConfig
 from rodit.core.enums import DraftKind, Intent, Mode
-from rodit.core.errors import DecisionError, KnowledgeUnavailable, LLMError
+from rodit.core.errors import DecisionError, KnowledgeUnavailable, LLMError, LLMTimeout
 from rodit.core.models import Draft, EngineResult
+from rodit.core.ports import LLMResponse
+from rodit.decision import build_llm_provider
 from rodit.engine import LATENCY_KEYS, RESULT_DETAIL_KEYS
 from rodit.engine.engine import (
     REASON_ENGINE,
     REASON_GENERATOR,
     REASON_KNOWLEDGE,
     REASON_QA_ERROR,
+    REASON_QA_FAILED,
     REASON_RETRIEVER,
     REASON_ROUTER,
     REASON_UNDERSTANDING,
 )
+from rodit.qa import QA_UNAVAILABLE, DefaultQualityGate
+from rodit.testing.fakes import FakeLLMClient
 from rodit.testing.fixtures import CONV, SHOP_A
 
 SHIP = "亲，发货与快递：现货付款后 48 小时内发货"
@@ -132,6 +139,42 @@ def test_qa_degraded_is_reported_and_hinted(kit: Kit) -> None:
     result = handle(kit)
     assert result.degraded == ["decision:qa"]
     assert result.suggestions[0].risk_hints == ["判断层质检暂不可用，只做了硬规则检查，请核实"]
+
+
+@pytest.mark.parametrize(
+    ("answer", "why"),
+    [
+        (LLMTimeout("大模型调用超时（1 秒）"), "大模型判断全部失败（1 次：超时 1）"),
+        (
+            LLMResponse(text='{"grounded": {"answer": "是"', finish_reason="length"),
+            "大模型判断全部失败（1 次：截断 1）",
+        ),
+        (LLMResponse(text=""), "大模型判断全部失败（1 次：空回答 1）"),
+    ],
+    ids=["timeout", "truncated", "blank"],
+)
+def test_real_gate_with_an_unusable_judge_blocks_without_a_rewrite(
+    kit: Kit, caplog: pytest.LogCaptureFixture, answer: Any, why: str
+) -> None:
+    """真的质检 + 真的大模型判断层，判断层每次都答不出（超时、被截断、空回答）：草稿不放行、
+    原因照旧是"质检不可用"，不重写——判断层只调一次，生成也只调一次；原因进了日志。"""
+    judge = FakeLLMClient(lambda request: answer)
+    provider = build_llm_provider(DecisionConfig(), purpose="qa", llm=judge)
+    gate = DefaultQualityGate(provider, QAGateConfig(), kit.audit, kit.clock)
+    kit.generator.script = [
+        [Draft(text=SHIP, kind=DraftKind.LLM, evidence_ids=["policy:ship_time"])],
+        [Draft(text="不该调用", kind=DraftKind.LLM)],
+    ]
+    with caplog.at_level(logging.WARNING):
+        result = handle(kit, engine=kit.engine(gate=gate))
+    assert result.suggestions == []
+    assert result.no_suggestion_reason == REASON_QA_FAILED + QA_UNAVAILABLE
+    assert result.degraded == ["decision:qa"]
+    assert [c["retry_feedback"] for c in kit.generator.calls] == [None]
+    assert len(judge.calls_for("qa")) == 1
+    assert why in caplog.text
+    detail = assert_single_result_event(kit, result)
+    assert detail["qa_failed"] == 1 and detail["qa_reasons"] == [QA_UNAVAILABLE]
 
 
 def test_route_degraded_is_reported_and_hinted(kit: Kit) -> None:
