@@ -14,7 +14,9 @@
   给了单价时估算成本。失败的调用不在合计里，另给估算；接口没返回用量、回显的模型名和配置的不一样
   都会写明；
 - 降级统计（§12.2）；失败清单：每条用例的问题、实际推荐；接大模型时还有模型草稿和质检原因；
-- §13.5 回归比较（--baseline）：指标比基线下降超过容差时退出码为 1。
+- §13.5 回归比较（--baseline）：指标比基线下降超过容差时退出码为 1（这一轮不算数时是 3，见下）。
+  基线开跑前就检查：--llm env 跑出来的基线自己要是有效评到模型的一轮（有运行健康度，而且按默认
+  上限算数），和这次选出的用例要有共同的——不然不跑（退出码 2）。
 
 两种模式（--llm）：
 - offline（默认）：离线替身——生成只复述依据、关键词规则路由、启发式质检，全部合成数据、不联网。
@@ -34,10 +36,11 @@
 照样跑完，但那组数字量的是兜底逻辑，不是模型。报告里的 health 记下：路由退回关键词规则、路由丢票
 （判断层照常给出结果，但有一票没算上）、质检判断层不可用、生成没有可用草稿、引擎异常各有几条，
 每个用途的调用里失败（按原因分开）、被截断、为空、用不上的各有几次，实际做出路由的判断层。
-超过上限（默认 2%，至少容许 1 条；--max-degraded 改这一次的上限）这一轮就不算数：文本报告开头和
-上线门槛旁边写明原因，退出码 3。--allow-degraded 时不因此返回 3（没有回归就是 0；JSON 里的
-valid 照旧是 false）。连续 8 条用例的大模型调用全部失败（抛 LLMError / LLMTimeout）时提前停下
-（退出码 2，不出报告）；--allow-degraded 时不停。
+超过上限（默认 2%，至少容许 1 条；--max-degraded 改这一次的上限，路由丢票的上限固定是 10%、
+不随它变）这一轮就不算数：文本报告开头和上线门槛旁边写明原因，退出码 3。--allow-degraded 时
+不因此返回 3（没有回归就是 0；JSON 里的 valid 照旧是 false）。连续 8 条用例的大模型调用全部失败
+（抛 LLMError / LLMTimeout）时提前停下（退出码 2，不出报告；标准错误按失败原因给下一步）；
+--allow-degraded 时不停。
 --min-interval 秒数：相邻两条用例的开始至少隔这么久（限流时用，等待不计入耗时）。
 
 部分评测：--intent 只跑某个问题类型，--limit N 用 --seed 随机抽 N 条（可复现）。
@@ -45,15 +48,19 @@ valid 照旧是 false）。连续 8 条用例的大模型调用全部失败（�
 判断层，两种模式都可以；上线前和 --baseline 一起跑回归（§13.5）。
 完整结果：--json 输出 JSON 到标准输出；--json out.json 写文件（文本报告照常输出）。写文件的路径
 开跑前先验证写得进去；跑完先写 JSON（临时文件写好再换名）再出文本报告。
+不算数的一轮不覆盖已有的文件：--json 指的文件已经存在（或者就是 --baseline 那个）时，这一轮的
+JSON 写到旁边的 <文件名>.invalid.json（out.json → out.invalid.json），标准错误和文本报告末尾
+写明；--allow-degraded 也一样。
 报告带指纹（rodit.eval.fingerprint）：按实际跑的记——配置的 config_fingerprint（--classifier 时
 判断层记为 classifier）、路由 / 质检问题定义版本、生成环节和判断层提示词的版本、用的大模型
 （模型名、接口主机）、--classifier 模型文件的 SHA-256、代码版本；
 python -m rodit.ops record-eval --report out.json
 把完整评测的结论记成 eval.verdict，上线状态只认指纹和线上一致的结论（§13.4、§13.5）。
-退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完——配置错误（环境变量、基线文件、筛选后
-没有用例、--json 的路径写不进去等）、连通性检查没过、连续多条用例调用全部失败而停下、最后写不进
-JSON；3 这一轮没有有效评到模型（报告和 JSON 照常写出；同时有指标下降也是 3——兜底逻辑的数字
-比不出回归）；130 被中断（Ctrl-C：结果没有保存）。
+退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完——配置错误（环境变量、基线文件读不了
+或不能当基线、筛选后没有用例、--json 的路径写不进去等）、连通性检查没过、连续多条用例调用全部
+失败而停下、最后写不进 JSON、跑完了但回归比较没有做成（报告照常给出）；3 这一轮没有有效评到
+模型（报告照常给出，JSON 不覆盖已有的文件；同时有指标下降也是 3——兜底逻辑的数字比不出回归）；
+130 被中断（Ctrl-C：结果没有保存）。
 """
 
 from __future__ import annotations
@@ -67,7 +74,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Literal, TextIO
+from typing import Any, Literal, TextIO
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -94,7 +101,13 @@ from rodit.engine import (
     DEGRADED_STORAGE,
     DEGRADED_UNDERSTANDING,
 )
-from rodit.eval.baseline import METRIC_LABELS, BaselineCheck, compare_to_baseline, load_baseline
+from rodit.eval.baseline import (
+    METRIC_LABELS,
+    BaselineCheck,
+    baseline_problems,
+    compare_to_baseline,
+    read_baseline,
+)
 from rodit.eval.calibration import (
     ReliabilityBin,
     Sample,
@@ -919,7 +932,8 @@ def _render_baseline(check: BaselineCheck, add: Add) -> None:
             for d in rows
         )
         add(f"{name:<6} n={rows[0].n:<3} {cells}")
-    add("→ 指标没有下降" if check.passed else "→ 有指标下降超过容差：不能上线（退出码 1）")
+    # 退出码不写在这里：这一轮同时不算数时进程返回的是 3，由 main 在标准错误里说实际的那个
+    add("→ 指标没有下降" if check.passed else "→ 有指标下降超过容差：不能上线")
 
 
 def _left_out_note(fallback: int, no_route: int) -> str:
@@ -1172,10 +1186,12 @@ def _seconds(text: str) -> float:
 
 
 EXIT_CODES_HELP = (
-    "退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完（配置错误、--json 的路径写不进去、"
-    "连通性检查没过、连续多条用例的大模型调用全部失败而停下、最后写不进 JSON）；"
-    "3 这一轮没有有效评到模型（--llm env：调用失败、被截断、读不出的用例超过上限，报告和 JSON "
-    "照常写出，同时有指标下降也是 3；--allow-degraded 时不返回 3）；130 被中断（结果没有保存）"
+    "退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完（配置错误、基线读不了或不能当基线、"
+    "--json 的路径写不进去、连通性检查没过、连续多条用例的大模型调用全部失败而停下、最后写不进 "
+    "JSON、跑完了但回归比较没有做成）；"
+    "3 这一轮没有有效评到模型（--llm env：调用失败、被截断、读不出的用例超过上限，报告照常给出，"
+    "JSON 不覆盖已有的文件、改写到旁边的 .invalid.json，同时有指标下降也是 3；"
+    "--allow-degraded 时不返回 3）；130 被中断（结果没有保存）"
 )
 
 
@@ -1197,7 +1213,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "完整结果（JSON）：不带 PATH 输出到标准输出；带 PATH 写文件，文本报告照常输出"
-            "（路径开跑前先验证写得进去）"
+            "（路径开跑前先验证写得进去）。这一轮没有有效评到模型时不覆盖已有的文件"
+            "（包括 --baseline 那个）：改写到旁边的 <文件名>.invalid.json"
         ),
     )
     parser.add_argument(
@@ -1227,7 +1244,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "运行健康度这一次用的上限（比例，默认 "
             f"{DEFAULT_CEILING:g} = {DEFAULT_CEILING * 100:g}%%）：出问题的用例占比超过它就不算"
-            "评到了模型。记在 health.ceiling 里，只影响这次的判定和退出码"
+            "评到了模型。记在 health.ceiling 里，只影响这次的判定和退出码（record-eval、--baseline "
+            "对基线的检查都按默认上限重新判定）；路由丢票的上限固定是 "
+            f"{LOST_VOTE_CEILING * 100:g}%%，不随它变"
         ),
     )
     parser.add_argument(
@@ -1259,7 +1278,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="用训练好的路由分类器（python -m rodit.ops train-classifier 的输出）代替路由判断层",
     )
-    parser.add_argument("--baseline", metavar="PATH", help="基线（之前一次 --json 的输出）")
+    parser.add_argument(
+        "--baseline",
+        metavar="PATH",
+        help=(
+            "基线（之前一次 --json 的输出）。开跑前检查：--llm env 跑出来的基线要是有效评到模型的"
+            "一轮（按默认上限），和这次选出的用例要有共同的，否则不跑（退出码 2）"
+        ),
+    )
     parser.add_argument(
         "--tolerance",
         type=_tolerance,
@@ -1337,10 +1363,35 @@ def _run_config(args: argparse.Namespace) -> tuple[EngineConfig | None, str | No
     return None, DEFAULTS_WARNING
 
 
+def _checked_baseline(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """--baseline 的逐条结果。能不能当基线在开跑前（第一次调用大模型之前）就查清，不能用抛
+    ValueError——不然跑完一整轮才发现比不了，或者和一份兜底逻辑的数字比出"没有下降"（§13.5）：
+    - 基线自己要是有效评到模型的一轮（baseline.baseline_problems）；
+    - 和这次选出的用例（和 evaluate 同一个 select_cases）至少有一条共同的。"""
+    data = read_baseline(args.baseline)
+    problems = baseline_problems(data)
+    if problems:
+        raise ValueError(
+            f"基线 {args.baseline} 不是一轮有效评到模型的结果，不能当回归基线（§13.5）："
+            + "；".join(p.rstrip("。") for p in problems)
+            + "。先重跑出一份有效的基线（--llm env 跑完退出码不是 3 的那种）"
+        )
+    rows: list[dict[str, Any]] = data["cases"]
+    selected = select_cases(cases(args.split), intent=args.intent, limit=args.limit, seed=args.seed)
+    known = {row["id"] for row in rows}
+    if selected and not any(c.id in known for c in selected):  # 没有用例时由 evaluate 报"为空"
+        raise ValueError(
+            f"基线 {args.baseline} 和这次选出的 {len(selected)} 条用例没有共同的用例，无法比较"
+            "（--split / --intent / --limit / --seed 选出的要和基线里的有重合）"
+        )
+    return rows
+
+
 def _json_target(arg: str | None) -> Path | None:
     """--json PATH 的目标文件。开跑前就确认写得进去：建好上级目录，在旁边写一个临时文件再删掉——
     不然跑完一整轮（真实大模型是几千次付费调用）才发现路径不对，结果就丢了。
-    不碰目标文件本身：--baseline 和 --json 可以是同一个文件。写不进去抛 ValueError。
+    不碰目标文件本身：--baseline 和 --json 可以是同一个文件（算数的一轮跑完才换成新的；不算数的
+    一轮不覆盖它，见 _keep_reason）。写不进去抛 ValueError。
     符号链接先解析到它指的文件（换名换的是那个文件，链接留着）；设备、管道这类不是普通文件的目标
     （如 /dev/stdout）没法先写旁边再换名，不验证，跑完直接写。"""
     if arg is None or arg == "-":
@@ -1373,6 +1424,33 @@ def _temp_beside(target: Path) -> Path:
     return target.with_name(f".{target.name}.{os.getpid()}.tmp")
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:  # 有一个不存在：按解析后的路径比
+        return os.path.realpath(a) == os.path.realpath(b)
+
+
+def _keep_reason(target: Path, baseline: str | None) -> str | None:
+    """不算数的一轮为什么不能覆盖 --json 的目标文件（可以覆盖时返回 None）。
+
+    目标就是这次的 --baseline，或者已经存在（多半是之前一轮的结果）：换成兜底逻辑的数字，原来那份
+    就没了——下一次回归比的就是它。设备、管道这类目标谈不上覆盖。"""
+    if _special(target):
+        return None
+    if baseline and _same_file(target, Path(baseline).expanduser()):
+        return "它是这次的基线"
+    if target.exists():
+        return "它已经存在"
+    return None
+
+
+def _invalid_sibling(target: Path) -> Path:
+    """不算数的一轮改写到的文件：和目标同一个目录（开跑前验证过写得进去），llm.json →
+    llm.invalid.json。之前不算数的一轮留在那里的同名文件会被换掉。"""
+    return target.with_name(f"{target.stem}.invalid{target.suffix}")
+
+
 def _write_json(target: Path, payload: str) -> None:
     """先写旁边的临时文件再换名（os.replace）：写到一半出错，原来的文件（可能就是基线）不会坏。
     落单的代理项（模型文字里偶尔有，UTF-8 写不出）写成 \\uXXXX，仍然是合法的 JSON。"""
@@ -1398,6 +1476,58 @@ def _emit(text: str, stream: TextIO) -> None:
     except LookupError:  # 流报了一个不认识的编码名
         safe = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
     print(safe, file=stream)
+
+
+THINKING_HINT = (
+    "多半是模型开着思考模式，在 --config 的 llm.extra_body 里关掉（例子见 config/rodit.yaml）"
+)
+_LABEL_KINDS = {"429": "rate_limit", "402": "billing", "401": "auth", "403": "auth"}
+
+
+def _label_kinds(labels: Any) -> set[str]:
+    """失败原因的标签（health.error_label：http_<状态码>[:代码]、<类别>[:代码]、异常类型名）
+    归成类别：429 → rate_limit，402 → billing，401 / 403 → auth，其他 4xx → bad_request，
+    5xx → server；不是 HTTP 状态码的取冒号前面那一段。读不懂的输入当作没有标签。"""
+    kinds: set[str] = set()
+    try:
+        names = [str(label) for label in labels or ()]
+    except TypeError:
+        return kinds
+    for name in names:
+        head = name.split(":", 1)[0].strip()
+        status = head.removeprefix("http_")
+        if status == head or not status.isdigit():
+            kinds.add(head)
+        elif status in _LABEL_KINDS:
+            kinds.add(_LABEL_KINDS[status])
+        elif status.startswith(("4", "5")):
+            kinds.add("bad_request" if status.startswith("4") else "server")
+        else:
+            kinds.add(head)
+    return kinds
+
+
+def _abort_hint(labels: Any) -> str:
+    """评测中止之后该做什么：按这几条用例的失败原因给，不是什么原因都说"加 --min-interval"。"""
+    kinds = _label_kinds(labels)
+    hints: list[str] = []
+    if "rate_limit" in kinds:
+        hints.append(
+            "被限流（HTTP 429）加 --min-interval 放慢，或提高限额（有的服务额度用完也回 429，"
+            "先看一眼余额）"
+        )
+    if "billing" in kinds:
+        hints.append("余额或额度用完（HTTP 402）要充值或换有额度的账号，放慢重跑没有用")
+    if kinds & {"auth", "bad_request", "malformed", "unusable"}:
+        hints.append(
+            "请求被拒或响应读不出来的，不带 --skip-preflight 重跑一次——连通性检查会先说明是"
+            "哪一种请求、什么原因"
+        )
+    if kinds & {"truncated", "empty", "length"}:
+        hints.append(f"回答被截断或为空的，{THINKING_HINT}")
+    if not hints:
+        return "先解决失败的原因再重跑"
+    return "先解决失败的原因再重跑：" + "；".join(hints)
 
 
 def main(
@@ -1429,7 +1559,7 @@ def main(
         ):
             # 不然路由悄悄换成关键词规则 / 大模型，回归测的不是要上线的分类器（§13.5）
             raise ValueError("配置的 decision.provider 是 classifier：用 --classifier 指定模型文件")
-        baseline = load_baseline(args.baseline) if args.baseline else None
+        baseline = _checked_baseline(args) if args.baseline else None  # 同样在开跑前
         json_target = _json_target(args.json)  # 第一次调用大模型之前就验证
         route_provider: DecisionProvider | None = None
         if args.classifier:
@@ -1470,17 +1600,9 @@ def main(
             min_interval_s=args.min_interval,
             stop_after_failed=STOP_AFTER_FAILED_CASES if stop_early else None,
         )
-        if baseline is not None:
-            check = compare_to_baseline(
-                [c.model_dump(mode="json") for c in report.cases],
-                baseline,
-                tolerance=args.tolerance,
-                source=args.baseline,
-            )
-            report = report.model_copy(update={"baseline": check})
     except EvalAborted as e:
         print(
-            f"评测中止：{e}。先解决失败的原因再重跑（被限流可以加 --min-interval）；"
+            f"评测中止：{e}。{_abort_hint(getattr(e, 'labels', None))}；"
             "确实要跑完、看兜底逻辑的数字时加 --allow-degraded",
             file=err,
         )
@@ -1497,7 +1619,27 @@ def main(
     except (ValueError, RuntimeError, OSError, yaml.YAMLError) as e:
         print(f"评测没有运行：{e}", file=err)
         return EXIT_NOT_RUN
-    return _deliver(report, args, json_target, out, err, config_note)
+    not_compared: str | None = None
+    if baseline is not None:
+        # 评测已经跑完：比较出了岔子（开跑前查过共同用例，正常到不了这里）也不能把报告丢掉
+        try:
+            check = compare_to_baseline(
+                [c.model_dump(mode="json") for c in report.cases],
+                baseline,
+                tolerance=args.tolerance,
+                source=args.baseline,
+            )
+            report = report.model_copy(update={"baseline": check})
+        except ValueError as e:
+            not_compared = (
+                f"§13.5 回归比较没有做成：{e}。评测已经跑完，报告和完整结果照常给出"
+                "（里面没有回归比较）"
+            )
+    code = _deliver(report, args, json_target, out, err, config_note)
+    if not_compared is not None:
+        print(f"{not_compared}（退出码 {code or EXIT_NOT_RUN}）", file=err)
+        return code or EXIT_NOT_RUN
+    return code
 
 
 def _json_payload(report: EvalCliReport, stream: TextIO | None = None) -> str:
@@ -1521,31 +1663,60 @@ def _deliver(
     err: TextIO,
     config_note: str | None,
 ) -> int:
-    """跑完之后：先把完整结果写出去（JSON 先于文本报告：渲染文本出错也不丢结果），再定退出码。"""
+    """跑完之后：先把完整结果写出去（JSON 先于文本报告：渲染文本出错也不丢结果），再定退出码。
+
+    不算数的一轮（health.valid 为 False，加没加 --allow-degraded 都一样）不覆盖已有的文件：
+    --json 的目标是这次的基线或者已经存在时，写到旁边的 _invalid_sibling，并在标准错误和文本
+    报告末尾写明。"""
     saved = True
+    health = report.health
+    invalid = health is not None and not health.valid
+    regressed = report.baseline is not None and not report.baseline.passed
     if args.json == "-":
         print(_json_payload(report, out), file=out)
     else:
+        written = args.json  # 实际写到哪里（给人看的）
+        note = ""
         if json_target is not None:
+            keep = _keep_reason(json_target, args.baseline) if invalid else None
+            if keep is not None:
+                json_target = _invalid_sibling(json_target)
+                written = str(json_target)
+                note = f"（这一轮没有有效评到模型，没有覆盖 {args.json}：{keep}）"
+                print(
+                    f"这一轮没有有效评到模型：不覆盖 {args.json}（{keep}），"
+                    f"完整结果改写到旁边的 {written}",
+                    file=err,
+                )
             try:
                 _write_json(json_target, _json_payload(report))
             except OSError as e:
                 saved = False
-                print(f"完整结果写不进 {args.json}：{type(e).__name__}", file=err)
+                print(f"完整结果写不进 {written}：{type(e).__name__}", file=err)
         _emit(render_text(report), out)
         if json_target is not None and saved:
-            _emit(f"\n完整结果（JSON）已写入 {args.json}", out)
-    if config_note == DEFAULTS_WARNING:  # 进度刷了几百行，结尾再提醒一次
+            _emit(f"\n完整结果（JSON）已写入 {written}{note}", out)
+    if config_note:  # 进度刷了几百行，结尾再说一次这次用的是哪份配置
         print(config_note, file=err)
     if not saved:
         return EXIT_NOT_RUN
-    health = report.health
-    if health is not None and not health.valid:
+    if health is not None and invalid:
         if not args.allow_degraded:
+            labels = [label for p in health.by_purpose.values() for label in p.errors]
+            slow_down = (
+                "；被限流（HTTP 429）的调用，重跑时加 --min-interval 放慢"
+                if "rate_limit" in _label_kinds(labels)
+                else ""
+            )
+            also = (
+                f"。回归比较也有指标下降，但兜底逻辑的数字比不出回归，退出码仍是 {EXIT_DEGRADED}"
+                if regressed
+                else ""
+            )
             print(
                 f"这一轮没有有效评到模型（退出码 {EXIT_DEGRADED}）："
                 + "；".join(r.rstrip("。") for r in health.reasons)
-                + "。确认就是要这份结果时加 --allow-degraded",
+                + f"{slow_down}{also}。确认就是要这份结果时加 --allow-degraded",
                 file=err,
             )
             return EXIT_DEGRADED
@@ -1553,7 +1724,8 @@ def _deliver(
             "这一轮没有有效评到模型（原因见报告开头）；加了 --allow-degraded，退出码不因此改变",
             file=err,
         )
-    if report.baseline is not None and not report.baseline.passed:
+    if regressed:
+        print(f"§13.5 回归比较有指标下降超过容差（退出码 {EXIT_REGRESSION}）", file=err)
         return EXIT_REGRESSION
     return 0
 

@@ -12,6 +12,10 @@
 任一项在任一范围里比基线低超过容差（tolerance，比例，0.02 = 2 个百分点）就算回归，
 命令行以退出码 1 结束。默认容差 0：§13.5 要求指标不下降；真实大模型有采样波动，
 可以按用例数给一点容差（一条用例在 n 条里是 1/n）。
+
+基线自己也得是"评到了模型"的一轮（baseline_problems）：--llm env 跑出来的基线没有运行健康度，
+或者按默认上限不算数（路由退回关键词规则、质检只跑硬规则……）时不能用——兜底逻辑的数字低，
+拿它当基线，什么模型都"没有下降"。离线替身的基线不调大模型，没有这一条。
 """
 
 from __future__ import annotations
@@ -21,7 +25,9 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from rodit.eval.health import HealthCounts, assess
 
 REGRESSION_METRICS = ("intent_accuracy", "action_accuracy", "factual", "compliance")
 METRIC_LABELS = {
@@ -98,19 +104,57 @@ def _by_id(rows: Sequence[Mapping[str, Any]], what: str) -> dict[str, Mapping[st
     return out
 
 
-def load_baseline(path: str | Path) -> list[dict[str, Any]]:
-    """读基线文件里的逐条结果。文件不存在、不是 JSON、没有 cases 时抛 ValueError。"""
+def read_baseline(path: str | Path) -> dict[str, Any]:
+    """读整份基线文件（一次 --json 的输出）。文件不存在、不是 JSON、没有 cases 时抛 ValueError。"""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except OSError as e:
         raise ValueError(f"读不了基线文件 {path}：{type(e).__name__}") from None
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         raise ValueError(f"基线文件 {path} 不是 JSON") from None
     cases = data.get("cases") if isinstance(data, dict) else None
     if not isinstance(cases, list):
         raise ValueError(f"基线文件 {path} 没有逐条结果 cases：请用本版本的 --json 输出做基线")
     _by_id(cases, "基线")
-    return cases
+    return data
+
+
+def load_baseline(path: str | Path) -> list[dict[str, Any]]:
+    """读基线文件里的逐条结果。文件不存在、不是 JSON、没有 cases 时抛 ValueError。"""
+    return read_baseline(path)["cases"]
+
+
+def _counts(raw: Any) -> HealthCounts:
+    """报告里的一组计数。只取本版本认识的字段：以后的版本多写了字段，不该因此读不了
+    （HealthCounts 本身不收多余字段）；以前的版本少写的按 0 算。"""
+    if not isinstance(raw, Mapping):
+        raise TypeError("不是对象")
+    return HealthCounts(**{k: raw[k] for k in HealthCounts.model_fields if k in raw})
+
+
+def baseline_problems(data: Mapping[str, Any]) -> list[str]:
+    """这份基线为什么不能用（空列表表示能用）。data 是 read_baseline 读出的整份报告。
+
+    --llm env 跑出来的基线（llm.mode 是 env，或者带着 health）要是"评到了模型"的一轮：和
+    record-eval 同一个判定——不信报告里的 valid，用它的计数按默认上限重新算一遍
+    rodit.eval.health.assess（只在 --max-degraded 放宽后才算数的不行）。没有 health（以前的版本
+    写的，或者被删了）也不行：看不出那一轮有多少用例走了兜底逻辑。
+    离线替身的基线（没有 health）不调大模型，照常接受。"""
+    llm = data.get("llm")
+    mode = llm.get("mode") if isinstance(llm, Mapping) else None
+    health = data.get("health")
+    if health is None:
+        if mode != "env":
+            return []
+        return ["没有运行健康度（health）：看不出那一轮有多少用例走了兜底逻辑"]
+    try:
+        if not isinstance(health, Mapping):
+            raise TypeError("不是对象")
+        overall = _counts(health.get("overall"))
+        test = _counts(health["test"]) if health.get("test") is not None else None
+    except (TypeError, ValidationError):
+        return ["运行健康度（health）读不出来"]
+    return assess(overall, test)
 
 
 def compare_to_baseline(
@@ -165,6 +209,8 @@ __all__ = [
     "REGRESSION_METRICS",
     "BaselineCheck",
     "MetricDelta",
+    "baseline_problems",
     "compare_to_baseline",
     "load_baseline",
+    "read_baseline",
 ]
