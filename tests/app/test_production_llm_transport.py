@@ -124,6 +124,41 @@ def test_transport_also_used_when_llm_comes_from_env(prod_env, monkeypatch):
     assert [c[2]["model"] for c in transport.calls] == ["env-model"]
 
 
+STANDARD_FIELDS = {"model", "messages", "temperature", "max_tokens", "stream"}
+
+
+@pytest.mark.parametrize("llm_from", ["config", "env"])
+def test_configured_extra_body_reaches_the_request_payload(prod_env, monkeypatch, llm_from):
+    """llm.extra_body（模型服务特有的请求参数，如关闭思考模式，docs/架构与分工.md §4.4）：
+    地址和模型写在配置里、或者来自环境变量，两条构造分支发出去的请求都带着它。它算在配置指纹里，
+    评测带了、线上没带的话，同一个指纹下发出去的请求就不一样。"""
+    extra = {"thinking": {"type": "disabled"}, "enable_thinking": False}
+    if llm_from == "config":
+        with_extra = LLMConfig(base_url=BASE_URL, model="synthetic-model", extra_body=extra)
+        without = LLMConfig(base_url=BASE_URL, model="synthetic-model")
+    else:
+        monkeypatch.setenv("RODIT_LLM_BASE_URL", BASE_URL)
+        monkeypatch.setenv("RODIT_LLM_MODEL", "synthetic-model")
+        with_extra, without = LLMConfig(extra_body=extra), LLMConfig()
+
+    transport = RecordingTransport()
+    unit, _ = _unit(EngineConfig(llm=with_extra), llm_transport=transport)
+    unit.llm.complete(_request())
+    unit.llm.complete(_request())
+    assert len(transport.calls) == 2
+    for _, _, body, _ in transport.calls:  # 每次请求都带
+        assert body["thinking"] == {"type": "disabled"} and body["enable_thinking"] is False
+        assert set(body) == STANDARD_FIELDS | set(extra)
+        assert body["model"] == "synthetic-model" and body["stream"] is False
+    assert with_extra.extra_body == extra  # 配置本身没被改动
+
+    # 没配的时候请求里只有标准字段
+    plain = RecordingTransport()
+    unit, _ = _unit(EngineConfig(llm=without), llm_transport=plain)
+    unit.llm.complete(_request())
+    assert set(plain.calls[0][2]) == STANDARD_FIELDS
+
+
 def test_default_path_is_unchanged(prod_env):
     unit, _ = _unit(CONFIGURED)
     assert unit.llm._inner._transport is urllib_transport  # type: ignore[attr-defined]

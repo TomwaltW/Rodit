@@ -139,6 +139,8 @@ def build_production_unit(
     if audit_wrapper is not None:
         repos = replace(repos, audit=audit_wrapper(repos.audit))
     base_url, model, from_config = llm_endpoint(config.llm)
+    # llm.extra_body（模型服务特有的请求参数，如关闭思考模式）两条分支都带上：它算在配置指纹里，
+    # 线上发出去的请求要和评测时的一样
     if from_config:
         client = OpenAICompatibleClient(
             base_url=base_url,
@@ -146,10 +148,13 @@ def build_production_unit(
             api_key_env=config.llm.api_key_env,
             timeout_s=config.llm.timeout_s,
             transport=llm_transport,
+            extra_body=config.llm.extra_body,
         )
     else:
         client = OpenAICompatibleClient.from_env(
-            api_key_env=config.llm.api_key_env, transport=llm_transport
+            api_key_env=config.llm.api_key_env,
+            transport=llm_transport,
+            extra_body=config.llm.extra_body,
         )
     llm = MeteredLLMClient(client, repos.audit, clock)
     return build_unit(

@@ -3,12 +3,32 @@
 很多境内已备案模型都提供 OpenAI 兼容接口；具体用哪个模型是 D5 待决策项，
 base_url / model 由部署配置决定，代码里不写死。实现 core.ports.LLMClient：
 
-- 密钥：每次调用时从环境变量读（默认 RODIT_LLM_API_KEY），不保存在对象上；
-  缺失时抛 LLMError。密钥不出现在 repr、异常消息、日志里（传输层异常的文字也会先抹掉密钥）。
+- 密钥：每次调用时从环境变量读（默认 RODIT_LLM_API_KEY），不保存在对象上；缺失、或者取值
+  中间有换行、有非 ASCII 字符（多行的 .env 取值、带了中文引号）时抛 LLMError，消息里只有变量名。
+  密钥不出现在 repr、异常消息、日志里：传输层自己抛的 LLMError 先抹掉密钥；别的异常只报类型名，
+  不带异常的文字——里面可能有转义过的密钥（http.client 报请求头不合法时把整个头值打出来，
+  按原文抹不掉）、接口地址的路径和查询参数、代理地址。
 - 超时：request.timeout_s 优先，否则用构造时的 timeout_s（路由 ≤ 1 秒由调用方传入，§12.1）。
 - 错误（§12.2 调用方据此退回 FAQ / 模板）：超时 → LLMTimeout；HTTP 429 / 5xx / 其他非 2xx、
   网络错误、响应格式不对 → LLMError。不重试：延迟预算紧，降级比重试更可控。
+- 失败原因（core.errors.LLMError 的 status / kind / code；调用方、计量、评测报告只读这三项，
+  不解析消息）：
+  - kind：超时 timeout；429 rate_limit；401 / 403 auth；402 billing；其他 4xx bad_request；
+    5xx server；3xx redirect；连不上 network；响应读不出来（不是 JSON 对象、没有 choices、
+    没有文本）malformed；finish_reason 是 content_filter / sensitive → content_filter；
+    密钥没设或不能用 → config。
+  - status：HTTP 状态码。非 2xx 时带；响应读不出来（malformed）时也照带，哪怕是 200。
+    没收到响应（超时、连不上、密钥不能用）就没有；内容安全拦截也不带，评测按 kind 归类。
+  - code：响应体里的 error.code，没有就用 error.type；抹掉密钥、最多 64 个字符，
+    不取 error.message（原文可能回显提示词里的买家文字）。
+  传输层自己抛的 LLMError 按原类型重抛，这三项照带（code 同样抹掉密钥）。
+- finish_reason：接口返回什么就填进 LLMResponse.finish_reason（没给是 None）。被 max_tokens 截断
+  （length）、文本是空的都照常返回，不抛异常：token 已经花了要照常计量，算不算数由调用方定。
 - json_mode → response_format {"type": "json_object"}；usage → input_tokens / output_tokens。
+- extra_body：模型服务特有的请求参数（如关闭思考模式），并入每次请求，标准字段优先。取值来自
+  配置的 llm.extra_body（core.config.LLMConfig：算进配置指纹，不放密钥），由组装客户端的地方
+  在构造时传进来（线上是 app.production；评测见 docs/架构与分工.md §4.4）。from_env 不从
+  环境变量读它：那样给的值不在指纹里。
 - want_logprobs → 请求 logprobs + top_logprobs，读出"选项 → 概率"放进 LLMResponse.logprobs（§6.4）：
   取第一个有内容的输出位置（跳过只有空白、引号、括号、冒号、逗号的 token），
   把该位置的候选 token 去掉这些字符后作为选项，概率 = exp(logprob)，同名选项相加（上限 1）。
@@ -31,7 +51,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from rodit.core.errors import LLMError, LLMTimeout
+from rodit.core.errors import LLMError, LLMErrorKind, LLMTimeout
 from rodit.core.ports import LLMRequest, LLMResponse
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], tuple[int, dict[str, Any]]]
@@ -94,6 +114,49 @@ def _scrub(text: str, secret: str, *, limit: int = 200) -> str:
     return (text.replace(secret, "***") if secret else text)[:limit]
 
 
+def _short_code(value: Any, key: str) -> str | None:
+    """错误代码整理成短字符串（LLMError.code）：抹掉密钥，最多 64 个字符；不是字符串 / 整数、
+    或者是空的，返回 None。"""
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return None
+    return _scrub(str(value).strip(), key, limit=64) or None
+
+
+def _error_code(body: Mapping[str, Any], key: str) -> str | None:
+    """模型服务给的错误代码：响应体里的 error.code，没有就用 error.type。
+    不取 error.message：原文可能回显提示词里的买家文字。"""
+    err = body.get("error")
+    if not isinstance(err, dict):
+        return None
+    return _short_code(err.get("code"), key) or _short_code(err.get("type"), key)
+
+
+def _http_kind(status: int) -> LLMErrorKind:
+    """非 2xx 的状态码 → 失败原因（LLMError.kind）。"""
+    if 300 <= status < 400:
+        return "redirect"
+    if status == 429:
+        return "rate_limit"
+    if status in (401, 403):
+        return "auth"
+    if status == 402:
+        return "billing"
+    if status >= 500:
+        return "server"
+    return "bad_request"
+
+
+def _exception_types(e: BaseException) -> str:
+    """异常的类型名，不带异常的文字。urllib 的 URLError 把真正的原因放在 reason 里，
+    那一层的类型名也带上（"URLError（ConnectionRefusedError）"），不然域名解析不了、连接被拒、
+    证书不对看起来都一样。"""
+    name = type(e).__name__
+    reason = getattr(e, "reason", None)
+    if isinstance(reason, BaseException):
+        name += f"（{type(reason).__name__}）"
+    return name
+
+
 def _non_negative_int(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return 0
@@ -151,7 +214,8 @@ class OpenAICompatibleClient:
     """实现 core.ports.LLMClient，调用 OpenAI 兼容的 {base_url}/chat/completions。
 
     - top_logprobs：want_logprobs 时每个位置返回的候选数。
-    - extra_body：模型服务特有的参数（如关闭思考模式），会被标准字段覆盖。
+    - extra_body：模型服务特有的参数（如关闭思考模式），会被标准字段覆盖；组装时传配置里的
+      llm.extra_body。
     线程安全（无可变状态），可以给自一致性投票并发调用。
     """
 
@@ -232,7 +296,14 @@ class OpenAICompatibleClient:
     def complete(self, request: LLMRequest) -> LLMResponse:
         key = os.environ.get(self.api_key_env, "").strip()
         if not key:
-            raise LLMError(f"环境变量 {self.api_key_env} 未设置：没有大模型 API key")
+            raise LLMError(f"环境变量 {self.api_key_env} 未设置：没有大模型 API key", kind="config")
+        if "\r" in key or "\n" in key or not key.isascii():
+            # 不能放进请求头。在这里拦下，消息里只有变量名：交给 http.client 的话，它报错时
+            # 会把整个头值（也就是密钥）打出来
+            raise LLMError(
+                f"环境变量 {self.api_key_env} 的取值不能当 API key 用：中间有换行或非 ASCII 字符",
+                kind="config",
+            )
         timeout = request.timeout_s if request.timeout_s is not None else self.timeout_s
         headers = {
             "Authorization": f"Bearer {key}",
@@ -243,13 +314,18 @@ class OpenAICompatibleClient:
             status, body = self._transport(
                 self.endpoint, headers, self.build_payload(request), timeout
             )
-        except LLMError as e:
-            raise type(e)(_scrub(str(e), key)) from None
+        except LLMError as e:  # 传输层自己抛的：抹掉密钥后按原类型重抛，失败原因照带
+            raise type(e)(
+                _scrub(str(e), key), status=e.status, kind=e.kind, code=_short_code(e.code, key)
+            ) from None
         except TimeoutError:
             raise LLMTimeout(f"大模型调用超时（{timeout:g} 秒）") from None
-        except Exception as e:  # 网络错误、响应不是 JSON 等：统一成 LLMError，抹掉可能带出的密钥
+        except Exception as e:
+            # 网络错误、响应不是 JSON 等：统一成 LLMError。只报异常类型，不带异常的文字
+            # （见模块说明）。按传输层的约定，ValueError 是 2xx 但响应体不是 JSON 对象
             raise LLMError(
-                f"大模型接口调用失败：{type(e).__name__}: {_scrub(str(e), key)}"
+                f"大模型接口调用失败：{_exception_types(e)}",
+                kind="malformed" if isinstance(e, ValueError) else "network",
             ) from None
         return self._parse(status, body, request, key)
 
@@ -257,20 +333,31 @@ class OpenAICompatibleClient:
 
     def _parse(self, status: int, body: Any, request: LLMRequest, key: str) -> LLMResponse:
         if not isinstance(body, dict):
-            raise LLMError("大模型响应格式不对：不是 JSON 对象")
+            raise LLMError("大模型响应格式不对：不是 JSON 对象", status=status, kind="malformed")
         if not 200 <= status < 300:
-            raise LLMError(self._http_error(status, body, key))
+            raise LLMError(
+                self._http_error(status, body, key),
+                status=status,
+                kind=_http_kind(status),
+                code=_error_code(body, key),
+            )
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-            raise LLMError("大模型响应格式不对：没有 choices")
+            # 有的服务出错时也回 HTTP 200，错误放在响应体的 error 里：代码照样带上
+            raise LLMError(
+                "大模型响应格式不对：没有 choices",
+                status=status,
+                kind="malformed",
+                code=_error_code(body, key),
+            )
         choice = choices[0]
         reason = choice.get("finish_reason")
         if isinstance(reason, str) and reason in _FILTERED:
-            raise LLMError("大模型输出被内容安全策略拦截")
+            raise LLMError("大模型输出被内容安全策略拦截", kind="content_filter")
         message = choice.get("message")
         text = _text_content(message.get("content")) if isinstance(message, dict) else None
         if text is None:
-            raise LLMError("大模型响应格式不对：没有文本内容")
+            raise LLMError("大模型响应格式不对：没有文本内容", status=status, kind="malformed")
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         model = body.get("model")
         return LLMResponse(
@@ -281,6 +368,8 @@ class OpenAICompatibleClient:
             logprobs=_option_probabilities(choice.get("logprobs"))
             if request.want_logprobs
             else None,
+            # 照实填，被截断（length）、文本是空的也不抛异常：算不算数由调用方定
+            finish_reason=reason if isinstance(reason, str) and reason else None,
         )
 
     @staticmethod
