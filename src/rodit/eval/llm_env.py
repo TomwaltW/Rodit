@@ -12,6 +12,8 @@ RODIT_LLM_PRICE_INPUT_PER_1K / RODIT_LLM_PRICE_OUTPUT_PER_1K（每 1000 token �
 
 跑之前先做一次连通性检查（preflight）：一个几个 token 的请求，地址、模型名、密钥不对时立刻报错
 （客户端的错误信息里已经抹掉了密钥），不白跑一整轮、也不让整轮结果全是降级。
+检查没过抛 LLMError / LLMTimeout 或 PreflightFailed；python -m rodit.eval --skip-preflight 跳过检查
+（只在调试时用）。via_proxy 说明请求是不是经环境里配置的代理发出去的（§12.1 的耗时要看这条路径）。
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from rodit.core.config import EngineConfig
 from rodit.core.ports import LLMClient, LLMMessage, LLMRequest
 from rodit.eval.perf import Pricing
 from rodit.llm import OpenAICompatibleClient
@@ -29,6 +32,10 @@ ENV_PREFIX = "RODIT_LLM_"
 PRICE_INPUT_ENV = "RODIT_LLM_PRICE_INPUT_PER_1K"
 PRICE_OUTPUT_ENV = "RODIT_LLM_PRICE_OUTPUT_PER_1K"
 KEY_HINT = "密钥只放本地 .env 或环境的密钥设置，不要提交进仓库"
+
+
+class PreflightFailed(RuntimeError):
+    """连通性检查没过。消息是给操作的人看的完整说明（可以多行），不含密钥。"""
 
 
 def client_from_env(*, prefix: str = ENV_PREFIX, **kwargs: Any) -> OpenAICompatibleClient:
@@ -62,8 +69,11 @@ def describe_model(client: object) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
-def preflight(client: LLMClient) -> None:
-    """连通性检查：失败时照常抛 LLMError / LLMTimeout（调用方报错退出）。"""
+def preflight(client: LLMClient, config: EngineConfig | None = None) -> list[str]:
+    """连通性检查：失败时抛 LLMError / LLMTimeout 或 PreflightFailed（调用方报错退出）。
+
+    config 是这次评测用的配置（None 表示内置默认值）。返回给人看的检查摘要，一行一条，
+    命令行打到标准错误；现在只发一个几个 token 的请求，没有摘要。"""
     client.complete(
         LLMRequest(
             purpose="other",
@@ -72,6 +82,14 @@ def preflight(client: LLMClient) -> None:
             max_tokens=8,
         )
     )
+    return []
+
+
+def via_proxy(client: object) -> bool | None:
+    """这个客户端的请求是不是经环境里配置的代理发出去的：是 True、直连 False；不知道
+    （不是 HTTP 客户端、注入了 transport）是 None。只回答是不是，不返回代理地址
+    （地址里可能有用户名密码）。现在还判断不了，一律是 None。"""
+    return None
 
 
 def _price(flag: float | None, env_name: str, env: Mapping[str, str]) -> float | None:
@@ -112,9 +130,11 @@ def resolve_pricing(
 __all__ = [
     "PRICE_INPUT_ENV",
     "PRICE_OUTPUT_ENV",
+    "PreflightFailed",
     "client_from_env",
     "describe_endpoint",
     "describe_model",
     "preflight",
     "resolve_pricing",
+    "via_proxy",
 ]

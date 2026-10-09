@@ -9,17 +9,70 @@ ToolFailureReason = Literal["unavailable", "throttled", "timeout"]
 
 TOOL_FAILURE_REASONS: tuple[ToolFailureReason, ...] = get_args(ToolFailureReason)
 
+LLMErrorKind = Literal[
+    "timeout",
+    "rate_limit",
+    "auth",
+    "billing",
+    "bad_request",
+    "content_filter",
+    "server",
+    "redirect",
+    "network",
+    "malformed",
+    "config",
+]
+"""大模型调用失败的原因（LLMError.kind）。评测报告、计量按它分开统计（§12.4、§13、§14）：
+timeout 超时；rate_limit 被限流（稍后再调可能成功）；auth 密钥无效或没有权限；
+billing 余额或额度用完（再调也没用）；bad_request 请求被拒（参数、模型名不对）；
+content_filter 被模型服务的内容安全拦截；server 模型服务出错；redirect 返回重定向（不跟随）；
+network 连不上（DNS、TLS、代理、连接被拒）；malformed 响应读不出来（不是 JSON、没有 choices、
+没有文本）；config 本地配置不对，请求没发出去（如密钥的环境变量没设）。"""
+
+LLM_ERROR_KINDS: tuple[LLMErrorKind, ...] = get_args(LLMErrorKind)
+
 
 class RoditError(Exception):
     """所有业务异常的基类。"""
 
 
 class LLMError(RoditError):
-    """大模型调用失败：报错、限流、输出无法解析。调用方退回 FAQ / 模板（§12.2）。"""
+    """大模型调用失败：报错、限流、输出无法解析。调用方退回 FAQ / 模板（§12.2）。
+
+    失败原因可以一起带上，三项都可以为空（不知道就不填）：status 是 HTTP 状态码（收到了响应时）；
+    kind 是 LLMErrorKind 里的一类，不认识的取值抛 ValueError；code 是模型服务给的错误代码或类型
+    （短字符串）。这三项会原样进审计、日志和评测报告，所以不放密钥、提示词、买家文字，
+    code 也不放错误消息原文。
+    """
+
+    def __init__(
+        self,
+        msg: str = "",
+        *,
+        status: int | None = None,
+        kind: LLMErrorKind | None = None,
+        code: str | None = None,
+    ) -> None:
+        if kind is not None and kind not in LLM_ERROR_KINDS:
+            raise ValueError(f"未知的大模型失败原因：{kind!r}")
+        super().__init__(msg)
+        self.status: int | None = status
+        self.kind: LLMErrorKind | None = kind
+        self.code: str | None = code
 
 
 class LLMTimeout(LLMError):
-    """大模型调用超时。"""
+    """大模型调用超时。参数同 LLMError，kind 默认是 timeout。"""
+
+    def __init__(
+        self,
+        msg: str = "",
+        *,
+        status: int | None = None,
+        kind: LLMErrorKind | None = "timeout",
+        code: str | None = None,
+    ) -> None:
+        super().__init__(msg, status=status, kind=kind, code=code)
 
 
 class DecisionError(RoditError):

@@ -130,11 +130,37 @@ class AfterSaleConfig(_Model):
     repeat_threshold: int = 3  # R7
 
 
+def _json_serialisable(value: Any) -> bool:
+    """能不能原样写成 JSON（UTF-8）：NaN、无穷大、集合、字节串、任意对象都不行。"""
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+LLM_EXTRA_BODY_RESERVED: frozenset[str] = frozenset(
+    {
+        "model",
+        "messages",
+        "temperature",
+        "max_tokens",
+        "stream",
+        "response_format",
+        "logprobs",
+        "top_logprobs",
+    }
+)
+"""llm.extra_body 里不能出现的键：这些字段由大模型客户端按每次请求自己填，写进 extra_body
+要么被覆盖、要么混进本来不该带它的请求（response_format、logprobs 只在请求要求时才填）。"""
+
+
 class LLMConfig(_Model):
     """境内已备案大模型（D5）的调用配置。密钥不在这里：只写环境变量名，调用时再读。
 
     public_name / filing_no：对外公示的模型名称和备案号（§12.3 生成式人工智能服务登记 / 备案），
     网页工具和 /v1/me 展示；require_disclosure 为 True 时生产部署缺这两项拒绝启动。
+    extra_body：模型服务特有的请求参数，评测和线上发出去的请求里都带（见字段上的说明）。
     """
 
     base_url: str | None = None  # OpenAI 兼容接口地址；为空时从环境变量 RODIT_LLM_BASE_URL 读
@@ -144,6 +170,22 @@ class LLMConfig(_Model):
     public_name: str | None = None  # 公示的模型名称【待定：D5 选定后填】
     filing_no: str | None = None  # 备案号【待定：D5 选定后填】
     require_disclosure: bool = False
+    # 模型服务特有的请求参数：原样并入每次 chat/completions 请求（常见用途：关闭思考模式）。
+    # 不要放密钥：取值会算进配置指纹（config_fingerprint），也可能被打印出来。
+    # 特意算进指纹：这一项不一样，评测和部署发出去的请求就不一样，不能看成同一套配置。
+    # 不能包含 LLM_EXTRA_BODY_RESERVED 里的键，取值要能序列化成 JSON。
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("extra_body")
+    @classmethod
+    def _check_extra_body(cls, v: dict[str, Any]) -> dict[str, Any]:
+        reserved = sorted(set(v) & LLM_EXTRA_BODY_RESERVED)
+        if reserved:
+            raise ValueError(f"extra_body 不能包含客户端每次请求自己填的字段：{reserved}")
+        bad = sorted(k for k, value in v.items() if not _json_serialisable({k: value}))
+        if bad:  # 只报键名，不带取值
+            raise ValueError(f"extra_body 的取值不能序列化成 JSON：{bad}")
+        return v
 
 
 LLM_ENV_PREFIX = "RODIT_LLM_"

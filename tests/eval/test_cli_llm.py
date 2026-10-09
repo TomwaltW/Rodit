@@ -35,7 +35,7 @@ from rodit.decision.llm import SYSTEM_PROMPT as JUDGE_SYSTEM_PROMPT
 from rodit.eval.cli import Failure, _render_failure, evaluate, main, render_text
 from rodit.eval.dataset import CASES, cases
 from rodit.eval.harness import UNPARSED_PREFIX, DraftRecorder, llm_harness
-from rodit.eval.llm_env import client_from_env
+from rodit.eval.llm_env import PreflightFailed, client_from_env
 from rodit.eval.perf import Pricing
 from rodit.testing.fakes import FakeLLMClient
 
@@ -244,6 +244,7 @@ def test_cli_env_mode_with_injected_client(tmp_path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["n"] == 4 and data["limit"] == 4 and data["seed"] == 7
     assert data["llm"]["mode"] == "env" and data["usage"]["calls"] > 0
+    assert data["health"] is None  # 运行健康度（rodit.eval.health）：字段已经在报告里，还没有人填
     assert len(data["cases"]) == 4 and all(c["usage"]["calls"] > 0 for c in data["cases"])
     # 同一个 seed 抽到同样的用例
     _, out2, _ = _run(
@@ -335,6 +336,71 @@ def test_cli_env_mode_preflight_failure_stops_before_running():
     assert code == 2 and out == ""
     assert "连通性检查失败" in err and "HTTP 401" in err
     assert len(fake.calls) == 1  # 只打了一次检查请求
+
+
+def test_cli_skip_preflight_sends_no_check_request():
+    """--skip-preflight（只在调试时用）：一条检查请求都不发，检查过不了的客户端也照样开跑。"""
+    model = ScriptedModel()
+
+    def refuses_the_check(request: LLMRequest):
+        if request.purpose == "other":  # 连通性检查
+            return LLMError("合成的故障：检查请求被拒")
+        return model(request)
+
+    argv = ["--llm", "env", "--limit", "2", "--seed", "7", "--json"]
+    blocked = FakeLLMClient(handler=refuses_the_check, model="synthetic-llm")
+    code, out, err = _run(argv, client_factory=lambda: blocked)
+    assert code == 2 and out == "" and "连通性检查失败" in err  # 默认：检查没过就不跑
+
+    skipped = FakeLLMClient(handler=refuses_the_check, model="synthetic-llm")
+    code, out, err = _run([*argv, "--skip-preflight"], client_factory=lambda: skipped)
+    assert code == 0, err
+    assert "连通性检查" not in err and not skipped.calls_for("other")
+    data = json.loads(out)
+    assert data["n"] == 2 and len(skipped.calls) == data["usage"]["calls"] > 0  # 全是评测自己的请求
+
+
+def test_cli_hands_the_config_to_preflight_and_prints_its_summary(monkeypatch, tmp_path):
+    """main 把这次评测的配置交给 preflight，返回的每一行在开跑前打到标准错误；
+    PreflightFailed 的说明原样报出（可以多行），退出码 2。"""
+    seen: list[tuple[Any, Any]] = []
+
+    def summarising(client, config=None):
+        seen.append((client, config))
+        return ["合成的摘要：路由 3 票 0.42 秒", "合成的摘要：生成 1.10 秒"]
+
+    monkeypatch.setattr("rodit.eval.cli.preflight", summarising)
+    config_path = tmp_path / "eval.yaml"
+    config_path.write_text("decision:\n  timeout_s: 3.0\n", encoding="utf-8")
+    with_config, without_config = _fake(), _fake()
+    code, _, err = _run(
+        ["--llm", "env", "--limit", "1", "--config", str(config_path)],
+        client_factory=lambda: with_config,
+    )
+    assert code == 0, err
+    assert "合成的摘要：路由 3 票 0.42 秒\n合成的摘要：生成 1.10 秒\n" in err
+    assert err.index("合成的摘要：生成") < err.index("[1/1]")  # 摘要在第一条用例之前
+    code, _, err = _run(["--llm", "env", "--limit", "1"], client_factory=lambda: without_config)
+    assert code == 0, err
+    (first_client, first_config), (second_client, second_config) = seen
+    assert first_client is with_config and first_config.decision.timeout_s == 3.0
+    assert second_client is without_config and second_config is None  # 没给 --config
+
+    def failing(client, config=None):
+        raise PreflightFailed("连通性检查没过（合成）：\n  路由：3 票里有 3 票超时（1 秒）")
+
+    monkeypatch.setattr("rodit.eval.cli.preflight", failing)
+    never_called = _fake()
+    code, out, err = _run(["--llm", "env"], client_factory=lambda: never_called)
+    assert code == 2 and out == "" and never_called.calls == []
+    assert "连通性检查没过（合成）：\n  路由：3 票里有 3 票超时（1 秒）" in err
+    assert "Traceback" not in err and "大模型连通性检查失败" not in err  # 不再包一层
+
+    # 跳过检查时根本不调 preflight
+    code, _, err = _run(
+        ["--llm", "env", "--limit", "1", "--skip-preflight"], client_factory=lambda: _fake()
+    )
+    assert code == 0, err
 
 
 # ---------------------------------------------------------------- §13.5 回归比较

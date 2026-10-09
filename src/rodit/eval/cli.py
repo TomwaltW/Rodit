@@ -20,7 +20,9 @@
   --config 里 llm.base_url 和 llm.model 都写了用配置，否则用环境变量（rodit.eval.llm_env：
   RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_LLM_TIMEOUT_S）；密钥从 llm.api_key_env 指的
   环境变量读（默认 RODIT_LLM_API_KEY）。路由和质检按 EngineConfig.decision 组装
-  （默认 incloud_llm）。只在本地开发机上这样做：密钥放本地 .env，不进仓库；评测集全是合成数据。
+  （默认 incloud_llm）。开跑前先做连通性检查（rodit.eval.llm_env.preflight，没过就不跑；
+  --skip-preflight 跳过，只在调试时用）。
+  只在本地开发机上这样做：密钥放本地 .env，不进仓库；评测集全是合成数据。
 
 部分评测：--intent 只跑某个问题类型，--limit N 用 --seed 随机抽 N 条（可复现）。
 路由分类器（§6.4）：--classifier 模型文件（python -m rodit.ops train-classifier 的输出）代替路由的
@@ -68,6 +70,7 @@ from rodit.eval.calibration import (
 from rodit.eval.dataset import EvalCase, cases
 from rodit.eval.fingerprint import EvalFingerprint, file_sha256, fingerprint_of
 from rodit.eval.harness import DEMO_PLATFORM, DemoHarness, demo_harness, llm_harness
+from rodit.eval.health import RunHealth
 from rodit.eval.llm_env import (
     PRICE_INPUT_ENV,
     PRICE_OUTPUT_ENV,
@@ -239,6 +242,8 @@ class EvalCliReport(_Model):
     latency: LatencyReport
     usage: UsageReport | None = None
     degraded_counts: dict[str, int] = Field(default_factory=dict)
+    # 运行健康度（rodit.eval.health）：这一轮算不算"评到了模型"；离线替身不调大模型，为 None
+    health: RunHealth | None = None
     baseline: BaselineCheck | None = None
     fingerprint: EvalFingerprint | None = None  # 评测用的配置、问题定义、代码版本（§13.5）
 
@@ -782,6 +787,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="offline",
         help="offline：离线替身（默认，不联网）；env：环境变量 RODIT_LLM_* 配置的真实大模型",
     )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="--llm env 时跳过开跑前的连通性检查（只在调试时用）",
+    )
     parser.add_argument("--intent", choices=[i.value for i in Intent], help="只跑某个问题类型")
     parser.add_argument("--limit", type=_positive_int, help="随机抽 N 条（按 --seed，可复现）")
     parser.add_argument("--seed", type=int, default=0, help="--limit 抽样的随机种子（默认 0）")
@@ -871,10 +881,13 @@ def main(
         llm: LLMClient | None = None
         if args.llm == "env":
             llm = client_factory() if client_factory is not None else env_client(config)
-            try:
-                preflight(llm)
-            except LLMError as e:  # 客户端的错误信息里已经抹掉了密钥
-                raise RuntimeError(f"大模型连通性检查失败：{e}") from None
+            if not args.skip_preflight:
+                try:
+                    summary = preflight(llm, config)
+                except LLMError as e:  # 客户端的错误信息里已经抹掉了密钥
+                    raise RuntimeError(f"大模型连通性检查失败：{e}") from None
+                for line in summary:  # 检查摘要；PreflightFailed 由下面的 RuntimeError 分支报出
+                    print(line, file=err, flush=True)
         report = evaluate(
             args.split,
             intent=args.intent,

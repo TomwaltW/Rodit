@@ -75,6 +75,7 @@ def _run(*argv: str) -> str:
 def test_json_report_meets_floors(split: str):
     data = json.loads(_run("--split", split, "--json"))
     assert data["split"] == split and data["n"] == len(cases(split))
+    assert data["health"] is None  # 离线替身不调大模型：没有运行健康度（rodit.eval.health）
     overall = data["overall"]
     floors = FLOORS[split]
     for key in ("intent_accuracy", "action_accuracy", "suggestion_rate"):

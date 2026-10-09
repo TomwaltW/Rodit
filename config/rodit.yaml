@@ -61,6 +61,9 @@ aftersale:
 llm:
   api_key_env: RODIT_LLM_API_KEY
   timeout_s: 10.0
+  # 模型服务特有的请求参数：原样并入每次请求，会进配置指纹，不要放密钥。常见用途是关闭思考模式：
+  # extra_body: {thinking: {type: disabled}}      # DeepSeek、火山方舟、智谱等
+  # extra_body: {enable_thinking: false}           # 阿里云百炼等
   # 对外公示的模型名称和备案号（§12.3）【待定：D5 选定后填】；require_disclosure: true 时
   # 生产部署缺这两项拒绝启动
   # public_name: ...

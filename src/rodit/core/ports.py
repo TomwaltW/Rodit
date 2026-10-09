@@ -121,6 +121,9 @@ class LLMResponse(BaseModel):
     # 接口支持 logprobs 时：输出里第一个有意义的 token（去掉空白、引号、括号、冒号、逗号）的
     # 候选 → 概率（已从对数概率换算成 0–1）；只适合"只输出一个选项标签"的请求。不支持时为 None。
     logprobs: dict[str, float] | None = None
+    # 接口返回的 finish_reason（stop / length / ……）；接口没给时为 None。
+    # "length" 表示输出被 max_tokens 截断了。
+    finish_reason: str | None = None
 
 
 @runtime_checkable
