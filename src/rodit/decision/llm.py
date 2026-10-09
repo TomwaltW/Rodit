@@ -11,16 +11,26 @@
 - 多问题（§6.6 规则 5）：请求里带了追问 second_intent（core.questions.ROUTER_VOTE_QUESTIONS，
   由路由器在同一个请求里一并问，不多跑一轮）时，追问的票按采样和主要问题配对
   （voting.second_intent_votes）；追问没答、答不出来都按"无"计，不影响其他问题，也不算有效票不足。
-- 选项概率（LLMResponse.logprobs）：接口读的是输出里第一个有内容的 token，只能记到一个单选题上：
-  输出的第一个问题是单选题时记给它，否则只有一个单选题时记给那一个（选项名对得上才用），
-  都不满足就不请求。路由请求里 intent 排第一，追问和它同一套选项、排在最后，只看票。
-- 失败：单次调用抛 LLMError 的那一票作废；所有采样都失败，或某个问题的有效票数少于 min_votes，
-  抛 DecisionError（调用方据此降级，§12.2）。返回前一律 validate_response。
+- 选项概率（LLMResponse.logprobs）：不请求（want_logprobs 一律是 False）。判断层的请求都是
+  JSON 模式，接口读的是输出里第一个有内容的 token，这时它是键名（如 intent）、不是选项，
+  读不出选项概率；不少境内模型不支持 logprobs，带上这个参数整个请求可能被拒掉；接口照给的话，
+  键名那个位置的候选里只要混进一个和选项同名的 token，归一化之后就是 1.0，一张票能盖过全部投票。
+  响应里自己带了选项概率时（现在只有测试替身会带）照旧使用，只能记到一个单选题上：
+  输出的第一个问题是单选题时记给它，否则只有一个单选题时记给那一个（选项名对得上才用）；
+  路由请求里 intent 排第一，追问和它同一套选项、排在最后，只看票。
+- 失败：单次调用抛 LLMError 的那一票作废；回答被 max_tokens 截断（finish_reason 是 length）
+  或者文本为空的那一票也作废、不解析（截到一半的 JSON 不能当答案）。所有采样都作废，或某个问题的
+  有效票数少于 min_votes，抛 DecisionError（调用方据此降级，§12.2）；消息里写明一共采样几次、
+  没算上的票各是什么原因、各几票，如"3 次：超时 2、截断 1"（回答完整但这道题读不出有效票的
+  算"读不出"）。原因只取类别和 LLMError 上的 kind / status / code，不带异常消息和模型输出的文字。
+  返回前一律 validate_response。
 """
 
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
@@ -36,7 +46,7 @@ from rodit.core.decision import (
     ScoreQuestion,
     validate_response,
 )
-from rodit.core.errors import DecisionError, LLMError
+from rodit.core.errors import DecisionError, LLMError, LLMTimeout
 from rodit.core.ports import LLMClient, LLMMessage, LLMRequest, LLMResponse
 from rodit.core.questions import Q_INTENT, Q_SECOND_INTENT
 from rodit.decision.voting import (
@@ -65,6 +75,66 @@ SYSTEM_PROMPT = (
 )
 
 _TYPE_LABELS = {"noul": "是否题", "choice": "单选题", "score": "打分题"}
+
+ERROR_KIND_LABELS: dict[str, str] = {
+    "timeout": "超时",
+    "rate_limit": "限流",
+    "auth": "密钥无效或没有权限",
+    "billing": "余额或额度用完",
+    "bad_request": "请求被拒",
+    "content_filter": "内容安全拦截",
+    "server": "模型服务出错",
+    "redirect": "重定向",
+    "network": "连不上",
+    "malformed": "响应格式不对",
+    "config": "本地配置不对",
+}
+"""LLMError.kind（core.errors.LLMErrorKind）在报错消息里的说法。"""
+
+# 一票没算上的其他原因（和上面的说法一起写进 DecisionError 的消息）
+LOST_TRUNCATED = "截断"  # 回答被 max_tokens 截断（finish_reason 是 length），文本空不空都算
+LOST_EMPTY = "空回答"  # 没被截断，但文本为空
+LOST_UNREADABLE = "读不出"  # 回答完整，但这道题解析不出有效票
+
+_CODE_CHARS = 64  # 错误代码写进消息时最多留这么长（客户端给的本来就是短字符串，这里再兜一层）
+
+
+def _short(value: object) -> str:
+    """kind / code 写进消息前：压成一行、截短；不是字符串或整数的（没填）给空串。"""
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return ""
+    return " ".join(str(value).split())[:_CODE_CHARS]
+
+
+def _error_cause(error: LLMError) -> str:
+    """一次失败调用的原因，如"超时""限流（HTTP 429，rate_limit_exceeded）"。
+
+    只读 LLMError 上的 kind / status / code（core.errors；没有这几项的替身按没填算），不读异常消息
+    ——里面可能有模型服务返回的文字。都没填时只有异常类型。
+    """
+    kind = _short(getattr(error, "kind", None))
+    code = _short(getattr(error, "code", None))
+    status = getattr(error, "status", None)
+    http = f"HTTP {status}" if isinstance(status, int) and not isinstance(status, bool) else ""
+    if not kind and isinstance(error, LLMTimeout):
+        kind = "timeout"
+    if kind:
+        label, detail = ERROR_KIND_LABELS.get(kind, kind), [http, code]
+    elif http:
+        label, detail = http, [code]
+    else:
+        label, detail = type(error).__name__, [code]
+    detail = [d for d in detail if d]
+    return f"{label}（{'，'.join(detail)}）" if detail else label
+
+
+def _vote_counts(samples: int, lost: Iterable[str]) -> str:
+    """一共采样几次，没算上的票各是什么原因、各几票，如"3 次：超时 2、截断 1"
+    （多的在前，票数一样按原因名排，写法固定）。"""
+    counts = sorted(Counter(lost).items(), key=lambda item: (-item[1], item[0]))
+    if not counts:
+        return f"{samples} 次"
+    return f"{samples} 次：" + "、".join(f"{cause} {n}" for cause, n in counts)
 
 
 def _question_block(key: str, question: Question) -> str:
@@ -96,7 +166,7 @@ def _output_template(questions: dict[str, Question]) -> str:
 
 
 def logprob_target(questions: dict[str, Question]) -> str | None:
-    """选项概率记给哪个单选题（见模块说明）；没有能记的返回 None（不请求 logprobs）。"""
+    """响应里带了选项概率时记给哪个单选题（见模块说明）；没有能记的返回 None。"""
     first = next(iter(questions.items()), None)
     if first is not None and isinstance(first[1], ChoiceQuestion):
         return first[0]
@@ -169,7 +239,7 @@ class InCloudLLMProvider:
             temperature=self.temperature,
             max_tokens=self.max_tokens or max(128, 64 + 48 * len(request.questions)),
             json_mode=True,
-            want_logprobs=logprob_target(request.questions) is not None,
+            want_logprobs=False,  # JSON 模式下读不出选项概率，还可能被接口拒掉（见模块说明）
             timeout_s=self.timeout_s,
             shop_id=current_shop_id(),
         )
@@ -195,10 +265,23 @@ class InCloudLLMProvider:
 
     def decide(self, request: DecisionRequest) -> DecisionResponse:
         results = self._sample(self._llm_request(request))
-        responses = [r for r in results if isinstance(r, LLMResponse)]
+        errors = [r for r in results if isinstance(r, LLMError)]
+        lost = [_error_cause(e) for e in errors]  # 没算上的票各是什么原因
+        responses: list[LLMResponse] = []
+        for r in results:
+            if not isinstance(r, LLMResponse):
+                continue
+            if getattr(r, "finish_reason", None) == "length":
+                lost.append(LOST_TRUNCATED)  # 截到一半的回答不解析：里面凑得出的片段不能当答案
+            elif not r.text.strip():
+                lost.append(LOST_EMPTY)
+            else:
+                responses.append(r)
         if not responses:
-            errors = [r for r in results if isinstance(r, LLMError)]
-            raise DecisionError(f"大模型判断全部失败（{len(errors)} 次）") from errors[-1]
+            cause = errors[-1] if errors else None  # 都是截断、空回答时没有调用异常可挂
+            raise DecisionError(
+                f"大模型判断全部失败（{_vote_counts(self.samples, lost)}）"
+            ) from cause
         parsed = [parse_sample(request.questions, r.text) for r in responses]
         target = logprob_target(request.questions)
         paired = _paired_second_intent(request.questions)
@@ -216,19 +299,19 @@ class InCloudLLMProvider:
                         for r in responses
                         if (d := choice_distribution(question, r.logprobs)) is not None
                     ]
-                self._check_quorum(key, max(len(votes), len(dists)))
+                self._check_quorum(key, max(len(votes), len(dists)), len(responses), lost)
                 answers[key] = aggregate_choice(
                     key, question, [v for v in votes if isinstance(v, str)], dists
                 )
             elif isinstance(question, NoulQuestion):
-                self._check_quorum(key, len(votes))
+                self._check_quorum(key, len(votes), len(responses), lost)
                 answers[key] = aggregate_noul(
                     key,
                     [v for v in votes if isinstance(v, NoulVote)],
                     use_reported_p=self.samples == 1,
                 )
             else:
-                self._check_quorum(key, len(votes))
+                self._check_quorum(key, len(votes), len(responses), lost)
                 answers[key] = aggregate_score(
                     key, question, [float(v) for v in votes if isinstance(v, float)]
                 )
@@ -236,8 +319,14 @@ class InCloudLLMProvider:
         validate_response(request, response)
         return response
 
-    def _check_quorum(self, key: str, valid: int) -> None:
+    def _check_quorum(self, key: str, valid: int, usable: int, lost: list[str]) -> None:
+        """这道题的有效票不够就抛 DecisionError。usable 是拿去解析的回答数（其中没给出有效票的
+        算"读不出"），lost 是没算上的票各自的原因。"""
+        if valid >= self.min_votes:
+            return
+        counts = _vote_counts(self.samples, [*lost, *[LOST_UNREADABLE] * (usable - valid)])
         if valid == 0:
-            raise DecisionError(f"问题 {key!r} 的所有投票都无效")
-        if valid < self.min_votes:
-            raise DecisionError(f"问题 {key!r} 只有 {valid} 张有效票，少于 {self.min_votes}")
+            raise DecisionError(f"问题 {key!r} 的所有投票都无效（{counts}）")
+        raise DecisionError(
+            f"问题 {key!r} 只有 {valid} 张有效票，少于 {self.min_votes}（{counts}）"
+        )

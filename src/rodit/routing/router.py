@@ -7,7 +7,8 @@
    一票只能选一个 intent，认不出第二个问题；规则、分类器、Jev 的 intent 概率本来就分摊到
    各个类型上，照旧只问四个必答问题（兜底的关键词规则也一样）；
 2. 调主判断层；判断层不可用（DecisionError / LLMError）时退回 fallback（关键词规则），
-   degraded=True；
+   degraded=True，并记一条警告说明原因（异常类型和消息、异常链最里层的原因；消息先遮个人信息、
+   截短，见 _failure_for_log），不然事后只看得到"退回了规则"，看不到为什么；
    fallback 也失败 → NO_SUGGESTION（规则 8、provider="none"），不向外抛；
    全自动模式下主判断层答出来了，也再问一次 fallback 的"要求人工"（关键词，不联网），
    交给 RoutingPolicy 当规则 2 的兜底（§5.7 买家要求人工 → 全自动立即转人工）；
@@ -34,8 +35,9 @@ from rodit.core.decision import (
     validate_response,
 )
 from rodit.core.enums import DecisionStage, Intent, Mode, RouteAction
-from rodit.core.errors import DecisionError, LLMError
+from rodit.core.errors import DecisionError, LLMError, RoditError
 from rodit.core.models import ConversationContext, DecisionLogEntry, RouteDecision
+from rodit.core.pii import mask_pii
 from rodit.core.ports import AuditSink
 from rodit.core.questions import (
     Q_NEED_HUMAN,
@@ -51,6 +53,57 @@ from rodit.routing.policy import RoutingPolicy
 logger = logging.getLogger(__name__)
 
 NO_PROVIDER = "none"
+
+_LOG_MESSAGE_CHARS = 200  # 降级原因写进日志时，异常消息最多留这么长
+_LOG_TAG_CHARS = 64  # LLMError 的 kind / code 最多留这么长
+
+
+def _log_safe(text: str, limit: int) -> str:
+    """写进日志前：遮个人信息、压成一行、截到 limit 字。"""
+    return " ".join(mask_pii(text).split())[:limit]
+
+
+def _error_tag(exc: BaseException) -> str:
+    """异常类型；LLMError 再带上它的 kind / status / code（没填的不写，没有这几项的替身也一样）。"""
+    name = type(exc).__name__
+    if not isinstance(exc, LLMError):
+        return name
+    kind, status, code = (getattr(exc, attr, None) for attr in ("kind", "status", "code"))
+    tags = [
+        "" if kind is None else str(kind),
+        f"HTTP {status}" if isinstance(status, int) and not isinstance(status, bool) else "",
+        "" if code is None else str(code),
+    ]
+    tags = [tag for tag in (_log_safe(t, _LOG_TAG_CHARS) for t in tags) if tag]
+    return f"{name}（{'，'.join(tags)}）" if tags else name
+
+
+def _failure_for_log(exc: BaseException) -> str:
+    """判断层为什么不可用，写日志用（§12.3 日志脱敏）：异常类型和消息，加上异常链最里层的原因。
+
+    和 qa.gate 里的同名函数是同一套写法（子包之间不互相 import，各留一份）：
+    - 消息只记业务异常（core.errors.RoditError）的：DecisionError 的消息由票数、题名、失败原因的
+      类别拼成，没有 state、提示词和买家原文；但 validate_response 会引用判断层给的选项文字
+      （模型给什么就是什么），所以先遮个人信息、压成一行，再截到 _LOG_MESSAGE_CHARS 字。
+      别的异常消息里是什么说不准，只记类型。
+    - 最里层的原因只记类型，是 LLMError 时加上它的 kind / status / code（core.errors：这三项
+      本来就不放密钥、提示词和买家文字）；它的消息不记，里面可能带着模型输出
+      （比如校验错误里的输入值）。
+    不靠日志处理器上的过滤（ops.logconfig）兜底：评测命令行没有装它。
+    """
+    text = _error_tag(exc)
+    if isinstance(exc, RoditError):
+        message = _log_safe(str(exc), _LOG_MESSAGE_CHARS)
+        if message:
+            text += f"：{message}"
+    root, seen = exc, {id(exc)}
+    while True:
+        cause = root.__cause__ or (None if root.__suppress_context__ else root.__context__)
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        root = cause
+    return text if root is exc else f"{text}；根因 {_error_tag(root)}"
 
 
 def vote_samples_of(provider: DecisionProvider) -> int | None:
@@ -126,8 +179,9 @@ class DecisionRouter:
             try:
                 response = self._ask(self.provider, self.request_for(self.provider, request))
                 used = self.provider.name
-            except (DecisionError, LLMError):
+            except (DecisionError, LLMError) as exc:
                 degraded = True
+                logger.warning("路由判断层不可用，退回关键词规则：%s", _failure_for_log(exc))
                 try:
                     response = self._ask(self.fallback, self.request_for(self.fallback, request))
                     used = self.fallback.name

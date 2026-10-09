@@ -990,10 +990,12 @@ class AssistEngine:
                     why = _qa_reasons(qa)
                     failed_reasons.extend(why)
                     unit.qa_reasons.extend(r for r in why if r not in unit.qa_reasons)
-                    if draft.kind == DraftKind.LLM:
-                        llm_failed.append(qa)
-                    else:  # FAQ / 模板：标准回答本身有问题，重写没用
+                    if draft.kind != DraftKind.LLM:  # FAQ / 模板：标准回答本身有问题，重写没用
                         unit.alerts.append(dropped_draft_alert(draft, qa))
+                    elif not qa.degraded:
+                        # 判断层质检不可用（qa.degraded）的草稿不算重写的理由：不是回答写得不对，
+                        # 重写出来的一样没有判断层可判，只会在接口出故障的时候多调一轮大模型
+                        llm_failed.append(qa)
             if len(unit.passed) >= unit.limit or not llm_failed or regenerations >= max_regen:
                 break
             if not budget.llm_allowed():  # 来不及再调一次大模型：不重写，保留已通过的

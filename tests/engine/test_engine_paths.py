@@ -29,7 +29,7 @@ from rodit.core.enums import (
     RouteAction,
     SuggestionStatus,
 )
-from rodit.core.models import Draft, EvidenceBundle, EvidenceRefView
+from rodit.core.models import Draft, EvidenceBundle, EvidenceRefView, QAResult
 from rodit.engine import AssistEngine
 from rodit.engine.engine import (
     REASON_DISABLED,
@@ -41,6 +41,7 @@ from rodit.engine.engine import (
     REASON_SHOP_INACTIVE,
     REASON_TRANSFER,
 )
+from rodit.qa import QA_UNAVAILABLE
 from rodit.testing.fixtures import BUYER_DOUYIN, CONV, SHOP_A, SHOP_B, SHOP_D
 
 SHIP = "亲，发货与快递：现货付款后 48 小时内发货"
@@ -405,6 +406,88 @@ def test_no_regeneration_when_enough_passed(kit: Kit) -> None:
     kit.generator.script = [[llm("48 小时内发"), llm("一定发")]]
     result = kit.engine().handle(kit.msg("什么时候发货"))
     assert result is not None and [c.text for c in result.suggestions] == ["48 小时内发"]
+    assert len(kit.generator.calls) == 1
+
+
+# ================================================================ 判断层质检不可用：不重写（§12.2）
+
+
+def unjudged(draft: Draft, *hard_reasons: str, rule: str | None = None) -> QAResult:
+    """质检的结论：判断层不可用，这份草稿没判成（qa.gate 的 degraded 结果，原因里有"质检不可用"）；
+    hard_reasons 是同时命中的硬规则原因。"""
+    return qa_fail(draft, [*hard_reasons, QA_UNAVAILABLE], rule=rule, degraded=True)
+
+
+def test_qa_unavailable_blocks_the_draft_without_a_rewrite(kit: Kit) -> None:
+    """判断层质检不可用不是回答写得不对：照旧不放行、原因照记，但不带着"质检不可用"去重写
+    （重写出来的一样没有判断层可判，只会在接口出故障的时候多调一轮大模型）。"""
+    kit.gate.rule = lambda d: unjudged(d)
+    kit.generator.script = [[llm("亲，现货付款后 48 小时内发货")], [llm("不该调用")]]
+    result = kit.engine().handle(kit.msg("什么时候发货"))
+    assert result is not None
+    assert result.suggestions == []
+    assert result.no_suggestion_reason == REASON_QA_FAILED + QA_UNAVAILABLE
+    assert result.degraded == ["decision:qa"]
+    assert result.alerts == []  # 不是 FAQ / 模板本身有问题：不提醒改知识库
+    assert [c["retry_feedback"] for c in kit.generator.calls] == [None]
+    assert len(kit.gate.calls) == 1
+    [result_event] = kit.result_events()
+    assert result_event.detail["qa_failed"] == 1
+    assert result_event.detail["qa_reasons"] == [QA_UNAVAILABLE]
+    [qa_event] = kit.events(AuditAction.QA)
+    assert qa_event.detail["regenerations"] == 0 and qa_event.detail["degraded"] is True
+    assert kit.suggestions.list(SHOP_A) == []
+
+
+def test_mixed_wave_is_rewritten_with_the_content_reasons_only(kit: Kit) -> None:
+    """同一批里一份没判成（判断层不可用）、一份因为内容被拦：照常重写，重写原因只有内容那一份的。"""
+    lost = llm("亲，现货付款后 48 小时内发货")
+    kit.gate.rule = lambda d: unjudged(d) if d.text == lost.text else None
+    kit.generator.script = [
+        [lost, llm("亲，明天一定能发哦！")],
+        [llm("亲，付款后 48 小时内发出")],
+    ]
+    result = kit.engine().handle(kit.msg("什么时候发货"))
+    assert result is not None
+    assert [c.text for c in result.suggestions] == ["亲，付款后 48 小时内发出"]
+    assert [c["retry_feedback"] for c in kit.generator.calls] == [None, ["绝对化用语：一定"]]
+    assert result.degraded == ["decision:qa"]
+    assert result.alerts == []
+    [result_event] = kit.result_events()
+    assert result_event.detail["qa_failed"] == 2
+    assert result_event.detail["qa_reasons"] == [QA_UNAVAILABLE, "绝对化用语：一定"]
+    [qa_event] = kit.events(AuditAction.QA)
+    assert qa_event.detail["regenerations"] == 1
+
+
+def test_unjudged_draft_with_a_hard_rule_hit_is_not_rewritten_either(kit: Kit) -> None:
+    """硬规则命中、判断层又不可用（质检的原因里两样都有）：也不重写，重写出来的照样没法判；
+    两条原因照旧都给客服看。"""
+    promise = "包含依据中没有的时效承诺：明天"
+    kit.gate.rule = lambda d: unjudged(d, promise, rule="time_promise")
+    kit.generator.script = [[llm("亲，明天能到哦")], [llm("不该调用")]]
+    result = kit.engine().handle(kit.msg("明天能到吗"))
+    assert result is not None
+    assert result.suggestions == []
+    assert result.no_suggestion_reason == REASON_QA_FAILED + promise + "；" + QA_UNAVAILABLE
+    assert result.degraded == ["decision:qa"]
+    assert len(kit.generator.calls) == 1
+    assert kit.result_events()[0].detail["hard_hits"] == ["time_promise"]
+
+
+def test_faq_dropped_next_to_an_unjudged_draft_still_alerts(kit: Kit) -> None:
+    """FAQ 没过硬规则的提醒不受影响；没判成的大模型草稿不会被当成 FAQ / 模板来提醒。"""
+    bad_faq = faq_draft("亲，全网最低价哦", faq_id=7)
+    kit.generator.script = [[bad_faq, llm("亲，店铺满 199 减 20")]]
+    kit.gate.rule = lambda d: (
+        qa_fail(d, ["商家禁用词：全网最低"], rule="banned_word")
+        if d.kind == DraftKind.FAQ
+        else unjudged(d)
+    )
+    result = kit.engine().handle(kit.msg("能便宜点吗"))
+    assert result is not None
+    assert result.suggestions == []
+    assert result.alerts == ["FAQ #7未通过质检（商家禁用词），本次不推荐，请检查并修改知识库"]
     assert len(kit.generator.calls) == 1
 
 

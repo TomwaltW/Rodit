@@ -6,6 +6,8 @@
   也是 §13.3 校准阈值要用的数据。阈值见 QAGateConfig，边界值算通过；
 - 判断层不可用（未配置、DecisionError / LLMError、答案不完整）→ degraded=True，大模型草稿不放行
   （§12.2：质检不可用时不推荐未经质检的生成内容），原因里加"质检不可用"；
+  调判断层出错时另记一条警告说明原因（异常类型和消息、异常链最里层的原因；消息先遮个人信息、
+  截短，见 _failure_for_log），没有配置判断层不算出错、不逐条记；
 - 跑了判断层质检时写一条 decision_log（stage=qa），不写 audit_log（引擎写）；
   写失败只记警告（只记异常类型），质检结论照常返回；
 - 进判断层的回答先遮个人信息（回答可能复述了买家的手机号、地址，§5.3）；
@@ -33,7 +35,7 @@ from rodit.core.decision import (
     validate_response,
 )
 from rodit.core.enums import DecisionStage, DraftKind
-from rodit.core.errors import DecisionError, LLMError
+from rodit.core.errors import DecisionError, LLMError, RoditError
 from rodit.core.models import (
     ConversationContext,
     DecisionLogEntry,
@@ -63,6 +65,57 @@ logger = logging.getLogger(__name__)
 QA_UNAVAILABLE = "质检不可用"
 QA_OUT_OF_TIME = "时间不够，没有做完模型质检"
 EMPTY_ANSWER = "回答为空"
+
+_LOG_MESSAGE_CHARS = 200  # 降级原因写进日志时，异常消息最多留这么长
+_LOG_TAG_CHARS = 64  # LLMError 的 kind / code 最多留这么长
+
+
+def _log_safe(text: str, limit: int) -> str:
+    """写进日志前：遮个人信息、压成一行、截到 limit 字。"""
+    return " ".join(mask_text(text).split())[:limit]
+
+
+def _error_tag(exc: BaseException) -> str:
+    """异常类型；LLMError 再带上它的 kind / status / code（没填的不写，没有这几项的替身也一样）。"""
+    name = type(exc).__name__
+    if not isinstance(exc, LLMError):
+        return name
+    kind, status, code = (getattr(exc, attr, None) for attr in ("kind", "status", "code"))
+    tags = [
+        "" if kind is None else str(kind),
+        f"HTTP {status}" if isinstance(status, int) and not isinstance(status, bool) else "",
+        "" if code is None else str(code),
+    ]
+    tags = [tag for tag in (_log_safe(t, _LOG_TAG_CHARS) for t in tags) if tag]
+    return f"{name}（{'，'.join(tags)}）" if tags else name
+
+
+def _failure_for_log(exc: BaseException) -> str:
+    """判断层为什么不可用，写日志用（§12.3 日志脱敏）：异常类型和消息，加上异常链最里层的原因。
+
+    和 routing.router 里的同名函数是同一套写法（子包之间不互相 import，各留一份）：
+    - 消息只记业务异常（core.errors.RoditError）的：DecisionError 的消息由票数、题名、失败原因的
+      类别拼成，没有 state、提示词、买家原文和待检查的回答；但 validate_response 会引用判断层给的
+      选项文字（模型给什么就是什么），所以先遮个人信息、压成一行，再截到 _LOG_MESSAGE_CHARS 字。
+      别的异常（判断层实现自己出错的 KeyError / TypeError）消息里是什么说不准，只记类型。
+    - 最里层的原因只记类型，是 LLMError 时加上它的 kind / status / code（core.errors：这三项
+      本来就不放密钥、提示词和买家文字）；它的消息不记，里面可能带着模型输出
+      （比如校验错误里的输入值）。
+    不靠日志处理器上的过滤（ops.logconfig）兜底：评测命令行没有装它。
+    """
+    text = _error_tag(exc)
+    if isinstance(exc, RoditError):
+        message = _log_safe(str(exc), _LOG_MESSAGE_CHARS)
+        if message:
+            text += f"：{message}"
+    root, seen = exc, {id(exc)}
+    while True:
+        cause = root.__cause__ or (None if root.__suppress_context__ else root.__context__)
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        root = cause
+    return text if root is exc else f"{text}；根因 {_error_tag(root)}"
 
 
 def model_reasons(
@@ -179,7 +232,8 @@ class DefaultQualityGate:
             response = provider.decide(request)
             validate_response(request, response)
             scores = _scores(response)
-        except (DecisionError, LLMError, KeyError, TypeError):
+        except (DecisionError, LLMError, KeyError, TypeError) as exc:
+            logger.warning("判断层质检不可用，这份大模型草稿不放行：%s", _failure_for_log(exc))
             return self._degraded(text, hits, hard_reasons, provider=provider.name)
         if budget.expired():  # 答完时截止时间已过：结论不用，也不写 decision_log
             return self._out_of_time(text, hits, hard_reasons, provider=provider.name)

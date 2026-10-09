@@ -238,7 +238,10 @@ def test_single_sample_uses_its_own_followup():
 # ---------------------------------------------------------------- 选项概率（logprobs）归属
 
 
-def test_logprobs_are_requested_for_the_first_choice_question_only():
+def test_response_logprobs_go_to_the_first_choice_question_only():
+    """判断层不请求选项概率（JSON 模式下读不出来）；响应里自己带了的（这里由替身给）照旧记到
+    输出的第一个问题 intent 上。"""
+
     def handler(r: LLMRequest) -> LLMResponse:
         return LLMResponse(
             text=json.dumps(_vote("size_advice", "shipping_policy", multi=True)),
@@ -247,7 +250,7 @@ def test_logprobs_are_requested_for_the_first_choice_question_only():
 
     llm = FakeLLMClient(handler)
     resp = _provider(llm, samples=1).decide(_request())
-    assert llm.calls[0].want_logprobs is True  # 输出的第一个问题是 intent（单选）
+    assert llm.calls[0].want_logprobs is False
     assert resp.choice(Q_INTENT).probabilities == pytest.approx(
         {"size_advice": 0.7, "product_spec": 0.3}
     )
@@ -272,14 +275,19 @@ def test_logprobs_are_not_requested_when_they_cannot_be_attributed():
     assert llm.calls[0].want_logprobs is False  # 两个单选题、第一个问题又不是单选：归不了
     assert resp.choice("q_a").probabilities == {"a": 1.0}  # 只看票
     assert resp.choice("q_b").probabilities == {"b": 1.0}
-    # 只有一个单选题：照旧读（选项名对得上才用）
-    single = FakeLLMClient(lambda r: {"q_yes": "是", "q_a": "a"})
-    _provider(single, samples=1).decide(
+    # 只有一个单选题：同样不请求；响应里带了选项概率就记给它（选项名对得上才用）
+    single = FakeLLMClient(
+        lambda r: LLMResponse(
+            text=json.dumps({"q_yes": "是", "q_a": "a"}), logprobs={"b": 0.9, "a": 0.1}
+        )
+    )
+    resp = _provider(single, samples=1).decide(
         DecisionRequest(
             model="m", state={"synthetic": True}, questions={k: qs[k] for k in ("q_yes", "q_a")}
         )
     )
-    assert single.calls[0].want_logprobs is True
+    assert single.calls[0].want_logprobs is False
+    assert resp.choice("q_a").probabilities == pytest.approx({"b": 0.9, "a": 0.1})
 
 
 def test_plain_router_request_is_unchanged():
@@ -288,7 +296,7 @@ def test_plain_router_request_is_unchanged():
     resp = _provider(llm).decide(_request(questions=ROUTER_QUESTIONS))
     assert set(resp.answers) == set(ROUTER_QUESTIONS)
     assert "second_intent" not in llm.calls[0].messages[1].content
-    assert llm.calls[0].want_logprobs is True
+    assert llm.calls[0].want_logprobs is False
 
 
 # ---------------------------------------------------------------- 合并：被问到的概率
