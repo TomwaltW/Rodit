@@ -111,6 +111,13 @@ def _run(argv: list[str], **kw: Any) -> tuple[int, str, str]:
     return code, out.getvalue(), err.getvalue()
 
 
+@pytest.fixture(autouse=True)
+def _no_deployment_config(monkeypatch):
+    """--llm env 没给 --config 时会读环境变量 RODIT_CONFIG 指的配置：这里的测试按内置默认值
+    （或自己给的 --config）跑，不受运行环境影响。"""
+    monkeypatch.delenv("RODIT_CONFIG", raising=False)
+
+
 # ---------------------------------------------------------------- 接线与计量
 
 
@@ -244,7 +251,15 @@ def test_cli_env_mode_with_injected_client(tmp_path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["n"] == 4 and data["limit"] == 4 and data["seed"] == 7
     assert data["llm"]["mode"] == "env" and data["usage"]["calls"] > 0
-    assert data["health"] is None  # 运行健康度（rodit.eval.health）：字段已经在报告里，还没有人填
+    # 运行健康度（rodit.eval.health）：接大模型时每次都有；假模型每次都答得上，这一轮算数
+    health = data["health"]
+    assert health["valid"] is True and health["reasons"] == [] and health["ceiling"] == 0.02
+    assert health["overall"]["cases"] == 4 and health["overall"]["route_fallback"] == 0
+    assert health["by_purpose"]["route"]["calls"] == 12 and health["routed_by"] == {
+        "incloud_llm": 4
+    }
+    assert "运行健康度：有效" in out and "!!" not in out
+    assert all(c["route_provider"] == "incloud_llm" for c in data["cases"])
     assert len(data["cases"]) == 4 and all(c["usage"]["calls"] > 0 for c in data["cases"])
     # 同一个 seed 抽到同样的用例
     _, out2, _ = _run(

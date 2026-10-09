@@ -12,7 +12,14 @@ from rodit.eval.baseline import compare_to_baseline, load_baseline
 from rodit.eval.cli import evaluate, main, render_text
 from rodit.eval.dataset import CASES, cases
 from rodit.eval.llm_env import describe_endpoint, resolve_pricing
-from rodit.eval.perf import Pricing, case_usage, latency_report, usage_report
+from rodit.eval.perf import (
+    Pricing,
+    calls_by_purpose,
+    case_usage,
+    is_timeout,
+    latency_report,
+    usage_report,
+)
 from rodit.eval.runner import select_cases
 
 
@@ -51,6 +58,42 @@ def test_latency_report_percentiles_and_targets():
     empty = latency_report([])
     assert empty.n == 0 and empty.stages["total"].p50 is None
     assert empty.e2e_p95_within_target is None
+    # 没给调用记录、没有被截断的用例：和原来一样，没有"被截短"这回事
+    assert not report.limited_by_budget and (report.budget_cut, report.llm_timeouts) == (0, 0)
+    assert all(s.llm_calls == s.llm_timeouts == 0 for s in report.stages.values())
+
+
+def test_latency_report_marks_values_cut_short_by_timeouts_or_the_budget():
+    """单次调用到超时就断、整条消息到时间预算就返回：端到端超不过 5 秒的目标。有调用超时或有用例
+    被截断时，没超标也不算达标（None）；分位数本身不改。"""
+    rows = [{"route": 900, "generate": 2000, "qa": 800, "total": 4000}] * 20
+    answered = [{"purpose": "route", "latency_ms": 300}] * 57 + [
+        {"purpose": "generate", "latency_ms": 900}
+    ] * 4
+    failed = [
+        {"purpose": "route", "latency_ms": 1005, "error": "LLMTimeout", "kind": "timeout"},
+        {"purpose": "route", "latency_ms": 1005, "error": "LLMTimeout"},  # 还没带 kind 的事件
+        {"purpose": "qa", "latency_ms": 20, "error": "LLMError", "kind": "rate_limit"},
+    ]
+    clean = latency_report(rows, answered)
+    assert clean.e2e_p95_within_target is True and not clean.limited_by_budget
+    assert clean.stages["route"].llm_calls == 57 and clean.stages["generate"].llm_calls == 4
+    assert clean.stages["total"].llm_calls == clean.stages["retrieve"].llm_calls == 0
+    report = latency_report(rows, [*answered, *failed])
+    route = report.stages["route"]
+    assert (route.llm_calls, route.llm_timeouts, route.within_target) == (59, 2, True)
+    qa = report.stages["qa"]
+    assert (qa.llm_calls, qa.llm_timeouts) == (1, 0)  # 被限流不是超时
+    assert report.llm_timeouts == 2 and report.limited_by_budget and report.budget_cut == 0
+    total = report.stages["total"]
+    assert total.p95 == 4000 and total.within_target is None
+    assert report.e2e_p95_within_target is None
+    cut = latency_report(rows, budget_cut=3)  # 没有调用超时，但有用例被时间预算截断
+    assert cut.limited_by_budget and cut.budget_cut == 3 and cut.e2e_p95_within_target is None
+    over = latency_report([{"total": 6000}], budget_cut=1)  # 被截短的数都超过目标：就是超标
+    assert over.e2e_p95_within_target is False
+    assert is_timeout({"kind": "timeout"}) and is_timeout({"error": "LLMTimeout"})
+    assert not is_timeout({"error": "LLMError", "kind": "rate_limit"}) and not is_timeout({})
 
 
 # ---------------------------------------------------------------- §14 用量与成本
@@ -99,6 +142,59 @@ def test_usage_report_totals_shares_and_projection():
     assert report.projected_monthly_cost_per_shop == pytest.approx(5.6 / 3 * 900 * 30)
     unpriced = usage_report([CALLS])
     assert unpriced.cost is None and unpriced.projected_monthly_cost_per_shop is None
+
+
+def test_usage_report_says_what_the_totals_leave_out():
+    """失败的调用按 0 token 计（另给估算）、成功却没有用量的调用、接口回显的模型名。"""
+    served = "synthetic-model-2026-09-01"  # 配置的 synthetic-model 是别名
+    calls = [
+        {"purpose": "route", "model": served, "input_tokens": 600, "output_tokens": 40},
+        {"purpose": "route", "model": served, "input_tokens": 800, "output_tokens": 60},
+        {"purpose": "route", "model": "synthetic-model", "error": "LLMTimeout", "kind": "timeout"},
+        {
+            "purpose": "route",
+            "model": "synthetic-model",
+            "error": "LLMError",
+            "kind": "rate_limit",
+            "status": 429,
+        },
+        # 成功，但接口没有返回 usage
+        {"purpose": "generate", "model": served, "input_tokens": 0, "output_tokens": 0},
+        {
+            "purpose": "qa",
+            "model": "synthetic-model",
+            "error": "LLMError",
+            "kind": "bad_request",
+            "status": 400,
+            "code": "unsupported_parameter",
+        },
+    ]
+    report = usage_report([calls])
+    assert report.total_tokens == 1500  # 合计照旧只算计量到的
+    route = report.by_purpose["route"]
+    assert route.errors == 2 and route.zero_usage_calls == 0
+    assert route.failed_tokens_estimate == pytest.approx(2 * 1500 / 2)  # 成功调用平均 750
+    generate = report.by_purpose["generate"]
+    assert generate.zero_usage_calls == 1 and generate.failed_tokens_estimate == 0
+    qa = report.by_purpose["qa"]
+    assert qa.errors == 1 and qa.failed_tokens_estimate is None  # 没有成功的调用可参照
+    assert report.failed_tokens_estimate == pytest.approx(1500)  # 只加估得出的
+    assert report.zero_usage_calls == 1
+    assert report.served_models == {served: 3}  # 失败的调用没有回显，不算
+    # 失败原因按 health.error_label 分开（带了 kind / status / code 才细分）
+    assert report.error_types == {
+        "timeout": 1,
+        "http_429": 1,
+        "http_400:unsupported_parameter": 1,
+    }
+    clean = usage_report([CALLS[:2]])
+    assert clean.failed_tokens_estimate == 0 and clean.zero_usage_calls == 0
+    assert clean.served_models == {}  # 事件里没有模型名
+    assert usage_report([[calls[5]]]).failed_tokens_estimate is None
+    # 成功的调用都没有用量时，失败的也估不出（不拿 0 当平均值）
+    no_usage = usage_report([[calls[4], {"purpose": "generate", "error": "LLMError"}]])
+    assert no_usage.by_purpose["generate"].failed_tokens_estimate is None
+    assert list(calls_by_purpose(calls, also=["other"])) == ["route", "generate", "qa", "other"]
 
 
 def test_resolve_pricing_from_flags_and_env():

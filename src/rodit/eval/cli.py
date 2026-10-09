@@ -6,10 +6,13 @@
 - §13.2 四个维度（事实正确、切题、合规、表达）的满分率；
 - §13.2 上线门槛：只看测试集（§13.1 留出的 20%）——事实正确、合规满分率都 ≥ 95%；
 - §13.3 智能辅助阈值（target_precision = 0.90）：只用开发集的路由结果校准（测试集不参与调参），
-  另给出可靠性分箱和期望校准误差（ECE）；
-- §12.1 耗时：逐条和汇总（各环节、端到端的 P50 / P95，对照 §12.1 目标），最慢的几条；
+  另给出可靠性分箱和期望校准误差（ECE）。只用配置的判断层做出的路由：退回关键词规则的用例不参与
+  （两边的置信度不是一个刻度），报告里写明排除了几条；
+- §12.1 耗时：逐条和汇总（各环节、端到端的 P50 / P95，对照 §12.1 目标），最慢的几条；各环节有多少
+  调用到超时才结束；有用例被时间预算截断或有调用超时时，端到端不写"达标"（那个数被截短了）；
 - §14 大模型用量：逐条和汇总的 token、调用次数、失败次数，按用途（路由 / 生成 / 质检）的占比；
-  给了单价时估算成本；
+  给了单价时估算成本。失败的调用不在合计里，另给估算；接口没返回用量、回显的模型名和配置的不一样
+  都会写明；
 - 降级统计（§12.2）；失败清单：每条用例的问题、实际推荐；接大模型时还有模型草稿和质检原因；
 - §13.5 回归比较（--baseline）：指标比基线下降超过容差时退出码为 1。
 
@@ -19,31 +22,49 @@
 - env：真实的 OpenAI 兼容大模型，和线上取同一个（app.production.build_production_unit 的规则）：
   --config 里 llm.base_url 和 llm.model 都写了用配置，否则用环境变量（rodit.eval.llm_env：
   RODIT_LLM_BASE_URL / RODIT_LLM_MODEL / RODIT_LLM_TIMEOUT_S）；密钥从 llm.api_key_env 指的
-  环境变量读（默认 RODIT_LLM_API_KEY）。路由和质检按 EngineConfig.decision 组装
-  （默认 incloud_llm）。开跑前先做连通性检查（rodit.eval.llm_env.preflight，没过就不跑；
-  --skip-preflight 跳过，只在调试时用）。
+  环境变量读（默认 RODIT_LLM_API_KEY）；配置里的 llm.extra_body（如关闭思考模式）并入每次请求。
+  路由和质检按 EngineConfig.decision 组装（默认 incloud_llm）。
+  没给 --config 时用环境变量 RODIT_CONFIG 指的文件（和 python -m rodit.ops 的任务一样）；两样都
+  没有就按内置默认值跑，并提醒：配置指纹和用 config/rodit.yaml 的部署对不上，结果不能当上线依据。
+  开跑前先做连通性检查（rodit.eval.llm_env.preflight，没过就不跑；--skip-preflight 跳过，
+  只在调试时用）。
   只在本地开发机上这样做：密钥放本地 .env，不进仓库；评测集全是合成数据。
+
+运行健康度（只有 --llm env；rodit.eval.health）：调用失败、被截断、读不出时链路按 §12.2 降级，评测
+照样跑完，但那组数字量的是兜底逻辑，不是模型。报告里的 health 记下：路由退回关键词规则、路由丢票
+（判断层照常给出结果，但有一票没算上）、质检判断层不可用、生成没有可用草稿、引擎异常各有几条，
+每个用途的调用里失败（按原因分开）、被截断、为空、用不上的各有几次，实际做出路由的判断层。
+超过上限（默认 2%，至少容许 1 条；--max-degraded 改这一次的上限）这一轮就不算数：文本报告开头和
+上线门槛旁边写明原因，退出码 3。--allow-degraded 时不因此返回 3（没有回归就是 0；JSON 里的
+valid 照旧是 false）。连续 8 条用例的大模型调用全部失败（抛 LLMError / LLMTimeout）时提前停下
+（退出码 2，不出报告）；--allow-degraded 时不停。
+--min-interval 秒数：相邻两条用例的开始至少隔这么久（限流时用，等待不计入耗时）。
 
 部分评测：--intent 只跑某个问题类型，--limit N 用 --seed 随机抽 N 条（可复现）。
 路由分类器（§6.4）：--classifier 模型文件（python -m rodit.ops train-classifier 的输出）代替路由的
 判断层，两种模式都可以；上线前和 --baseline 一起跑回归（§13.5）。
-完整结果：--json 输出 JSON 到标准输出；--json out.json 写文件（文本报告照常输出）。
+完整结果：--json 输出 JSON 到标准输出；--json out.json 写文件（文本报告照常输出）。写文件的路径
+开跑前先验证写得进去；跑完先写 JSON（临时文件写好再换名）再出文本报告。
 报告带指纹（rodit.eval.fingerprint）：按实际跑的记——配置的 config_fingerprint（--classifier 时
 判断层记为 classifier）、路由 / 质检问题定义版本、生成环节和判断层提示词的版本、用的大模型
 （模型名、接口主机）、--classifier 模型文件的 SHA-256、代码版本；
 python -m rodit.ops record-eval --report out.json
 把完整评测的结论记成 eval.verdict，上线状态只认指纹和线上一致的结论（§13.4、§13.5）。
-退出码：0 正常；1 回归比较有指标下降；2 配置错误（环境变量、基线文件、筛选后没有用例等）。
+退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完——配置错误（环境变量、基线文件、筛选后
+没有用例、--json 的路径写不进去等）、连通性检查没过、连续多条用例调用全部失败而停下、最后写不进
+JSON；3 这一轮没有有效评到模型（报告和 JSON 照常写出；同时有指标下降也是 3——兜底逻辑的数字
+比不出回归）；130 被中断（Ctrl-C：结果没有保存）。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Literal, TextIO
@@ -52,6 +73,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from rodit.app.offline import EvidenceEchoLLM
+from rodit.core.audit import DEGRADED_BUDGET
 from rodit.core.config import EngineConfig, load_config
 from rodit.core.decision import DecisionProvider
 from rodit.core.enums import INTENT_LABELS, Intent, ProviderName
@@ -59,6 +81,7 @@ from rodit.core.errors import LLMError
 from rodit.core.models import EngineResult
 from rodit.core.ports import LLMClient
 from rodit.decision import ClassifierArtifactError, ClassifierProvider, RuleProvider
+from rodit.engine import DEGRADED_DECISION, DEGRADED_DECISION_QA, DEGRADED_ENGINE
 from rodit.eval.baseline import METRIC_LABELS, BaselineCheck, compare_to_baseline, load_baseline
 from rodit.eval.calibration import (
     ReliabilityBin,
@@ -70,7 +93,15 @@ from rodit.eval.calibration import (
 from rodit.eval.dataset import EvalCase, cases
 from rodit.eval.fingerprint import EvalFingerprint, file_sha256, fingerprint_of
 from rodit.eval.harness import DEMO_PLATFORM, DemoHarness, demo_harness, llm_harness
-from rodit.eval.health import RunHealth
+from rodit.eval.health import (
+    DEFAULT_CEILING,
+    LOST_VOTE_CEILING,
+    HealthCounts,
+    PurposeHealth,
+    RunHealth,
+    assess,
+    error_label,
+)
 from rodit.eval.llm_env import (
     PRICE_INPUT_ENV,
     PRICE_OUTPUT_ENV,
@@ -79,6 +110,7 @@ from rodit.eval.llm_env import (
     describe_model,
     preflight,
     resolve_pricing,
+    via_proxy,
 )
 from rodit.eval.perf import (
     DAYS_PER_MONTH,
@@ -87,14 +119,18 @@ from rodit.eval.perf import (
     CaseUsage,
     LatencyReport,
     Pricing,
+    StageLatency,
     UsageReport,
+    calls_by_purpose,
     case_usage,
+    is_timeout,
     latency_report,
     usage_report,
 )
-from rodit.eval.runner import CaseTrace, Progress, run_eval, select_cases
+from rodit.eval.runner import CaseTrace, EvalAborted, Progress, run_eval, select_cases
 from rodit.eval.scoring import DIMENSIONS, CaseScore, summarize
 from rodit.llm import OpenAICompatibleClient
+from rodit.routing import NO_PROVIDER
 from rodit.testing import fixtures
 from rodit.testing.fixtures import build_demo_world
 
@@ -105,6 +141,16 @@ Add = Callable[[str], None]  # 文本报告逐行追加
 ASSIST_PRECISION = 0.90  # §13.3 智能辅助阈值
 GATE = 0.95  # §13.2 上线门槛
 SLOWEST_SHOWN = 5  # 文本报告里列出最慢的几条
+LOST_VOTES_SHOWN = 20  # 文本报告里列出路由丢票的用例，最多这么多条
+STOP_AFTER_FAILED_CASES = 8  # 连续这么多条用例的大模型调用全部失败就停下（--allow-degraded 时不停）
+CONFIG_ENV = "RODIT_CONFIG"  # 没给 --config 时 --llm env 读它指的配置文件（同 python -m rodit.ops）
+EXIT_REGRESSION, EXIT_NOT_RUN, EXIT_DEGRADED, EXIT_INTERRUPTED = 1, 2, 3, 130
+BANNER = "!! "  # 这一轮不算数时提示行的开头
+DEFAULTS_WARNING = (
+    f"注意：没有 --config，也没有环境变量 {CONFIG_ENV}，按内置默认值跑。配置指纹和用 "
+    "config/rodit.yaml 的部署对不上，这次的结果不能当上线依据（record-eval 会说和线上不一致）；"
+    "要当依据，加 --config config/rodit.yaml 重跑。"
+)
 STAGE_SHORT = {"route": "路由", "retrieve": "检索", "generate": "生成", "qa": "质检"}
 OFFLINE_UNIT_LINE = (
     "单元：本地演示（离线大模型只复述依据、关键词规则路由、启发式质检；合成数据，不联网）"
@@ -165,14 +211,19 @@ class GateVerdict(_Model):
 class Calibration(_Model):
     target_precision: float
     samples_split: str  # 校准用的是哪部分数据
-    n_samples: int
+    n_samples: int  # 参与校准的条数：只算配置的判断层做出的路由
     thresholds: dict[str, ThresholdPick | None]
+    # 这部分数据里没参与校准的：退回了关键词规则的（置信度不是一个刻度）、没有路由结果的
+    left_out_fallback: int = 0
+    left_out_no_route: int = 0
 
 
 class Reliability(_Model):
     n_samples: int
     bins: list[ReliabilityBin]
     ece: float
+    left_out_fallback: int = 0  # 同 Calibration，范围是全部用例
+    left_out_no_route: int = 0
 
 
 class LLMInfo(_Model):
@@ -185,6 +236,9 @@ class LLMInfo(_Model):
     route_votes: int | None = None  # 路由自一致性投票次数（§6.4）
     qa_votes: int | None = None
     route_timeout_s: float | None = None
+    # 请求是不是经环境里配置的代理发出去的（rodit.eval.llm_env.via_proxy）：耗时是从这台机器量的，
+    # 要看这条路径（§12.1）。不知道（离线替身、注入的客户端）时为 None；不记代理地址
+    via_proxy: bool | None = None
 
 
 class CaseRecord(_Model):
@@ -203,6 +257,12 @@ class CaseRecord(_Model):
     latency_ms: dict[str, int] = Field(default_factory=dict)
     degraded: list[str] = Field(default_factory=list)
     usage: CaseUsage | None = None  # 离线模式不计量
+    # 实际做出路由的判断层（incloud_llm / rules / classifier / none）；没有路由结果时为 None。
+    # 配置的是 incloud_llm、这里却是 rules，就是退回了关键词规则（degraded 里有 decision）
+    route_provider: str | None = None
+    # 路由发出的票数（一次调用一票）和其中算得上的；离线模式、不用大模型路由时为 None / 0
+    route_votes: int | None = None
+    route_votes_usable: int | None = None
 
 
 class Failure(_Model):
@@ -284,17 +344,34 @@ def _by_intent(scores: Sequence[CaseScore], by_id: dict[str, EvalCase]) -> dict[
     return out
 
 
-def _samples(scores: Sequence[CaseScore], by_id: dict[str, EvalCase]) -> list[Sample]:
-    """(预测类型, 置信度, 真实类型)：没有路由结果的用例不算（§13.3 只校准路由）。"""
-    return [
-        Sample(
-            predicted=str(s.predicted_intent),
-            confidence=s.intent_confidence,
-            true=str(by_id[s.case_id].expected_intent),
-        )
-        for s in scores
-        if s.predicted_intent is not None and s.intent_confidence is not None
-    ]
+def _judge_routed(provider: str | None, degraded: Sequence[str]) -> bool:
+    """这条用例的路由是不是配置的判断层做出来的：有路由结果，而且没有退回关键词规则。"""
+    return provider is not None and DEGRADED_DECISION not in degraded
+
+
+def _samples(
+    scores: Sequence[CaseScore], by_id: dict[str, EvalCase], traces: Mapping[str, CaseTrace]
+) -> tuple[list[Sample], int, int]:
+    """(预测类型, 置信度, 真实类型)，和没算进去的两个条数（退回关键词规则的、没有路由结果的）。
+
+    §13.3 校准的是配置的判断层：退回关键词规则的用例不算——关键词规则的置信度（0.4–0.9）和判断层的
+    （投票占比）不是一个刻度，混在一起扫出来的阈值两边都不适用；没有路由结果的也不算。"""
+    samples: list[Sample] = []
+    fallback = no_route = 0
+    for s in scores:
+        if DEGRADED_DECISION in traces[s.case_id].degraded:
+            fallback += 1
+        elif s.predicted_intent is None or s.intent_confidence is None:
+            no_route += 1
+        else:
+            samples.append(
+                Sample(
+                    predicted=str(s.predicted_intent),
+                    confidence=s.intent_confidence,
+                    true=str(by_id[s.case_id].expected_intent),
+                )
+            )
+    return samples, fallback, no_route
 
 
 def _failure(
@@ -321,6 +398,7 @@ def _failure(
 def _case_record(
     score: CaseScore, case: EvalCase, trace: CaseTrace, pricing: Pricing | None
 ) -> CaseRecord:
+    votes = trace.stats("route") if trace.metered else None
     return CaseRecord(
         id=score.case_id,
         split=score.split,
@@ -335,6 +413,9 @@ def _case_record(
         latency_ms=dict(trace.latency_ms),
         degraded=list(trace.degraded),
         usage=case_usage(trace.llm_calls, pricing) if trace.metered else None,
+        route_provider=trace.route_provider,
+        route_votes=votes.calls if votes is not None else None,
+        route_votes_usable=votes.usable if votes is not None else None,
     )
 
 
@@ -355,6 +436,79 @@ def _llm_info(
         route_votes=decision.vote_samples,
         qa_votes=decision.qa_vote_samples,
         route_timeout_s=decision.timeout_s,
+        via_proxy=via_proxy(llm),
+    )
+
+
+# ================================================================ 运行健康度（rodit.eval.health）
+
+
+def _lost_votes(trace: CaseTrace) -> int:
+    """路由用了判断层、却没算上的票数（调用失败、被截断、为空、读不出主要问题）。
+    退回关键词规则的用例不在这里数（那是 route_fallback）。"""
+    if not _judge_routed(trace.route_provider, trace.degraded):
+        return 0
+    votes = trace.stats("route")
+    return votes.calls - votes.usable
+
+
+def _health_counts(traces: Sequence[CaseTrace]) -> HealthCounts:
+    """一组用例的计数（各项的含义见 rodit.eval.health.HealthCounts）。降级标记是引擎给的，
+    丢票、有没有送检、有没有可用草稿是 harness 的 CallRecorder 记的。"""
+    attempted = [t for t in traces if t.stats("generate").calls]
+    return HealthCounts(
+        cases=len(traces),
+        route_fallback=sum(1 for t in traces if DEGRADED_DECISION in t.degraded),
+        route_lost_votes=sum(1 for t in traces if _lost_votes(t) > 0),
+        # 判断层质检不可用的用例也算送过检（保证分子不超过分母）
+        qa_judged=sum(
+            1 for t in traces if t.stats("qa").calls or DEGRADED_DECISION_QA in t.degraded
+        ),
+        qa_unavailable=sum(1 for t in traces if DEGRADED_DECISION_QA in t.degraded),
+        generation_attempted=len(attempted),
+        generation_unusable=sum(1 for t in attempted if not t.stats("generate").usable),
+        engine_errors=sum(1 for t in traces if DEGRADED_ENGINE in t.degraded),
+        budget_cut=sum(1 for t in traces if DEGRADED_BUDGET in t.degraded),
+    )
+
+
+def _purpose_health(traces: Sequence[CaseTrace]) -> dict[str, PurposeHealth]:
+    """每个用途的调用情况：次数、失败和失败原因来自 llm.usage 的 detail（原因的标签由
+    health.error_label 给），被截断、为空、用不上来自 CallRecorder（它看得到响应本身）。"""
+    recorded = sorted({purpose for t in traces for purpose in t.calls})
+    grouped = calls_by_purpose([d for t in traces for d in t.llm_calls], also=recorded)
+    out: dict[str, PurposeHealth] = {}
+    for purpose, calls in grouped.items():
+        failed = [d for d in calls if d.get("error")]
+        stats = [t.stats(purpose) for t in traces]
+        out[purpose] = PurposeHealth(
+            calls=len(calls),
+            failed=len(failed),
+            timeouts=sum(1 for d in failed if is_timeout(d)),
+            truncated=sum(s.truncated for s in stats),
+            empty=sum(s.empty for s in stats),
+            unusable=sum(s.unusable for s in stats),
+            errors=dict(Counter(error_label(d) for d in failed).most_common()),
+        )
+    return out
+
+
+def _run_health(
+    traces: Sequence[CaseTrace], test: Sequence[CaseTrace], ceiling: float
+) -> RunHealth:
+    """这一轮的运行健康度。算不算数只有 health.assess 这一条规则（ceiling 是这次用的上限）。"""
+    overall = _health_counts(traces)
+    test_counts = _health_counts(test) if test else None
+    reasons = assess(overall, test_counts, ceiling=ceiling)
+    return RunHealth(
+        ceiling=ceiling,
+        overall=overall,
+        test=test_counts,
+        by_purpose=_purpose_health(traces),
+        routed_by=dict(Counter(t.route_provider or NO_PROVIDER for t in traces).most_common()),
+        late_calls=sum(t.late_calls for t in traces),
+        valid=not reasons,
+        reasons=reasons,
     )
 
 
@@ -371,6 +525,9 @@ def evaluate(
     progress: Progress | None = None,
     route_provider: DecisionProvider | None = None,
     classifier_sha256: str | None = None,
+    ceiling: float = DEFAULT_CEILING,
+    min_interval_s: float = 0.0,
+    stop_after_failed: int | None = None,
 ) -> EvalCliReport:
     """在演示单元上跑评测集的一部分，汇总成报告。
 
@@ -378,7 +535,11 @@ def evaluate(
     route_provider 给了就用它路由（--classifier：训练好的分类器，§6.4 上线前的 §13.5 回归），
     classifier_sha256 是它的模型文件的 SHA-256（记进指纹）。
     intent / limit / seed 见 runner.select_cases；pricing 为空时只报 token。
+    ceiling：运行健康度这次用的上限（health.assess；只有给了 llm 才有 health）。
+    min_interval_s / stop_after_failed 见 runner.run_eval（后者触发时抛 runner.EvalAborted）。
     """
+    if not 0 <= ceiling <= 1:  # 开跑前就拦下：不然跑完一整轮才在组装 health 时报错
+        raise ValueError(f"运行健康度的上限必须在 [0, 1] 之间（比例，不是百分数）：{ceiling}")
     wanted = Intent(intent) if intent is not None else None
     selected = select_cases(cases(split), intent=wanted, limit=limit, seed=seed)
     if not selected:
@@ -390,7 +551,13 @@ def evaluate(
     else:
         make_harness = partial(llm_harness, llm, config, route_provider)
     run = run_eval(
-        selected, make_harness, gate=GATE, assist_precision=target_precision, progress=progress
+        selected,
+        make_harness,
+        gate=GATE,
+        assist_precision=target_precision,
+        progress=progress,
+        min_interval_s=min_interval_s,
+        stop_after_failed=stop_after_failed,
     )
     by_id = {c.id: c for c in selected}
     scores = run.scores
@@ -416,15 +583,19 @@ def evaluate(
     # §13.1：测试集不参与调参——有开发集时只用开发集校准
     dev_scores = [s for s in scores if s.split == "dev"]
     calib_scores, calib_split = (dev_scores, "dev") if dev_scores else (scores, split)
-    calib_samples = _samples(calib_scores, by_id)
+    calib_samples, calib_fallback, calib_no_route = _samples(calib_scores, by_id, run.traces)
     intents = sorted({str(by_id[s.case_id].expected_intent) for s in calib_scores})
     thresholds = calibrate(calib_samples, intents, target_precision=target_precision)
 
-    all_samples = _samples(scores, by_id)
+    all_samples, all_fallback, all_no_route = _samples(scores, by_id, run.traces)
     bins, ece = reliability(all_samples) if all_samples else ([], 0.0)
     report = summarize(scores, selected, gate=GATE)
     traces = [run.traces[s.case_id] for s in scores]
     metered = any(t.metered for t in traces)
+    health: RunHealth | None = None
+    if llm is not None:  # 离线替身不调大模型：没有"评没评到模型"这回事
+        test_traces = [run.traces[s.case_id] for s in test_scores]
+        health = _run_health(traces, test_traces, ceiling)
     return EvalCliReport(
         split=split,
         n=len(scores),
@@ -438,8 +609,16 @@ def evaluate(
             samples_split=calib_split,
             n_samples=len(calib_samples),
             thresholds=thresholds,
+            left_out_fallback=calib_fallback,
+            left_out_no_route=calib_no_route,
         ),
-        reliability=Reliability(n_samples=len(all_samples), bins=bins, ece=ece),
+        reliability=Reliability(
+            n_samples=len(all_samples),
+            bins=bins,
+            ece=ece,
+            left_out_fallback=all_fallback,
+            left_out_no_route=all_no_route,
+        ),
         confusion=report.confusion,
         failures=[
             _failure(s, by_id[s.case_id], run.results.get(s.case_id), run.traces[s.case_id])
@@ -450,9 +629,14 @@ def evaluate(
         seed=seed if limit is not None else None,
         llm=_llm_info(llm, config, classifier=route_provider is not None),
         cases=[_case_record(s, by_id[s.case_id], run.traces[s.case_id], pricing) for s in scores],
-        latency=latency_report([t.latency_ms for t in traces]),
+        latency=latency_report(
+            [t.latency_ms for t in traces],
+            [d for t in traces for d in t.llm_calls],
+            budget_cut=sum(1 for t in traces if DEGRADED_BUDGET in t.degraded),
+        ),
         usage=usage_report([t.llm_calls for t in traces], pricing) if metered else None,
         degraded_counts=dict(Counter(d for t in traces for d in t.degraded).most_common()),
+        health=health,
         fingerprint=_run_fingerprint(llm, config, route_provider, classifier_sha256),
     )
 
@@ -523,23 +707,54 @@ def _stage_breakdown(latency: dict[str, int]) -> str:
     return f"（{' / '.join(parts)}）" if parts else ""
 
 
+VIA_PROXY_LABELS = {True: "经本机代理", False: "直连", None: "未知"}
+LIMITED_BY_BUDGET = "受时间预算限制"
+
+
+def _share(count: int, total: int) -> str:
+    return f"{count / total * 100:.1f}%" if total else "—"
+
+
+def _stage_verdict(key: str, stage: StageLatency, lat: LatencyReport) -> str:
+    if stage.target_ms is None:
+        return "—"
+    if stage.within_target is None:
+        # 端到端：没有数据，或者那个数被时间预算截短了——后一种不能写"达标"
+        limited = key == "total" and lat.limited_by_budget and stage.p95 is not None
+        return f"≤ {stage.target_ms}{' ' + LIMITED_BY_BUDGET if limited else ''}"
+    return f"≤ {stage.target_ms} {'达标' if stage.within_target else '超标'}"
+
+
 def _render_latency(report: EvalCliReport, add: Add) -> None:
     lat = report.latency
     add(f"== §12.1 耗时（毫秒，{lat.n} 条；没跑的环节记 0；目标对照 P95）")
     if report.llm.mode == "offline":
         add("离线替身的耗时只说明代码路径，不代表真实大模型")
-    add(f"{'环节':<8}{'n':>4}  {'P50':>7}  {'P95':>7}  {'最大':>7}  目标")
-    for stage in lat.stages.values():
-        if stage.target_ms is None:
-            verdict = "—"
-        else:
-            status = (
-                "" if stage.within_target is None else (" 达标" if stage.within_target else " 超标")
-            )
-            verdict = f"≤ {stage.target_ms}{status}"
+    else:
         add(
+            f"网络路径：{VIA_PROXY_LABELS[report.llm.via_proxy]}。耗时是从这台机器量的"
+            "（含到模型服务的网络），不是平台云内的耗时"
+        )
+    with_calls = any(stage.llm_calls for stage in lat.stages.values())
+    head = f"{'环节':<8}{'n':>4}  {'P50':>7}  {'P95':>7}  {'最大':>7}  目标"
+    add(head + ("  ｜到超时才结束的调用" if with_calls else ""))
+    for key, stage in lat.stages.items():
+        row = (
             f"{stage.label:<8}{stage.count:>4}  {_ms(stage.p50):>7}  {_ms(stage.p95):>7}"
-            f"  {_ms(stage.max):>7}  {verdict}"
+            f"  {_ms(stage.max):>7}  {_stage_verdict(key, stage, lat)}"
+        )
+        if stage.llm_calls:
+            row += (
+                f"  ｜{stage.llm_timeouts} / {stage.llm_calls}"
+                f"（{_share(stage.llm_timeouts, stage.llm_calls)}）"
+            )
+        add(row)
+    if lat.limited_by_budget:
+        add(
+            f"端到端{LIMITED_BY_BUDGET}：有 {lat.budget_cut} 条用例被时间预算截断、"
+            f"{lat.llm_timeouts} 次调用到超时才结束。单次调用到超时就断、整条消息到时间预算就返回，"
+            "所以端到端超不过目标：上面的数是被截短的，不是模型服务的真实耗时，不能算达标"
+            "（有调用超时的环节，耗时同样只是下限）"
         )
     slowest = sorted(
         (c for c in report.cases if c.latency_ms.get("total") is not None),
@@ -578,6 +793,7 @@ def _render_usage(report: EvalCliReport, add: Add) -> None:
             f"输入 {p.input_tokens:,}、输出 {p.output_tokens:,}，占 {share}；"
             f"单次耗时 P50 {_ms(lat.p50)} / P95 {_ms(lat.p95)} 毫秒"
         )
+    _render_usage_caveats(report, usage, add)
     if usage.pricing is None:
         add(
             "成本：没有单价，只报 token（--price-input / --price-output，"
@@ -595,6 +811,40 @@ def _render_usage(report: EvalCliReport, add: Add) -> None:
         f"§14 示例口径（每店每天 {MESSAGES_PER_SHOP_DAY} 条消息 × {DAYS_PER_MONTH} 天）：{monthly}"
         "（评测集的问题类型分布和真实咨询不同，只作量级参考）"
     )
+
+
+def _render_usage_caveats(report: EvalCliReport, usage: UsageReport, add: Add) -> None:
+    """合计里少了什么：失败的调用、没返回用量的调用；实际应答的是哪个模型。"""
+    if usage.errors:
+        add(
+            f"失败的 {usage.errors} 次调用按 0 token 计，上面的合计、成本和每店每月都不含它们"
+            "（请求已经发出去，模型服务可能照常计费）。按同用途成功调用的平均值估算（只是估算，不是计量）："
+        )
+        for purpose, p in usage.by_purpose.items():
+            if not p.errors:
+                continue
+            estimate = (
+                f"估算 ≈ {_num(p.failed_tokens_estimate, 0)} token"
+                if p.failed_tokens_estimate is not None
+                else "估不出（这个用途没有带用量的成功调用可参照）"
+            )
+            add(f"  {PURPOSE_LABELS.get(purpose, purpose)}：失败 {p.errors} 次，{estimate}")
+        if usage.failed_tokens_estimate is not None:
+            add(f"  估得出的合计 ≈ {_num(usage.failed_tokens_estimate, 0)} token（估算）")
+    if usage.zero_usage_calls:
+        add(
+            f"注意：有 {usage.zero_usage_calls} 次成功的调用 token 数是 0——接口没有返回用量"
+            "（usage），上面的 token 和成本少算了，不是真的为 0"
+        )
+    if usage.served_models:
+        names = "、".join(f"{name} ×{n}" for name, n in usage.served_models.items())
+        add(f"模型服务回显的模型名（成功的调用）：{names}")
+        configured = report.llm.model
+        if configured and any(name != configured for name in usage.served_models):
+            add(
+                f"注意：回显的模型名和配置的 {configured} 不一样（配置的可能只是别名）："
+                "这次量的是回显的那个版本，请记下来——别名以后改指向别的版本，配置指纹看不出来"
+            )
 
 
 def _render_failure(f: Failure, add: Add) -> None:
@@ -640,9 +890,101 @@ def _render_baseline(check: BaselineCheck, add: Add) -> None:
     add("→ 指标没有下降" if check.passed else "→ 有指标下降超过容差：不能上线（退出码 1）")
 
 
+def _left_out_note(fallback: int, no_route: int) -> str:
+    """没参与 §13.3 校准的用例：几条、为什么（都是 0 时返回空串）。"""
+    parts = []
+    if fallback:
+        parts.append(
+            f"{fallback} 条退回了关键词规则（它的置信度和判断层的不是一个刻度，不能混在一起）"
+        )
+    if no_route:
+        parts.append(f"{no_route} 条没有路由结果")
+    return "、".join(parts)
+
+
+def _ceiling_note(health: RunHealth) -> str:
+    note = f"上限 {health.ceiling * 100:g}%"
+    if health.ceiling != DEFAULT_CEILING:
+        default = f"{DEFAULT_CEILING * 100:g}%"
+        note += f"，--max-degraded 给的；默认 {default}，record-eval 按默认上限重新判定"
+    return note
+
+
+def _health_banner(health: RunHealth) -> list[str]:
+    """这一轮不算数时的提示：报告开头和上线门槛旁边各放一次，原因逐条列出。"""
+    return [
+        f"{BANNER}这一轮没有有效评到模型（{_ceiling_note(health)}）：有超过上限的用例走了兜底逻辑"
+        "（关键词规则、只跑硬规则的质检、模板）或者缺了票，下面的数字不是模型正常工作时的成绩，"
+        "不能当成模型的评测结果。原因：",
+        *(f"{BANNER}  {reason}" for reason in health.reasons),
+    ]
+
+
+def _counts_line(name: str, c: HealthCounts) -> str:
+    return (
+        f"{name} {c.cases} 条：路由退回关键词规则 {c.route_fallback}、"
+        f"路由丢票 {c.route_lost_votes}、"
+        f"引擎异常 {c.engine_errors}、被时间预算截断 {c.budget_cut}；"
+        f"质检判断层不可用 {c.qa_unavailable} / {c.qa_judged}（有草稿送检的）；"
+        f"生成没有可用草稿 {c.generation_unusable} / {c.generation_attempted}（调过大模型生成的）"
+    )
+
+
+def _accuracy_of(rows: Sequence[CaseRecord]) -> str:
+    if not rows:
+        return "0 条"
+    return f"{len(rows)} 条 {_pct(sum(1 for c in rows if c.intent_ok) / len(rows))}"
+
+
+def _render_health(report: EvalCliReport, health: RunHealth, add: Add) -> None:
+    add(
+        f"== 运行健康度（这一轮算不算评到了模型：{_ceiling_note(health)}，"
+        f"路由丢票上限 {LOST_VOTE_CEILING * 100:g}%，各项至少容许 1 条）"
+    )
+    add(_counts_line("全部", health.overall))
+    if health.test is not None:
+        add(_counts_line("测试集", health.test))
+    add(
+        "大模型调用（失败原因分开列：timeout 超时，http_<状态码>[:模型服务的错误代码]，"
+        "其余是类别或异常类型名）："
+    )
+    for purpose, p in health.by_purpose.items():
+        causes = "、".join(f"{label} ×{n}" for label, n in p.errors.items())
+        add(
+            f"  {PURPOSE_LABELS.get(purpose, purpose)}：调用 {p.calls}，"
+            f"失败 {p.failed}{f'（{causes}）' if causes else ''}；"
+            f"有响应的里面被截断 {p.truncated}、为空 {p.empty}、用不上 {p.unusable}"
+        )
+    if health.late_calls:
+        add(
+            f"  handle() 返回之后才结束的调用 {health.late_calls} 次"
+            "（到时间预算被丢下的，已经计入上面的次数和 §14 的用量）"
+        )
+    routed = "、".join(f"{name} {n} 条" for name, n in health.routed_by.items())
+    add(f"实际做出路由的判断层：{routed}（{NO_PROVIDER} = 没有路由结果或判断层和兜底都没答出来）")
+    judge = [c for c in report.cases if _judge_routed(c.route_provider, c.degraded)]
+    fallback = [c for c in report.cases if DEGRADED_DECISION in c.degraded]
+    rest = len(report.cases) - len(judge) - len(fallback)
+    add(
+        f"类型准确率分开看：判断层路由 {_accuracy_of(judge)}；"
+        f"退回关键词规则 {_accuracy_of(fallback)}；没有路由结果 {rest} 条"
+    )
+    lost = [c for c in judge if (c.route_votes or 0) > (c.route_votes_usable or 0)]
+    if lost:
+        shown = "、".join(
+            f"{c.id} {c.route_votes_usable}/{c.route_votes}" for c in lost[:LOST_VOTES_SHOWN]
+        )
+        more = f"……（只列前 {LOST_VOTES_SHOWN} 条）" if len(lost) > LOST_VOTES_SHOWN else ""
+        add(
+            f"路由丢票的用例 {len(lost)} 条（算得上的票 / 发出的票；票少了，置信度的刻度就粗了）："
+            f"{shown}{more}"
+        )
+
+
 def render_text(report: EvalCliReport) -> str:
     lines: list[str] = []
     add = lines.append
+    health = report.health
     sizes = "、".join(f"{k} {v} 条" for k, v in report.split_sizes.items() if v)
     add(f"Rodit 评测（§13）  评测集：{report.split}（{report.n} 条：{sizes}）")
     add(_unit_line(report.llm))
@@ -653,6 +995,10 @@ def render_text(report: EvalCliReport) -> str:
         picks.append(f"随机抽 {report.limit} 条（seed {report.seed}）")
     if picks:
         add("部分评测：" + "；".join(picks))
+    if health is not None and not health.valid:
+        lines.extend(_health_banner(health))
+    elif health is not None:
+        add(f"运行健康度：有效（{_ceiling_note(health)}）。{_counts_line('全部', health.overall)}")
     add("")
     add("== 总体（§13.2 四个维度的满分率）")
     add(_summary_line("全部", report.overall))
@@ -670,6 +1016,11 @@ def render_text(report: EvalCliReport) -> str:
             f"测试集 n={gate.n}：事实正确 {_pct(gate.factual)}，合规 {_pct(gate.compliance)}"
             f" → {verdict}"
         )
+    if health is not None and not health.valid:
+        lines.extend(_health_banner(health))  # 判定旁边再说一次：这个"通过 / 未通过"不算数
+    if health is not None:
+        add("")
+        _render_health(report, health, add)
     add("")
     add("== 按问题类型")
     add(f"{'类型':<18}{'n':>3}  {'类型准确率':>8}  {'出推荐':>6}  {'事实':>6}  {'切题':>6}")
@@ -694,6 +1045,14 @@ def render_text(report: EvalCliReport) -> str:
     )
     if cal.samples_split == "test":
         add("注意：只跑了测试集，阈值是用测试集算的，仅供参考；正式阈值用开发集校准（§13.1）")
+    left_out = _left_out_note(cal.left_out_fallback, cal.left_out_no_route)
+    if left_out:
+        add(f"只用配置的判断层做出的路由：{cal.samples_split} 里另有 {left_out}，没有参与校准")
+    if health is not None and health.overall.route_lost_votes:
+        add(
+            f"注意：有 {health.overall.route_lost_votes} 条用例路由丢了票（见运行健康度），"
+            "它们的置信度是按更少的票算的，刻度更粗；丢票多的话这里的阈值要打折扣看"
+        )
     for intent, pick in cal.thresholds.items():
         if pick is None:
             add(f"{intent:<18}达不到目标准确率")
@@ -703,7 +1062,9 @@ def render_text(report: EvalCliReport) -> str:
                 f"  覆盖率 {_pct(pick.coverage)}  召回 {_pct(pick.recall)}  (n={pick.support})"
             )
     rel = report.reliability
-    add(f"可靠性（{rel.n_samples} 条）：ECE = {rel.ece:.4f}")
+    rel_left_out = rel.left_out_fallback + rel.left_out_no_route
+    without = f"，不含没参与的 {rel_left_out} 条" if rel_left_out else ""
+    add(f"可靠性（{rel.n_samples} 条{without}）：ECE = {rel.ece:.4f}")
     for b in rel.bins:
         add(
             f"  [{b.lower:.1f}, {b.upper:.1f}{']' if b.upper == 1.0 else ')'}  n={b.count:<3}"
@@ -764,6 +1125,28 @@ def _tolerance(text: str) -> float:
     return value
 
 
+def _ratio(text: str) -> float:
+    value = float(text)
+    if not 0 <= value <= 1:  # NaN 也过不了这个比较
+        raise argparse.ArgumentTypeError("必须在 [0, 1] 之间（比例，不是百分数：0.02 = 2%）")
+    return value
+
+
+def _seconds(text: str) -> float:
+    value = float(text)
+    if not 0 <= value < float("inf"):
+        raise argparse.ArgumentTypeError("必须是非负的秒数")
+    return value
+
+
+EXIT_CODES_HELP = (
+    "退出码：0 正常；1 回归比较有指标下降；2 没有跑或没有跑完（配置错误、--json 的路径写不进去、"
+    "连通性检查没过、连续多条用例的大模型调用全部失败而停下、最后写不进 JSON）；"
+    "3 这一轮没有有效评到模型（--llm env：调用失败、被截断、读不出的用例超过上限，报告和 JSON "
+    "照常写出，同时有指标下降也是 3；--allow-degraded 时不返回 3）；130 被中断（结果没有保存）"
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m rodit.eval",
@@ -771,6 +1154,7 @@ def build_parser() -> argparse.ArgumentParser:
             "在合成评测集上跑演示单元（离线替身或真实大模型），输出 §13.2 评分、上线门槛、"
             "§13.3 阈值校准、§12.1 耗时、§14 用量，可与基线做 §13.5 回归比较"
         ),
+        epilog=EXIT_CODES_HELP,
     )
     parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
     parser.add_argument(
@@ -779,7 +1163,10 @@ def build_parser() -> argparse.ArgumentParser:
         const="-",
         default=None,
         metavar="PATH",
-        help="完整结果（JSON）：不带 PATH 输出到标准输出；带 PATH 写文件，文本报告照常输出",
+        help=(
+            "完整结果（JSON）：不带 PATH 输出到标准输出；带 PATH 写文件，文本报告照常输出"
+            "（路径开跑前先验证写得进去）"
+        ),
     )
     parser.add_argument(
         "--llm",
@@ -792,10 +1179,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="--llm env 时跳过开跑前的连通性检查（只在调试时用）",
     )
+    parser.add_argument(
+        "--allow-degraded",
+        action="store_true",
+        help=(
+            "--llm env 时这一轮没有有效评到模型也不返回 3（JSON 里 health.valid 照旧是 false），"
+            f"连续 {STOP_AFTER_FAILED_CASES} 条用例调用全部失败时也不提前停下"
+        ),
+    )
+    parser.add_argument(
+        "--max-degraded",
+        type=_ratio,
+        default=DEFAULT_CEILING,
+        metavar="FLOAT",
+        help=(
+            "运行健康度这一次用的上限（比例，默认 "
+            f"{DEFAULT_CEILING:g} = {DEFAULT_CEILING * 100:g}%%）：出问题的用例占比超过它就不算"
+            "评到了模型。记在 health.ceiling 里，只影响这次的判定和退出码"
+        ),
+    )
+    parser.add_argument(
+        "--min-interval",
+        type=_seconds,
+        default=0.0,
+        metavar="SECONDS",
+        help="相邻两条用例的开始至少隔这么多秒（被限流时用；等待不计入耗时，默认 0）",
+    )
     parser.add_argument("--intent", choices=[i.value for i in Intent], help="只跑某个问题类型")
     parser.add_argument("--limit", type=_positive_int, help="随机抽 N 条（按 --seed，可复现）")
     parser.add_argument("--seed", type=int, default=0, help="--limit 抽样的随机种子（默认 0）")
-    parser.add_argument("--config", metavar="YAML", help="引擎配置（如 config/rodit.yaml）")
+    parser.add_argument(
+        "--config",
+        metavar="YAML",
+        help=(
+            f"引擎配置（如 config/rodit.yaml）；--llm env 没给时用环境变量 {CONFIG_ENV} 指的文件，"
+            "都没有就按内置默认值跑（指纹和部署对不上，不能当上线依据）"
+        ),
+    )
     parser.add_argument(
         "--price-input", type=float, metavar="PRICE", help="输入单价：每 1000 token 的价格"
     )
@@ -821,15 +1241,18 @@ def env_client(config: EngineConfig | None) -> OpenAICompatibleClient:
     """--llm env 的大模型客户端，和 app.production.build_production_unit 取同一个：配置里
     llm.base_url 和 llm.model 都写了用配置（超时 llm.timeout_s），否则用环境变量 RODIT_LLM_*
     （llm_env.client_from_env）。密钥从 llm.api_key_env 指的环境变量读，没设时抛 RuntimeError
-    （信息里只有变量名）。评测记下的大模型（指纹）就是它。"""
+    （信息里只有变量名）。评测记下的大模型（指纹）就是它。
+    两条路都带上配置里的 llm.extra_body（模型服务特有的请求参数，如关闭思考模式）：它算在配置
+    指纹里，评测发出去的请求要和这份配置的部署发出去的一样。"""
     llm = (config or EngineConfig()).llm
     if not (llm.base_url and llm.model):
-        return client_from_env(api_key_env=llm.api_key_env)
+        return client_from_env(api_key_env=llm.api_key_env, extra_body=llm.extra_body)
     client = OpenAICompatibleClient(
         base_url=llm.base_url,
         model=llm.model,
         api_key_env=llm.api_key_env,
         timeout_s=llm.timeout_s,
+        extra_body=llm.extra_body,
     )
     if not os.environ.get(client.api_key_env, "").strip():
         raise RuntimeError(f"环境变量 {client.api_key_env} 未设置：没有大模型 API key")
@@ -841,9 +1264,108 @@ def _progress_printer(err: TextIO) -> Progress:
         ms = trace.latency_ms.get("total")
         failed = sum(1 for c in trace.llm_calls if c.get("error"))
         calls = f"，大模型调用 {len(trace.llm_calls)} 次" + (f"（失败 {failed}）" if failed else "")
-        print(f"[{index}/{total}] {case.id} {_ms(ms)} 毫秒{calls}", file=err, flush=True)
+        # 丢票和降级标记也打出来：有响应却用不上（被截断、读不出）时没有失败的调用，丢一票连降级
+        # 都没有——几百条跑完才在报告里发现就晚了
+        votes = trace.stats("route")
+        lost = f"，路由只有 {votes.usable}/{votes.calls} 票算数" if _lost_votes(trace) else ""
+        degraded = f"，降级：{'、'.join(trace.degraded)}" if trace.degraded else ""
+        line = f"[{index}/{total}] {case.id} {_ms(ms)} 毫秒{calls}{lost}{degraded}"
+        print(line, file=err, flush=True)
 
     return show
+
+
+class _Tracker:
+    """进度：记下跑完了几条（被中断时报出来）；show 给了就每跑完一条转给它（接大模型时打进度）。"""
+
+    def __init__(self, show: Progress | None = None) -> None:
+        self._show = show
+        self.done = 0
+        self.total: int | None = None
+
+    def __call__(self, index: int, total: int, case: EvalCase, trace: CaseTrace) -> None:
+        self.done, self.total = index, total
+        if self._show is not None:
+            self._show(index, total, case, trace)
+
+
+def _run_config(args: argparse.Namespace) -> tuple[EngineConfig | None, str | None]:
+    """这次评测的配置，和要告诉操作的人的话（没有就是 None）。
+
+    --config 优先。--llm env 没给 --config 时用环境变量 RODIT_CONFIG 指的文件（部署和
+    python -m rodit.ops 的任务都读它），连它也没有就是内置默认值（返回 None），并给出提醒。
+    离线替身不读 RODIT_CONFIG：它的数字只是回归基线，不随运行环境变。"""
+    if args.config:
+        return load_config(args.config), None
+    if args.llm != "env":
+        return None, None
+    path = os.environ.get(CONFIG_ENV, "").strip()
+    if path:
+        return load_config(path), f"配置：没有给 --config，用环境变量 {CONFIG_ENV} 指的 {path}"
+    return None, DEFAULTS_WARNING
+
+
+def _json_target(arg: str | None) -> Path | None:
+    """--json PATH 的目标文件。开跑前就确认写得进去：建好上级目录，在旁边写一个临时文件再删掉——
+    不然跑完一整轮（真实大模型是几千次付费调用）才发现路径不对，结果就丢了。
+    不碰目标文件本身：--baseline 和 --json 可以是同一个文件。写不进去抛 ValueError。
+    符号链接先解析到它指的文件（换名换的是那个文件，链接留着）；设备、管道这类不是普通文件的目标
+    （如 /dev/stdout）没法先写旁边再换名，不验证，跑完直接写。"""
+    if arg is None or arg == "-":
+        return None
+    target = Path(arg).expanduser()
+    try:
+        if target.is_symlink():
+            target = target.resolve()
+        if target.is_dir():
+            raise IsADirectoryError(str(target))
+        if _special(target):
+            return target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        probe = _temp_beside(target)
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        raise ValueError(
+            f"完整结果写不进 {arg}（{type(e).__name__}）：换一个写得进去的 --json 路径再跑"
+        ) from None
+    return target
+
+
+def _special(target: Path) -> bool:
+    """已经存在、但不是普通文件（设备、管道）。"""
+    return target.exists() and not target.is_file()
+
+
+def _temp_beside(target: Path) -> Path:
+    return target.with_name(f".{target.name}.{os.getpid()}.tmp")
+
+
+def _write_json(target: Path, payload: str) -> None:
+    """先写旁边的临时文件再换名（os.replace）：写到一半出错，原来的文件（可能就是基线）不会坏。
+    落单的代理项（模型文字里偶尔有，UTF-8 写不出）写成 \\uXXXX，仍然是合法的 JSON。"""
+    if _special(target):
+        target.write_text(payload + "\n", encoding="utf-8", errors="backslashreplace")
+        return
+    temp = _temp_beside(target)
+    try:
+        temp.write_text(payload + "\n", encoding="utf-8", errors="backslashreplace")
+        os.replace(temp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp.unlink()
+        raise
+
+
+def _emit(text: str, stream: TextIO) -> None:
+    """打印一段文字。流的编码写不出的字符（如模型文字里落单的代理项）换成反斜杠转义：
+    不能因为一个字符，把跑完的一整轮结果丢在最后一步。"""
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        safe = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    except LookupError:  # 流报了一个不认识的编码名
+        safe = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    print(safe, file=stream)
 
 
 def main(
@@ -861,9 +1383,13 @@ def main(
     args = build_parser().parse_args(argv)
     out = out or sys.stdout
     err = err or sys.stderr
+    tracker = _Tracker(_progress_printer(err) if args.llm == "env" else None)
+    config_note: str | None = None
     try:
         pricing = resolve_pricing(args.price_input, args.price_output)
-        config = load_config(args.config) if args.config else None
+        config, config_note = _run_config(args)
+        if config_note:
+            print(config_note, file=err, flush=True)
         if (
             config is not None
             and config.decision.provider == ProviderName.CLASSIFIER
@@ -872,6 +1398,7 @@ def main(
             # 不然路由悄悄换成关键词规则 / 大模型，回归测的不是要上线的分类器（§13.5）
             raise ValueError("配置的 decision.provider 是 classifier：用 --classifier 指定模型文件")
         baseline = load_baseline(args.baseline) if args.baseline else None
+        json_target = _json_target(args.json)  # 第一次调用大模型之前就验证
         route_provider: DecisionProvider | None = None
         if args.classifier:
             try:
@@ -888,6 +1415,7 @@ def main(
                     raise RuntimeError(f"大模型连通性检查失败：{e}") from None
                 for line in summary:  # 检查摘要；PreflightFailed 由下面的 RuntimeError 分支报出
                     print(line, file=err, flush=True)
+        stop_early = llm is not None and not args.allow_degraded
         report = evaluate(
             args.split,
             intent=args.intent,
@@ -896,9 +1424,12 @@ def main(
             llm=llm,
             config=config,
             pricing=pricing,
-            progress=_progress_printer(err) if llm is not None else None,
+            progress=tracker,
             route_provider=route_provider,
             classifier_sha256=file_sha256(args.classifier) if args.classifier else None,
+            ceiling=args.max_degraded,
+            min_interval_s=args.min_interval,
+            stop_after_failed=STOP_AFTER_FAILED_CASES if stop_early else None,
         )
         if baseline is not None:
             check = compare_to_baseline(
@@ -908,25 +1439,83 @@ def main(
                 source=args.baseline,
             )
             report = report.model_copy(update={"baseline": check})
+    except EvalAborted as e:
+        print(
+            f"评测中止：{e}。先解决失败的原因再重跑（被限流可以加 --min-interval）；"
+            "确实要跑完、看兜底逻辑的数字时加 --allow-degraded",
+            file=err,
+        )
+        return EXIT_NOT_RUN
+    except KeyboardInterrupt:
+        done = "还没有跑完一条"
+        if tracker.total:
+            done = f"已经跑完 {tracker.done} / {tracker.total} 条"
+        print(
+            f"\n评测被中断：{done}，结果没有保存（没有报告，也没有 JSON）；重跑会从头开始",
+            file=err,
+        )
+        return EXIT_INTERRUPTED
     except (ValueError, RuntimeError, OSError, yaml.YAMLError) as e:
         print(f"评测没有运行：{e}", file=err)
-        return 2
-    payload = json.dumps(report.model_dump(mode="json"), ensure_ascii=False, indent=2)
+        return EXIT_NOT_RUN
+    return _deliver(report, args, json_target, out, err, config_note)
+
+
+def _json_payload(report: EvalCliReport, stream: TextIO | None = None) -> str:
+    """报告的 JSON。给了 stream（输出到标准输出）而它的编码写不出原文时，改成全 ASCII 转义：
+    哪种编码都写得出，而且仍然是合法的 JSON。"""
+    data = report.model_dump(mode="json")
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    if stream is not None:
+        try:
+            payload.encode(getattr(stream, "encoding", None) or "utf-8")
+        except (UnicodeEncodeError, LookupError):
+            return json.dumps(data, ensure_ascii=True, indent=2)
+    return payload
+
+
+def _deliver(
+    report: EvalCliReport,
+    args: argparse.Namespace,
+    json_target: Path | None,
+    out: TextIO,
+    err: TextIO,
+    config_note: str | None,
+) -> int:
+    """跑完之后：先把完整结果写出去（JSON 先于文本报告：渲染文本出错也不丢结果），再定退出码。"""
+    saved = True
     if args.json == "-":
-        print(payload, file=out)
+        print(_json_payload(report, out), file=out)
     else:
-        print(render_text(report), file=out)
-        if args.json:
+        if json_target is not None:
             try:
-                target = Path(args.json).expanduser()
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(payload + "\n", encoding="utf-8")
+                _write_json(json_target, _json_payload(report))
             except OSError as e:
+                saved = False
                 print(f"完整结果写不进 {args.json}：{type(e).__name__}", file=err)
-                return 2
-            print(f"\n完整结果（JSON）已写入 {args.json}", file=out)
+        _emit(render_text(report), out)
+        if json_target is not None and saved:
+            _emit(f"\n完整结果（JSON）已写入 {args.json}", out)
+    if config_note == DEFAULTS_WARNING:  # 进度刷了几百行，结尾再提醒一次
+        print(config_note, file=err)
+    if not saved:
+        return EXIT_NOT_RUN
+    health = report.health
+    if health is not None and not health.valid:
+        if not args.allow_degraded:
+            print(
+                f"这一轮没有有效评到模型（退出码 {EXIT_DEGRADED}）："
+                + "；".join(r.rstrip("。") for r in health.reasons)
+                + "。确认就是要这份结果时加 --allow-degraded",
+                file=err,
+            )
+            return EXIT_DEGRADED
+        print(
+            "这一轮没有有效评到模型（原因见报告开头）；加了 --allow-degraded，退出码不因此改变",
+            file=err,
+        )
     if report.baseline is not None and not report.baseline.passed:
-        return 1
+        return EXIT_REGRESSION
     return 0
 
 

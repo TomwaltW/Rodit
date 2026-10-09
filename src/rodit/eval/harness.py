@@ -7,8 +7,11 @@
 - llm_harness(client)：同一个演示单元，大模型换成 client（真实的 OpenAI 兼容接口，或测试里的
   FakeLLMClient）。接线和 build_demo_unit 传入 llm 时一样：路由、质检按 config.decision 组装
   （默认 incloud_llm：路由自一致性投票 3 次、质检 1 次，§6.4），生成走 DefaultAnswerGenerator。
-  client 外面包两层（都不改变调用结果）：
+  client 外面包三层（都不改变调用结果）：
   - DraftRecorder：记下生成请求的输出（模型草稿），失败清单里给人看；
+  - CallRecorder：记下每次调用的结果——失败、被截断、空、读不出（只有计数，不留提示词和输出）。
+    有响应不等于用得上：路由少了一票、生成解析不出回答，链路都不报错也不降级，只有在这里看得到，
+    报告的运行健康度（rodit.eval.health）靠它；
   - MeteredLLMClient：每次调用写一条 llm.usage 审计（token、耗时、失败类型，§12.4、§14），
     写进本用例自己的审计（harness.usage），不和别的用例混在一起。
 """
@@ -16,7 +19,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from rodit.app.demo import build_demo_unit
 from rodit.core.audit import InMemoryAuditSink
@@ -26,7 +29,9 @@ from rodit.core.enums import Platform
 from rodit.core.errors import LLMError
 from rodit.core.pii import mask_pii
 from rodit.core.ports import AuditLog, ConversationRepository, LLMClient, LLMRequest, LLMResponse
-from rodit.eval.runner import EngineLike
+from rodit.core.questions import Q_INTENT, QA_QUESTIONS, ROUTER_VOTE_QUESTIONS
+from rodit.decision.voting import parse_sample
+from rodit.eval.runner import CallStats, EngineLike
 from rodit.generation import parse_generation_output
 from rodit.llm import MeteredLLMClient
 from rodit.testing.fakes import FakeClock
@@ -35,6 +40,7 @@ from rodit.testing.fixtures import DemoWorld, build_demo_world
 DEMO_PLATFORM = Platform.TAOBAO  # 评测集用店铺 A（淘宝）
 UNPARSED_PREFIX = "[无法解析的输出] "
 UNPARSED_MAX_CHARS = 200
+FINISH_TRUNCATED = "length"  # LLMResponse.finish_reason：输出被 max_tokens 截断
 
 
 class DraftRecorder:
@@ -77,13 +83,94 @@ class DraftRecorder:
             return list(self._drafts)
 
 
+def _readable(purpose: str, text: str) -> bool:
+    """这个环节的解析器读不读得出东西：路由要读得出主要问题（intent）这一票——别的问题、追问
+    答没答不看，置信度是按 intent 的有效票算的（§13.3）；质检五个问题都要读得出（少一个，
+    判断层就答不全）；生成要解析得出回答（§5.4 的 JSON）。别的用途不判断。"""
+    if purpose == "route":
+        return Q_INTENT in parse_sample(ROUTER_VOTE_QUESTIONS, text)
+    if purpose == "qa":
+        return len(parse_sample(QA_QUESTIONS, text)) == len(QA_QUESTIONS)
+    if purpose == "generate":
+        try:
+            parse_generation_output(text)
+        except LLMError:
+            return False
+    return True
+
+
+def _worth(purpose: str, response: LLMResponse) -> dict[str, int]:
+    """一次有响应的调用记哪几项（runner.CallStats 的字段）。finish_reason 用 getattr 读：
+    别的 LLMClient 实现返回的对象不一定有这个字段。"""
+    truncated = getattr(response, "finish_reason", None) == FINISH_TRUNCATED
+    empty = not response.text.strip()
+    usable = not empty and _readable(purpose, response.text)
+    if purpose in ("route", "qa"):  # 判断层的一票：被截断的不算数，哪怕碰巧读得出
+        usable = usable and not truncated
+    return {
+        "truncated": int(truncated),
+        "empty": int(empty),
+        "usable": int(usable),
+        "unusable": int(not usable),
+    }
+
+
+class CallRecorder:
+    """实现 core.ports.LLMClient：原样转发给 inner，按用途记下每次调用的结果（runner.CallStats）。
+
+    - 调用抛 LLMError / LLMTimeout：failed（别的异常是代码缺陷，照常抛出，只记进 calls）；
+    - 有响应：finish_reason 是 length 记 truncated，文本为空记 empty（两样可以同时有）；
+      再看用不用得上——路由、质检的一票被截断、为空或读不出（_readable）都算作废，生成只看解析不
+      解析得出回答——用得上记 usable，否则记 unusable。
+    只有计数，不留提示词和输出。线程安全（路由投票会并发调用同一个客户端）。
+    """
+
+    def __init__(self, inner: LLMClient) -> None:
+        self._inner = inner
+        self._lock = threading.Lock()
+        self._stats: dict[str, CallStats] = {}
+
+    @property
+    def model(self) -> str:
+        return str(getattr(self._inner, "model", "") or "")
+
+    def __repr__(self) -> str:
+        return f"CallRecorder(inner={self._inner!r})"
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        purpose = request.purpose
+        self._add(purpose, calls=1)
+        try:
+            response = self._inner.complete(request)
+        except LLMError:
+            self._add(purpose, failed=1)
+            raise
+        try:
+            counts = _worth(purpose, response)
+        except Exception:  # noqa: BLE001 — 记录不能改变调用结果：判断不了就当用不上
+            counts = {"unusable": 1}
+        self._add(purpose, **counts)
+        return response
+
+    def _add(self, purpose: str, **counts: int) -> None:
+        with self._lock:
+            now = self._stats.get(purpose, CallStats())
+            changes = {name: getattr(now, name) + n for name, n in counts.items()}
+            self._stats[purpose] = replace(now, **changes)
+
+    def stats(self) -> dict[str, CallStats]:
+        with self._lock:
+            return dict(self._stats)
+
+
 @dataclass
 class DemoHarness:
     """runner.EvalHarness 的实现：一个全新的演示单元（每条用例一套，互不影响）。
 
     - audit：单元自己的审计，读 engine.result（质检原因等）；
     - usage：只有接大模型时有，本用例的 llm.usage 事件；
-    - drafts：只有接大模型时有，本用例的模型草稿。
+    - drafts：只有接大模型时有，本用例的模型草稿；
+    - calls：只有接大模型时有，本用例每个用途的调用结果。
     """
 
     engine: EngineLike
@@ -92,6 +179,7 @@ class DemoHarness:
     audit: AuditLog | None = None
     usage: InMemoryAuditSink | None = None
     drafts: DraftRecorder | None = None
+    calls: CallRecorder | None = None
 
 
 def demo_harness(
@@ -118,12 +206,13 @@ def llm_harness(
     config: EngineConfig | None = None,
     route_provider: DecisionProvider | None = None,
 ) -> DemoHarness:
-    """接大模型的单元（见模块说明）。client 在各用例之间共用，计量和草稿按用例分开。
+    """接大模型的单元（见模块说明）。client 在各用例之间共用，计量、草稿、调用结果按用例分开。
     route_provider 给了就用它路由（如训练好的分类器），生成和质检照旧用大模型。"""
     world = build_demo_world()
     usage = InMemoryAuditSink()
     recorder = DraftRecorder(client)
-    metered = MeteredLLMClient(recorder, usage, FakeClock(world.now))
+    calls = CallRecorder(recorder)
+    metered = MeteredLLMClient(calls, usage, FakeClock(world.now))
     unit = build_demo_unit(
         DEMO_PLATFORM, world=world, config=config, llm=metered, route_provider=route_provider
     )
@@ -134,7 +223,15 @@ def llm_harness(
         audit=unit.repos.audit,
         usage=usage,
         drafts=recorder,
+        calls=calls,
     )
 
 
-__all__ = ["DEMO_PLATFORM", "DemoHarness", "DraftRecorder", "demo_harness", "llm_harness"]
+__all__ = [
+    "DEMO_PLATFORM",
+    "CallRecorder",
+    "DemoHarness",
+    "DraftRecorder",
+    "demo_harness",
+    "llm_harness",
+]
